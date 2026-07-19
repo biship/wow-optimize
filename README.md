@@ -1,4 +1,7 @@
-# wow_optimize
+# wow_optimize 
+
+# DO NOT USE ON WARMANE -- CAUSE BAN 
+
 
 Performance optimization DLL for World of Warcraft 3.3.5a (WotLK)
 Author: SUPREMATIST
@@ -337,7 +340,7 @@ Then inject after WoW starts.
 
 ### Supported Clients & Private Servers
 The optimization suite is compatible with any standard or customized WotLK 3.3.5a client (build 12340), including private servers using custom executables:
-* **Warmane** (Icecrown, Lordaeron, Onyxia)
+* **Warmane** (Icecrown, Lordaeron, Onyxia) -- DO NOT USE, CAUSE BAN
 * **Project Ascension** (supporting custom `Ascension.exe` launches)
 * **WoW Circle** (supporting `WoWCircle.exe` launches)
 * **EZ WoW**
