@@ -5,7 +5,6 @@
 #include <cmath>
 
 extern "C" void Log(const char* fmt, ...);
-extern "C" void RegisterShadowCVar(const char* name, void* cvar);
 extern "C" void RegisterParticleCVar(const char* name, void* cvar);
 extern "C" void RegisterNameplateCVar(const char* name, void* cvar);
 
@@ -29,7 +28,6 @@ static void* __cdecl Hooked_CVar_Register(const char* name, const char* defaultV
             g_farclipCVar = cvar;
             Log("[AdaptiveFarclip] Captured farclip CVar pointer: 0x%p", g_farclipCVar);
         }
-        RegisterShadowCVar(name, cvar);
         RegisterParticleCVar(name, cvar);
         RegisterNameplateCVar(name, cvar);
     }

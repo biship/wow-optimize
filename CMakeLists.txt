@@ -202,8 +202,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/strncmp_null_guard.h
     src/hooks_subsystems/frame_throttle.cpp
     src/hooks_subsystems/frame_throttle.h
-    src/hooks_subsystems/ui_frame_batch.cpp
-    src/hooks_subsystems/ui_frame_batch.h
     src/runtime_vm/lua_vm_cache.cpp
     src/runtime_vm/lua_vm_cache.h
     src/runtime_vm/lua_settable_cache.cpp
@@ -427,8 +425,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/sound_buffer_guard.h
     src/hooks_subsystems/sound_update_guard.h
 
-    src/hooks_subsystems/dynamic_shadow_scaler.cpp
-    src/hooks_subsystems/dynamic_shadow_scaler.h
     src/hooks_subsystems/sound_coalescer.cpp
     src/hooks_subsystems/sound_coalescer.h
     src/hooks_subsystems/aura_preload_cache.cpp
@@ -443,8 +439,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/particle_density_scaler.h
     src/hooks_subsystems/addon_msg_limiter.cpp
     src/hooks_subsystems/addon_msg_limiter.h
-    src/hooks_subsystems/mouse_cursor_smooth.cpp
-    src/hooks_subsystems/mouse_cursor_smooth.h
     src/hooks_subsystems/vertex_buffer_prealloc.cpp
     src/hooks_subsystems/vertex_buffer_prealloc.h
     src/hooks_subsystems/world_object_opt.cpp

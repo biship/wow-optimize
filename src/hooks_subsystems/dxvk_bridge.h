@@ -25,17 +25,9 @@ bool Init();
 void Shutdown();
 
 bool IsActive();
-double PresentIntervalMs();
-bool   ShouldSkipGpuSync();
-bool   ShouldSkipStateCache();
-
-void NotePresent();
-
 struct Stats {
     bool        active;
     const char* detectionReason;
-    double      presentIntervalMs;
-    uint64_t    presents;
 };
 void GetStats(Stats* out);
 

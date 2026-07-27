@@ -271,6 +271,11 @@ static int __cdecl hook_lua_tothread(uintptr_t L, int idx) {
 typedef int (__cdecl* lua_remove_t)(uintptr_t L, int idx);
 static lua_remove_t orig_lua_remove = nullptr;
 
+// `processed` is set before the first write, not after the last. These three
+// functions shift live stack slots in place; if a fault lands mid-shift and the
+// handler falls through to the original, the original shifts an already-shifted
+// stack and the damage doubles. Once a single slot has been touched, the only
+// safe exit is our own.
 static int __cdecl hook_lua_remove(uintptr_t L, int idx) {
     if (IsTeardownState()) return orig_lua_remove(L, idx);
     bool processed = false;
@@ -285,6 +290,7 @@ static int __cdecl hook_lua_remove(uintptr_t L, int idx) {
                 uint32_t a4 = *(uint32_t*)TAINT_A4;
                 uint32_t current_taint = TAINT_CELL;
 
+                processed = true;
                 uintptr_t curr = target + 16;
                 while (curr < top) {
                     uint32_t val0 = *(uint32_t*)(curr + 0);
@@ -312,12 +318,11 @@ static int __cdecl hook_lua_remove(uintptr_t L, int idx) {
                 }
 
                 *(uintptr_t*)(L + 0x0C) = top - 16;
-                processed = true;
                 return (int)top;
             }
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        if (processed) return 0;
+        if (processed) return 0;   // stack already moved - never re-run the original
     }
     return orig_lua_remove(L, idx);
 }
@@ -343,6 +348,7 @@ static int __cdecl hook_lua_insert(uintptr_t L, int idx) {
                 uint32_t a4 = *(uint32_t*)TAINT_A4;
                 uint32_t current_taint = TAINT_CELL;
 
+                processed = true;
                 // Copy original top element (now at top - 16) to temp
                 uintptr_t src_top = top - 16;
                 uint32_t t_val0 = *(uint32_t*)(src_top + 0);
@@ -391,12 +397,11 @@ static int __cdecl hook_lua_insert(uintptr_t L, int idx) {
                     *(uint32_t*)0x00D4139C = current_taint;
                 }
 
-                processed = true;
                 return (int)target;
             }
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        if (processed) return (int)target;
+        if (processed) return (int)target;   // stack already moved
     }
     return orig_lua_insert(L, idx);
 }
@@ -418,6 +423,7 @@ static int __cdecl hook_lua_replace(uintptr_t L, int idx) {
             bool defer = false;
             target = ResolveTValue(L, idx, &defer);
             if (!defer && target && target >= base && target < top && idx >= -10002) {
+                processed = true;
                 uint32_t a0 = *(uint32_t*)TAINT_A0;
                 uint32_t a4 = *(uint32_t*)TAINT_A4;
 
@@ -439,12 +445,11 @@ static int __cdecl hook_lua_replace(uintptr_t L, int idx) {
                 }
 
                 *(uintptr_t*)(L + 0x0C) = top - 16;
-                processed = true;
                 return (int)target;
             }
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        if (processed) return (int)target;
+        if (processed) return (int)target;   // stack already moved
     }
     return orig_lua_replace(L, idx);
 }

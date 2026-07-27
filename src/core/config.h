@@ -7,6 +7,19 @@ namespace Config {
         // General & Memory
         bool OptSleepPrecision = true;
         int SleepPrecisionValue = 8;
+        // One log per session preserves earlier runs, which is the whole point
+        // when a tester is comparing two configurations - a single overwritten
+        // file keeps only the last one. Turning this off restores that older
+        // behaviour for anyone who would rather not accumulate files.
+        bool OptSessionLogs = true;
+        // Reimplements 16 core Lua stack API functions, including the three that
+        // shift values around (lua_remove, lua_insert, lua_replace). Off by
+        // default: an error of one slot there moves every later argument, and the
+        // logs of two testers running it are full of exactly that shape of failure.
+        bool OptLuaStackFast = false;
+        // How many session logs to keep. The oldest beyond this are deleted at
+        // startup, so the folder stops growing without anyone having to tidy it.
+        int SessionLogsToKeep = 10;
         bool OptMemoryPressure = true;
         bool OptHeapCompactor = true;
         bool OptDefragLf = false;
@@ -119,10 +132,8 @@ namespace Config {
         bool OptCombatLogAsync = true;
         bool OptCombatTextFont = true;
         bool OptDbcFileCache = true;
-        bool OptDynamicShadowScaler = true;
         bool OptFontOutlineCache = true;
         bool OptMouseClipRelease = true;
-        bool OptMouseCursorSmooth = true;
         bool OptNameplateDistanceCvar = true;
         bool OptParticleDensityScaler = true;
         bool OptSavedVarsBackup = true;
@@ -137,6 +148,10 @@ namespace Config {
 
     // Load settings from wow_opt.ini
     void Load();
+
+    // Writes the resolved ini path and its contents to the log. Call after Load
+    // and after logging is up, so every report says what was actually enabled.
+    void DumpToLog();
 }
 
 #endif // WOW_OPT_CONFIG_H

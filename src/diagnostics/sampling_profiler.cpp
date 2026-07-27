@@ -312,6 +312,38 @@ static int g_modCount = 0;
 // DLL base) so it maps directly to wow_optimize.map.
 static uintptr_t g_selfBase = 0;
 static uintptr_t g_selfEnd  = 0;
+
+// Our own functions, by absolute address, so a hot spot inside this DLL prints a
+// name instead of an offset nobody can resolve without the matching .map.
+static constexpr int MAX_SELF_SYMBOLS = 64;
+struct SelfSymbol { uintptr_t addr; const char* name; };
+static SelfSymbol g_selfSymbols[MAX_SELF_SYMBOLS] = {};
+static int        g_selfSymbolCount = 0;
+
+void RegisterSelfSymbol(const char* name, const void* addr) {
+    if (!name || !addr || g_selfSymbolCount >= MAX_SELF_SYMBOLS) return;
+    g_selfSymbols[g_selfSymbolCount].addr = (uintptr_t)addr;
+    g_selfSymbols[g_selfSymbolCount].name = name;
+    g_selfSymbolCount++;
+}
+
+// Nearest registered symbol at or below addr, within a sane distance. The bound
+// matters: without it every unregistered hot spot would be attributed to whichever
+// registered function happens to sit lowest in the image, which is worse than
+// admitting we do not know.
+static const char* ResolveSelfSymbol(uintptr_t addr) {
+    const char* best = nullptr;
+    uintptr_t bestDelta = 0x4000;   // 16 KB
+    for (int i = 0; i < g_selfSymbolCount; i++) {
+        if (g_selfSymbols[i].addr > addr) continue;
+        uintptr_t d = addr - g_selfSymbols[i].addr;
+        if (d < bestDelta) {
+            bestDelta = d;
+            best = g_selfSymbols[i].name;
+        }
+    }
+    return best;
+}
 static constexpr int SELF_PAGES = 4096;   // covers a 16MB image
 static uint32_t g_selfPageCounts[SELF_PAGES];
 
@@ -373,7 +405,10 @@ static void DumpFineHistogram(const uint32_t* counts, int slots, int shift,
     for (int i = 0; i < found; i++) {
         uint32_t c = counts[idx[i]];
         char addr[32];
-        wsprintfA(addr, addrFormat, (unsigned)(addrBase + ((uintptr_t)idx[i] << shift)));
+        uintptr_t slotAddr = addrBase + ((uintptr_t)idx[i] << shift);
+        const char* sym = (addrBase == 0) ? ResolveSelfSymbol(g_selfBase + slotAddr) : nullptr;
+        if (sym) wsprintfA(addr, "wowopt!%.20s", sym);
+        else     wsprintfA(addr, addrFormat, (unsigned)slotAddr);
         Log("[SamplingProfiler]   %-14s %8u samples (%5.2f%%)",
             addr, c, 100.0 * (double)c / (double)total);
     }
@@ -621,7 +656,54 @@ static void DumpResults() {
                   return a.count > b.count;
               });
 
-    // Dump top-N (named functions and hot unlisted regions intermixed by heat)
+    // Separate "the thread was blocked" from "the thread was running code".
+    //
+    // Every sample landing in one of these is the main thread parked in the
+    // kernel with nothing to do - waiting on the present queue, a vsync interval,
+    // an event or an IO completion. Listing them by heat put
+    // NtWaitForAlertByThreadId at the top of a table headed HOT FUNCTIONS, where
+    // it reads as the most expensive thing in the client rather than as proof
+    // that the client had no work at all. A tester session came back with 94.8%
+    // of samples there: 0.9ms of CPU per 16.7ms frame, with every optimization in
+    // this DLL competing for the remaining 5%.
+    //
+    // Knowing which side of that line a session falls on decides whether any CPU
+    // work here can matter, so it is now the first thing the profile says.
+    uint64_t waitSamples = 0;
+    for (int i = 0; i < bucketCount; i++) {
+        const char* n = buckets[i].name;
+        if (!n) continue;
+        if (n[0] == 'N' && n[1] == 't' &&
+            (strncmp(n, "NtWaitFor", 9) == 0 ||
+             strncmp(n, "NtDelayExecution", 16) == 0 ||
+             strncmp(n, "NtRemoveIoCompletion", 20) == 0)) {
+            waitSamples += buckets[i].count;
+        }
+    }
+    uint64_t workSamples = (total > waitSamples) ? (total - waitSamples) : 0;
+    double   workPct     = total ? (100.0 * (double)workSamples / (double)total) : 0.0;
+
+    Log("[SamplingProfiler] === MAIN THREAD: %.1f%% executing, %.1f%% blocked "
+        "(%llu of %llu steady-state samples were a kernel wait) ===",
+        workPct, 100.0 - workPct,
+        (unsigned long long)waitSamples, (unsigned long long)total);
+    if (total >= 1000) {
+        if (workPct < 15.0) {
+            Log("[SamplingProfiler]   The client is not CPU-bound here - it spends "
+                "the frame waiting on the GPU, vsync or a frame limiter. CPU-side "
+                "optimizations cannot show up in this session no matter how good "
+                "they are; uncap the frame rate or profile a heavier scene to get "
+                "a workload where they can.");
+        } else if (workPct > 60.0) {
+            Log("[SamplingProfiler]   The client IS CPU-bound here. The list below "
+                "is where the frame time actually goes.");
+        }
+    }
+
+    // Dump top-N (named functions and hot unlisted regions intermixed by heat).
+    // Two percentages: of everything, and of the time the thread was running -
+    // the second is the one that says how much of a real optimization target
+    // something is, and it is the one that was missing.
     Log("[SamplingProfiler] === TOP %d HOT FUNCTIONS/REGIONS (%llu steady-state samples, %llu skipped: loading/warmup) ===",
         TOP_N, (unsigned long long)total, (unsigned long long)g_skippedSamples);
 
@@ -636,7 +718,9 @@ static void DumpResults() {
         } else if (g_selfBase && buckets[i].addr >= g_selfBase && buckets[i].addr < g_selfEnd) {
             // A hot page inside our own DLL — label by offset from our base so it
             // maps directly to wow_optimize.map (which of our hooks costs time).
-            wsprintfA(label, "wowopt+0x%05X", (unsigned)(buckets[i].addr - g_selfBase));
+            const char* sym = ResolveSelfSymbol(buckets[i].addr);
+            if (sym) wsprintfA(label, "wowopt!%.24s", sym);
+            else     wsprintfA(label, "wowopt+0x%05X", (unsigned)(buckets[i].addr - g_selfBase));
             name = label;
         } else {
             // Unlisted WoW code region — label by its 4KB page base so the
@@ -644,8 +728,10 @@ static void DumpResults() {
             wsprintfA(label, "wow_region_0x%08X", (unsigned)buckets[i].addr);
             name = label;
         }
-        Log("[SamplingProfiler] %3d. %-24s  %8llu samples (%5.2f%%)",
-            printed + 1, name, (unsigned long long)buckets[i].count, pct);
+        double workPctOfEntry = workSamples
+            ? (100.0 * (double)buckets[i].count / (double)workSamples) : 0.0;
+        Log("[SamplingProfiler] %3d. %-24s  %8llu samples (%5.2f%% total, %5.2f%% of executing)",
+            printed + 1, name, (unsigned long long)buckets[i].count, pct, workPctOfEntry);
         printed++;
     }
 

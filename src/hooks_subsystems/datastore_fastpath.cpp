@@ -68,6 +68,17 @@ __forceinline void UpdateTLS(CDataStore* s) {
     t_cache.allocated_size = s->allocated_size;
 }
 
+// End of the window this store currently maps, clamped to the data actually
+// written. The engine (sub_47B290) refuses a read that leaves
+// [base_offset, base_offset + allocated_size) and calls a virtual method to fetch
+// the next window instead. Checking read_pos against write_pos alone accepts
+// positions that are inside the stream but outside the mapping, and reads them
+// from unmapped memory.
+__forceinline uint32_t WindowEnd(CDataStore* s) {
+    uint32_t end = s->base_offset + s->allocated_size;
+    return (end > s->write_pos) ? s->write_pos : end;
+}
+
 __forceinline bool TLSCacheValid(CDataStore* s) {
     return t_cache.store == s &&
            t_cache.allocated_size == s->allocated_size &&
@@ -84,7 +95,7 @@ static CDataStore* __fastcall HookGetDword(CDataStore* self, void*, uint32_t* ou
 
     if (TLSCacheValid(self)) {
         uint32_t rp = self->read_pos;
-        if (rp >= self->base_offset && (rp + 4) <= self->write_pos) {
+        if (rp >= self->base_offset && (rp + 4) <= WindowEnd(self)) {
             ++g_getdword_hits;
             *out = *reinterpret_cast<uint32_t*>(t_cache.effective_base + rp);
             self->read_pos = rp + 4;
@@ -133,7 +144,7 @@ static CDataStore* __fastcall HookGetByte(CDataStore* self, void*, uint8_t* out)
 
     if (TLSCacheValid(self)) {
         uint32_t rp = self->read_pos;
-        if (rp >= self->base_offset && (rp + 1) <= self->write_pos) {
+        if (rp >= self->base_offset && (rp + 1) <= WindowEnd(self)) {
             ++g_getbyte_hits;
             *out = t_cache.effective_base[rp];
             self->read_pos = rp + 1;
@@ -211,7 +222,7 @@ static CDataStore* __fastcall HookGetQword(CDataStore* self, void*, uint32_t* ou
 
     if (TLSCacheValid(self)) {
         uint32_t rp = self->read_pos;
-        if (rp >= self->base_offset && (rp + 8) <= self->write_pos) {
+        if (rp >= self->base_offset && (rp + 8) <= WindowEnd(self)) {
             ++g_getqword_hits;
             uint8_t* p = t_cache.effective_base + rp;
             out[0] = *reinterpret_cast<uint32_t*>(p);

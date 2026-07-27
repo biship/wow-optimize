@@ -59,7 +59,6 @@
 #include "combatlog_incremental.h"
 #include "lua_alloc_pool.h"
 #include "world_state_coalesce.h"
-#include "hooks_subsystems/dynamic_shadow_scaler.h"
 #include "hooks_subsystems/sound_coalescer.h"
 #include "hooks_subsystems/aura_preload_cache.h"
 #include "hooks_subsystems/dbc_file_cache.h"
@@ -67,7 +66,6 @@
 #include "hooks_subsystems/lua_gc_governor.h"
 #include "hooks_subsystems/particle_density_scaler.h"
 #include "hooks_subsystems/addon_msg_limiter.h"
-#include "hooks_subsystems/mouse_cursor_smooth.h"
 #include "hooks_subsystems/vertex_buffer_prealloc.h"
 #include "hooks_subsystems/world_object_opt.h"
 #include "hooks_subsystems/nameplate_distance_cvar.h"
@@ -1018,6 +1016,56 @@ static DWORD WINAPI LogThreadProc(LPVOID) {
     return 0;
 }
 
+// Deletes the oldest session logs, keeping the newest `keep`. The timestamp in the
+// name is YYYY-MM-DD_HH-MM-SS, so sorting the names as text sorts them by time and
+// no file has to be opened to find out how old it is.
+//
+// Matches only names whose next character is a digit: wow_optimize_proxy.log lives
+// in the same folder and is not ours to delete.
+static void PruneSessionLogs(int keep) {
+    if (keep <= 0) return;
+
+    static const int MAX_TRACKED = 512;
+    static char names[MAX_TRACKED][64];
+    int count = 0;
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA("Logs\\wow_optimize_*.log", &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const char* tail = fd.cFileName + 13;          // past "wow_optimize_"
+        if (*tail < '0' || *tail > '9') continue;
+        if (strlen(fd.cFileName) >= sizeof(names[0])) continue;
+        if (count < MAX_TRACKED) {
+            lstrcpynA(names[count], fd.cFileName, sizeof(names[0]));
+            count++;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    if (count <= keep) return;
+
+    // Newest first. Insertion sort: a few hundred names at startup, once.
+    for (int i = 1; i < count; i++) {
+        char tmp[64];
+        lstrcpynA(tmp, names[i], sizeof(tmp));
+        int j = i - 1;
+        while (j >= 0 && strcmp(names[j], tmp) < 0) {
+            lstrcpynA(names[j + 1], names[j], sizeof(names[0]));
+            j--;
+        }
+        lstrcpynA(names[j + 1], tmp, sizeof(names[0]));
+    }
+
+    for (int i = keep; i < count; i++) {
+        char path[MAX_PATH];
+        _snprintf(path, sizeof(path), "Logs\\%s", names[i]);
+        path[sizeof(path) - 1] = '\0';
+        DeleteFileA(path);
+    }
+}
+
 static void LogOpen() {
     CreateDirectoryA("Logs", NULL);
     
@@ -1027,18 +1075,26 @@ static void LogOpen() {
         g_log = fopen("Logs\\wow_optimize.log", "w");
     }
     
-    // 2. Session log with timestamp (wow_optimize_YYYY-MM-DD_HH-MM-SS.log) to preserve history
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char sessionPath[MAX_PATH];
-    _snprintf(sessionPath, sizeof(sessionPath), "Logs\\wow_optimize_%04d-%02d-%02d_%02d-%02d-%02d.log",
-              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    sessionPath[sizeof(sessionPath) - 1] = '\0';
-    g_sessionLog = _fsopen(sessionPath, "w", _SH_DENYNO);
-    if (!g_sessionLog) {
-        g_sessionLog = fopen(sessionPath, "w");
+    // 2. Session log with timestamp (wow_optimize_YYYY-MM-DD_HH-MM-SS.log) to preserve history.
+    //
+    // The overwritten file above is the "one log like before" - it has never gone
+    // away. This second one exists because comparing two configurations needs both
+    // runs, and a single file keeps only the last. What it lacked was an end: left
+    // alone the folder grows for as long as someone keeps playing.
+    if (Config::g_settings.OptSessionLogs) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char sessionPath[MAX_PATH];
+        _snprintf(sessionPath, sizeof(sessionPath), "Logs\\wow_optimize_%04d-%02d-%02d_%02d-%02d-%02d.log",
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        sessionPath[sizeof(sessionPath) - 1] = '\0';
+        g_sessionLog = _fsopen(sessionPath, "w", _SH_DENYNO);
+        if (!g_sessionLog) {
+            g_sessionLog = fopen(sessionPath, "w");
+        }
+        PruneSessionLogs(Config::g_settings.SessionLogsToKeep);
     }
-    
+
     static const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
     if (g_log) {
         fwrite(bom, 1, 3, g_log);
@@ -1458,9 +1514,6 @@ static void WINAPI hooked_Sleep(DWORD ms) {
             }
 
             LuaOpt::OnMainThreadSleep(g_mainThreadId, elapsedMs);
-            LuaVMEngine_FrameTick();
-            ApiCache::OnNewFrame();
-            FontMetrics_OnFrame();
 #if !TEST_DISABLE_LUA_GETTIME_FAST
             if (Config::g_settings.OptLuaGetTimeFast) {
                 LuaGetTimeFast_NewFrame();
@@ -1491,9 +1544,6 @@ static void WINAPI hooked_Sleep(DWORD ms) {
             if (Config::g_settings.OptMpqMmapVfs) {
                 MpqMmapVfs::OnFrame();
             }
-#if !TEST_DISABLE_OBJ_VIS_CACHE
-            ObjVisCache::OnFrame();
-#endif
             RcuObjMgr::OnFrame();
 #if !TEST_DISABLE_TEXTURE_DECODE_MT
             AsyncTexLoader::OnFrame();
@@ -1507,19 +1557,13 @@ static void WINAPI hooked_Sleep(DWORD ms) {
             EventCoalescer_Flush();
 #endif
 
-#if !TEST_DISABLE_PARTICLE_THROTTLE
-            IncrementParticleFrameCount();
-#endif
-
             // Enable D3D9 State Manager frame update
             OnFrameD3D9StateManager(g_mainThreadId);
             OnFrameRenderHooks(g_mainThreadId);
             OnFrameLogicHooks(g_mainThreadId);
             OnFrameAsyncHooks(g_mainThreadId);
-            DynamicShadowScaler::OnFrame((float)elapsedMs);
             ParticleDensityScaler::OnFrame((float)elapsedMs);
             // LuaGcGovernor::OnFrame((float)elapsedMs); // Disabled duplicate governor
-            MouseCursorSmooth::OnFrame();
 #if !TEST_DISABLE_LUA_GC_GOVERNOR
             LuaGCGovernor::OnFrame(elapsedMs);
 #endif
@@ -2186,11 +2230,47 @@ static void RemoveCacheForHandle(HANDLE hFile) {
     }
 }
 
+static BOOL WINAPI hooked_ReadFile_Inner(HANDLE hFile, LPVOID lpBuffer,
+    DWORD nBytesToRead, LPDWORD lpBytesRead, LPOVERLAPPED lpOverlapped);
+
+// Times reads while a loading screen is up, so the load report can say how much
+// of a load is the disk. Two QueryPerformanceCounter calls, and only during a
+// load - gameplay never reaches this branch.
 static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
+    DWORD nBytesToRead, LPDWORD lpBytesRead, LPOVERLAPPED lpOverlapped)
+{
+    if (!LoadingState::IsLoading())
+        return hooked_ReadFile_Inner(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
+
+    static LARGE_INTEGER freq = {};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    BOOL r = hooked_ReadFile_Inner(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
+    QueryPerformanceCounter(&b);
+    if (freq.QuadPart) {
+        double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        LoadingState::NoteRead(ms, (lpBytesRead && r) ? *lpBytesRead : 0u);
+    }
+    return r;
+}
+
+static BOOL WINAPI hooked_ReadFile_Inner(HANDLE hFile, LPVOID lpBuffer,
     DWORD nBytesToRead, LPDWORD lpBytesRead, LPOVERLAPPED lpOverlapped)
 {
     // Skip: overlapped I/O, non-MPQ, or not initialized
     if (lpOverlapped)
+        return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
+
+    // NULL-buffer guard: WoW may call ReadFile with lpBuffer=NULL to advance the
+    // file pointer during loading/streaming with HD MPQs.
+    //
+    // This used to sit below the two cache serves, which both memcpy into
+    // lpBuffer. A legitimate NULL-buffer call landing on a handle either of them
+    // tracked was a memcpy to address zero. That is what "interferes with WoW file
+    // I/O" meant in the note that disabled the addon RAM-disk, and it is why the
+    // guard belongs above every serve rather than in the middle of them.
+    if (!lpBuffer || !nBytesToRead)
         return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
 
     // Addon file RAM-disk: serve pre-loaded addon files from memory
@@ -2203,11 +2283,6 @@ static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
     #endif
 
     if (!g_cacheInitialized || !IsMpqHandle(hFile))
-        return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
-
-    // NULL-buffer guard: WoW may call ReadFile with lpBuffer=NULL to advance
-    // the file pointer during loading/streaming with HD MPQs.
-    if (!lpBuffer || !nBytesToRead)
         return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
 
     // Get the atomic locked cache for this handle to prevent concurrent seek/read races
@@ -4421,6 +4496,7 @@ static void DumpPeriodicStats() {
     }
 #endif
     FrameBench::Report("periodic");
+    CrashDumper::ReportFeatureActivity();
 }
 
 // ================================================================
@@ -4530,13 +4606,9 @@ static void __fastcall hooked_SwapPresent(void* This, void* unused) {
         // vtable, once per presented frame. It is the one place that can measure
         // frame time honestly, so the benchmark is fed from here.
         FrameBench::OnPresent(FrameBench::Source::SwapHook);
+        // Flushes the deferred field and world-state queues. That used to be two
+        // explicit calls here, which left the D3D9 path without them.
         WowOpt_OnFrameBoundary();
-
-        // Ensure deferred field updates and coalesced world states are flushed 
-        // on the main thread every frame boundary, even when the client is running
-        // with VSync off / uncapped framerates (which bypass hooked_Sleep).
-        FlushFieldUpdates();
-        WorldStateCoalesce::OnFrame();
 #if !TEST_DISABLE_LUA_GETTIME_FAST
         if (Config::g_settings.OptLuaGetTimeFast) {
             LuaGetTimeFast_NewFrame();
@@ -4647,9 +4719,41 @@ static SwapPresentTiming_fn orig_SwapPresentTiming = nullptr;
 // hooked_Sleep tick, which is gated to fire at most once every 8ms - i.e. it
 // stops tracking frames at all above ~125fps.
 extern "C" void WowOpt_OnFrameBoundary() {
-    // Nothing ages per frame right now. Kept as the single place for work that
-    // must, so it never goes back into the hooked_Sleep tick - that one is gated
-    // to 8ms and stops tracking frames at all above ~125fps.
+    // Deferred unit field writes and coalesced world states must be applied on a
+    // real frame boundary. Addons read unit state the moment an event arrives, so
+    // a descriptor write that is still sitting in a queue is read as stale, and no
+    // further event fires to correct it once the queue drains.
+    //
+    // Both were already flushed from the OpenGL swap hook for exactly this reason,
+    // with a comment about uncapped frame rates bypassing hooked_Sleep - but that
+    // path is sub_69E220, which a D3D9/DXVK client never reaches. On DXVK the only
+    // caller left was the hooked_Sleep tick, gated to one pass every
+    // SleepPrecisionValue ms, so past ~125 fps the flush fell behind the frames
+    // that queued the work.
+    //
+    // Calling from both present paths costs an empty-queue check per frame: each
+    // of these takes its lock, sees head == tail, and returns.
+    FlushFieldUpdates();
+    WorldStateCoalesce::OnFrame();
+
+    // Frame counters that bound how long a cached entry stays valid. Both caches
+    // re-validate on hit - the Lua inline cache re-reads the key out of the node,
+    // the object cache re-reads the GUID out of the object - so the counter is not
+    // the only thing standing between a hit and a freed pointer. It is what limits
+    // the exposure to a single frame, and on the hooked_Sleep tick that bound
+    // stretched to however many frames fit between two passes.
+    //
+    // These must advance exactly once per frame: incrementing twice would stamp
+    // entries with a generation that is already stale by the time they are read,
+    // and every lookup would miss. Only one present hook is live per renderer, so
+    // this runs once - and they are deliberately not left on the Sleep tick as a
+    // fallback, because a fallback here would be the double increment.
+    LuaVMEngine_FrameTick();
+    ObjVisCache::OnFrame();
+    FontMetrics_OnFrame();
+#if !TEST_DISABLE_PARTICLE_THROTTLE
+    IncrementParticleFrameCount();
+#endif
 }
 
 static int __fastcall hooked_SwapPresent_TimingOnly(void* This, void* unused) {
@@ -6342,6 +6446,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     // where the LargestBlock=14MB fragmentation comes from. The old sequence
     // waited 5s then installed, missing the entire early-init allocation stream.
     LogOpen();
+    Config::DumpToLog();
     Log("========================================");
 #ifndef WOW_OPTIMIZE_GIT_HASH
 #define WOW_OPTIMIZE_GIT_HASH "unknown"
@@ -6875,9 +6980,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("[PushValueFast] DISABLED via TEST_DISABLE_PUSHVALUE_FAST");
 #endif
 
-    Log("--- Lua Stack Push/Query Fast Paths (8 hooks) ---");
+    Log("--- Lua Stack Push/Query Fast Paths ---");
 #if !TEST_DISABLE_LUA_STACK_FAST
-    bool luaStackFastOk = Config::g_settings.OptLuaNumConvFast && InstallLuaStackFast();
+    // Its own switch now. It used to ride on LuaNumConvFast, whose launcher label
+    // reads "Lua Number Conversion Fast Path" and promises tonumber/gettop/settop -
+    // nothing that suggests sixteen rewrites of the stack API underneath it.
+    bool luaStackFastOk = Config::g_settings.OptLuaStackFast && InstallLuaStackFast();
 #else
     bool luaStackFastOk = false;
     Log("[LuaStackFast] DISABLED via TEST_DISABLE_LUA_STACK_FAST");
@@ -7515,6 +7623,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     // Addon file RAM-disk - pre-load all addon files into memory
 #if !TEST_DISABLE_ADDON_PRELOAD
+    // The RAM-disk is served through the CreateFile/CloseHandle hooks, which only
+    // go in with DbcLookupCache or SavedVarsPretoken. Tell it so it can decline
+    // rather than read thousands of files it will never be asked for.
+    AddonPreload_SetFileHooksInstalled(fileOk && closeOk);
     bool addonPreloadOk = InitAddonPreload();
 #else
     bool addonPreloadOk = false;
@@ -7611,7 +7723,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     }
 
     Log("");
-    Log("--- D3D9 State Manager (15 hooks) ---");
+    Log("--- D3D9 State Manager ---");
     bool d3d9StateOk = InstallD3D9StateManager();
 
     Log("");
@@ -7766,7 +7878,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- 20 New Subsystem Performance & Stability Features ---");
-    if (Config::g_settings.OptDynamicShadowScaler) DynamicShadowScaler::Init();
     if (Config::g_settings.OptSoundCoalescer) SoundCoalescer::Init();
     if (Config::g_settings.OptAuraPreloadCache) AuraPreloadCache::Init();
     if (Config::g_settings.OptDbcFileCache) DbcFileCache::Init();
@@ -7774,7 +7885,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     // LuaGcGovernor::Init(); // Disabled duplicate governor
     if (Config::g_settings.OptParticleDensityScaler) ParticleDensityScaler::Init();
     if (Config::g_settings.OptAddonMsgLimiter) AddonMsgLimiter::Init();
-    if (Config::g_settings.OptMouseCursorSmooth) MouseCursorSmooth::Init();
     if (Config::g_settings.OptVertexBufferPrealloc) VertexBufferPrealloc::Init();
     if (Config::g_settings.OptWorldObjectOpt) WorldObjectOpt::Init();
     if (Config::g_settings.OptNameplateDistanceCvar) NameplateDistanceCvar::Init();
@@ -9794,6 +9904,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             DbcLookupCacheFast::Shutdown();
             HotPatch::ShutdownAll();
             ReportHotFunctionStats();
+            CrashDumper::ReportFeatureActivity();
+            LoadingState::ReportLoadTimes();
             WorldToScreenSse::Shutdown();
             D3D9TssCache::Shutdown();
             LuaStringPoolFast::Shutdown();

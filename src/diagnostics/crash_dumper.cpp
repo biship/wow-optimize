@@ -905,18 +905,84 @@ void Shutdown() {
 #endif
 }
 
-void RegisterFeature(const char* name) {
+int RegisterFeature(const char* name) {
     AcquireSRWLockExclusive(&s_featureLock);
     LONG idx = InterlockedIncrement(&s_featureCount) - 1;
     if (idx < MAX_TRACKED_FEATURES) {
         s_features[idx].name = name;
         s_features[idx].active = true;
+        s_features[idx].counted = false;
+        s_features[idx].hits = 0;
         s_features[idx].callCount = 0;
         s_features[idx].errorCount = 0;
         s_features[idx].lastCallTick = 0;
         s_features[idx].lastError = nullptr;
     }
     ReleaseSRWLockExclusive(&s_featureLock);
+    return (idx < MAX_TRACKED_FEATURES) ? (int)idx : -1;
+}
+
+int FeatureTokenForCounting(const char* name) {
+    if (!name) return -1;
+
+    LONG count = InterlockedCompareExchange(&s_featureCount, 0, 0);
+    if (count > MAX_TRACKED_FEATURES) count = MAX_TRACKED_FEATURES;
+    for (int i = 0; i < count; i++) {
+        if (s_features[i].name && strcmp(s_features[i].name, name) == 0) {
+            s_features[i].counted = true;
+            return i;
+        }
+    }
+
+    int token = RegisterFeature(name);
+    if (token >= 0) {
+        s_features[token].counted = true;
+    }
+    return token;
+}
+
+void FeatureHit(int token) {
+    if (token < 0 || token >= MAX_TRACKED_FEATURES) return;
+    ++s_features[token].hits;
+}
+
+void ReportFeatureActivity() {
+    LONG count = InterlockedCompareExchange(&s_featureCount, 0, 0);
+    if (count > MAX_TRACKED_FEATURES) count = MAX_TRACKED_FEATURES;
+
+    int ran = 0, silent = 0, uncounted = 0, disabled = 0;
+    for (int i = 0; i < count; i++) {
+        if (!s_features[i].active)      { disabled++;  continue; }
+        if (!s_features[i].counted)     { uncounted++; continue; }
+        if (s_features[i].hits > 0)     { ran++; }
+        else                            { silent++; }
+    }
+
+    Log("");
+    Log("[Features] === WHAT ACTUALLY RAN THIS SESSION ===");
+
+    if (ran > 0) {
+        Log("[Features] Did work (%d):", ran);
+        for (int i = 0; i < count; i++) {
+            if (s_features[i].active && s_features[i].counted && s_features[i].hits > 0) {
+                Log("[Features]     %-32s %u", s_features[i].name, s_features[i].hits);
+            }
+        }
+    }
+
+    if (silent > 0) {
+        Log("[Features] Enabled but never ran (%d) - these report their own activity,"
+            " so a zero here means the code path was not reached:", silent);
+        for (int i = 0; i < count; i++) {
+            if (s_features[i].active && s_features[i].counted && s_features[i].hits == 0) {
+                Log("[Features]     %s", s_features[i].name);
+            }
+        }
+    }
+
+    // Said plainly, because the alternative is a reader assuming these did nothing.
+    Log("[Features] %d enabled features do not report activity and are not judged"
+        " here; %d are disabled.", uncounted, disabled);
 }
 
 void FeatureCall(const char* name) {

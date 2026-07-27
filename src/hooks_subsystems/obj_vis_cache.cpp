@@ -13,6 +13,7 @@
 #include <intrin.h>
 
 extern "C" void Log(const char* fmt, ...);
+#include "crash_dumper.h"
 
 #if !TEST_DISABLE_OBJ_VIS_CACHE
 
@@ -37,6 +38,7 @@ struct ThreadCacheSlot {
 
 static ThreadCacheSlot g_cachePool[MAX_THREADS];
 static volatile LONG g_frameCounter = 0;
+static int g_featureToken = -1;
 static volatile LONG g_poolInitDone = 0;
 
 static volatile LONG g_cacheHits = 0;
@@ -133,6 +135,7 @@ static void* __fastcall hooked_HashLookup(
                 uint64_t actualGuid = *(uint64_t*)((char*)resObj + 48);
                 if (actualGuid == expectedGuid) {
                     InterlockedIncrement(&g_cacheHits);
+                    CrashDumper::FeatureHit(g_featureToken);
                     return resObj;
                 }
             }
@@ -206,6 +209,7 @@ bool Init() {
         MH_EnableHook(teardownTarget);
     }
 
+    g_featureToken = CrashDumper::FeatureTokenForCounting("ObjVisCache");
     Log("[ObjVisCache] [ OK ] Hooked lookup, static pool=%d threads (no alloc)", MAX_THREADS);
     return true;
 }

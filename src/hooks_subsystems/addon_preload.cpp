@@ -40,6 +40,13 @@ static SRWLOCK g_handleLock = SRWLOCK_INIT;
 
 static volatile LONG g_hits = 0, g_misses = 0, g_filesLoaded = 0;
 
+// Set by dllmain once it knows whether the CreateFile/CloseHandle hooks went in.
+// Without them this cache has no way to learn which handle belongs to which file.
+static volatile LONG g_fileHooksInstalled = 0;
+static bool AddonPreload_FileHooksInstalled() {
+    return InterlockedCompareExchange(&g_fileHooksInstalled, 0, 0) != 0;
+}
+
 // Worker threads
 static HANDLE g_workers[2] = {};
 static volatile LONG g_shutdown = 0;
@@ -137,6 +144,17 @@ void AddonPreload_OnWriteFile(const char* filename) {
 bool AddonPreload_TryServe(HANDLE hFile, LPVOID lpBuffer, DWORD nBytes, LPDWORD lpBytesRead) {
     if (!InterlockedCompareExchange(&g_ready, 0, 0)) return false;
 
+    // The caller is expected to have screened these already, but this function
+    // memcpys into lpBuffer and the cost of being wrong is a write to address
+    // zero. WoW calls ReadFile with a null buffer on purpose, to advance the file
+    // pointer without reading, so this is a case that genuinely occurs rather
+    // than a defensive formality.
+    if (!lpBuffer || !nBytes) return false;
+
+    // Nothing is tracked, so there is nothing to scan for. Worth its own check:
+    // the loop below runs under a lock on every single ReadFile the client makes.
+    if (InterlockedCompareExchange(&g_handleCount, 0, 0) == 0) return false;
+
     AcquireSRWLockShared(&g_handleLock);
     for (LONG i = 0; i < g_handleCount; i++) {
         if (g_handles[i] == hFile) {
@@ -194,6 +212,10 @@ static void ScanAddonDir(const std::string& base, int depth) {
     FindClose(h);
 }
 
+void AddonPreload_SetFileHooksInstalled(bool installed) {
+    InterlockedExchange(&g_fileHooksInstalled, installed ? 1 : 0);
+}
+
 bool InitAddonPreload() {
     // Skip the RAM-disk entirely when several clients share the machine: each
     // client would hold its own full copy of every addon file, multiplying memory
@@ -203,6 +225,24 @@ bool InitAddonPreload() {
     // it for headroom.
     if (g_isMultiClient) {
         Log("[AddonPreload] Disabled in multi-client mode (memory/VA headroom)");
+        return true;
+    }
+
+    // This cache is only reachable through the CreateFile and CloseHandle hooks:
+    // CreateFile is what maps an opened handle onto a cached file, CloseHandle is
+    // what releases that mapping. Both are installed together, and only when
+    // DbcLookupCache or SavedVarsPretoken is on - two switches that have nothing
+    // to do with addons and both default to off.
+    //
+    // Without them nothing is ever tracked, so every read misses and the only
+    // effect of this feature is reading several thousand files at startup and
+    // holding up to 192 MB of them in a 32-bit address space for no reason.
+    // Refusing here is the difference between a feature that does nothing and a
+    // feature that costs a lot to do nothing.
+    if (!AddonPreload_FileHooksInstalled()) {
+        Log("[AddonPreload] Not started: the CreateFile/CloseHandle hooks it serves "
+            "through are not installed (they need DbcLookupCache or "
+            "SavedVarsPretoken enabled). Nothing would be served from the cache.");
         return true;
     }
 
@@ -290,6 +330,7 @@ void AddonPreload_OnCloseHandle(HANDLE hFile) {
 
 #else
 bool InitAddonPreload() { return false; }
+void AddonPreload_SetFileHooksInstalled(bool) {}
 void ShutdownAddonPreload() {}
 void ClearAddonPreload() {}
 void AddonPreload_OnCreateFile(HANDLE, const char*) {}

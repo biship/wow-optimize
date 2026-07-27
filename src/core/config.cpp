@@ -1,9 +1,42 @@
 #include "config.h"
 #include <windows.h>
 #include <string>
+#include <cstdio>
+#include <cstring>
+
+extern "C" void Log(const char* fmt, ...);
 
 namespace Config {
     Settings g_settings;
+
+    // Which file the settings above actually came from. A bug report is only as
+    // good as knowing what was switched on, and twice now a log and the ini sent
+    // with it disagreed - once because a launcher button had overridden a switch,
+    // once with no explanation available at all, because nothing recorded where
+    // the DLL had read from or what it concluded.
+    static std::string g_loadedFrom;
+
+    void DumpToLog() {
+        Log("[Config] Read from: %s", g_loadedFrom.empty() ? "(none)" : g_loadedFrom.c_str());
+
+        FILE* f = fopen(g_loadedFrom.c_str(), "r");
+        if (!f) {
+            Log("[Config] File could not be reopened for the dump - the settings "
+                "above are whatever the defaults are.");
+            return;
+        }
+        Log("[Config] Effective contents:");
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            char* p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t n = strlen(p);
+            while (n && (p[n-1] == '\n' || p[n-1] == '\r' || p[n-1] == ' ')) p[--n] = 0;
+            if (!*p || *p == ';' || *p == '#') continue;
+            Log("[Config]   %s", p);
+        }
+        fclose(f);
+    }
 
     void Load() {
         std::string iniPath;
@@ -36,6 +69,9 @@ namespace Config {
             // General
             WritePrivateProfileStringA("General", "SleepPrecision", "1", iniPath.c_str());
             WritePrivateProfileStringA("General", "SleepPrecisionValue", "8", iniPath.c_str());
+            WritePrivateProfileStringA("General", "SessionLogs", "1", iniPath.c_str());
+            WritePrivateProfileStringA("UI_Lua", "LuaStackFast", "0", iniPath.c_str());
+            WritePrivateProfileStringA("General", "SessionLogsToKeep", "10", iniPath.c_str());
             WritePrivateProfileStringA("General", "MemoryPressure", "1", iniPath.c_str());
             WritePrivateProfileStringA("General", "HeapCompactor", "1", iniPath.c_str());
             WritePrivateProfileStringA("General", "DefragLf", "0", iniPath.c_str());
@@ -135,6 +171,9 @@ namespace Config {
         // General
         g_settings.OptSleepPrecision      = GetPrivateProfileIntA("General", "SleepPrecision", 1, iniPath.c_str()) != 0;
         g_settings.SleepPrecisionValue    = GetPrivateProfileIntA("General", "SleepPrecisionValue", 8, iniPath.c_str());
+        g_settings.OptSessionLogs         = GetPrivateProfileIntA("General", "SessionLogs", 1, iniPath.c_str()) != 0;
+        g_settings.OptLuaStackFast        = GetPrivateProfileIntA("UI_Lua", "LuaStackFast", 0, iniPath.c_str()) != 0;
+        g_settings.SessionLogsToKeep      = GetPrivateProfileIntA("General", "SessionLogsToKeep", 10, iniPath.c_str());
         g_settings.OptMemoryPressure      = GetPrivateProfileIntA("General", "MemoryPressure", 1, iniPath.c_str()) != 0;
         g_settings.OptHeapCompactor       = GetPrivateProfileIntA("General", "HeapCompactor", 1, iniPath.c_str()) != 0;
         g_settings.OptDefragLf            = GetPrivateProfileIntA("General", "DefragLf", 0, iniPath.c_str()) != 0;
@@ -259,16 +298,16 @@ namespace Config {
         g_settings.OptCombatLogAsync       = GetPrivateProfileIntA("Combat_Net", "CombatLogAsync", 0, iniPath.c_str()) != 0;
         g_settings.OptCombatTextFont       = GetPrivateProfileIntA("UI_Lua", "CombatTextFont", 0, iniPath.c_str()) != 0;
         g_settings.OptDbcFileCache         = GetPrivateProfileIntA("Graphics_Sound", "DbcFileCache", 0, iniPath.c_str()) != 0;
-        g_settings.OptDynamicShadowScaler  = GetPrivateProfileIntA("Graphics_Sound", "DynamicShadowScaler", 0, iniPath.c_str()) != 0;
         g_settings.OptFontOutlineCache     = GetPrivateProfileIntA("UI_Lua", "FontOutlineCache", 0, iniPath.c_str()) != 0;
         g_settings.OptMouseClipRelease     = GetPrivateProfileIntA("General", "MouseClipRelease", 0, iniPath.c_str()) != 0;
-        g_settings.OptMouseCursorSmooth    = GetPrivateProfileIntA("General", "MouseCursorSmooth", 0, iniPath.c_str()) != 0;
         g_settings.OptNameplateDistanceCvar= GetPrivateProfileIntA("Combat_Net", "NameplateDistanceCvar", 0, iniPath.c_str()) != 0;
         g_settings.OptParticleDensityScaler= GetPrivateProfileIntA("Graphics_Sound", "ParticleDensityScaler", 0, iniPath.c_str()) != 0;
         g_settings.OptSavedVarsBackup      = GetPrivateProfileIntA("General", "SavedVarsBackup", 0, iniPath.c_str()) != 0;
         g_settings.OptSoundCoalescer       = GetPrivateProfileIntA("Graphics_Sound", "SoundCoalescer", 0, iniPath.c_str()) != 0;
         g_settings.OptSpellOverlayPreload  = GetPrivateProfileIntA("Combat_Net", "SpellOverlayPreload", 0, iniPath.c_str()) != 0;
         g_settings.OptUnitMaxPowerCache    = GetPrivateProfileIntA("UI_Lua", "UnitMaxPowerCache", 0, iniPath.c_str()) != 0;
+
+        g_loadedFrom = iniPath;
         g_settings.OptVertexBufferPrealloc = GetPrivateProfileIntA("General", "VertexBufferPrealloc", 0, iniPath.c_str()) != 0;
         g_settings.OptWorldObjectOpt       = GetPrivateProfileIntA("Graphics_Sound", "WorldObjectOpt", 0, iniPath.c_str()) != 0;
     }

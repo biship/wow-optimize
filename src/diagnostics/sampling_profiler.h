@@ -52,4 +52,17 @@ uint64_t GetSampleCount();
 // fast process-exit path skips Shutdown().
 void DumpNow();
 
+// Names one of our own functions so the profile can say which of this DLL's hooks
+// is costing time.
+//
+// Samples landing inside wow_optimize.dll are reported as "wowopt+0x3EF00". That
+// offset is only meaningful against the .map of the exact build that produced the
+// log, and tester logs routinely arrive from builds several commits old, by which
+// point every offset has moved. A CPU-bound session had 7.6% of its samples in
+// this DLL and there was no way to say which part.
+//
+// Call it at install time with the detour's own address. Costs one array slot and
+// nothing at sample time - resolution happens only when the profile is printed.
+void RegisterSelfSymbol(const char* name, const void* addr);
+
 } // namespace SamplingProfiler

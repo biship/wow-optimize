@@ -89,11 +89,63 @@ EventKind ClassifyEvent(int eventId) {
     return EVENT_OTHER;
 }
 
+// ---- where a loading screen's time goes -------------------------------------
+static LARGE_INTEGER g_qpcFreq      = {};
+static LARGE_INTEGER g_loadStartQpc = {};
+static double        g_ioMsThisLoad = 0.0;
+static uint64_t      g_ioBytesThisLoad = 0;
+static uint64_t      g_ioReadsThisLoad = 0;
+
+static int      g_loadCount   = 0;
+static double   g_loadMsTotal = 0.0;
+static double   g_loadMsWorst = 0.0;
+static double   g_ioMsTotal   = 0.0;
+static uint64_t g_ioBytesTotal = 0;
+
+static void LoadTimerBegin() {
+    if (g_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&g_qpcFreq);
+    QueryPerformanceCounter(&g_loadStartQpc);
+    g_ioMsThisLoad = 0.0;
+    g_ioBytesThisLoad = 0;
+    g_ioReadsThisLoad = 0;
+}
+
+static void LoadTimerEnd() {
+    if (g_qpcFreq.QuadPart == 0) return;
+    if (g_loadStartQpc.QuadPart == 0) {
+        // The initial entry into the world has no PLAYER_LEAVING_WORLD before it,
+        // so there was no start to time. Said out loud, because this is the
+        // longest load of the session and silence here reads as "it was free".
+        Log("[LoadingState] Initial world entry finished - not timed, it has no "
+            "start event to measure from");
+        return;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double ms = (double)(now.QuadPart - g_loadStartQpc.QuadPart) * 1000.0
+              / (double)g_qpcFreq.QuadPart;
+    g_loadStartQpc.QuadPart = 0;
+    if (ms <= 0.0 || ms > 600000.0) return;   // clock went backwards, or a stuck screen
+
+    g_loadCount++;
+    g_loadMsTotal += ms;
+    g_ioMsTotal   += g_ioMsThisLoad;
+    g_ioBytesTotal += g_ioBytesThisLoad;
+    if (ms > g_loadMsWorst) g_loadMsWorst = ms;
+
+    Log("[LoadingState] Load took %.0f ms - %.0f ms (%.0f%%) inside ReadFile, "
+        "%llu reads, %.1f MB",
+        ms, g_ioMsThisLoad, (ms > 0.0) ? (100.0 * g_ioMsThisLoad / ms) : 0.0,
+        (unsigned long long)g_ioReadsThisLoad,
+        (double)g_ioBytesThisLoad / (1024.0 * 1024.0));
+}
+
 void ApplyEventKind(EventKind kind) {
     switch (kind) {
         case EVENT_LOADING_BEGIN:
             if (InterlockedExchange(&g_isLoading, 1) == 0) {
                 LuaGCGovernor::g_isLoading = true;
+                LoadTimerBegin();
                 CrashDumper::Trace("LOADING begin (PLAYER_LEAVING_WORLD)");
                 Log("[LoadingState] Loading screen started (PLAYER_LEAVING_WORLD)");
                 ReserveLoadingArena();
@@ -120,6 +172,7 @@ void ApplyEventKind(EventKind kind) {
                 CrashDumper::Trace("LOADING end (PLAYER_ENTERING_WORLD)");
                 Log("[LoadingState] Loading screen finished (PLAYER_ENTERING_WORLD)");
             }
+            LoadTimerEnd();
             LuaGCGovernor::g_isLoading = false;
             ReleaseLoadingArena();
             break;
@@ -180,6 +233,27 @@ __declspec(naked) static void Hooked_FrameScript_SignalEvent() {
 }
 
 namespace LoadingState {
+
+void NoteRead(double ms, unsigned int bytes) {
+    g_ioMsThisLoad += ms;
+    g_ioBytesThisLoad += bytes;
+    g_ioReadsThisLoad++;
+}
+
+void ReportLoadTimes() {
+    if (g_loadCount == 0) {
+        Log("[LoadingState] No loading screens completed this session");
+        return;
+    }
+    Log("[LoadingState] %d load(s): %.1fs total, %.0f ms average, %.0f ms worst",
+        g_loadCount, g_loadMsTotal / 1000.0, g_loadMsTotal / g_loadCount, g_loadMsWorst);
+    Log("[LoadingState]   of that, %.1fs was ReadFile (%.0f%%) moving %.1f MB - "
+        "prefetch and archive work can only ever address that share",
+        g_ioMsTotal / 1000.0,
+        (g_loadMsTotal > 0.0) ? (100.0 * g_ioMsTotal / g_loadMsTotal) : 0.0,
+        (double)g_ioBytesTotal / (1024.0 * 1024.0));
+}
+
 
 bool Init() {
     unsigned char* p = (unsigned char*)ADDR_FrameScript_SignalEvent;

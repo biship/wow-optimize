@@ -14,4 +14,19 @@ namespace LoadingState {
 
     // True between PLAYER_LEAVING_WORLD and PLAYER_ENTERING_WORLD.
     bool IsLoading();
+
+    // Accounting for where a loading screen's time goes.
+    //
+    // The project has spent years adding prefetch, memory-mapped archives and
+    // async texture decode to make loading faster, and has never measured what a
+    // load is actually made of. Prefetching only helps if loading is waiting on
+    // the disk; if it is dominated by decompression or scene building, more
+    // prefetch is free of both cost and benefit. This measures the split so the
+    // next change to the loading path is aimed at something.
+    //
+    // Only called while IsLoading() is true, so gameplay pays nothing.
+    void NoteRead(double ms, unsigned int bytes);
+
+    // Session summary: how many loads, how long, and how much of it was I/O.
+    void ReportLoadTimes();
 }

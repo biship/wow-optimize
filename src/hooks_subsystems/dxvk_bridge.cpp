@@ -14,10 +14,6 @@ namespace DXVKBridge {
 
 static volatile LONG g_active = 0;
 static const char*   g_reason = "not detected";
-static double        g_presentIntervalMs = 0.0;
-static volatile LONG64 g_presents = 0;
-static LARGE_INTEGER g_lastPresentQpc = {};
-static LARGE_INTEGER g_qpcFreq = {};
 
 static const char* CheckLoadedModules() {
     HMODULE mods[1024];
@@ -122,7 +118,6 @@ static void DetectOnce() {
 }
 
 bool Init() {
-    QueryPerformanceFrequency(&g_qpcFreq);
     DetectOnce();
     if (!g_active) {
         Log("[DXVKBridge] no Vulkan translation layer detected yet (vulkan-1.dll loads lazily on device creation; will keep checking via IsActive())");
@@ -132,8 +127,7 @@ bool Init() {
 
 void Shutdown() {
     InterlockedExchange(&g_active, 0);
-    Log("[DXVKBridge] shutdown presents=%lld interval=%.3fms",
-       (long long)g_presents, g_presentIntervalMs);
+    Log("[DXVKBridge] shutdown");
 }
 
 static volatile LONG g_lazyAttempted = 0;
@@ -154,30 +148,10 @@ bool IsActive() {
     }
     return g_active != 0;
 }
-double PresentIntervalMs()   { return g_presentIntervalMs; }
-bool ShouldSkipGpuSync()     { return g_active != 0; }
-bool ShouldSkipStateCache()  { return g_active != 0; }
-
-void NotePresent() {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    InterlockedIncrement64(&g_presents);
-    if (g_lastPresentQpc.QuadPart != 0 && g_qpcFreq.QuadPart != 0) {
-        double dt = (double)(now.QuadPart - g_lastPresentQpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
-        if (dt > 0.5 && dt < 200.0) {
-            if (g_presentIntervalMs == 0.0) g_presentIntervalMs = dt;
-            else g_presentIntervalMs += (dt - g_presentIntervalMs) / 16.0;
-        }
-    }
-    g_lastPresentQpc = now;
-}
-
 void GetStats(Stats* out) {
     if (!out) return;
     out->active            = g_active != 0;
     out->detectionReason   = g_reason;
-    out->presentIntervalMs = g_presentIntervalMs;
-    out->presents          = (uint64_t)g_presents;
 }
 
 } // namespace DXVKBridge

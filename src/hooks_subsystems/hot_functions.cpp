@@ -12,6 +12,8 @@
 #include <emmintrin.h>   // SSE2
 #include "MinHook.h"
 #include "hot_functions.h"
+#include "crash_dumper.h"
+#include "sampling_profiler.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -35,6 +37,8 @@ extern "C" void Log(const char* fmt, ...);
 static uint64_t g_memset_calls = 0;
 static uint64_t g_simd_path = 0;
 
+static int g_featureToken = -1;
+
 // Above this size, clears are almost always one-shot (large allocations,
 // textures, audio/network buffers) and won't be re-read soon, so streaming
 // (non-temporal) stores that bypass the cache are a net win.
@@ -50,6 +54,7 @@ void* __cdecl Hooked_memset(void* dest, int Val, size_t Size) {
     if (!dest || Size == 0) return dest;
 
     g_memset_calls++;
+    CrashDumper::FeatureHit(g_featureToken);
 
     unsigned char* p = (unsigned char*)dest;
     unsigned char  v = (unsigned char)Val;
@@ -111,6 +116,8 @@ bool InstallHotFunctionOptimizations() {
         return false;
     }
     
+    g_featureToken = CrashDumper::FeatureTokenForCounting("HotFunctions");
+    SamplingProfiler::RegisterSelfSymbol("memset_SSE2", (const void*)&Hooked_memset);
     Log("[FastMemset] Installed: SSE2 memset replacement (1108 callers, NT >= 2MB)");
     return true;
 }

@@ -20,6 +20,7 @@ The current public build is focused on real frametime stability, long-session sm
 
 ## Table of Contents
 * [What's New in v3.17.0](#whats-new-in-v3170)
+* [Send me your log](#send-me-your-log)
 * [Reviews & Acknowledgments](#reviews)
 * [Current Feature Set](#current-feature-set)
 * [Installation](#installation)
@@ -143,6 +144,40 @@ A/B testing a single toggle is two logs on the same route.
 
 ---
 
+## Send me your log
+
+This is the single most useful thing anyone does for this project, and it costs
+you about thirty seconds.
+
+After playing, attach `Logs\wow_optimize_<date>_<time>.log` to an
+[issue](https://github.com/suprepupre/wow-optimize/issues) or drop it in
+[Discussions](https://github.com/suprepupre/wow-optimize/discussions). Nothing
+needs to be wrong for a log to be worth sending — a session where everything
+worked is just as informative as one where it did not.
+
+**What is in it and why it matters.** The log ends with a frame-time distribution,
+a note on whether your client was actually CPU-bound or waiting on the GPU, a
+profile of where time went, and which features did work rather than merely being
+switched on. Together those answer questions that cannot be answered from here:
+
+- Which optimizations pay off on hardware and addon sets I do not have. Several
+  features have been removed after logs showed they did nothing, and a few were
+  fixed after a log showed them doing the wrong thing.
+- Where the remaining time actually goes. One log turned out to be 94% idle,
+  which meant no CPU-side work could have helped that player at all; another was
+  genuinely CPU-bound and pointed straight at the hot code.
+- Whether a bug is mine. A log carries the exact build hash, so a report can be
+  matched to source instead of guessed at.
+
+Please send the whole file rather than an excerpt, and do not trim the first
+lines — that is where the build hash and your settings are. If you are reporting
+a bug, say what you saw and roughly when; the log has timestamps and the two
+together usually locate it.
+
+If you would rather not share it publicly, that is fine — say so in an issue.
+
+---
+
 ## Reviews
 
 <details>
@@ -156,7 +191,7 @@ See what other players say: [Reviews and Testimonials](https://github.com/suprep
 This project wouldn't exist without the community. Every crash report, every bisection test, every "hey this broke my addon" message directly shaped the release. 
 
 Special thanks to:
-Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude
+Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude, Houmbro
 
 </details>
 

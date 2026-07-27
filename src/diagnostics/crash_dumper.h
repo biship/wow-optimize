@@ -20,20 +20,49 @@
 #define MAX_TRACKED_FEATURES 128
 
 struct FeatureState {
-    const char* name;        // Feature name (e.g., "AdaptiveGC", "GetStrInline")
-    bool        active;      // Currently enabled
-    long long   callCount;   // Total invocations since init
-    long long   errorCount;  // SEH exceptions caught
-    DWORD       lastCallTick;// GetTickCount of last invocation
-    const char* lastError;   // Last error description (static string)
+    const char*  name;        // Feature name (e.g., "AdaptiveGC", "GetStrInline")
+    bool         active;      // Currently enabled
+    bool         counted;     // Something calls FeatureHit for this one
+    unsigned int hits;        // Times its work actually ran (32-bit: see FeatureHit)
+    long long    callCount;   // Total invocations via the legacy by-name API
+    long long    errorCount;  // SEH exceptions caught
+    DWORD        lastCallTick;// GetTickCount of last invocation
+    const char*  lastError;   // Last error description (static string)
 };
 
 namespace CrashDumper {
     bool Init();
     void Shutdown();
 
-    // Register a tracked feature for crash diagnostics
-    void RegisterFeature(const char* name);
+    // Register a tracked feature for crash diagnostics. Returns a token for
+    // FeatureHit, or -1 if the table is full.
+    int RegisterFeature(const char* name);
+
+    // Claims a token for counting, by the same name dllmain already registered.
+    // Resolving the name costs one scan, done once at install time; registration
+    // itself lives in dllmain for every feature, so looking up beats registering
+    // again and ending up with two rows for one feature. Registers the name if it
+    // is not present yet.
+    //
+    // Claiming also marks the feature as reporting its activity, so a zero count
+    // means "it never ran" rather than "nobody instrumented it". Without that
+    // distinction the report accuses every uninstrumented feature of doing
+    // nothing, which is the same lie as a feature logging success while installing
+    // no hook.
+    int FeatureTokenForCounting(const char* name);
+
+    // O(1) increment at a known index. The old by-name API below scans the table
+    // and strcmps every entry, which is why in practice it was wired into three
+    // call sites out of a hundred features and everything else reported zero.
+    //
+    // Deliberately not atomic and deliberately 32-bit. This sits on paths that
+    // run millions of times a session: a lock cmpxchg8b per call would cost more
+    // than the work being counted, and a torn 64-bit read would print a number
+    // far more misleading than a lost increment under contention.
+    void FeatureHit(int token);
+
+    // Writes the "what actually ran" section to the log.
+    void ReportFeatureActivity();
 
     // Update feature state (call from hooks/fast-paths)
     void FeatureCall(const char* name);

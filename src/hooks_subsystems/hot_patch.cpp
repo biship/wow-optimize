@@ -9,6 +9,8 @@
 #include "hot_patch.h"
 #include "MinHook.h"
 #include "version.h"
+#include "crash_dumper.h"
+#include "sampling_profiler.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -41,6 +43,7 @@ extern "C" void Log(const char* fmt, ...);
 // index at or past the top - falls through to the original, which keeps
 // the LUA_TNONE and upvalue/registry/globals cases exactly as they are.
 // ================================================================
+static int g_featureToken = -1;
 static unsigned int g_typeFastHits = 0;
 static unsigned int g_typeFastMisses = 0;
 
@@ -60,6 +63,7 @@ static int __cdecl Hooked_LuaType(int L, int idx) {
                 // locked atomic here costs more than the index2adr call the
                 // fast path saves, which made the hook net-negative.
                 ++g_typeFastHits;
+                CrashDumper::FeatureHit(g_featureToken);
                 return tt;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -79,6 +83,8 @@ namespace HotPatch {
             Log("[HotPatch] lua_type fast path: MH_EnableHook FAILED");
             return false;
         }
+        g_featureToken = CrashDumper::FeatureTokenForCounting("HotPatch");
+        SamplingProfiler::RegisterSelfSymbol("lua_type_fast", (const void*)&Hooked_LuaType);
         Log("[HotPatch] lua_type fast path: ACTIVE");
         return true;
     }

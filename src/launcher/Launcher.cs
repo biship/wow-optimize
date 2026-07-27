@@ -18,12 +18,24 @@ namespace WowOptimizeLauncher {
         public CheckBox Ctrl;
         public string Tooltip;
 
-        public SettingItem(string section, string key, bool defaultVal, CheckBox ctrl, string tooltip) {
+        // Experimental entries are skipped by "ENABLE ALL FEATURES". A tester was
+        // asked to leave one of these off so we could tell whether it caused their
+        // addon errors; they pressed Enable All, it went on with everything else,
+        // and the comparison measured nothing. A switch that exists to be left off
+        // has to survive the button that turns everything on.
+        public bool Experimental;
+
+        public SettingItem(string section, string key, bool defaultVal, CheckBox ctrl, string tooltip)
+            : this(section, key, defaultVal, ctrl, tooltip, false) {
+        }
+
+        public SettingItem(string section, string key, bool defaultVal, CheckBox ctrl, string tooltip, bool experimental) {
             Section = section;
             Key = key;
             DefaultVal = defaultVal;
             Ctrl = ctrl;
             Tooltip = tooltip;
+            Experimental = experimental;
         }
     }
 
@@ -301,6 +313,8 @@ namespace WowOptimizeLauncher {
             settingsMap = new Dictionary<string, SettingItem>() {
                 // General
                 { "Precise Sleep Frame Pacing", new SettingItem("General", "SleepPrecision", true, null, "Enforces millisecond-accurate frame-rate sleep pacing to reduce input lag and stabilize frame delivery.") },
+                { "Keep a Log File per Session", new SettingItem("General", "SessionLogs", true, null, "Writes a separate timestamped log for every session, so two runs can be compared. Older ones are deleted automatically (SessionLogsToKeep in wow_opt.ini, default 10). Turn off to keep only the single overwritten wow_optimize.log.") },
+                { "Lua Stack API Fast Paths (experimental)", new SettingItem("UI_Lua", "LuaStackFast", false, null, "Replaces 16 core Lua stack functions, including lua_remove, lua_insert and lua_replace. Off by default and skipped by Enable All: it is under investigation for addon errors where an argument arrives missing or wrong.", true) },
                 { "Memory Pressure Governor", new SettingItem("General", "MemoryPressure", true, null, "Sheds caches and adjusts texture footprint dynamically under critical 32-bit virtual address (VA) space limits.") },
                 { "Heap Compactor", new SettingItem("General", "HeapCompactor", true, null, "Defragments the client heap every 5 seconds to prevent Out-Of-Memory (OOM) crashes during teleports.") },
                 { "Lock-Free Heap Defragmenter", new SettingItem("General", "DefragLf", false, null, "Experimental defragmentation on the main thread using lock-free structures. Bypasses standard heap serialization.") },
@@ -344,7 +358,6 @@ namespace WowOptimizeLauncher {
                 { "Texture Smart Unload Delay", new SettingItem("Graphics_Sound", "TextureUnloadDelay", false, null, "Delays texture unloading during camera turnarounds to prevent immediate load micro-stutters.") },
                 { "Mipmap Bias Governor", new SettingItem("Graphics_Sound", "MipBiasGovernor", false, null, "Adjusts mipmap texture bias dynamically based on virtual memory pressure to prevent allocation spikes.") },
                 { "SIMD Matrix Vector Transforms", new SettingItem("Graphics_Sound", "SimdMatrixTransform", false, null, "Vectorizes 3D coordinate and matrix-vector calculations using SSE2 SIMD instructions to accelerate particle updates.") },
-                { "Dynamic Shadow Quality Auto-Scaler", new SettingItem("Graphics_Sound", "DynamicShadowScaler", false, null, "Dynamically scales shadow quality and resolution depending on the active frame rate.") },
                 { "Advanced Sound Channels Coalescer", new SettingItem("Graphics_Sound", "SoundCoalescer", false, null, "Coalesces rapid duplicated sound plays to prevent channel exhaustion under AOE spam.") },
                 { "Particle Density Dynamic Scaler", new SettingItem("Graphics_Sound", "ParticleDensityScaler", false, null, "Dynamically scales down particle density in heavy raid environments to keep FPS high.") },
                 { "Overlapping Sound Volume Limiter", new SettingItem("Graphics_Sound", "SoundVolumeLimit", false, null, "Limits and clamps volume for overlapping duplicate sound effects to prevent clipping and audio driver lag.") },
@@ -927,17 +940,19 @@ namespace WowOptimizeLauncher {
 
         private void ToggleAll(bool enabled) {
             foreach (SettingItem item in settingsMap.Values) {
-                if (item.Ctrl != null) {
-                    item.Ctrl.Checked = enabled;
-                }
+                if (item.Ctrl == null) continue;
+                // Turning everything off is always safe and always honoured.
+                // Turning everything on skips the experimental ones on purpose.
+                if (enabled && item.Experimental) continue;
+                item.Ctrl.Checked = enabled;
             }
         }
 
         private void ToggleTabFeatures(string section, bool enabled) {
             foreach (SettingItem item in settingsMap.Values) {
-                if (item.Section == section && item.Ctrl != null) {
-                    item.Ctrl.Checked = enabled;
-                }
+                if (item.Section != section || item.Ctrl == null) continue;
+                if (enabled && item.Experimental) continue;
+                item.Ctrl.Checked = enabled;
             }
         }
 
@@ -1159,6 +1174,23 @@ namespace WowOptimizeLauncher {
         private void CheckForUpdatesAsync() {
             System.Threading.ThreadPool.QueueUserWorkItem(delegate {
                 try {
+                    // This launcher targets .NET Framework 4.0, whose default
+                    // SecurityProtocol is SSL3 | TLS 1.0. GitHub stopped accepting
+                    // both in 2018, so every request below failed at the handshake
+                    // and the empty catch swallowed it - which is why the update
+                    // notice has never once appeared for anyone.
+                    //
+                    // SecurityProtocolType.Tls12 does not exist as a named member
+                    // in the 4.0 reference assemblies; 3072 is its value, and the
+                    // runtime underneath is a later 4.x that understands it.
+                    try {
+                        System.Net.ServicePointManager.SecurityProtocol |=
+                            (System.Net.SecurityProtocolType)3072;
+                    } catch {
+                        // Very old runtime with no TLS 1.2 at all: leave it alone
+                        // and let the request fail as before.
+                    }
+
                     using (System.Net.WebClient wc = new System.Net.WebClient()) {
                         wc.Headers.Add("User-Agent", "WoW-Optimize-Launcher");
                         string rawVer = wc.DownloadString("https://raw.githubusercontent.com/suprepupre/wow-optimize/main/version.txt?t=" + DateTime.UtcNow.Ticks.ToString());

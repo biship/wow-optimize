@@ -93,8 +93,25 @@ CDataStore* __cdecl Hooked_GetWowGUID(CDataStore* self, uint64_t* outGuid) {
             uint8_t* effective_base = self->buffer - self->base_offset;
             uint32_t rp = self->read_pos;
             uint32_t wp = self->write_pos;
-            if (rp < wp) {
-                uint32_t remaining = wp - rp;
+
+            // A CDataStore is a WINDOW onto a larger stream, not a flat buffer.
+            // The engine's own bounds check (sub_47B290) demands two things before
+            // touching memory: that the read fits within the total size, and that
+            // it lies inside the currently mapped window
+            // [base_offset, base_offset + allocated_size). When it does not, the
+            // engine calls a virtual method to fetch the next window.
+            //
+            // This fast path only checked the first. For a store whose window does
+            // not cover the whole stream - which is what a segmented packet is -
+            // a position past the window still passed, and the read came from
+            // buffer - base_offset + rp: memory outside the mapping. read_pos was
+            // then advanced over it, so every field after that GUID in the packet
+            // was parsed from the wrong place.
+            uint32_t winEnd = self->base_offset + self->allocated_size;
+            if (winEnd > wp) winEnd = wp;
+
+            if (rp >= self->base_offset && rp < winEnd) {
+                uint32_t remaining = winEnd - rp;
                 uint32_t bytesRead = FastUnpackGuidSSE2(effective_base + rp, remaining, outGuid);
                 if (bytesRead > 0) {
                     self->read_pos = rp + bytesRead;
