@@ -6,4 +6,5 @@ namespace VertexBufferPrealloc {
     void Shutdown();
     void* AllocateBuffer(size_t size);
     void FreeBuffer(void* ptr);
+
 }

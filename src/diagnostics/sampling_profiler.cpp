@@ -8,15 +8,29 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <psapi.h>
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
 #include "sampling_profiler.h"
 #include "version.h"
+#pragma comment(lib, "psapi.lib")
 
 extern "C" void Log(const char* fmt, ...);
 
+// Forward decl (avoid pulling in the whole lua_optimize header here). Returns
+// true while a zone/UI load or transition is in progress.
+namespace LuaOpt { bool IsLoadingMode(); }
+
 namespace SamplingProfiler {
+
+// Samples taken during loading screens / the first few seconds after start are
+// not representative of steady-state play (they're dominated by MPQ/DBC load,
+// hook install and page faults). Excluding them makes the profile reflect what
+// actually costs frame time in the world. Counted separately for transparency.
+static DWORD    g_samplerStartTick = 0;
+static uint64_t g_skippedSamples = 0;
+static const DWORD PROFILER_WARMUP_MS = 15000;
 
 // ---- configuration ------------------------------------------------
 static constexpr DWORD SAMPLE_INTERVAL_MS = 1;      // target interval
@@ -248,24 +262,227 @@ static DWORD WINAPI SamplerThreadProc(LPVOID) {
     CONTEXT ctx;
     ctx.ContextFlags = CONTEXT_CONTROL;  // just EIP + segment regs
 
+    if (g_samplerStartTick == 0) g_samplerStartTick = GetTickCount();
+
     while (g_running) {
         // Suspend → read → resume. The window is ~microseconds;
         // WoW won't notice. Same technique crash dumpers use.
         if (SuspendThread(g_mainThread) != (DWORD)-1) {
-            if (GetThreadContext(g_mainThread, &ctx)) {
-                uintptr_t eip = (uintptr_t)ctx.Eip;
-                uint64_t idx = g_writeIdx % RING_SIZE;
-                g_ring[idx] = eip;
-                g_writeIdx++;
-                g_totalSamples++;
+            uintptr_t eip = 0;
+            if (GetThreadContext(g_mainThread, &ctx)) eip = (uintptr_t)ctx.Eip;
+            ResumeThread(g_mainThread);  // resume ASAP, then decide off-thread
+
+            if (eip) {
+                // Only record steady-state, in-world samples: skip the warmup
+                // window and any loading/transition. This keeps startup one-shots
+                // (hook install, MPQ/DBC load) and load-screen page-fault spikes
+                // out of the "what costs frame time in play" picture.
+                bool warmedUp = (GetTickCount() - g_samplerStartTick) >= PROFILER_WARMUP_MS;
+                if (warmedUp && !LuaOpt::IsLoadingMode()) {
+                    uint64_t idx = g_writeIdx % RING_SIZE;
+                    g_ring[idx] = eip;
+                    g_writeIdx++;
+                    g_totalSamples++;
+                } else {
+                    g_skippedSamples++;
+                }
             }
-            ResumeThread(g_mainThread);
         }
 
         Sleep(SAMPLE_INTERVAL_MS);
     }
 
     return 0;
+}
+
+// ---- system-module classification ---------------------------------
+// Samples that land outside the WoW image are otherwise lumped into one
+// opaque "system_dll" bucket. On DXVK that bucket can be the majority of
+// main-thread time, and it matters a great deal WHICH module it is:
+// d3d9.dll/vulkan-1.dll = GPU present/sync wait (not CPU-fixable), while
+// ntdll.dll = page-fault / heap work (fixable by reducing memory pressure).
+// Enumerate loaded modules once per dump and range-classify each system sample.
+struct ModRange { uintptr_t base; uintptr_t end; char name[32]; uint64_t count; };
+static ModRange g_mods[128];
+static int g_modCount = 0;
+
+// Our own DLL is broken down per-4KB-page too (like the WoW image), because it
+// showed up as a top-4 consumer (~8% of main-thread time) and we need to know
+// WHICH of our hooks costs that. Reported as "wowopt+0xNNNN" (offset from our
+// DLL base) so it maps directly to wow_optimize.map.
+static uintptr_t g_selfBase = 0;
+static uintptr_t g_selfEnd  = 0;
+static constexpr int SELF_PAGES = 4096;   // covers a 16MB image
+static uint32_t g_selfPageCounts[SELF_PAGES];
+
+// The 4KB page above ranks our DLL against everything else, but it cannot answer
+// WHICH hook is hot: at this build's code density a single page holds about
+// nineteen functions, so a page that reads 1.97% could be one expensive hook or
+// nineteen cheap ones. Resolving that from a tester log used to mean rebuilding
+// the exact commit just to read its .map, and even then a page listed too many
+// candidates to choose between.
+//
+// So our own image is counted a second time at 256-byte resolution, and reported
+// as its own section rather than merged into the main ranking - splitting our
+// share across eight buckets would push every one of them below the top-N cutoff
+// and hide the very thing this is for.
+static constexpr int SELF_FINE_SHIFT = 8;      // 256-byte buckets
+static constexpr int SELF_FINE_SLOTS = 8192;   // covers a 2MB image (~600KB today)
+static constexpr int SELF_FINE_TOP   = 20;
+static uint32_t g_selfFineCounts[SELF_FINE_SLOTS];
+
+// The client's code has exactly the same problem, and it is the bigger half: the
+// hottest region in a recent profile, 0x005B2000 at 6.45%, holds four functions,
+// so "which client function is worth hooking" could not be answered from a log at
+// all. 512 bytes over the 8MB image costs 64KB of counters and usually lands on
+// one function, which can then be decompiled directly.
+static constexpr int WOW_FINE_SHIFT = 9;       // 512-byte buckets
+static constexpr int WOW_FINE_SLOTS = (int)((WOW_END - WOW_BASE) >> WOW_FINE_SHIFT) + 1;
+static uint32_t g_wowFineCounts[WOW_FINE_SLOTS];
+
+// Prints the top SELF_FINE_TOP buckets of a histogram, largest first. Selection is
+// an insertion pass over a 20-entry list rather than a sort of the whole array,
+// which would mean copying 16-32K entries inside a diagnostic dump.
+static void DumpFineHistogram(const uint32_t* counts, int slots, int shift,
+                              uint64_t total, const char* title,
+                              const char* addrFormat, uintptr_t addrBase) {
+    int idx[SELF_FINE_TOP];
+    int found = 0;
+
+    for (int i = 0; i < slots; i++) {
+        uint32_t c = counts[i];
+        if (!c) continue;
+        int at = found;
+        if (found < SELF_FINE_TOP) {
+            found++;
+        } else if (c > counts[idx[SELF_FINE_TOP - 1]]) {
+            at = SELF_FINE_TOP - 1;
+        } else {
+            continue;
+        }
+        while (at > 0 && c > counts[idx[at - 1]]) {
+            idx[at] = idx[at - 1];
+            at--;
+        }
+        idx[at] = i;
+    }
+
+    if (found == 0 || total == 0) return;
+
+    Log("[SamplingProfiler] === %s ===", title);
+    for (int i = 0; i < found; i++) {
+        uint32_t c = counts[idx[i]];
+        char addr[32];
+        wsprintfA(addr, addrFormat, (unsigned)(addrBase + ((uintptr_t)idx[i] << shift)));
+        Log("[SamplingProfiler]   %-14s %8u samples (%5.2f%%)",
+            addr, c, 100.0 * (double)c / (double)total);
+    }
+}
+
+// A cheap marker: this variable lives inside our own DLL, so its address tells
+// us which module is ours.
+static int g_selfAnchor = 0;
+
+static void BuildModuleTable() {
+    g_modCount = 0;
+    g_selfBase = g_selfEnd = 0;
+    HMODULE mods[256];
+    DWORD needed = 0;
+    HANDLE proc = GetCurrentProcess();
+    if (!EnumProcessModules(proc, mods, sizeof(mods), &needed)) return;
+    int count = (int)(needed / sizeof(HMODULE));
+    if (count > 256) count = 256;
+    for (int i = 0; i < count && g_modCount < 128; i++) {
+        MODULEINFO mi;
+        if (!GetModuleInformation(proc, mods[i], &mi, sizeof(mi))) continue;
+        uintptr_t base = (uintptr_t)mi.lpBaseOfDll;
+        uintptr_t end  = base + mi.SizeOfImage;
+        // Skip the wow.exe main image — those samples are already handled by
+        // the named-function / per-page buckets (WOW_BASE..WOW_END).
+        if (base <= WOW_BASE && WOW_BASE < end) continue;
+        // Identify our own DLL by the anchor address; it gets a per-page
+        // breakdown instead of a single module bucket.
+        if ((uintptr_t)&g_selfAnchor >= base && (uintptr_t)&g_selfAnchor < end) {
+            g_selfBase = base;
+            g_selfEnd  = end;
+            continue;
+        }
+        char nm[MAX_PATH];
+        if (!GetModuleBaseNameA(proc, mods[i], nm, sizeof(nm))) continue;
+        ModRange& m = g_mods[g_modCount];
+        m.base = base;
+        m.end  = end;
+        strncpy(m.name, nm, sizeof(m.name) - 1);
+        m.name[sizeof(m.name) - 1] = '\0';
+        m.count = 0;
+        g_modCount++;
+    }
+}
+
+static ModRange* FindModule(uintptr_t eip) {
+    for (int i = 0; i < g_modCount; i++) {
+        if (eip >= g_mods[i].base && eip < g_mods[i].end) return &g_mods[i];
+    }
+    return nullptr;
+}
+
+// ntdll shows up as one big bucket (~40%+ of main-thread time), but that lumps
+// together two very different things: threads BLOCKED in a wait (NtWait* /
+// NtDelayExecution = idle GPU/frame-pacing, NOT CPU we can cut) versus HEAP work
+// (RtlAllocateHeap/RtlFreeHeap = reducible by cutting allocations). Resolving
+// ntdll samples to the nearest key exported function tells us which - i.e.
+// whether a memory optimization is even worth attempting.
+struct NtFunc { uintptr_t addr; const char* name; uint64_t count; };
+static NtFunc g_ntFuncs[24];
+static int g_ntFuncCount = 0;
+static uintptr_t g_ntdllBase = 0, g_ntdllEnd = 0;
+
+static void BuildNtFuncTable() {
+    g_ntFuncCount = 0; g_ntdllBase = g_ntdllEnd = 0;
+    HMODULE h = GetModuleHandleA("ntdll.dll");
+    if (!h) return;
+    MODULEINFO mi;
+    if (GetModuleInformation(GetCurrentProcess(), h, &mi, sizeof(mi))) {
+        g_ntdllBase = (uintptr_t)mi.lpBaseOfDll;
+        g_ntdllEnd  = g_ntdllBase + mi.SizeOfImage;
+    }
+    static const char* const names[] = {
+        // blocked in a wait -> idle (GPU/frame-pacing/lock), not fixable CPU work
+        "NtWaitForSingleObject", "NtWaitForMultipleObjects", "NtDelayExecution",
+        "NtWaitForAlertByThreadId", "NtSignalAndWaitForSingleObject", "NtRemoveIoCompletion",
+        // heap -> real CPU work, reducible by cutting main-thread allocations
+        "RtlAllocateHeap", "RtlFreeHeap", "RtlReAllocateHeap", "RtlSizeHeap",
+        // locks / dispatch
+        "RtlEnterCriticalSection", "RtlLeaveCriticalSection",
+        "KiUserCallbackDispatcher", "KiUserApcDispatcher", "KiUserExceptionDispatcher",
+    };
+    for (int i = 0; i < (int)(sizeof(names)/sizeof(names[0])) && g_ntFuncCount < 24; i++) {
+        void* p = (void*)GetProcAddress(h, names[i]);
+        if (p) {
+            g_ntFuncs[g_ntFuncCount].addr = (uintptr_t)p;
+            g_ntFuncs[g_ntFuncCount].name = names[i];
+            g_ntFuncs[g_ntFuncCount].count = 0;
+            g_ntFuncCount++;
+        }
+    }
+    for (int i = 1; i < g_ntFuncCount; i++) {  // insertion sort by address
+        NtFunc t = g_ntFuncs[i]; int j = i - 1;
+        while (j >= 0 && g_ntFuncs[j].addr > t.addr) { g_ntFuncs[j+1] = g_ntFuncs[j]; j--; }
+        g_ntFuncs[j+1] = t;
+    }
+}
+
+// Nearest key ntdll function at or below eip, within 64KB. Wait stubs are leaf
+// syscalls so a blocked thread lands right on them (precise); heap internals are
+// approximate but a heap-heavy cluster is still unmistakable.
+static NtFunc* FindNtFunc(uintptr_t eip) {
+    NtFunc* best = nullptr;
+    for (int i = 0; i < g_ntFuncCount; i++) {
+        if (g_ntFuncs[i].addr <= eip) best = &g_ntFuncs[i];
+        else break;
+    }
+    if (best && (eip - best->addr) <= 0x10000) return best;
+    return nullptr;
 }
 
 // ---- aggregation + dump -------------------------------------------
@@ -276,10 +493,23 @@ static void DumpResults() {
         return;
     }
 
+    // Reset the per-page tally so DumpResults can be called repeatedly (the
+    // periodic stats dump calls it every few minutes, not only at shutdown —
+    // the shutdown path is often skipped on the fast process-exit, which lost
+    // the profile entirely). Each call re-aggregates the current ring contents.
+    memset(g_pageCounts, 0, sizeof(g_pageCounts));
+    memset(g_selfPageCounts, 0, sizeof(g_selfPageCounts));
+    memset(g_selfFineCounts, 0, sizeof(g_selfFineCounts));
+    memset(g_wowFineCounts, 0, sizeof(g_wowFineCounts));
+
+    // Snapshot loaded modules so system samples can be attributed to a DLL.
+    BuildModuleTable();
+    BuildNtFuncTable();
+
     // Buckets: one per named function, one "system_dll", plus one per non-empty
     // 4KB WoW page (so unlisted hot code is reported by address, not lumped into
     // a single opaque blob). Static (not on the stack) because of the page slots.
-    static constexpr int MAX_BUCKETS = MAX_KNOWN_FUNCS + NUM_PAGES + 1;
+    static constexpr int MAX_BUCKETS = MAX_KNOWN_FUNCS + NUM_PAGES + SELF_PAGES + 128 + 24 + 1;
     static SampleBucket buckets[MAX_BUCKETS];
     int bucketCount = 0;
 
@@ -318,13 +548,62 @@ static void DumpResults() {
         }
 
         // Not matched to a named function: aggregate WoW samples per 4KB page,
-        // everything else into the system bucket.
+        // our own DLL per 4KB page, and other non-WoW samples per owning module
+        // (falling back to the opaque system bucket only when unresolved).
         if (eip >= WOW_BASE && eip <= WOW_END) {
-            g_pageCounts[(eip - WOW_BASE) >> 12]++;
+            uintptr_t woff = eip - WOW_BASE;
+            g_pageCounts[woff >> 12]++;
+            uint32_t wfine = (uint32_t)(woff >> WOW_FINE_SHIFT);
+            if (wfine < WOW_FINE_SLOTS) g_wowFineCounts[wfine]++;
+        } else if (g_selfBase && eip >= g_selfBase && eip < g_selfEnd) {
+            uintptr_t off = eip - g_selfBase;
+            uint32_t pg = (uint32_t)(off >> 12);
+            if (pg < SELF_PAGES) g_selfPageCounts[pg]++;
+            uint32_t fine = (uint32_t)(off >> SELF_FINE_SHIFT);
+            if (fine < SELF_FINE_SLOTS) g_selfFineCounts[fine]++;
         } else {
-            buckets[systemIdx].count++;
+            ModRange* m = FindModule(eip);
+            if (m) {
+                if (g_ntdllBase && eip >= g_ntdllBase && eip < g_ntdllEnd) {
+                    NtFunc* nf = FindNtFunc(eip);
+                    if (nf) nf->count++;   // attributed to a known ntdll function
+                    else    m->count++;    // ntdll but unrecognized -> stays in ntdll bucket
+                } else {
+                    m->count++;
+                }
+            } else {
+                buckets[systemIdx].count++;
+            }
         }
         next_sample:;
+    }
+
+    // Emit one bucket per non-empty page of our own DLL (labelled "wowopt+0x..").
+    for (int p = 0; p < SELF_PAGES && bucketCount < MAX_BUCKETS; p++) {
+        if (!g_selfPageCounts[p]) continue;
+        buckets[bucketCount].addr  = g_selfBase + ((uintptr_t)p << 12);
+        buckets[bucketCount].name  = nullptr;   // labelled by self-offset at print time
+        buckets[bucketCount].count = g_selfPageCounts[p];
+        bucketCount++;
+    }
+
+    // Emit one bucket per system module that got samples (labelled "sys:<dll>").
+    for (int mi = 0; mi < g_modCount && bucketCount < MAX_BUCKETS; mi++) {
+        if (!g_mods[mi].count) continue;
+        buckets[bucketCount].addr  = g_mods[mi].base;
+        buckets[bucketCount].name  = g_mods[mi].name;  // e.g. "d3d9.dll", "ntdll.dll"
+        buckets[bucketCount].count = g_mods[mi].count;
+        bucketCount++;
+    }
+
+    // Emit ntdll sub-function buckets (e.g. "ntdll!NtWaitForSingleObject") so the
+    // big ntdll bucket is split into idle-wait vs heap vs locks.
+    for (int i = 0; i < g_ntFuncCount && bucketCount < MAX_BUCKETS; i++) {
+        if (!g_ntFuncs[i].count) continue;
+        buckets[bucketCount].addr  = g_ntFuncs[i].addr;
+        buckets[bucketCount].name  = g_ntFuncs[i].name;  // e.g. "NtWaitForSingleObject"
+        buckets[bucketCount].count = g_ntFuncs[i].count;
+        bucketCount++;
     }
 
     // Merge every non-empty page region as an address-labelled bucket.
@@ -343,8 +622,8 @@ static void DumpResults() {
               });
 
     // Dump top-N (named functions and hot unlisted regions intermixed by heat)
-    Log("[SamplingProfiler] === TOP %d HOT FUNCTIONS/REGIONS (%llu total samples) ===",
-        TOP_N, (unsigned long long)total);
+    Log("[SamplingProfiler] === TOP %d HOT FUNCTIONS/REGIONS (%llu steady-state samples, %llu skipped: loading/warmup) ===",
+        TOP_N, (unsigned long long)total, (unsigned long long)g_skippedSamples);
 
     int printed = 0;
     for (int i = 0; i < bucketCount && printed < TOP_N; i++) {
@@ -354,6 +633,11 @@ static void DumpResults() {
         const char* name;
         if (buckets[i].name) {
             name = buckets[i].name;
+        } else if (g_selfBase && buckets[i].addr >= g_selfBase && buckets[i].addr < g_selfEnd) {
+            // A hot page inside our own DLL — label by offset from our base so it
+            // maps directly to wow_optimize.map (which of our hooks costs time).
+            wsprintfA(label, "wowopt+0x%05X", (unsigned)(buckets[i].addr - g_selfBase));
+            name = label;
         } else {
             // Unlisted WoW code region — label by its 4KB page base so the
             // region can be decompiled directly from the dump.
@@ -364,6 +648,14 @@ static void DumpResults() {
             printed + 1, name, (unsigned long long)buckets[i].count, pct);
         printed++;
     }
+
+    // Our own hot spots at 256-byte resolution, then the client's at 512-byte.
+    // Both are narrow enough to land on a single function, which the 4KB page
+    // buckets in the ranking above cannot do.
+    DumpFineHistogram(g_selfFineCounts, SELF_FINE_SLOTS, SELF_FINE_SHIFT, total,
+                      "wow_optimize.dll HOT SPOTS (256-byte resolution)", "wowopt+0x%05X", 0);
+    DumpFineHistogram(g_wowFineCounts, WOW_FINE_SLOTS, WOW_FINE_SHIFT, total,
+                      "wow.exe HOT SPOTS (512-byte resolution)", "0x%08X", WOW_BASE);
 
     Log("[SamplingProfiler] === END PROFILE ===");
 }
@@ -383,6 +675,8 @@ bool Init(HANDLE mainThread) {
     }
     g_writeIdx = 0;
     g_totalSamples = 0;
+    g_skippedSamples = 0;
+    g_samplerStartTick = 0;  // re-arm the warmup window on (re)start
     memset((void*)g_ring, 0, sizeof(g_ring));
     memset(g_pageCounts, 0, sizeof(g_pageCounts));
 
@@ -440,5 +734,14 @@ void Shutdown() {
 bool IsActive() { return g_running; }
 
 uint64_t GetSampleCount() { return g_totalSamples; }
+
+// Dump the current top-50 without stopping the sampler. Safe to call from the
+// main thread while sampling continues (it only reads the ring). Used by the
+// periodic stats dump so the profile survives the fast process-exit path that
+// skips Shutdown().
+void DumpNow() {
+    if (!g_running) return;
+    DumpResults();
+}
 
 } // namespace SamplingProfiler

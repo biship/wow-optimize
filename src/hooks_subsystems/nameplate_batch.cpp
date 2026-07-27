@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: nameplate_batch.cpp
-// Description: Supporting utility functions for `nameplate_batch.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "nameplate_batch.h"

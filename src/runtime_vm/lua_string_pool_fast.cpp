@@ -41,4 +41,5 @@ void Shutdown() {
     Log("[LuaStringPoolFast] Stats: %lld hits, %lld misses in string pool", g_hits, g_misses);
 }
 
+
 } // namespace LuaStringPoolFast

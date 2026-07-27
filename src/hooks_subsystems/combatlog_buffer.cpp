@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: combatlog_buffer.cpp
-// Description: Supporting utility functions for `combatlog_buffer.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "combatlog_buffer.h"

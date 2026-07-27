@@ -1,7 +1,6 @@
 #pragma once
-#include <windows.h>
 
-namespace UnitAuraCoalesce {
+namespace MpqAsyncDecompress {
     bool Init();
     void Shutdown();
 }

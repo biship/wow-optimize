@@ -20,4 +20,16 @@ void OnFocusChange(bool hasFocus) {
     }
 }
 
+void OnFrame() {
+    // Focus = the foreground window belongs to our process. Poll it each frame
+    // (cheap) and fire OnFocusChange only on transitions.
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    bool hasFocus = (pid == GetCurrentProcessId());
+    if (hasFocus != g_hasFocus) {
+        OnFocusChange(hasFocus);
+    }
+}
+
 } // namespace MouseClipRelease

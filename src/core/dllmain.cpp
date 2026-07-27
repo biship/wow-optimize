@@ -35,9 +35,6 @@
 #include "lua_objlen_inline.h"
 #include "lua_error_diag.h"
 #include "hooks_memory.h"
-#include "data_caches.h"
-#include "compute_caches.h"
-#include "tooltip_cache.h"
 #include "regex_cache.h"
 #include "texcache_tuning.h"
 #include "lua_register_fast.h"
@@ -52,21 +49,16 @@
 #include "lua_yield_fast.h"
 #include "lua_getn_fast.h"
 #include "loading_defrag.h"
-#include "async_culling.h"
 #include "d3d9_state_cache.h"
 #include "d3d9_render_thread.h"
 #include "frame_limiter.h"
-#include "saved_vars_async_serializer.h"
-#include "simd_skinning.h"
 #include "net_packet_offload.h"
 #include "predictive_prefetch.h"
-#include "parallel_m2_skinning.h"
 #include "guid_lookup_cache.h"
 #include "simd_math_fast.h"
 #include "combatlog_incremental.h"
 #include "lua_alloc_pool.h"
 #include "world_state_coalesce.h"
-#include "hw_vertex_skinning.h"
 #include "hooks_subsystems/dynamic_shadow_scaler.h"
 #include "hooks_subsystems/sound_coalescer.h"
 #include "hooks_subsystems/aura_preload_cache.h"
@@ -87,7 +79,6 @@
 #include "hooks_subsystems/saved_vars_backup.h"
 #include "hooks_subsystems/unit_max_power_cache.h"
 #include "hooks_subsystems/mouse_clip_release.h"
-#include "hooks_subsystems/loading_screen_opt.h"
 #include "hooks_subsystems/combat_log_filter.h"
 #include "hooks_subsystems/sound_volume_limit.h"
 #include "hooks_subsystems/ui_layout_throttle.h"
@@ -98,17 +89,14 @@
 #include "hooks_subsystems/movement_smoothing.h"
 #include "hooks_subsystems/font_alpha_fastpath.h"
 
-// 20 new colossal features (Features 31-50)
 #include "hooks_subsystems/packet_processing_throttle.h"
 #include "hooks_subsystems/nameplate_culling.h"
 #include "hooks_subsystems/texture_unload_delay.h"
-#include "hooks_subsystems/m2_matrix_simd.h"
 #include "hooks_subsystems/minimap_refresh_governor.h"
 #include "hooks_subsystems/spell_effect_culling.h"
 #include "hooks_subsystems/lua_string_compare_fast.h"
 #include "hooks_subsystems/dbc_row_caching.h"
 #include "hooks_subsystems/network_string_dedup.h"
-#include "hooks_subsystems/camera_collision_throttle.h"
 #include "hooks_subsystems/sound_freq_coalesce.h"
 #include "hooks_subsystems/aura_update_dedup.h"
 #include "hooks_subsystems/ui_texture_caching.h"
@@ -142,7 +130,81 @@ static void UpdateMainThreadActivity() {
     CrashDumper::FeatureCall("SleepHook");
 }
 
+// Classify a code address to "module.dll+0xOFFSET" (or raw hex if not in a module).
+static void FreezeClassifyAddr(uintptr_t addr, char* out) {
+    HMODULE hm = NULL;
+    if (addr >= 0x10000 &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &hm) && hm) {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(hm, path, MAX_PATH)) {
+            const char* base = strrchr(path, '\\');
+            base = base ? base + 1 : path;
+            wsprintfA(out, "%s+0x%X", base, (unsigned)(addr - (uintptr_t)hm));
+            return;
+        }
+    }
+    wsprintfA(out, "0x%08X", (unsigned)addr);
+}
+
+// On a real freeze, snapshot WHERE the main thread is actually stuck. The EIP
+// tells us whether it's blocked in a syscall (ntdll = a wait) and the stack
+// return addresses tell us who called it: d3d9.dll/vulkan = DXVK GPU/pipeline
+// wait, wow_optimize.dll = our fault, Wow.exe = engine/addon. This is what turns
+// a useless "SleepHook 10s ago" into an actual diagnosis.
+static void CaptureFreezeLocation(DWORD mainTid) {
+    if (mainTid == 0) return;
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                          FALSE, mainTid);
+    if (!h) return;
+
+    // While the main thread is suspended, ONLY read raw memory (EIP + a slice of
+    // the stack). Do NOT call GetModuleHandleExA here: it takes the loader lock,
+    // and if the thread froze while holding that lock (e.g. mid DLL load) we'd
+    // deadlock. Classification happens after we resume.
+    uintptr_t eip = 0, rawStack[96]; int rawCount = 0;
+    if (SuspendThread(h) != (DWORD)-1) {
+        CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (GetThreadContext(h, &ctx)) {
+            eip = ctx.Eip;
+            uintptr_t* sp = (uintptr_t*)ctx.Esp;
+            for (int i = 0; i < 96; i++) {
+                __try { rawStack[rawCount] = sp[i]; } __except(EXCEPTION_EXECUTE_HANDLER) { break; }
+                rawCount++;
+            }
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+
+    // Now safe to classify (loader lock) and log — main thread is running again.
+    if (eip) {
+        char buf[MAX_PATH + 32];
+        FreezeClassifyAddr(eip, buf);
+        Log("!!!   STUCK AT: EIP=%s", buf);
+        int shown = 0;
+        for (int i = 0; i < rawCount && shown < 6; i++) {
+            uintptr_t v = rawStack[i];
+            HMODULE hm = NULL;
+            if (v >= 0x10000 &&
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)v, &hm) && hm) {
+                FreezeClassifyAddr(v, buf);
+                Log("!!!     stack -> %s", buf);
+                shown++;
+            }
+        }
+    }
+}
+
+// perf_diagnostics.h is included further down this file; declare what the
+// watchdog needs here so the escalation path can dump the memory snapshot.
+namespace PerfDiagnostics { void LogPerformanceSnapshot(double elapsedMs); }
+
 static DWORD WINAPI FreezeWatchdogProc(LPVOID) {
+    bool escalatedThisStall = false;   // reset once the main thread ticks again
     while (g_freezeWatchdogActive) {
         Sleep(5000);
         if (!g_freezeWatchdogActive) break;
@@ -151,6 +213,7 @@ static DWORD WINAPI FreezeWatchdogProc(LPVOID) {
         if (lastTick == 0) continue;
 
         DWORD elapsed = GetTickCount() - lastTick;
+        if (elapsed <= 10000) escalatedThisStall = false;
         if (elapsed > 10000) {
             // Loading screens, UI reloads and lua_State swaps legitimately block
             // the main thread (cold MPQ asset loads + addon (re)load). That is NOT
@@ -163,11 +226,26 @@ static DWORD WINAPI FreezeWatchdogProc(LPVOID) {
             DWORD swapTick = LuaOpt::GetLastSwapTick();
             bool inPostSwapGrace = (swapTick != 0 && (GetTickCount() - swapTick) < 30000);
             bool expected = LuaOpt::IsLoadingMode() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || inPostSwapGrace;
+
+            // A loading screen that never ends looks exactly like "expected"
+            // blocking, so staying quiet forever means we never see the one
+            // failure we most need to diagnose. Past 45s no legitimate zone load
+            // is still running: escalate and capture the stuck location anyway.
+            // Once per stall, so a genuinely slow cold load doesn't spam.
+            if (expected && elapsed > 45000 && !escalatedThisStall) {
+                escalatedThisStall = true;
+                Log("!!! LOADING STALL !!! Main thread blocked %u ms and still flagged as "
+                    "loading/transition -- this is no longer a normal load", elapsed);
+                CaptureFreezeLocation(g_mainThreadId);
+                PerfDiagnostics::LogPerformanceSnapshot((double)elapsed);
+            }
+
             if (expected) {
                 Log("[FreezeWatchdog] main thread blocked %u ms during loading/transition (expected, not a hang)", elapsed);
             } else {
                 Log("!!! FREEZE DETECTED !!! Main thread silent for %u ms (no loading/transition active)", elapsed);
                 Log("!!! Last main thread tick: %u, current: %u", lastTick, GetTickCount());
+                CaptureFreezeLocation(g_mainThreadId);
 
                 // Concise suspect list only: features that logged an error or were
                 // active right up to the stall. The old full dump printed 100+
@@ -216,7 +294,6 @@ static void StopFreezeWatchdog() {
 }
 
 #include "frame_throttle.h"
-#include "tooltip_cache.h"
 #include "spell_cache.h"
 // #include "ui_frame_batch.h" // REMOVED - optimization disabled
 
@@ -229,6 +306,7 @@ static void StopFreezeWatchdog() {
 #include "addon_dispatcher.h"
 #include "mpq_prefetch.h"
 #include "mpq_mmap_vfs.h"
+#include "mpq_async_decompress.h"
 #include "obj_vis_cache.h"
 #include "nameplate_batch.h"
 #include "addon_preload.h"
@@ -236,7 +314,6 @@ static void StopFreezeWatchdog() {
 #include "strstr_fast.h"
 #include "crt_char_fast.h"
 #include "crt_wchar_fast.h"
-#include "tls_cache.h"
 #include "stream_cache.h"
 #include "lua_this_cache.h"
 #include "io_cache.h"
@@ -284,13 +361,12 @@ static void StopFreezeWatchdog() {
 #include "lua_tonumber_fast.h"
 #include "lua_pushnumber_fast.h"
 #include "gettime_fast.h"
+#include "lua_gettime_fast.h"
 #include "lua_pushvalue_fast.h"
 #include "render_state_dedup.h"
 #include "lua_settable_cache.h"
 #include "regex_cache.h"
 #include "trig_lut.h"
-#include "data_caches.h"
-#include "compute_caches.h"
 #include "event_name_hash.h"
 #include "cdatastore_batch.h"
 #include "crt_memcpy_fast.h"
@@ -309,15 +385,14 @@ static void StopFreezeWatchdog() {
 #include "sound_buffer_guard.h"
 #include "sound_update_guard.h"
 #include "lua_vm_engine.h"
-#include "lua_vm_phase3.h"
 #include "lua_gettable_cache.h"
 #include "saved_vars_async.h"
 #include "event_coalescer.h"
+#include "loading_state.h"
+#include "diagnostics/frame_bench.h"
 #include "luaS_newlstr_sse2.h"
 #include "lua_bytecode_pre_compiler.h"
-#include "hook_prefetch.h"
 #include "hot_patch.h"
-#include "infra_patch.h"
 #include "wow_opt_hooks.h"
 #include "wow_perf_hooks.h"
 #include "wow_extended_hooks.h"
@@ -339,7 +414,6 @@ static void StopFreezeWatchdog() {
 #include "lua_pushfstring_fast.h"
 #include "lua_getupvalue_fast.h"
 #include "lua_buffinit_fast.h"
-#include "lua_file_cache.h"
 #include "combatlog_parser.h"
 
 void ClearCombatLogCache();
@@ -352,20 +426,14 @@ void ClearCombatLogCache();
 #include "tls_object_cache.h"
 #include "sound_mixer_opt.h"
 #include "lua_gc_governor.h"
-#include "m2_lod_bias.h"
 #include "async_tex_loader.h"
-#include "unit_aura_coalesce.h"
-#include "addon_tick_governor.h"
 #include "saved_vars_pretoken.h"
-#include "net_addon_coalescer.h"
 #include "mip_bias_governor.h"
-#include "spatial_culling.h"
 #include "perf_diagnostics.h"
 #include "adaptive_farclip.h"
 #include "m2_bone_simd.h"
 #include "font_glyph_cache.h"
 #include "saved_vars_preload_async.h"
-#include "combat_text_coalescer.h"
 #include "minimap_throttle.h"
 #include "dbc_lookup_cache_fast.h"
 #include "world_to_screen_sse.h"
@@ -422,7 +490,7 @@ extern "C" void IncrementParticleFrameCount();
 #define CRASH_TEST_DISABLE_THREAD_AFFINITY   0   // Thread core pinning (re-enabled - was disabled preemptively)
 #define CRASH_TEST_DISABLE_SHORT_WAIT_SPIN   1   // WaitSpin (ALREADY DISABLED - tested bad)
 #ifndef CRASH_TEST_DISABLE_VA_ARENA
-#define CRASH_TEST_DISABLE_VA_ARENA          1   // VA Arena virtual alloc (enabled with memory limit fix)
+#define CRASH_TEST_DISABLE_VA_ARENA          0   // VA Arena compiled in; activation is runtime opt-in via Config OptVaArena (default off). Set to 1 to hard-remove.
 #endif
 #define CRASH_TEST_DISABLE_DISPATCH_POOL     1   // DispatchPool (ALREADY DISABLED - tested bad)
 #define CRASH_TEST_DISABLE_BGPRELOAD_CACHE   1   // bgpreloadsleep cache (ALREADY DISABLED - 0 hits)
@@ -503,7 +571,9 @@ static SRWLOCK        g_vaArenaLock      = SRWLOCK_INIT;
 static long           g_vaArenaHits      = 0;
 static long           g_vaArenaFallbacks = 0;
 static long           g_vaArenaFailures  = 0;
+static long           g_vaArenaFull      = 0;  // qualifying requests that didn't fit -> "arena too small" signal for sizing
 static DWORD          g_vaArenaUsedPages = 0;
+static DWORD          g_vaArenaPeakPages = 0;  // high-water mark of used pages
 
 // Bitmap + span tracking
 static uint64_t g_vaArenaBitmap[VA_ARENA_BITMAP_SIZE] = {0};
@@ -803,6 +873,18 @@ extern "C" void ClearLuaOptCaches() {
     ClearRawGetIInlineCache();
     ClearEventDispatchCache();
     ClearTableCache();
+
+    // The glyph and outline caches are keyed by the font object's address, and a
+    // UI reload destroys and recreates every font object without touching the D3D9
+    // device. Until now they were only flushed from device reset and device change,
+    // so after a /reload the allocator could hand a new font the address of a dead
+    // one and a lookup would return a glyph descriptor rasterized for a different
+    // font - wrong advance widths, characters drawn on top of each other. That is
+    // the "smushed text" seen after reloading, and it is the same defect shape as
+    // the model-pointer table that used to hide corpses: a cache keyed by an
+    // address the engine is free to reuse must be dropped when the owner dies.
+    FontGlyphCache::ClearCache();
+    FontOutlineCache::ClearCache();
 }
 
 // Stats for new hooks (defined with implementations below)
@@ -866,6 +948,14 @@ static FILE* g_sessionLog = nullptr;
 static constexpr int LOG_RING_SIZE = 2048;
 static constexpr int LOG_RING_MASK = LOG_RING_SIZE - 1;
 
+// ready: 0 = free (producer may fill), 1 = filled, 2 = claimed by a consumer.
+// The ring has two consumers - the background log thread and whichever thread calls
+// LogFlushImmediate - so a slot must be claimed with an interlocked 1 -> 2 transition
+// before it is written out, and only released back to 0 once its text has been read.
+static constexpr LONG LOG_SLOT_FREE = 0;
+static constexpr LONG LOG_SLOT_FILLED = 1;
+static constexpr LONG LOG_SLOT_CLAIMED = 2;
+
 struct LogEntry {
     char text[2048];
     volatile LONG ready;
@@ -873,40 +963,58 @@ struct LogEntry {
 
 static LogEntry g_logRing[LOG_RING_SIZE] = {};
 static volatile LONG g_logWritePos = 0;
-static LONG g_logReadPos = 0;
+static volatile LONG g_logReadPos = 0;
 static HANDLE g_logEvent = NULL;
 static HANDLE g_logThread = NULL;
 static volatile bool g_logShutdown = false;
 
+static HANDLE LogFileHandle(FILE* f) {
+    if (!f) return NULL;
+    HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    return h;
+}
+
+// Writes out every filled ring entry and returns how many were drained. Both
+// consumers go through this single path with unbuffered WriteFile, so log lines can
+// never interleave through two independent stream buffers on the same descriptor.
+static int LogDrainRing() {
+    HANDLE hMain = LogFileHandle(g_log);
+    HANDLE hSession = LogFileHandle(g_sessionLog);
+    if (!hMain && !hSession) return 0;
+
+    int drained = 0;
+    for (int guard = 0; guard < LOG_RING_SIZE; guard++) {
+        int slot = g_logReadPos & LOG_RING_MASK;
+        if (InterlockedCompareExchange(&g_logRing[slot].ready,
+                                       LOG_SLOT_CLAIMED, LOG_SLOT_FILLED) != LOG_SLOT_FILLED) {
+            break;
+        }
+        InterlockedIncrement(&g_logReadPos);
+
+        DWORD len = (DWORD)strlen(g_logRing[slot].text);
+        DWORD written = 0;
+        if (hMain) WriteFile(hMain, g_logRing[slot].text, len, &written, NULL);
+        if (hSession) WriteFile(hSession, g_logRing[slot].text, len, &written, NULL);
+
+        InterlockedExchange(&g_logRing[slot].ready, LOG_SLOT_FREE);
+        drained++;
+    }
+    return drained;
+}
+
 static DWORD WINAPI LogThreadProc(LPVOID) {
     while (!g_logShutdown) {
         WaitForSingleObject(g_logEvent, 100);
-        if (!g_log && !g_sessionLog) continue;
-
-        int flushed = 0;
-        while (g_logRing[g_logReadPos & LOG_RING_MASK].ready) {
-            int slot = g_logReadPos & LOG_RING_MASK;
-            if (g_log) fputs(g_logRing[slot].text, g_log);
-            if (g_sessionLog) fputs(g_logRing[slot].text, g_sessionLog);
-            InterlockedExchange(&g_logRing[slot].ready, 0);
-            g_logReadPos++;
-            flushed++;
-        }
-        if (flushed > 0) {
-            if (g_log) fflush(g_log);
-            if (g_sessionLog) fflush(g_sessionLog);
-        }
+        LogDrainRing();
     }
 
-    while (g_logRing[g_logReadPos & LOG_RING_MASK].ready) {
-        int slot = g_logReadPos & LOG_RING_MASK;
-        if (g_log) fputs(g_logRing[slot].text, g_log);
-        if (g_sessionLog) fputs(g_logRing[slot].text, g_sessionLog);
-        InterlockedExchange(&g_logRing[slot].ready, 0);
-        g_logReadPos++;
-    }
-    if (g_log) fflush(g_log);
-    if (g_sessionLog) fflush(g_sessionLog);
+    LogDrainRing();
+
+    HANDLE hMain = LogFileHandle(g_log);
+    HANDLE hSession = LogFileHandle(g_sessionLog);
+    if (hMain) FlushFileBuffers(hMain);
+    if (hSession) FlushFileBuffers(hSession);
     return 0;
 }
 
@@ -959,45 +1067,56 @@ static void LogClose() {
     if (g_sessionLog) { fclose(g_sessionLog); g_sessionLog = nullptr; }
 }
 
+// Teardown for DLL_PROCESS_DETACH with lpReserved != NULL (the process is exiting).
+// LogClose() must NOT be used there: by that point the OS has already terminated
+// every other thread, including the log thread, possibly while it held the CRT
+// stream lock - so fprintf/fclose can deadlock the exiting process, and waiting on
+// the dead log thread just burns the timeout. Drain whatever the log thread never
+// got to using raw WriteFile (a syscall, unaffected by an orphaned CRT lock), force
+// it to disk, and leave the handles for the OS to close.
+static void LogFinalizeOnProcessExit(const char* note) {
+    g_logShutdown = true;
+    LogDrainRing();
+
+    HANDLE hMain = LogFileHandle(g_log);
+    HANDLE hSession = LogFileHandle(g_sessionLog);
+
+    if (note && (hMain || hSession)) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char line[512];
+        int n = _snprintf(line, sizeof(line) - 1, "[%02d:%02d:%02d.%03d] %s\n",
+                          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, note);
+        if (n > 0) {
+            DWORD written = 0;
+            if (hMain) WriteFile(hMain, line, (DWORD)n, &written, NULL);
+            if (hSession) WriteFile(hSession, line, (DWORD)n, &written, NULL);
+        }
+    }
+
+    if (hMain) FlushFileBuffers(hMain);
+    if (hSession) FlushFileBuffers(hSession);
+}
+
+// Minimum spacing between physical FlushFileBuffers calls. WriteFile already hands
+// the bytes to the OS file cache, so they survive a process crash (which is all the
+// log has to survive); FlushFileBuffers additionally forces a disk sync and costs
+// several milliseconds per call. Calling it per line made a multi-line ERROR dump
+// stall the main thread for hundreds of milliseconds.
+static constexpr DWORD LOG_FSYNC_INTERVAL_MS = 1000;
+static DWORD g_lastLogFsyncTick = 0;
+
 void LogFlushImmediate() {
-    if (!g_log && !g_sessionLog) return;
+    if (!LogDrainRing()) return;
 
-    int maxDrain = LOG_RING_SIZE;
-    while (maxDrain-- > 0) {
-        int slot = g_logReadPos & LOG_RING_MASK;
-        LONG ready = InterlockedCompareExchange(&g_logRing[slot].ready, 0, 1);
-        if (ready != 1) break;
+    DWORD now = GetTickCount();
+    if (now - g_lastLogFsyncTick < LOG_FSYNC_INTERVAL_MS) return;
+    g_lastLogFsyncTick = now;
 
-        DWORD len = (DWORD)strlen(g_logRing[slot].text);
-        DWORD written = 0;
-
-        if (g_log) {
-            HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(g_log));
-            if (hFile != INVALID_HANDLE_VALUE && hFile != NULL) {
-                WriteFile(hFile, g_logRing[slot].text, len, &written, NULL);
-            }
-        }
-        if (g_sessionLog) {
-            HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(g_sessionLog));
-            if (hFile != INVALID_HANDLE_VALUE && hFile != NULL) {
-                WriteFile(hFile, g_logRing[slot].text, len, &written, NULL);
-            }
-        }
-        g_logReadPos++;
-    }
-
-    if (g_log) {
-        HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(g_log));
-        if (hFile != INVALID_HANDLE_VALUE && hFile != NULL) {
-            FlushFileBuffers(hFile);
-        }
-    }
-    if (g_sessionLog) {
-        HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(g_sessionLog));
-        if (hFile != INVALID_HANDLE_VALUE && hFile != NULL) {
-            FlushFileBuffers(hFile);
-        }
-    }
+    HANDLE hMain = LogFileHandle(g_log);
+    HANDLE hSession = LogFileHandle(g_sessionLog);
+    if (hMain) FlushFileBuffers(hMain);
+    if (hSession) FlushFileBuffers(hSession);
 }
 
   extern "C" void LogEx(LogLevel level, const char* context, const char* fmt, ...) {
@@ -1100,8 +1219,8 @@ static void __cdecl hooked_free(void* ptr) {
 }
 
 static void* __cdecl hooked_malloc(size_t size) {
-    if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId &&
-        size >= MIMALLOC_LARGE_THRESHOLD) {
+    if (Config::g_settings.OptCrtMimalloc ||
+        (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId && size >= MIMALLOC_LARGE_THRESHOLD)) {
         void* p = mi_malloc(size);
         if (p) {
             if ((uintptr_t)p < 0x80000000) return p;  // low 2GB only
@@ -1114,8 +1233,8 @@ static void* __cdecl hooked_malloc(size_t size) {
 static void* __cdecl hooked_calloc(size_t count, size_t size) {
     if (size != 0 && count > (size_t)-1 / size) return nullptr;  // overflow guard
     size_t total = count * size;
-    if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId &&
-        total >= MIMALLOC_LARGE_THRESHOLD) {
+    if (Config::g_settings.OptCrtMimalloc ||
+        (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId && total >= MIMALLOC_LARGE_THRESHOLD)) {
         void* p = mi_calloc(count, size);
         if (p) {
             if ((uintptr_t)p < 0x80000000) return p;
@@ -1246,6 +1365,12 @@ static void RunPeriodicMaintenanceOnMainThread() {
     if (g_mainThreadId == 0 || GetCurrentThreadId() != g_mainThreadId)
         return;
 
+    // Everything below is this DLL's own work on the game's main thread, so it
+    // lands inside a frame. When a hitch is reported, the first question is
+    // whether we caused it, and this is the probe that answers it. The inner
+    // probes attribute further once this one fires.
+    StallProbe maintenanceProbe("periodic maintenance", 4.0);
+
     DWORD nowTick = GetTickCount();
 
     if (g_nextStatsDumpTick == 0) {
@@ -1283,7 +1408,10 @@ static void RunPeriodicMaintenanceOnMainThread() {
         if (g_nextMiCollectTick == 0) {
             g_nextMiCollectTick = nowTick + 60000;
         } else if ((LONG)(nowTick - g_nextMiCollectTick) >= 0) {
-            mi_collect(true);
+            {
+                StallProbe probe("60s safety mi_collect", 4.0);
+                mi_collect(true);
+            }
             g_nextMiCollectTick = nowTick + 60000;
         }
     }
@@ -1333,14 +1461,14 @@ static void WINAPI hooked_Sleep(DWORD ms) {
             LuaVMEngine_FrameTick();
             ApiCache::OnNewFrame();
             FontMetrics_OnFrame();
+#if !TEST_DISABLE_LUA_GETTIME_FAST
+            if (Config::g_settings.OptLuaGetTimeFast) {
+                LuaGetTimeFast_NewFrame();
+            }
+#endif
             if (Config::g_settings.OptDefragLf) {
                 LoadingDefrag::OnFrame();
             }
-#if !TEST_DISABLE_ASYNC_CULLING
-            if (Config::g_settings.OptDbcLookupCache) {
-                AsyncCulling::OnFrameStart();
-            }
-#endif
 #if !TEST_DISABLE_PREDICTIVE_PREFETCH
             PredictivePrefetch::OnFrame();
 #endif
@@ -1398,18 +1526,12 @@ static void WINAPI hooked_Sleep(DWORD ms) {
 #if !TEST_DISABLE_ADAPTIVE_FARCLIP
             AdaptiveFarclip::OnFrame((float)elapsedMs);
 #endif
-#if !TEST_DISABLE_M2_LOD_BIAS
-            M2LodBias::UpdateLodBias(elapsedMs);
-#endif
 #if !TEST_DISABLE_NET_ADDON_COALESCER
-            NetAddonCoalescer::OnFrame();
-#endif
-#if !TEST_DISABLE_SPATIAL_CULLING
-            SpatialCulling::OnFrame();
 #endif
 #if !TEST_DISABLE_MIP_BIAS_GOVERNOR
             MipBiasGovernor::UpdateMipBias(elapsedMs);
 #endif
+            if (Config::g_settings.OptMouseClipRelease) MouseClipRelease::OnFrame();
 #if !TEST_DISABLE_PERF_DIAGNOSTICS
             PerfDiagnostics::OnFrame(elapsedMs);
 #endif
@@ -1421,7 +1543,7 @@ static void WINAPI hooked_Sleep(DWORD ms) {
         }
 
         if (Config::g_settings.OptSleepPrecision && ms <= 3) {
-            if (!LuaOpt::IsInitialized() || LuaOpt::IsLoadingMode() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) {
+            if (IsWine() || IsRosetta() || !LuaOpt::IsInitialized() || LuaOpt::IsLoadingMode() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) {
                 orig_Sleep(ms);
                 return;
             }
@@ -3279,9 +3401,6 @@ static HANDLE WINAPI hooked_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD
             extern bool ContainsWTF(const char* path);
             const char* luaExt = strrchr(lpFileName, '.');
             if (ContainsWTF(lpFileName) && luaExt && _stricmp(luaExt, ".lua") == 0) {
-                #if !TEST_DISABLE_SAVED_VARS_SERIALIZER
-                SavedVarsAsyncSerializer::FlushFile(lpFileName);
-                #endif
                 #if !TEST_DISABLE_SAVED_VARS_ASYNC
                 if (dwAccess & (GENERIC_WRITE | FILE_WRITE_DATA | GENERIC_ALL)) {
                     extern void TrackSVHandle(HANDLE h);
@@ -3328,9 +3447,6 @@ static HANDLE WINAPI hooked_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWOR
         extern bool ContainsWTF(const char* path);
         const char* luaExt = strrchr(buf, '.');
         if (ContainsWTF(buf) && luaExt && _stricmp(luaExt, ".lua") == 0) {
-            #if !TEST_DISABLE_SAVED_VARS_SERIALIZER
-            SavedVarsAsyncSerializer::FlushFile(buf);
-            #endif
             #if !TEST_DISABLE_SAVED_VARS_ASYNC
             if (dwAccess & (GENERIC_WRITE | FILE_WRITE_DATA | GENERIC_ALL)) {
                 extern void TrackSVHandle(HANDLE h);
@@ -3994,6 +4110,10 @@ static void DumpPeriodicStats() {
             pmc.PeakWorkingSetSize / (1024.0 * 1024.0),
             pmc.PageFaultCount);
     }
+    // Renderer line here too: DXVK's d3d9.dll can load after the startup probe,
+    // so re-report it once detection has reliably latched. Makes any mid-session
+    // log slice self-describing (GPU is static; logged once at startup).
+    Log("[Stats] Renderer: %s", DXVKBridge::IsActive() ? "DXVK / Vulkan translation" : "native Direct3D 9");
 
     // Virtual address space scan (32-bit fragmentation indicator)
     {
@@ -4140,14 +4260,6 @@ static void DumpPeriodicStats() {
         }
     }
 
-    // Tooltip Cache stats
-    {
-        TooltipCache::Stats stats = TooltipCache::GetStats();
-        if (stats.hits + stats.misses > 0) {
-            Log("[Stats] Tooltip Cache: %lld hits, %lld misses, %lld evictions (%.1f%% hit rate)",
-                stats.hits, stats.misses, stats.evictions, stats.hitRate);
-        }
-    }
 
     // Spell Cache stats
     {
@@ -4215,9 +4327,17 @@ static void DumpPeriodicStats() {
         long total = g_vaArenaHits + g_vaArenaFallbacks;
         double arenaPct = total > 0 ? (double)g_vaArenaHits / total * 100.0 : 0.0;
         double usedMB = (double)g_vaArenaUsedPages * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
-        Log("[Stats] VA Arena v3: %ld hits, %ld fallbacks, %ld fail (%.1f%% arena, %.1f MB used)",
+        double peakMB = (double)g_vaArenaPeakPages * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
+        double capMB  = (double)VA_ARENA_MAX_PAGES * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
+        Log("[Stats] VA Arena: %ld hits, %ld fallbacks, %ld fail (%.1f%% arena, %.1f MB used, %.1f MB peak of %.0f MB)",
             g_vaArenaHits, g_vaArenaFallbacks, g_vaArenaFailures,
-            arenaPct, usedMB);
+            arenaPct, usedMB, peakMB, capMB);
+        // g_vaArenaFull is the key sizing signal: qualifying allocations we had
+        // to reject because the arena ran out of contiguous space. If this is
+        // non-zero, 64MB is too small - grow it (or the peak is near the cap).
+        Log("[Stats] VA Arena sizing: %ld qualifying requests rejected (arena full/fragmented)%s",
+            g_vaArenaFull,
+            g_vaArenaFull > 0 ? "  <-- consider a larger arena" : "");
     }
     if (g_streamReadHits + g_streamReadFallbacks > 0)
         Log("[Stats] Stream read: %ld fast, %ld fallback (%.1f%%)",
@@ -4292,6 +4412,15 @@ static void DumpPeriodicStats() {
 
     Log("[Stats] ====================================");
 
+#if !TEST_DISABLE_SAMPLING_PROFILER
+    // If the sampling profiler is active, fold its current top-50 into the
+    // periodic dump. Shutdown() is skipped on the fast process-exit path, so
+    // this is the only way the profile reliably reaches the log.
+    if (Config::g_settings.OptSamplingProfiler) {
+        SamplingProfiler::DumpNow();
+    }
+#endif
+    FrameBench::Report("periodic");
 }
 
 // ================================================================
@@ -4388,6 +4517,8 @@ typedef void (__fastcall* SwapPresent_fn)(void*, void*);
 static SwapPresent_fn orig_SwapPresent = nullptr;
 static uint64_t g_glFinishSkips = 0;
 
+extern "C" void WowOpt_OnFrameBoundary();
+
 static void __fastcall hooked_SwapPresent(void* This, void* unused) {
     char* T = (char*)This;
 
@@ -4395,11 +4526,22 @@ static void __fastcall hooked_SwapPresent(void* This, void* unused) {
     // NO IsBadReadPtr - it breaks guard pages and causes mouse-triggered crashes
     // when cursor/UI redraw happens during device state transitions.
     __try {
+        // A true per-frame boundary: sub_69E220 is reached only through the render
+        // vtable, once per presented frame. It is the one place that can measure
+        // frame time honestly, so the benchmark is fed from here.
+        FrameBench::OnPresent(FrameBench::Source::SwapHook);
+        WowOpt_OnFrameBoundary();
+
         // Ensure deferred field updates and coalesced world states are flushed 
         // on the main thread every frame boundary, even when the client is running
         // with VSync off / uncapped framerates (which bypass hooked_Sleep).
         FlushFieldUpdates();
         WorldStateCoalesce::OnFrame();
+#if !TEST_DISABLE_LUA_GETTIME_FAST
+        if (Config::g_settings.OptLuaGetTimeFast) {
+            LuaGetTimeFast_NewFrame();
+        }
+#endif
 
         // sub_682E50()
         orig_sub_682E50();
@@ -4476,6 +4618,69 @@ static bool InstallSwapPresentHook() {
     Log("Swap present hook: ACTIVE (sub_69E220 @ 0x0069E220 - glFinish skip, Vulkan/D3D9)");
     return true;
 #endif
+}
+
+// ================================================================
+// Frame-boundary timing detour (used only when the optimizing swap
+// hook above is not installed)
+// ================================================================
+//
+// sub_69E220 is the only true frame boundary available: reached solely through
+// the render vtable, exactly once per presented frame. The optimizing hook above
+// already reports each frame to FrameBench, but it is gated behind OptVulkanDXVK,
+// which is off by default - so without this the benchmark would silently record
+// nothing for most users, which is worse than having no benchmark at all.
+//
+// Deliberately thin: report the frame, call the original, nothing else. It adds
+// no behaviour of its own, so it cannot influence what it is measuring.
+// Disassembly-verified: int __thiscall sub_69E220(void *this) - the instance
+// pointer arrives in ECX and there are no stack arguments, so a __fastcall detour
+// with an unused second register parameter matches exactly and no stack cleanup
+// is involved. The return value is propagated: unlike the optimizing hook above,
+// which reimplements the body and never reaches the original, this one wraps it,
+// so discarding EAX would change what the caller sees.
+typedef int (__fastcall* SwapPresentTiming_fn)(void*, void*);
+static SwapPresentTiming_fn orig_SwapPresentTiming = nullptr;
+
+// Work that must happen exactly once per presented frame, called from both
+// present paths. Anything that ages per frame belongs here rather than in the
+// hooked_Sleep tick, which is gated to fire at most once every 8ms - i.e. it
+// stops tracking frames at all above ~125fps.
+extern "C" void WowOpt_OnFrameBoundary() {
+    // Nothing ages per frame right now. Kept as the single place for work that
+    // must, so it never goes back into the hooked_Sleep tick - that one is gated
+    // to 8ms and stops tracking frames at all above ~125fps.
+}
+
+static int __fastcall hooked_SwapPresent_TimingOnly(void* This, void* unused) {
+    FrameBench::OnPresent(FrameBench::Source::SwapHook);
+    WowOpt_OnFrameBoundary();
+    return orig_SwapPresentTiming(This, unused);
+}
+
+static bool InstallSwapTimingHook() {
+    void* target = (void*)0x0069E220;
+
+    unsigned char* p = (unsigned char*)target;
+    if (p[0] != 0x56 || p[1] != 0x8B || p[2] != 0xF1) {
+        Log("[FrameBench] Swap timing hook: BAD PROLOGUE at 0x%08X (expected 56 8B F1)",
+            (uintptr_t)target);
+        return false;
+    }
+
+    if (WineSafe_CreateHook(target, (void*)hooked_SwapPresent_TimingOnly,
+                            (void**)&orig_SwapPresentTiming) != MH_OK) {
+        Log("[FrameBench] Swap timing hook: MH_CreateHook FAILED");
+        return false;
+    }
+    if (WO_EnableHook(target) != MH_OK) {
+        Log("[FrameBench] Swap timing hook: MH_EnableHook FAILED");
+        orig_SwapPresentTiming = nullptr;
+        return false;
+    }
+
+    Log("[FrameBench] Frame timing ACTIVE (sub_69E220, measurement only)");
+    return true;
 }
 
 // ================================================================
@@ -5680,25 +5885,37 @@ static bool InstallWFMOFast() {
 static void* g_loadingArena = nullptr;
 static SRWLOCK g_arenaLock = SRWLOCK_INIT;
 
+// Reserving the arena is a best-effort optimization that is deliberately skipped on
+// heavy clients, but entering the loading state is NOT optional - a whole family of
+// "bypass this hook while loading" guards depends on it. The two were previously
+// fused, so on any client with a working set above 500 MB (i.e. most HD clients) the
+// early return skipped the notification and the process never entered loading state.
 extern "C" void ReserveLoadingArena() {
     AcquireSRWLockExclusive(&g_arenaLock);
-    if (g_loadingArena) { ReleaseSRWLockExclusive(&g_arenaLock); return; }
+    if (!g_loadingArena) {
+        // Skip on HD clients - VA space already under pressure (32-bit, 1.3GB WS)
+        PROCESS_MEMORY_COUNTERS pmc = {};
+        pmc.cb = sizeof(pmc);
+        bool vaUnderPressure = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))
+                               && pmc.WorkingSetSize > 500u * 1024u * 1024u;
 
-    // Skip on HD clients - VA space already under pressure (32-bit, 1.3GB WS)
-    PROCESS_MEMORY_COUNTERS pmc = {};
-    pmc.cb = sizeof(pmc);
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))
-        && pmc.WorkingSetSize > 500u * 1024u * 1024u)
-        { ReleaseSRWLockExclusive(&g_arenaLock); return; }
-
-    g_loadingArena = VirtualAlloc(nullptr, 256 * 1024 * 1024, MEM_RESERVE, PAGE_NOACCESS);
-    ReleaseSRWLockExclusive(&g_arenaLock);
-
-    if (g_loadingArena) {
-        Log("[VA-Arena] Reserved 256MB for loading screen model/texture allocation");
+        if (!vaUnderPressure) {
+            g_loadingArena = VirtualAlloc(nullptr, 256 * 1024 * 1024, MEM_RESERVE, PAGE_NOACCESS);
+            ReleaseSRWLockExclusive(&g_arenaLock);
+            if (g_loadingArena) {
+                Log("[VA-Arena] Reserved 256MB for loading screen model/texture allocation");
+            } else {
+                Log("[VA-Arena] Failed to reserve 256MB (VA fragmented - continuing)");
+            }
+        } else {
+            ReleaseSRWLockExclusive(&g_arenaLock);
+            Log("[VA-Arena] Skipped reservation (working set %.1f MB - VA already under pressure)",
+                pmc.WorkingSetSize / (1024.0 * 1024.0));
+        }
     } else {
-        Log("[VA-Arena] Failed to reserve 256MB (VA fragmented - continuing)");
+        ReleaseSRWLockExclusive(&g_arenaLock);
     }
+
     LoadingDefrag::NotifyLoadingState(true);
     TextureUnloadDelay::Flush();
 }
@@ -6126,7 +6343,11 @@ static DWORD WINAPI MainThread(LPVOID param) {
     // waited 5s then installed, missing the entire early-init allocation stream.
     LogOpen();
     Log("========================================");
-    Log("  wow_optimize.dll v%s BY %s", WOW_OPTIMIZE_VERSION_STR, WOW_OPTIMIZE_AUTHOR);
+#ifndef WOW_OPTIMIZE_GIT_HASH
+#define WOW_OPTIMIZE_GIT_HASH "unknown"
+#endif
+    Log("  wow_optimize.dll v%s (build %s) BY %s",
+        WOW_OPTIMIZE_VERSION_STR, WOW_OPTIMIZE_GIT_HASH, WOW_OPTIMIZE_AUTHOR);
     Log("  PID: %lu", GetCurrentProcessId());
     Log("========================================");
     
@@ -6151,8 +6372,15 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- Memory Allocator ---");
     Log("[Allocator] CRT-wide redirect removed (Winsock stability). mimalloc used directly by subsystems.");
     bool mimallocLargeOk = false;
-    if (Config::g_settings.OptMimallocLarge) {
+    if (Config::g_settings.OptMimallocLarge || Config::g_settings.OptCrtMimalloc) {
         mimallocLargeOk = InstallMimallocLargeHooks();
+        // NOTE: this is the LARGE-ONLY redirect — only main-thread allocations
+        // >= 1 MB below the 2 GB line go to mimalloc. It is NOT the old CRT-wide
+        // redirect (that one broke connections and stays removed). The
+        // InstallMimallocLargeHooks() call above logs its own precise ACTIVE line.
+        if (!mimallocLargeOk) {
+            Log("[MimallocLarge] install failed — staying on stock CRT allocator");
+        }
     } else {
         Log("[MimallocLarge] disabled via configuration (opt-in; enable in launcher to route large allocations to mimalloc)");
     }
@@ -6191,7 +6419,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     CrashDumper::RegisterFeature("WowStrlen");
     CrashDumper::RegisterFeature("StrstrSSE2");
     CrashDumper::RegisterFeature("CrtCharSSE2");
-    CrashDumper::RegisterFeature("TlsCache");
     CrashDumper::RegisterFeature("StreamCache");
     CrashDumper::RegisterFeature("LuaThisCache");
     CrashDumper::RegisterFeature("IOCache");
@@ -6223,7 +6450,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     CrashDumper::RegisterFeature("HardwareCursor");
     CrashDumper::RegisterFeature("FrameThrottle");
     CrashDumper::RegisterFeature("UIFrameBatch");
-    CrashDumper::RegisterFeature("TooltipCache");
     CrashDumper::RegisterFeature("SpellCache");
     CrashDumper::RegisterFeature("LuaRawGetICache");
     CrashDumper::RegisterFeature("CombatLogFullCache");
@@ -6276,18 +6502,28 @@ static DWORD WINAPI MainThread(LPVOID param) {
     InstallSoundEmitterGuard();
     InstallSoundBufferGuard();
     InstallSoundUpdateGuard();
+    // Always installed: it owns the FrameScript_SignalEvent detour and publishes the
+    // loading state that the DBC cache, deferred field updates, LuaOpcache and the
+    // texture unload queue use as a safety gate. EventCoalescer, when enabled, hangs
+    // its dedup queue off this same detour.
+    FrameBench::Init();
+    LoadingState::Init();
 #if !TEST_DISABLE_EVENT_COALESCER
     EventCoalescer::Init();
 #endif
 #if !TEST_DISABLE_LUAS_NEWLSTR_SSE2
-    LuaSNewlstr::Init();
+    // The launcher has always offered a switch for this; nothing read it, so the
+    // hook installed unconditionally and a tester turning it off saw no change.
+    if (Config::g_settings.OptLuaSNewLstrFast) {
+        LuaSNewlstr::Init();
+    } else {
+        Log("[luaS_newlstr] disabled via configuration (opt-in)");
+    }
 #endif
     CrashDumper::RegisterFeature("LuaVMCache");
     CrashDumper::RegisterFeature("LuaGetTableCache");
     CrashDumper::RegisterFeature("SavedVarsAsync");
-    CrashDumper::RegisterFeature("HookPrefetch");
     CrashDumper::RegisterFeature("HotPatch");
-    CrashDumper::RegisterFeature("InfraPatch");
     CrashDumper::RegisterFeature("MemoryOpt");
     CrashDumper::RegisterFeature("SourceOpt");
     CrashDumper::RegisterFeature("TlsObjectCache");
@@ -6372,26 +6608,38 @@ static DWORD WINAPI MainThread(LPVOID param) {
     AdjustMimallocForMultiClient();    
     Log("--- System Timer ---");
     SetHighTimerResolution();
-    Log("--- Threads ---");
-    OptimizeThreads();
-    Log("--- Process ---");
-    
-    // Install SetPriorityClass hook BEFORE setting priority to block downgrade attempts
-    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-    if (hKernel32) {
-        void* pSetPriorityClass = (void*)GetProcAddress(hKernel32, "SetPriorityClass");
-        if (pSetPriorityClass && 
-            MH_CreateHook(pSetPriorityClass, (void*)hooked_SetPriorityClass, (void**)&orig_SetPriorityClass) == MH_OK &&
-            WO_EnableHook(pSetPriorityClass) == MH_OK) {
-            Log("SetPriorityClass hook: ACTIVE (blocks priority downgrades)");
-        } else {
-            Log("WARNING: SetPriorityClass hook failed");
+
+    // Compatibility mode: some virtualized environments (HyperV virtual switches
+    // especially) break WoW's logon TCP connection when the process runs at
+    // ABOVE_NORMAL priority with the anti-downgrade hook + watchdog forcing it -
+    // the virtualized network path gets starved. A tester on HyperV couldn't
+    // connect at all with the DLL loaded, regardless of feature toggles, because
+    // these scheduling tweaks are applied unconditionally. When CompatMode is on
+    // we skip all of them and let WoW run at normal priority/affinity/working set.
+    if (Config::g_settings.OptCompatMode) {
+        Log("--- Process/Threads --- CompatMode ON: skipping CPU priority/affinity/working-set tweaks");
+    } else {
+        Log("--- Threads ---");
+        OptimizeThreads();
+        Log("--- Process ---");
+
+        // Install SetPriorityClass hook BEFORE setting priority to block downgrade attempts
+        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+        if (hKernel32) {
+            void* pSetPriorityClass = (void*)GetProcAddress(hKernel32, "SetPriorityClass");
+            if (pSetPriorityClass &&
+                MH_CreateHook(pSetPriorityClass, (void*)hooked_SetPriorityClass, (void**)&orig_SetPriorityClass) == MH_OK &&
+                WO_EnableHook(pSetPriorityClass) == MH_OK) {
+                Log("SetPriorityClass hook: ACTIVE (blocks priority downgrades)");
+            } else {
+                Log("WARNING: SetPriorityClass hook failed");
+            }
         }
+
+        OptimizeProcess();
+        StartPriorityWatchdog();
+        OptimizeWorkingSet();
     }
-    
-    OptimizeProcess();
-    StartPriorityWatchdog();
-    OptimizeWorkingSet();
     Log("--- FPS Cap ---");
     TryRemoveFPSCap();
 
@@ -6400,7 +6648,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- WaitForSingleObject Spin ---");
     bool wfsOk = Config::g_settings.OptDefragLf && InstallWaitForSingleObjectHook();
     Log("--- Module Handle Cache ---");
-    bool modOk = Config::g_settings.OptLuaFileCache && InstallGetModuleHandleCache();
+    bool modOk = Config::g_settings.OptModuleHandleCache && InstallGetModuleHandleCache();
     Log("--- String Compare (lstrcmp) ---");
     bool lstrOk = Config::g_settings.OptStrStrSse2 && InstallLstrcmpHook();
     Log("--- String Length (lstrlen) ---");
@@ -6424,9 +6672,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     bool wcharOk = Config::g_settings.OptStrStrSse2 && InstallCrtWcharSSE2();
 
-    // TLS Pointer Cache - eliminate 1297+ TEB lookups per frame
-    bool tlsCacheOk = InstallTlsCache();
-
     // Stream Reader/Writer Cache - eliminate bounds checks
     bool streamCacheOk = Config::g_settings.OptSavedVarsPretoken && InstallStreamCache();
 
@@ -6440,13 +6685,13 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool luaGlobalCacheOk = Config::g_settings.OptLuaOpcache && InstallLuaGlobalCache();
 
     // memset hook - 1108 callers
-    bool hotFuncOk = Config::g_settings.OptStrStrSse2 && InstallHotFunctionOptimizations();
+    bool hotFuncOk = Config::g_settings.OptFastMemsetOpt && InstallHotFunctionOptimizations();
 
     bool memcpyFastOk = false; // Config::g_settings.OptStrStrSse2 && InstallMemcpyFast();
 
     // FrameScript hash dispatch - 18 handlers, O(1) vs O(n)
 #if !TEST_DISABLE_FRAME_SCRIPT_DISPATCH
-    bool fsDispatchOk = Config::g_settings.OptFrameScriptDispatch && InstallFrameScriptDispatch();
+    bool fsDispatchOk = InstallFrameScriptDispatch();
 #else
     bool fsDispatchOk = false;
     Log("[FrameScriptDispatch] DISABLED via feature flag");
@@ -6454,7 +6699,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     // Fast String Compare (strncmp) - 1013 callers
 #if !TEST_DISABLE_STRING_OPS_FAST
-    bool fastStrncmpOk = Config::g_settings.OptStrStrSse2 && InstallFastStrncmp();
+    bool fastStrncmpOk = Config::g_settings.OptFastStrnicmpOpt && InstallFastStrncmp();
 #else
     bool fastStrncmpOk = false;
 #endif
@@ -6465,10 +6710,16 @@ static DWORD WINAPI MainThread(LPVOID param) {
     // Aligned Allocator Cache - 1764 callers (thread-local pool for small allocations)
     bool alignedAllocOk = InstallAlignedAllocCache();
 
-    // NOTE: free_cache, strnicmp_fast, tick_counter_cache are DUPLICATES of existing hooks:
+    // NOTE: free_cache and strnicmp_fast are DUPLICATES of existing hooks:
     //   crt_free_hook.cpp   already hooks 0x76E5A0 (2901 callers)
     //   fast_strncmp.cpp    already hooks 0x76E780 (1013 callers)
-    //   tls_cache.cpp       already hooks 0x4D3790 (1297 callers)
+    // tick_counter_cache was listed here too, on the claim that tls_cache.cpp
+    // already hooked its target 0x4D3790. It never did - InstallTlsCache only
+    // logged a line and returned true - so nothing hooks 0x4D3790. It stays
+    // unhooked by choice now rather than by accident: wrapping a hot leaf
+    // accessor to count and cache it is the shape that measured net-negative
+    // every time it was tried, because the trampoline costs more than the
+    // handful of instructions it skips.
     // lua_pushnumber_fast DISABLED - corrupts numeric values, breaks addon UI bars
 
     // CDataStore Fast Path - 4179 xrefs (network packet serialization/deserialization)
@@ -6524,6 +6775,13 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- Swap/Present ---");
     bool swapOk = Config::g_settings.OptVulkanDXVK && InstallSwapPresentHook();
 
+    // Only one detour can own an address, and the optimizing hook already reports
+    // every frame. Fall back to the measurement-only detour so the benchmark works
+    // in every configuration rather than only the DXVK one.
+    if (!swapOk) {
+        InstallSwapTimingHook();
+    }
+
     Log("--- Lua Table Rehash ---");
     bool tableReshapeOk = Config::g_settings.OptLuaOpcache && InstallLuaHResizeHook();
     bool assetPathOk = false; // Disabled - breaks logout/teardown
@@ -6554,7 +6812,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #endif
 
     Log("--- Matrix SSE2 Fast Path ---");
-    if (Config::g_settings.OptStrStrSse2) {
+    if (Config::g_settings.OptM2MatrixSimd) {
         InstallMatrixCopySSE2();
     } else {
         Log("[MatrixSSE2] DISABLED via configuration");
@@ -6600,6 +6858,14 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("--- GetTime() Frame-Cached Fast Path ---");
     bool getTimeFastOk = Config::g_settings.OptTimingFix && InstallGetTimeFast();
+
+    Log("--- Lua GetTime Frame-Cached Fast Path ---");
+#if !TEST_DISABLE_LUA_GETTIME_FAST
+    bool luaGetTimeFastOk = Config::g_settings.OptLuaGetTimeFast && InstallLuaGetTimeFast();
+#else
+    bool luaGetTimeFastOk = false;
+    Log("[LuaGetTimeFast] DISABLED via TEST_DISABLE_LUA_GETTIME_FAST");
+#endif
 
     Log("--- lua_pushvalue Direct Stack Copy ---");
 #if !TEST_DISABLE_PUSHVALUE_FAST
@@ -6659,12 +6925,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("--- SSE2 Trig LUT ---");
     InitTrigLUT();
-
-    Log("--- Data Caches (10) ---");
-    bool dataCachesOk = InitDataCaches();
-
-    Log("--- Compute Caches (10) ---");
-    bool computeCachesOk = InitComputeCaches();
 
     Log("--- Event Name Hash Cache ---");
     bool eventHashOk = Config::g_settings.OptEventCoalescer && InstallEventNameHash();
@@ -6898,6 +7158,16 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("[GetTableSafety] DISABLED via feature flag");
 #endif
 
+    Log("--- GUID Type Check Safety Patch (0x4D4DF7 BG-load crash fix) ---");
+    extern bool InstallTypeCheckSafety();
+    bool typeCheckSafetyOk = Config::g_settings.OptCvarNullGuard && InstallTypeCheckSafety();
+    (void)typeCheckSafetyOk;
+
+    Log("--- Object Unlink Safety Patch (0x5C685C reaper NULL-write crash fix) ---");
+    extern bool InstallObjectUnlinkSafety();
+    bool objUnlinkSafetyOk = Config::g_settings.OptCvarNullGuard && InstallObjectUnlinkSafety();
+    (void)objUnlinkSafetyOk;
+
     Log("--- luaH_newkey Safety Patch (0x85CB43 crash fix) ---");
 #if !TEST_DISABLE_LUA_NEWKEY_SAFETY
     InstallLuaNewKeySafety();
@@ -6922,19 +7192,11 @@ static DWORD WINAPI MainThread(LPVOID param) {
     CrashDumper::RegisterFeature("LuaVMEngine");
     CrashDumper::FeatureSetActive("LuaVMEngine", vmEngineOk);
 
-    Log("--- Lua VM Phase3 Optimizations ---");
-    bool vmPhase3Ok = LuaVMPhase3::Init();
-    CrashDumper::RegisterFeature("LuaVMPhase3");
-    CrashDumper::FeatureSetActive("LuaVMPhase3", vmPhase3Ok);
-
     Log("--- Hardware Cursor ---");
     bool cursorOk = Config::g_settings.OptCvarNullGuard && InstallHardwareCursorHooks();
 
     Log("--- Frame Script Throttling ---");
     bool frameThrottleOk = Config::g_settings.OptUIFrameBatch && InstallFrameThrottling();
-
-    Log("--- Tooltip String Caching ---");
-    bool tooltipCacheOk = Config::g_settings.OptTooltipCache && TooltipCache::Install();
 
     Log("--- Spell Data Caching ---");
     bool spellCacheOk = Config::g_settings.OptGetSpellInfoCache && SpellCache::Init();
@@ -6968,18 +7230,20 @@ static DWORD WINAPI MainThread(LPVOID param) {
         // when any caller changes thread affinity.
         InstallWineSTIPNoop();
     }
-    g_threadAffOk = Config::g_settings.OptDefragLf && InstallThreadAffinity();
+    g_threadAffOk = Config::g_settings.OptDefragLf && !Config::g_settings.OptCompatMode && InstallThreadAffinity();
 
     Log("--- VA Arena ---");
     vaOk = InstallVAArena();
 
     Log("--- RTTI Type Check Cache ---");
-    // DISABLED: tls_cache.cpp hooks 0x4D4DB0 first (install order), making
-    // InstallRTTICache always fail the prologue check. Even if we resolved
-    // the hook conflict, caching (guid64,flags)->result has a stale-pointer
-    // risk: objects are destroyed at runtime, cached result pointers become
-    // dangling. The TLS cache's 0x4D4DB0 hook (caches TEB+TlsSlot only)
-    // is safe and runs instead.
+    // DISABLED, and the reason that matters is the second one: caching
+    // (guid64,flags)->result keys a cache on objects that are destroyed at
+    // runtime, so cached result pointers dangle - the same defect shape as the
+    // glyph and model caches keyed by a reused address.
+    // The first reason given here used to be a hook conflict with tls_cache.cpp,
+    // which was never true: that module installed no hooks at all. 0x4D4DB0 is
+    // hooked, but by type_check_safety.cpp, so a conflict does exist - just not
+    // the one recorded.
     bool rttiCacheOk = false;
 
     Log("--- Stream Buffer Fast Path ---");
@@ -6996,7 +7260,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Combat Log ---");
-    bool combatLogOk = Config::g_settings.OptCombatLogParser && CombatLogOpt::Init();
+    // The retention leak-fix (CombatLogOpt) is the proven, stable part: it just
+    // extends the combat-log retention CVar 300s->1800s. It runs on its own
+    // default-on flag, independent of the aggressive aggregator (Parser/Buffer/
+    // FullCache below, which stay on OptCombatLogParser).
+    bool combatLogOk = (Config::g_settings.OptCombatLogLeakFix || Config::g_settings.OptCombatLogParser)
+                       && CombatLogOpt::Init();
 
     Log("");
     Log("--- Combat Log Buffer Governor ---");
@@ -7028,6 +7297,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("");
     Log("--- Memory-Mapped MPQ VFS & Parallel Decompressor ---");
     bool mpqMmapVfsOk = (Config::g_settings.OptMpqMmapVfs || Config::g_settings.OptDbcPreload) && MpqMmapVfs::Init();
+    if (Config::g_settings.OptMpqAsyncDecompress) MpqAsyncDecompress::Init();
 
     Log("");
     Log("--- Object Visibility Cache ---");
@@ -7250,9 +7520,9 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool addonPreloadOk = false;
 #endif
 
-    // Lua bytecode cache (skips script parsing on reload)
+    // Lua bytecode cache (skips script parsing on reload & addon load)
 #if !TEST_DISABLE_LUA_BYTECODE_CACHE
-    bool bytecodeOk = Config::g_settings.OptLuaFileCache && LuaBytecodeCache::Init();
+    bool bytecodeOk = LuaBytecodeCache::Init();
 #else
     bool bytecodeOk = false;
 #endif
@@ -7277,9 +7547,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("[SavedVarsAsync] DISABLED via feature flag");
 #endif
 
-    Log("--- Lua File Cache ---");
-    bool luaFileCacheOk = Config::g_settings.OptLuaFileCache && InstallLuaFileCache();
-
     Log("--- Combat Log Parser ---");
     bool combatLogParserOk = Config::g_settings.OptCombatLogParser && InstallCombatLogParser();
 
@@ -7292,14 +7559,8 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #endif
     CrashDumper::RegisterFeature("LuaBytecodePreCompiler");
 
-    Log("--- Hook Prefetch (9 hooks) ---");
-    bool hookPrefetchOk = Config::g_settings.OptDbcLookupCache && HookPrefetch::InstallAll();
-
-    Log("--- Hot Patch (20 features) ---");
-    bool hotPatchOk = Config::g_settings.OptDbcLookupCache && HotPatch::InstallAll();
-
-    Log("--- Infra API (50 features) ---");
-    bool infraPatchOk = Config::g_settings.OptDbcLookupCache && InfraPatch::InstallAll();
+    Log("--- Hot Patch ---");
+    if (Config::g_settings.OptDbcLookupCache) HotPatch::InstallAll();
 
     Log("--- WoW.exe Optimization Hooks (20 hooks) ---");
     bool wowOptOk = WowOptHooks::InstallAll();
@@ -7330,6 +7591,24 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("");
     Log("--- DXVK/Vulkan Translation Layer Detection ---");
     DXVKBridge::Init();
+    {
+        // Log GPU + renderer up front so testers' logs are self-describing and
+        // we don't have to ask them for it. GPU comes from the primary display
+        // adapter; DXVK state comes from the detection bridge above.
+        char gpu[128] = "unknown";
+        DISPLAY_DEVICEA dd; ZeroMemory(&dd, sizeof(dd)); dd.cb = sizeof(dd);
+        if (EnumDisplayDevicesA(NULL, 0, &dd, 0)) {
+            strncpy(gpu, dd.DeviceString, sizeof(gpu) - 1);
+            gpu[sizeof(gpu) - 1] = '\0';
+        }
+        bool dxvk = DXVKBridge::IsActive();   // triggers a detection attempt
+        DXVKBridge::Stats dstat; ZeroMemory(&dstat, sizeof(dstat));
+        DXVKBridge::GetStats(&dstat);
+        Log("[SysInfo] GPU: %s", gpu);
+        Log("[SysInfo] Renderer: %s (%s)",
+            dxvk ? "DXVK / Vulkan translation" : "native Direct3D 9 (or not detected yet)",
+            dstat.detectionReason ? dstat.detectionReason : "no signal");
+    }
 
     Log("");
     Log("--- D3D9 State Manager (15 hooks) ---");
@@ -7369,14 +7648,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("[LoadingDefrag] DISABLED via TEST_DISABLE_LOADING_DEFRAG");
 #endif
 
-    Log("");
-    Log("--- Async Visual Frustum Culling Cache ---");
-#if !TEST_DISABLE_ASYNC_CULLING
-    bool asyncCullingOk = Config::g_settings.OptSpatialCulling && AsyncCulling::Init();
-#else
-    bool asyncCullingOk = false;
-    Log("[AsyncCulling] DISABLED via TEST_DISABLE_ASYNC_CULLING");
-#endif
 
     Log("");
     Log("--- D3D9 Render State Cache & Render Thread ---");
@@ -7405,37 +7676,17 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("[FrameLimiter] DISABLED via TEST_DISABLE_FRAME_LIMITER");
 #endif
 
-    Log("");
-    Log("--- Lock-Free SavedVariables Serializer ---");
-#if !TEST_DISABLE_SAVED_VARS_SERIALIZER
-    bool savedVarsSerializerOk = false;
-    if (Config::g_settings.OptSavedVarsSerializer) {
-        savedVarsSerializerOk = SavedVarsAsyncSerializer::Init();
-    } else {
-        Log("[SavedVarsSerializer] DISABLED via configuration (wow_opt.ini)");
-    }
-#else
-    bool savedVarsSerializerOk = false;
-    Log("[SavedVarsSerializer] DISABLED via TEST_DISABLE_SAVED_VARS_SERIALIZER");
-#endif
 
-    Log("");
-    Log("--- SIMD AVX2 Mesh Skinning Accelerator ---");
-#if !TEST_DISABLE_SIMD_SKINNING
-    bool simdSkinningOk = Config::g_settings.OptStrStrSse2 && SimdSkinning::Init();
-#else
-    bool simdSkinningOk = false;
-    Log("[SimdSkinning] DISABLED via TEST_DISABLE_SIMD_SKINNING");
-#endif
 
     Log("");
     Log("--- Parallel Network Packet Offloader ---");
 #if !TEST_DISABLE_NET_PACKET_OFFLOAD
     bool netPacketOffloadOk = false;
-    if (Config::g_settings.OptPacketOffload) {
+    if (Config::g_settings.OptPacketOffload && !RunningUnderTranslation()) {
         netPacketOffloadOk = NetPacketOffload::Init();
     } else {
-        Log("[NetPacketOffload] DISABLED via configuration (wow_opt.ini)");
+        Log("[NetPacketOffload] DISABLED via configuration (wow_opt.ini)%s",
+            RunningUnderTranslation() ? " [forced off: Wine/Rosetta]" : "");
     }
 #else
     bool netPacketOffloadOk = false;
@@ -7453,7 +7704,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Parallel M2 Geometry SIMD Skinning ---");
-    bool parallelM2Ok = Config::g_settings.OptStrStrSse2 && ParallelM2Skinning::Init();
 
     Log("");
     Log("--- Lock-Free Object GUID Lookup Cache ---");
@@ -7477,7 +7727,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Hardware-Accelerated Vertex Skinning ---");
-    bool hwSkinningOk = Config::g_settings.OptStrStrSse2 && HwVertexSkinning::Init();
 
     Log("");
     Log("--- FMOD Sound Mixer Optimizer ---");
@@ -7493,7 +7742,8 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- M2 Bone SIMD Acceleration ---");
-    if (Config::g_settings.OptStrStrSse2) M2BoneSimd::Init();
+    if ((Config::g_settings.OptM2MatrixSimd || Config::g_settings.OptM2BoneMt) && !RunningUnderTranslation()) M2BoneSimd::Init();
+    else if (RunningUnderTranslation()) Log("[M2BoneSimd] DISABLED [forced off: Wine/Rosetta]");
 
     Log("");
     Log("--- Font Glyph Cache ---");
@@ -7501,11 +7751,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Async SavedVariables Preloader ---");
-    if (Config::g_settings.OptSavedVarsAsync) SavedVarsPreloadAsync::Init();
+    if (Config::g_settings.OptSavedVarsAsync && !RunningUnderTranslation()) SavedVarsPreloadAsync::Init();
 
     Log("");
     Log("--- Combat Text Coalescer ---");
-    if (Config::g_settings.OptEventCoalescer) CombatTextCoalescer::Init();
 
     Log("");
     Log("--- Minimap Throttle ---");
@@ -7517,60 +7766,56 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- 20 New Subsystem Performance & Stability Features ---");
-    DynamicShadowScaler::Init();
-    SoundCoalescer::Init();
-    AuraPreloadCache::Init();
-    DbcFileCache::Init();
-    FontOutlineCache::Init();
+    if (Config::g_settings.OptDynamicShadowScaler) DynamicShadowScaler::Init();
+    if (Config::g_settings.OptSoundCoalescer) SoundCoalescer::Init();
+    if (Config::g_settings.OptAuraPreloadCache) AuraPreloadCache::Init();
+    if (Config::g_settings.OptDbcFileCache) DbcFileCache::Init();
+    if (Config::g_settings.OptFontOutlineCache) FontOutlineCache::Init();
     // LuaGcGovernor::Init(); // Disabled duplicate governor
-    ParticleDensityScaler::Init();
-    AddonMsgLimiter::Init();
-    MouseCursorSmooth::Init();
-    VertexBufferPrealloc::Init();
-    WorldObjectOpt::Init();
-    NameplateDistanceCvar::Init();
-    CombatLogAsync::Init();
-    CDataStoreBuffering::Init();
-    CameraShakeOpt::Init();
-    CombatTextFont::Init();
-    SpellOverlayPreload::Init();
-    SavedVarsBackup::Init();
-    UnitMaxPowerCache::Init();
-    MouseClipRelease::Init();
+    if (Config::g_settings.OptParticleDensityScaler) ParticleDensityScaler::Init();
+    if (Config::g_settings.OptAddonMsgLimiter) AddonMsgLimiter::Init();
+    if (Config::g_settings.OptMouseCursorSmooth) MouseCursorSmooth::Init();
+    if (Config::g_settings.OptVertexBufferPrealloc) VertexBufferPrealloc::Init();
+    if (Config::g_settings.OptWorldObjectOpt) WorldObjectOpt::Init();
+    if (Config::g_settings.OptNameplateDistanceCvar) NameplateDistanceCvar::Init();
+    if (Config::g_settings.OptCombatLogAsync) CombatLogAsync::Init();
+    if (Config::g_settings.OptCDataStoreBuffering) CDataStoreBuffering::Init();
+    if (Config::g_settings.OptCameraShakeOpt) CameraShakeOpt::Init();
+    if (Config::g_settings.OptCombatTextFont) CombatTextFont::Init();
+    if (Config::g_settings.OptSpellOverlayPreload) SpellOverlayPreload::Init();
+    if (Config::g_settings.OptSavedVarsBackup) SavedVarsBackup::Init();
+    if (Config::g_settings.OptUnitMaxPowerCache) UnitMaxPowerCache::Init();
+    if (Config::g_settings.OptMouseClipRelease) MouseClipRelease::Init();
 
     Log("--- 10 More New Performance & Stability Features ---");
-    LoadingScreenOpt::Init();
-    CombatLogFilter::Init();
-    SoundVolumeLimit::Init();
-    UILayoutThrottle::Init();
-    TerrainHeightCache::Init();
-    AnimBlendCache::Init();
-    SavedVarsOpt::Init();
-    ItemDataPrefetch::Init();
-    MovementSmoothing::Init();
-    FontAlphaFastpath::Init();
+    if (Config::g_settings.OptCombatLogFilter) CombatLogFilter::Init();
+    if (Config::g_settings.OptSoundVolumeLimit) SoundVolumeLimit::Init();
+    if (Config::g_settings.OptUILayoutThrottle) UILayoutThrottle::Init();
+    if (Config::g_settings.OptTerrainHeightCache) TerrainHeightCache::Init();
+    if (Config::g_settings.OptAnimBlendCache) AnimBlendCache::Init();
+    if (Config::g_settings.OptSavedVarsOpt) SavedVarsOpt::Init();
+    if (Config::g_settings.OptItemDataPrefetch) ItemDataPrefetch::Init();
+    if (Config::g_settings.OptMovementSmoothing) MovementSmoothing::Init();
+    if (Config::g_settings.OptFontAlphaFastpath) FontAlphaFastpath::Init();
 
-    Log("--- 20 New Colossal Optimization Features ---");
-    PacketProcessingThrottle::Init();
-    NameplateCulling::Init();
-    TextureUnloadDelay::Init();
-    M2MatrixSimd::Init();
-    MinimapRefreshGovernor::Init();
-    SpellEffectCulling::Init();
-    LuaStringCompareFast::Init();
-    DbcRowCaching::Init();
-    NetworkStringDedup::Init();
-    CameraCollisionThrottle::Init();
-    SoundFreqCoalesce::Init();
-    AuraUpdateDedup::Init();
-    UiTextureCaching::Init();
-    WmoCullingOpt::Init();
-    FastFloatParse::Init();
-    HeapAllocationTracker::Init();
-    SpellCooldownCache::Init();
-    GuidStringCache::Init();
-    FrameScriptMemOpt::Init();
-    CombatEventLimit::Init();
+    if (Config::g_settings.OptPacketProcessingThrottle) PacketProcessingThrottle::Init();
+    if (Config::g_settings.OptNameplateCulling) NameplateCulling::Init();
+    if (Config::g_settings.OptTextureUnloadDelay) TextureUnloadDelay::Init();
+    if (Config::g_settings.OptMinimapRefreshGovernor) MinimapRefreshGovernor::Init();
+    if (Config::g_settings.OptSpellEffectCulling) SpellEffectCulling::Init();
+    if (Config::g_settings.OptLuaStringCompareFast) LuaStringCompareFast::Init();
+    if (Config::g_settings.OptDbcRowCaching) DbcRowCaching::Init();
+    if (Config::g_settings.OptNetworkStringDedup) NetworkStringDedup::Init();
+    if (Config::g_settings.OptSoundFreqCoalesce) SoundFreqCoalesce::Init();
+    if (Config::g_settings.OptAuraUpdateDedup) AuraUpdateDedup::Init();
+    if (Config::g_settings.OptUiTextureCaching) UiTextureCaching::Init();
+    if (Config::g_settings.OptWmoCullingOpt) WmoCullingOpt::Init();
+    if (Config::g_settings.OptFastFloatParse) FastFloatParse::Init();
+    if (Config::g_settings.OptHeapAllocationTracker) HeapAllocationTracker::Init();
+    if (Config::g_settings.OptSpellCooldownCache) SpellCooldownCache::Init();
+    if (Config::g_settings.OptGuidStringCache) GuidStringCache::Init();
+    if (Config::g_settings.OptFrameScriptMemOpt) FrameScriptMemOpt::Init();
+    if (Config::g_settings.OptCombatEventLimit) CombatEventLimit::Init();
 
     Log("");
     Log("--- World-to-Screen SSE Math ---");
@@ -7586,7 +7831,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Async Sound FX Loader ---");
-    if (Config::g_settings.OptAudioDecodeMt) AsyncSoundLoader::Init();
+    if (Config::g_settings.OptAudioDecodeMt && !RunningUnderTranslation()) AsyncSoundLoader::Init();
 
     Log("");
     Log("--- Lua VM Bytecode JIT Compiler ---");
@@ -7594,27 +7839,21 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- RCU Object Manager Traverser ---");
-    RcuObjMgr::Init();
+    if (Config::g_settings.OptRcuObjMgr) RcuObjMgr::Init();
 
     Log("");
     Log("--- Asynchronous Terrain Mesh Loader ---");
-    AsyncTerrainLoader::Init();
+    if (Config::g_settings.OptAsyncTerrainLoader && !RunningUnderTranslation()) AsyncTerrainLoader::Init();
 
     Log("");
     Log("--- M2 LOD Bias Control ---");
-    M2LodBias::Init();
 
     Log("");
     Log("--- Lock-Free Texture Loader ---");
-    AsyncTexLoader::Init();
+    if (Config::g_settings.OptAsyncTexLoader && !RunningUnderTranslation()) AsyncTexLoader::Init();
 
     Log("");
     Log("--- Unit Aura Update Coalescing ---");
-    if (Config::g_settings.OptUnitAuraCoalesce) UnitAuraCoalesce::Init();
-
-    Log("");
-    Log("--- Adaptive Addon Tick Governor ---");
-    if (Config::g_settings.OptAddonTickGovernor) AddonTickGovernor::Init();
 
     Log("");
     Log("--- SavedVariables Pretoken Caching ---");
@@ -7622,7 +7861,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Net Addon message Coalescer ---");
-    if (Config::g_settings.OptNetAddonCoalescer) NetAddonCoalescer::Init();
 
     Log("");
     Log("--- Mipmap Bias Governor ---");
@@ -7630,7 +7868,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Spatial Culling Grid ---");
-    if (Config::g_settings.OptSpatialCulling) SpatialCulling::Init();
 
     Log("");
     Log("--- Performance Diagnostics Monitor ---");
@@ -7646,20 +7883,8 @@ static DWORD WINAPI MainThread(LPVOID param) {
         // YELLOW (free < 48MB): shed the 2 heaviest non-critical caches +
         // drop texture budget toward stock.  Regex is ~2.2MB (256×8KB bytecode),
         // tooltip is ~2.1MB (512×4KB text) — together ~4.3MB of VA returned.
-        struct ShedTooltip { static void Go(Level, void*) { TooltipCache::Clear(); } };
-        RegisterShedCallback(ShedTooltip::Go, nullptr);
-
         struct ShedRegex { static void Go(Level, void*) { RegexCache_Clear(); } };
         RegisterShedCallback(ShedRegex::Go, nullptr);
-
-        // Data + compute caches (~150KB) — low cost but cold under pressure.
-        struct ShedDataCaches { static void Go(Level, void*) { ClearAllDataCaches(); } };
-        RegisterShedCallback(ShedDataCaches::Go, nullptr);
-
-        struct ShedComputeCaches { static void Go(Level lv, void*) {
-            if (lv < PRESSURE_RED) ClearAllComputeCaches();
-        }};
-        RegisterShedCallback(ShedComputeCaches::Go, nullptr);
 
         // Texture budget: YELLOW → 72MB (half way to stock), RED → 64MB (stock).
         // On ease the normal TexCacheTuning_Tick re-arms the target budget
@@ -7697,7 +7922,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
         // cache shedders above have already freed their memory into mimalloc; bounded
         // (fires once per RED transition, not per frame).
         struct ShedMiCollect { static void Go(Level lv, void*) {
-            if (lv >= PRESSURE_RED) mi_collect(true);
+            if (lv >= PRESSURE_RED) {
+                StallProbe probe("pressure RED mi_collect", 4.0);
+                mi_collect(true);
+            }
         }};
         RegisterShedCallback(ShedMiCollect::Go, nullptr);
 
@@ -7819,7 +8047,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("  [%s] Lua PushString (intern)",     luaPushStringOk ? " OK " : "SKIP");
     Log("  [%s] Lua RawGetI (int-key)",       luaRawGetIOk ? " OK " : "SKIP");
     Log("  [%s] CombatLog full cache",        combatLogFullCacheOk ? " OK " : "SKIP");
-    Log("  [%s] Tooltip string cache (LRU)",  tooltipCacheOk ? " OK " : "SKIP");
     Log("  [%s] Spell data cache (LRU)",      spellCacheOk ? " OK " : "SKIP");
     Log("  [%s] Stream buffer fast path",     streamBufOk    ? " OK " : "SKIP");
     Log("  [%s] D3D9 State Manager (15 hooks)",   d3d9StateOk ? " OK " : "SKIP");
@@ -7836,11 +8063,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
 }
 
 // 16a. sub_4D4DB0 - Object Type Check Cache — REMOVED
-// tls_cache.cpp hooks 0x4D4DB0 first (wins the MinHook race).
-// The RTTI cache has a stale-pointer risk anyway: objects are
-// destroyed at runtime, cached result pointers become dangling.
-// The TLS cache's 0x4D4DB0 hook (caches TEB+TlsSlot only) is
-// safe and runs instead.
+// It caches (guid64,flags)->result, and objects are destroyed at
+// runtime, so the cached result pointers dangle. 0x4D4DB0 is hooked
+// by type_check_safety.cpp; the note here used to credit tls_cache.cpp,
+// which installed no hooks at all.
 
 // ================================================================
 // 16b. sub_47B3C0 / sub_47B0A0 - Stream Buffer Read/Write Fast Path
@@ -9167,6 +9393,7 @@ static LPVOID WINAPI Hooked_VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD 
 
             if (pagesNeeded > VA_ARENA_MAX_PAGES - g_vaArenaUsedPages) {
                 ReleaseSRWLockExclusive(&g_vaArenaLock);
+                InterlockedIncrement(&g_vaArenaFull);  // arena too small to hold this qualifying request
                 goto va_fallback;
             }
 
@@ -9187,6 +9414,7 @@ static LPVOID WINAPI Hooked_VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD 
 
             if (!found) {
                 ReleaseSRWLockExclusive(&g_vaArenaLock);
+                InterlockedIncrement(&g_vaArenaFull);  // qualifying request, but no contiguous run (fragmented arena)
                 goto va_fallback;
             }
 
@@ -9197,6 +9425,7 @@ static LPVOID WINAPI Hooked_VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD 
             }
             g_vaArenaSpan[startPage] = (DWORD)pagesNeeded;
             g_vaArenaUsedPages += (DWORD)pagesNeeded;
+            if (g_vaArenaUsedPages > g_vaArenaPeakPages) g_vaArenaPeakPages = g_vaArenaUsedPages;
             ReleaseSRWLockExclusive(&g_vaArenaLock);
 
             LPVOID result = (LPVOID)((uintptr_t)g_vaArenaBase + (startPage * VA_ARENA_PAGE_SIZE));
@@ -9254,20 +9483,23 @@ static BOOL WINAPI Hooked_VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwF
             SIZE_T spanSize = spanPages * VA_ARENA_PAGE_SIZE;
 
             if (dwFreeType == MEM_DECOMMIT) {
-                // Decommit arena pages via original VirtualFree
+                // Decommit only: drop the physical/pagefile backing but KEEP the
+                // pages marked owned in the bitmap. A decommit does not release
+                // the reservation - the caller still owns this address and may
+                // re-commit it later - so the arena must NOT hand these pages to
+                // another allocation. Only MEM_RELEASE reclaims them.
+                //
+                // (This is the bug that made the arena unsafe before: it cleared
+                // the bitmap on decommit, so a later allocation could grab pages
+                // the original owner still held -> heap/data corruption.)
+                //
+                // Honor the caller's requested range; fall back to the full span
+                // if they passed size 0.
+                SIZE_T decSize = dwSize ? dwSize : spanSize;
+                if (decSize > spanSize) decSize = spanSize;
                 ReleaseSRWLockExclusive(&g_vaArenaLock);
-                BOOL result = orig_VirtualFree(lpAddress, spanSize, MEM_DECOMMIT);
-                if (result) {
-                    // Clear bitmap + span after successful decommit
-                    AcquireSRWLockExclusive(&g_vaArenaLock);
-                    for (DWORD i = 0; i < spanPages && (page + i) < VA_ARENA_MAX_PAGES; i++) {
-                        g_vaArenaBitmap[(page + i) / 64] &= ~(1ULL << ((page + i) % 64));
-                        g_vaArenaSpan[page + i] = 0;
-                    }
-                    g_vaArenaUsedPages -= (DWORD)spanPages;
-                    ReleaseSRWLockExclusive(&g_vaArenaLock);
-                    InterlockedIncrement(&g_vaArenaHits);
-                }
+                BOOL result = orig_VirtualFree(lpAddress, decSize, MEM_DECOMMIT);
+                if (result) InterlockedIncrement(&g_vaArenaHits);
                 return result;
             }
 
@@ -9306,9 +9538,20 @@ static bool InstallVAArena() {
     Log("VA Arena: DISABLED (crash isolation)");
     return false;
 #else
-    // Pre-reserve 512MB in high address space (>=0xD0000000)
-    // This avoids low-address fragmentation that causes 32-bit crashes
-    g_vaArenaSize = VA_ARENA_MAX_PAGES * VA_ARENA_PAGE_SIZE;
+    // Opt-in: the arena hooks VirtualAlloc/VirtualFree process-wide, so it stays
+    // off unless a tester explicitly enables it in the launcher. Default users
+    // are unaffected - we return before reserving anything or installing hooks.
+    if (!Config::g_settings.OptVaArena) {
+        Log("VA Arena: DISABLED (opt-in; enable 'Segregated VA Arena' in the launcher to test)");
+        return false;
+    }
+
+    // Pre-reserve one contiguous block high in the address space (MEM_TOP_DOWN)
+    // and sub-allocate WoW's committing VirtualAllocs from it, so they don't
+    // scatter holes through the general 2-3GB user VA. VirtualFree still frees
+    // normally (placement only, no allocator redirection), so there's no
+    // cross-heap hazard like MimallocLarge had.
+    g_vaArenaSize = VA_ARENA_MAX_PAGES * VA_ARENA_PAGE_SIZE;  // 64MB (16384 * 4KB)
 
     // Try high addresses first with MEM_TOP_DOWN
     g_vaArenaBase = VirtualAlloc((LPVOID)0xF0000000, g_vaArenaSize, MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
@@ -9318,13 +9561,13 @@ static bool InstallVAArena() {
         if (!g_vaArenaBase) {
             g_vaArenaBase = VirtualAlloc(NULL, g_vaArenaSize, MEM_RESERVE, PAGE_NOACCESS);
             if (!g_vaArenaBase) {
-                Log("VA Arena: SKIP (cannot reserve 512MB block)");
+                Log("VA Arena: SKIP (cannot reserve 64MB block)");
                 return false;
             }
         }
     }
 
-    Log("VA Arena: ACTIVE (512MB block @ 0x%08X, 4KB pages, ALL callers, SEH-guarded)",
+    Log("VA Arena: ACTIVE (64MB block @ 0x%08X, 4KB pages, Wow.exe callers, SEH-guarded)",
        (unsigned)(uintptr_t)g_vaArenaBase);
 
     void* pAlloc = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "VirtualAlloc");
@@ -9440,15 +9683,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
                 FlushSavedVarsAsyncSynchronously();
 #endif
                 ClearAssetPathCache();
-                if (g_log) {
-                    SYSTEMTIME st;
-                    GetLocalTime(&st);
-                    fprintf(g_log, "[%02d:%02d:%02d.%03d] wow_optimize.dll: process terminating, hooks removed, skipping cleanup\n",
-                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-                    fflush(g_log);
-                    fclose(g_log);
-                    g_log = nullptr;
-                }
+                // The distribution is the point of the whole session; emit it
+                // before the log is finalized or it is lost on every normal exit.
+                FrameBench::Report("session end");
+                LogFinalizeOnProcessExit(
+                    "wow_optimize.dll: process terminating, hooks removed, skipping cleanup");
                 break;
             }
 
@@ -9525,29 +9764,23 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             HeapCompactor_Shutdown();
             VersionChecker_Shutdown();
             LoadingDefrag::Shutdown();
-            AsyncCulling::Shutdown();
             ShutdownAsyncIoWorker();
             D3D9RenderThread::Shutdown();
             D3D9StateCache::Shutdown();
             FrameLimiter::Shutdown();
-            SavedVarsAsyncSerializer::Shutdown();
-            SimdSkinning::Shutdown();
             NetPacketOffload::Shutdown();
             PredictivePrefetch::Shutdown();
-            ParallelM2Skinning::Shutdown();
             GuidLookupCache::Shutdown();
             SimdMathFast::Shutdown();
             CombatLogIncremental::Shutdown();
             LuaAllocPool::Shutdown();
             WorldStateCoalesce::Shutdown();
-            HwVertexSkinning::Shutdown();
             SoundMixerOpt::Shutdown();
             LuaGCGovernor::Shutdown();
             AdaptiveFarclip::Shutdown();
             M2BoneSimd::Shutdown();
             FontGlyphCache::Shutdown();
             SavedVarsPreloadAsync::Shutdown();
-            LoadingScreenOpt::Shutdown();
             CombatLogFilter::Shutdown();
             SoundVolumeLimit::Shutdown();
             UILayoutThrottle::Shutdown();
@@ -9557,9 +9790,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             ItemDataPrefetch::Shutdown();
             MovementSmoothing::Shutdown();
             FontAlphaFastpath::Shutdown();
-            CombatTextCoalescer::Shutdown();
             MinimapThrottle::Shutdown();
             DbcLookupCacheFast::Shutdown();
+            HotPatch::ShutdownAll();
+            ReportHotFunctionStats();
             WorldToScreenSse::Shutdown();
             D3D9TssCache::Shutdown();
             LuaStringPoolFast::Shutdown();
@@ -9567,22 +9801,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             LuaJitCompiler::Shutdown();
             RcuObjMgr::Shutdown();
             AsyncTerrainLoader::Shutdown();
-            M2LodBias::Shutdown();
             AsyncTexLoader::Shutdown();
-            UnitAuraCoalesce::Shutdown();
-            AddonTickGovernor::Shutdown();
             SavedVarsPretoken::Shutdown();
-            NetAddonCoalescer::Shutdown();
             MipBiasGovernor::Shutdown();
-            SpatialCulling::Shutdown();
             PerfDiagnostics::Shutdown();
             CrashDumper::Shutdown();
             ShutdownFrameThrottling();
-            TooltipCache::Shutdown();
             SpellCache::Shutdown();
             // ShutdownUIFrameBatching(); // REMOVED - optimization disabled
             ShutdownCombatLogParser();
-            ShutdownLuaFileCache();
             LuaBytecodePreCompiler::Shutdown();
 #if !TEST_DISABLE_SAVED_VARS_ASYNC
             ShutdownSavedVarsAsync();
@@ -9593,8 +9820,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             ShutdownLuaPushNumberFast();
             ShutdownGetTimeFast();
             ShutdownLuaPushValueFast();
-            ShutdownDataCaches();
-            ShutdownComputeCaches();
             ShutdownLuaStackFast();
             ShutdownUIAccessorFast();
             ShutdownFontMetricsFast();

@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: version_checker.cpp
-// Description: Supporting utility functions for `version_checker.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "version_checker.h"

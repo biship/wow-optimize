@@ -168,7 +168,12 @@ static void InvalidateCache() {
 
 
 static HRESULT WINAPI Hooked_SetRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state, DWORD value) {
-    if ((DWORD)state < 512) {
+    bool isCriticalState = (state == D3DRS_ALPHABLENDENABLE || state == D3DRS_SRCBLEND || 
+                           state == D3DRS_DESTBLEND || state == D3DRS_ALPHATESTENABLE || 
+                           state == D3DRS_ALPHAREF || state == D3DRS_ALPHAFUNC ||
+                           state == D3DRS_ZWRITEENABLE || state == D3DRS_ZENABLE);
+
+    if ((DWORD)state < 512 && !isCriticalState) {
         if (g_renderStateValid[state] && g_renderStateCache[state] == value) {
             g_renderStateSkips.fetch_add(1, std::memory_order_relaxed);
             return D3D_OK;
@@ -184,7 +189,9 @@ static HRESULT WINAPI Hooked_SetRenderState(IDirect3DDevice9* device, D3DRENDERS
 }
 
 static HRESULT WINAPI Hooked_SetTransform(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
-    if ((DWORD)state < 512 && matrix) {
+    bool isWorldTransform = (state == D3DTS_WORLD || (state >= 256 && state <= 511));
+
+    if ((DWORD)state < 512 && matrix && !isWorldTransform) {
         if (g_transformCache[state].valid && memcmp(&g_transformCache[state].matrix, matrix, sizeof(D3DMATRIX)) == 0) {
             g_transformSkips.fetch_add(1, std::memory_order_relaxed);
             return D3D_OK;

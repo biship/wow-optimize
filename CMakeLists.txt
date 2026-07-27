@@ -51,6 +51,10 @@ FetchContent_MakeAvailable(mimalloc)
 add_library(wow_optimize SHARED
     src/core/dllmain.cpp
     src/core/config.cpp
+    # Windows file-version metadata. This was never attached to a target, so the
+    # shipped DLL carried no version resource at all and the file sat at 3.12.0
+    # unnoticed through several releases.
+    src/core/version.rc
     src/hooks_subsystems/crt_mem_fastpath.cpp
     src/runtime_vm/lua_optimize.cpp
     src/runtime_vm/lua_optimize.h
@@ -64,6 +68,8 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/mpq_prefetch.h
     src/hooks_subsystems/mpq_mmap_vfs.cpp
     src/hooks_subsystems/mpq_mmap_vfs.h
+    src/hooks_subsystems/mpq_async_decompress.cpp
+    src/hooks_subsystems/mpq_async_decompress.h
     src/hooks_subsystems/obj_vis_cache.cpp
     src/hooks_subsystems/obj_vis_cache.h
     src/hooks_subsystems/rcu_obj_mgr.cpp
@@ -121,14 +127,10 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_gc_fast.h
     src/runtime_vm/lua_gc_governor.cpp
     src/runtime_vm/lua_gc_governor.h
-    src/runtime_vm/addon_tick_governor.cpp
-    src/runtime_vm/addon_tick_governor.h
     src/hooks_subsystems/sound_mixer_opt.cpp
     src/hooks_subsystems/sound_mixer_opt.h
     src/hooks_subsystems/async_tex_loader.cpp
     src/hooks_subsystems/async_tex_loader.h
-    src/hooks_subsystems/unit_aura_coalesce.cpp
-    src/hooks_subsystems/unit_aura_coalesce.h
     src/hooks_subsystems/adaptive_farclip.cpp
     src/hooks_subsystems/adaptive_farclip.h
     src/simd_math/m2_bone_simd.cpp
@@ -137,8 +139,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/font_glyph_cache.h
     src/runtime_vm/saved_vars_preload_async.cpp
     src/runtime_vm/saved_vars_preload_async.h
-    src/hooks_subsystems/combat_text_coalescer.cpp
-    src/hooks_subsystems/combat_text_coalescer.h
     src/hooks_subsystems/minimap_throttle.cpp
     src/hooks_subsystems/minimap_throttle.h
     src/hooks_subsystems/dbc_lookup_cache_fast.cpp
@@ -153,18 +153,14 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_jit_compiler.h
     src/hooks_subsystems/async_sound_loader.cpp
     src/hooks_subsystems/async_sound_loader.h
-    src/simd_math/m2_lod_bias.cpp
-    src/simd_math/m2_lod_bias.h
     src/runtime_vm/saved_vars_pretoken.cpp
     src/runtime_vm/saved_vars_pretoken.h
-    src/hooks_subsystems/net_addon_coalescer.cpp
-    src/hooks_subsystems/net_addon_coalescer.h
     src/hooks_subsystems/mip_bias_governor.cpp
     src/hooks_subsystems/mip_bias_governor.h
-    src/hooks_subsystems/spatial_culling.cpp
-    src/hooks_subsystems/spatial_culling.h
     src/diagnostics/perf_diagnostics.cpp
     src/diagnostics/perf_diagnostics.h
+    src/diagnostics/frame_bench.cpp
+    src/diagnostics/frame_bench.h
     src/runtime_vm/lua_xpcall_fast.cpp
     src/runtime_vm/lua_xpcall_fast.h
     src/runtime_vm/lua_getmetafield_fast.cpp
@@ -183,6 +179,8 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_rawseti_fast.h
     src/runtime_vm/lua_setfield_fast.cpp
     src/runtime_vm/lua_setfield_fast.h
+    src/runtime_vm/lua_gettime_fast.cpp
+    src/runtime_vm/lua_gettime_fast.h
     src/runtime_vm/lua_getupvalue_fast.cpp
     src/runtime_vm/lua_getupvalue_fast.h
     src/runtime_vm/lua_buffinit_fast.cpp
@@ -208,18 +206,12 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/ui_frame_batch.h
     src/runtime_vm/lua_vm_cache.cpp
     src/runtime_vm/lua_vm_cache.h
-    src/hooks_subsystems/tooltip_cache.cpp
-    src/hooks_subsystems/tooltip_cache.h
     src/runtime_vm/lua_settable_cache.cpp
     src/runtime_vm/lua_settable_cache.h
     src/runtime_vm/regex_cache.cpp
     src/runtime_vm/regex_cache.h
     src/simd_math/trig_lut.cpp
     src/simd_math/trig_lut.h
-    src/hooks_subsystems/data_caches.cpp
-    src/hooks_subsystems/data_caches.h
-    src/hooks_subsystems/compute_caches.cpp
-    src/hooks_subsystems/compute_caches.h
     src/hooks_subsystems/spell_cache.cpp
     src/hooks_subsystems/spell_cache.h
     src/runtime_vm/lua_bytecode_cache.cpp
@@ -234,8 +226,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/crt_char_fast.h
     src/hooks_subsystems/crt_wchar_fast.cpp
     src/hooks_subsystems/crt_wchar_fast.h
-    src/hooks_subsystems/tls_cache.cpp
-    src/hooks_subsystems/tls_cache.h
     src/hooks_subsystems/stream_cache.cpp
     src/hooks_subsystems/stream_cache.h
     src/runtime_vm/lua_this_cache.cpp
@@ -278,20 +268,12 @@ add_library(wow_optimize SHARED
     src/allocators/memory_pressure_governor.h
     src/allocators/loading_defrag.cpp
     src/allocators/loading_defrag.h
-    src/hooks_subsystems/async_culling.cpp
-    src/hooks_subsystems/async_culling.h
     src/hooks_subsystems/d3d9_state_cache.cpp
     src/hooks_subsystems/d3d9_state_cache.h
     src/hooks_subsystems/d3d9_render_thread.cpp
     src/hooks_subsystems/d3d9_render_thread.h
     src/hooks_subsystems/frame_limiter.cpp
     src/hooks_subsystems/frame_limiter.h
-    src/runtime_vm/saved_vars_async_serializer.cpp
-    src/runtime_vm/saved_vars_async_serializer.h
-    src/simd_math/simd_skinning.cpp
-    src/simd_math/simd_skinning.h
-    src/simd_math/parallel_m2_skinning.cpp
-    src/simd_math/parallel_m2_skinning.h
     src/hooks_subsystems/guid_lookup_cache.cpp
     src/hooks_subsystems/guid_lookup_cache.h
     src/simd_math/simd_math_fast.cpp
@@ -302,8 +284,6 @@ add_library(wow_optimize SHARED
     src/allocators/lua_alloc_pool.h
     src/hooks_subsystems/world_state_coalesce.cpp
     src/hooks_subsystems/world_state_coalesce.h
-    src/hooks_subsystems/hw_vertex_skinning.cpp
-    src/hooks_subsystems/hw_vertex_skinning.h
     src/hooks_subsystems/net_packet_offload.cpp
     src/hooks_subsystems/net_packet_offload.h
     src/hooks_subsystems/predictive_prefetch.cpp
@@ -338,24 +318,20 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_toboolean_inline.h
     src/runtime_vm/lua_gettable_safety.cpp
     src/runtime_vm/lua_gettable_safety.h
+    src/runtime_vm/type_check_safety.cpp
+    src/runtime_vm/object_unlink_safety.cpp
     src/runtime_vm/lua_newkey_safety.cpp
     src/runtime_vm/lua_newkey_safety.h
     src/runtime_vm/lua_vm_engine.cpp
     src/runtime_vm/lua_vm_engine.h
-    src/runtime_vm/lua_vm_phase3.cpp
-    src/runtime_vm/lua_vm_phase3.h
     src/runtime_vm/lua_gettable_cache.cpp
     src/runtime_vm/lua_gettable_cache.h
     src/hooks_subsystems/saved_vars_async.cpp
     src/hooks_subsystems/saved_vars_async.h
     src/runtime_vm/lua_bytecode_pre_compiler.cpp
     src/runtime_vm/lua_bytecode_pre_compiler.h
-    src/hooks_subsystems/hook_prefetch.cpp
-    src/hooks_subsystems/hook_prefetch.h
     src/hooks_subsystems/hot_patch.cpp
     src/hooks_subsystems/hot_patch.h
-    src/hooks_subsystems/infra_patch.cpp
-    src/hooks_subsystems/infra_patch.h
     src/hooks_subsystems/wow_opt_hooks.cpp
     src/hooks_subsystems/wow_opt_hooks.h
     src/hooks_subsystems/wow_perf_hooks.cpp
@@ -384,6 +360,8 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/d3d9_state_manager.h
     src/hooks_subsystems/event_coalescer.cpp
     src/hooks_subsystems/event_coalescer.h
+    src/hooks_subsystems/loading_state.cpp
+    src/hooks_subsystems/loading_state.h
     src/runtime_vm/luaS_newlstr_sse2.cpp
     src/runtime_vm/luaS_newlstr_sse2.h
     src/core/version_checker.cpp
@@ -431,8 +409,6 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_yield_fast.h
     src/runtime_vm/lua_getn_fast.cpp
     src/runtime_vm/lua_getn_fast.h
-    src/runtime_vm/lua_file_cache.cpp
-    src/runtime_vm/lua_file_cache.h
     src/runtime_vm/combatlog_parser.cpp
     src/runtime_vm/combatlog_parser.h
     src/hooks_subsystems/ui_accessor_fast.cpp
@@ -491,8 +467,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/unit_max_power_cache.h
     src/hooks_subsystems/mouse_clip_release.cpp
     src/hooks_subsystems/mouse_clip_release.h
-    src/hooks_subsystems/loading_screen_opt.cpp
-    src/hooks_subsystems/loading_screen_opt.h
     src/hooks_subsystems/combat_log_filter.cpp
     src/hooks_subsystems/combat_log_filter.h
     src/hooks_subsystems/sound_volume_limit.cpp
@@ -517,8 +491,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/nameplate_culling.h
     src/hooks_subsystems/texture_unload_delay.cpp
     src/hooks_subsystems/texture_unload_delay.h
-    src/hooks_subsystems/m2_matrix_simd.cpp
-    src/hooks_subsystems/m2_matrix_simd.h
     src/hooks_subsystems/minimap_refresh_governor.cpp
     src/hooks_subsystems/minimap_refresh_governor.h
     src/hooks_subsystems/spell_effect_culling.cpp
@@ -529,8 +501,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/dbc_row_caching.h
     src/hooks_subsystems/network_string_dedup.cpp
     src/hooks_subsystems/network_string_dedup.h
-    src/hooks_subsystems/camera_collision_throttle.cpp
-    src/hooks_subsystems/camera_collision_throttle.h
     src/hooks_subsystems/sound_freq_coalesce.cpp
     src/hooks_subsystems/sound_freq_coalesce.h
     src/hooks_subsystems/aura_update_dedup.cpp
@@ -581,10 +551,34 @@ set_target_properties(wow_optimize PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
 )
 
+# Stamp the commit into the banner. The version string only moves on releases,
+# so several different builds all report "3.16.3" -- which makes a tester log
+# impossible to match to source. The short hash identifies the build exactly.
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE WOW_OPT_GIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+# The hash above is read at CONFIGURE time. Without this, an incremental build
+# after a commit keeps baking in whatever hash was current when cmake last ran,
+# so tester logs report a build that no longer matches the source - exactly the
+# problem the hash exists to solve. Re-run configure whenever HEAD moves.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD"
+    "${CMAKE_CURRENT_SOURCE_DIR}/.git/logs/HEAD"
+)
+if(NOT WOW_OPT_GIT_HASH)
+    set(WOW_OPT_GIT_HASH "unknown")
+endif()
+
 target_compile_definitions(wow_optimize PRIVATE
     WIN32_LEAN_AND_MEAN
     _CRT_SECURE_NO_WARNINGS
     _WINSOCK_DEPRECATED_NO_WARNINGS
+    WOW_OPTIMIZE_GIT_HASH="${WOW_OPT_GIT_HASH}"
 )
 
 set_source_files_properties(src/hooks_subsystems/crt_mem_fastpath.cpp PROPERTIES

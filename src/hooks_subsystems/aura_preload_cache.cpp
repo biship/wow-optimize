@@ -31,4 +31,5 @@ void PreloadAuraTexture(const std::string& path) {
     }
 }
 
+
 } // namespace AuraPreloadCache

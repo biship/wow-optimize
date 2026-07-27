@@ -420,12 +420,7 @@ void QueuePresent(IDirect3DDevice9* device, const RECT* src, const RECT* dest, H
     QueueCommand(cmd);
 }
 
-#include "loading_screen_opt.h"
-
 static HRESULT WINAPI Hooked_DrawPrimitive(IDirect3DDevice9* device, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) {
-    if (LoadingScreenOpt::IsLoadingActive() && PrimitiveCount > 20) {
-        return D3D_OK;
-    }
     if (g_isActive.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_mainThreadId) {
         RenderCommand cmd;
         cmd.type = CMD_DRAW_PRIMITIVE;
@@ -440,9 +435,6 @@ static HRESULT WINAPI Hooked_DrawPrimitive(IDirect3DDevice9* device, D3DPRIMITIV
 }
 
 static HRESULT WINAPI Hooked_DrawIndexedPrimitive(IDirect3DDevice9* device, D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT primCount) {
-    if (LoadingScreenOpt::IsLoadingActive() && primCount > 20) {
-        return D3D_OK;
-    }
     if (g_isActive.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_mainThreadId) {
         RenderCommand cmd;
         cmd.type = CMD_DRAW_INDEXED_PRIMITIVE;

@@ -129,3 +129,5 @@ void GetFrameThrottleStats(long* skipped, long* executed, long* bypassed) {
 void ShutdownFrameThrottling() {
     // No cleanup required for static array cache
 }
+
+

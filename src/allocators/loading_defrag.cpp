@@ -6,6 +6,7 @@
 
 #include "loading_defrag.h"
 #include "api_cache.h"
+#include "diagnostics/crash_dumper.h"
 #include <windows.h>
 #include <psapi.h>
 #include <vector>
@@ -54,88 +55,6 @@ struct VisitedZone {
 };
 static std::vector<VisitedZone> g_zoneHistory;
 
-// Helper function to allocate and free blocks using Structured Exception Handling (SEH)
-// without utilizing any C++ stack-allocated objects with destructors to avoid compiler C2712.
-static void PrecommitAllocAndFree(size_t totalPrecommitMB) {
-    void** smallPtrs = (void**)mi_malloc(32768 * sizeof(void*));
-    void** mediumPtrs = (void**)mi_malloc(4096 * sizeof(void*));
-    void** largePtrs = (void**)mi_malloc(32 * sizeof(void*));
-
-    if (!smallPtrs || !mediumPtrs || !largePtrs) {
-        if (smallPtrs) mi_free(smallPtrs);
-        if (mediumPtrs) mi_free(mediumPtrs);
-        if (largePtrs) mi_free(largePtrs);
-        return;
-    }
-
-    memset(smallPtrs, 0, 32768 * sizeof(void*));
-    memset(mediumPtrs, 0, 4096 * sizeof(void*));
-    memset(largePtrs, 0, 32 * sizeof(void*));
-
-    int smallCount = 0;
-    int mediumCount = 0;
-    int largeCount = 0;
-
-    __try {
-        // 1. Small blocks (UI, entities)
-        for (int i = 0; i < 32768; i++) {
-            void* p = mi_malloc(256);
-            if (p) {
-                *(volatile char*)p = 0xAA; // Fault in the page
-                smallPtrs[i] = p;
-                smallCount++;
-            }
-        }
-        
-        // 2. Medium blocks (Models)
-        for (int i = 0; i < 4096; i++) {
-            void* p = mi_malloc(4096);
-            if (p) {
-                volatile char* cp = (volatile char*)p;
-                cp[0] = 0xBB;
-                cp[4095] = 0xBB;
-                mediumPtrs[i] = p;
-                mediumCount++;
-            }
-        }
-
-        // 3. Large blocks (Textures, chunks)
-        size_t largeBlocksCount = (totalPrecommitMB == 128) ? 32 : 16;
-        for (size_t i = 0; i < largeBlocksCount; i++) {
-            size_t sz = 1024 * 1024;
-            void* p = mi_malloc(sz);
-            if (p) {
-                volatile char* cp = (volatile char*)p;
-                for (size_t offset = 0; offset < sz; offset += 4096) {
-                    cp[offset] = 0xCC; // Touch every physical page
-                }
-                largePtrs[i] = p;
-                largeCount++;
-            }
-        }
-        
-        Log("[LoadingDefrag] Speculatively allocated and faulted %d slabs", smallCount + mediumCount + largeCount);
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("[LoadingDefrag] Exception occurred during pre-commit; safely reclaiming...");
-    }
-
-    // Safely free all allocated pointers
-    for (int i = 0; i < 32768; i++) {
-        if (smallPtrs[i]) mi_free(smallPtrs[i]);
-    }
-    for (int i = 0; i < 4096; i++) {
-        if (mediumPtrs[i]) mi_free(mediumPtrs[i]);
-    }
-    for (int i = 0; i < 32; i++) {
-        if (largePtrs[i]) mi_free(largePtrs[i]);
-    }
-
-    mi_free(smallPtrs);
-    mi_free(mediumPtrs);
-    mi_free(largePtrs);
-}
-
 // Speculatively pre-commit pages in mimalloc thread-local slabs
 static void PerformSpeculativePrecommit() {
     // Disabled: allocating on the background thread thrashes the background thread's
@@ -150,9 +69,17 @@ static DWORD WINAPI DefragWorkerThread(LPVOID) {
     while (!g_shutdown.load(std::memory_order_relaxed)) {
         // Wait for a loading screen trigger
         WaitForSingleObject(g_defragEvent, INFINITE);
-        
+
         if (g_shutdown.load(std::memory_order_relaxed)) break;
-        
+
+        // Reset before deciding, not after acting. The event is manual-reset, and
+        // the reset used to live inside the branch below - so a wake-up that found
+        // loading already finished left the event signalled forever and this loop
+        // span at full speed on one core for the rest of the session. Reaching that
+        // state became easy once the initial world entry started opening and
+        // closing the loading window back to back.
+        ResetEvent(g_defragEvent);
+
         if (g_loadingActive.load(std::memory_order_acquire)) {
             // Step 1: Pre-warm mimalloc caches for the new zone
             PerformSpeculativePrecommit();
@@ -179,8 +106,6 @@ static DWORD WINAPI DefragWorkerThread(LPVOID) {
             // and stalls the main thread for several seconds after loading completes.
             
             Log("[LoadingDefrag] Defragmenter loop finished (compactions run: %d)", compactionCount);
-            
-            ResetEvent(g_defragEvent);
         }
     }
     
@@ -233,8 +158,11 @@ void Shutdown() {
 
 extern "C" void ClearDbcLookupCache();
 
+static DWORD g_loadingStartTick = 0;
+
 void NotifyLoadingState(bool isLoading) {
     if (isLoading) {
+        g_loadingStartTick = GetTickCount();
         g_loadingActive.store(true, std::memory_order_release);
         SetEvent(g_defragEvent);
         ApiCache::ClearCache();
@@ -244,8 +172,25 @@ void NotifyLoadingState(bool isLoading) {
     }
 }
 
+// Safety net only. Loading now ends on the client's own PLAYER_ENTERING_WORLD
+// signal (LoadingState), so this exists purely so a missed end event cannot pin the
+// process in loading mode forever. The previous 8s cap was shorter than a real cold
+// zone load on a fragmented client, which silently dropped every loading-time
+// bypass part-way through the load it was meant to cover.
+static constexpr DWORD LOADING_WATCHDOG_MS = 30000;
+
 bool IsLoadingActive() {
-    return g_loadingActive.load(std::memory_order_acquire);
+    if (g_loadingActive.load(std::memory_order_acquire)) {
+        if (GetTickCount() - g_loadingStartTick > LOADING_WATCHDOG_MS) {
+            g_loadingActive.store(false, std::memory_order_release);
+            CrashDumper::Trace("LOADING watchdog expired after %u ms", (unsigned)LOADING_WATCHDOG_MS);
+            Log("[LoadingDefrag] Loading state watchdog expired after %u ms - forcing exit",
+                (unsigned)LOADING_WATCHDOG_MS);
+            return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 // Helper to check if string matches GetStackTopFast / SetStackTopFast definitions

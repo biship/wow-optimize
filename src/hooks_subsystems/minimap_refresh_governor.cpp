@@ -22,4 +22,5 @@ namespace MinimapRefreshGovernor {
         g_lastRefreshTime = now;
         return false;
     }
+
 }

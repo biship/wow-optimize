@@ -7,21 +7,11 @@
 // ============================================================================
 
 
-/**
- * @domain: Binary Detour Hooks Subsystem
- * @architecture: Detours target functions in `hooks_simd.h` to bypass legacy bottlenecks.
- * @thread_affinity: Main Render Thread / Async Safe depending on sub-feature
- * @regression_hazard: Verify registers and stack layouts match target declarations exactly to prevent stack corruption.
- */
 
 
 
-/**
- * @domain: Vectorized SIMD Math Operations
- * @architecture: Vectorizes legacy x87 FPU float operations using 128-bit SSE2 registers.
- * @thread_affinity: Main Loop / Worker Thread Safe
- * @regression_hazard: Unaligned vector load/store instructions or coordinate overlaps will cause memory violations or coordinate drift NaNs.
- */
+
+
 
 
 

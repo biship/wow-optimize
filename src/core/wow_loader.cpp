@@ -95,10 +95,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
 
-    // Build command line (pass through any arguments)
-    char cmdLine[MAX_PATH * 2];
+    // Pull an optional "--config <path>" out of our args and hand it to the DLL
+    // via an environment variable (the child inherits our environment, and the
+    // DLL reads WOW_OPT_CONFIG in Config::Load()). Everything else is passed
+    // through to Wow.exe unchanged. Falls back to the normal wow_opt.ini if the
+    // path is missing or the file doesn't exist.
+    char passThrough[MAX_PATH * 2] = "";
     if (lpCmdLine && lpCmdLine[0]) {
-        sprintf(cmdLine, "Wow.exe %s", lpCmdLine);
+        // Tokenize a private copy; --config consumes the following token.
+        char args[MAX_PATH * 2];
+        strncpy(args, lpCmdLine, sizeof(args) - 1);
+        args[sizeof(args) - 1] = '\0';
+
+        char* ctx = NULL;
+        for (char* tok = strtok_s(args, " \t", &ctx); tok;
+             tok = strtok_s(NULL, " \t", &ctx)) {
+            if (_stricmp(tok, "--config") == 0) {
+                char* val = strtok_s(NULL, " \t", &ctx);
+                if (val && val[0]) {
+                    char full[MAX_PATH];
+                    DWORD n = GetFullPathNameA(val, MAX_PATH, full, NULL);
+                    const char* use = (n > 0 && n < MAX_PATH) ? full : val;
+                    if (FileExists(use)) {
+                        SetEnvironmentVariableA("WOW_OPT_CONFIG", use);
+                    }
+                }
+                continue;
+            }
+            if (passThrough[0]) strcat(passThrough, " ");
+            strcat(passThrough, tok);
+        }
+    }
+
+    // Build command line (Wow.exe + any pass-through arguments)
+    char cmdLine[MAX_PATH * 2];
+    if (passThrough[0]) {
+        sprintf(cmdLine, "Wow.exe %s", passThrough);
     } else {
         strcpy(cmdLine, "Wow.exe");
     }

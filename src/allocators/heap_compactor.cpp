@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: heap_compactor.cpp
-// Description: Supporting utility functions for `heap_compactor.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "version.h"
@@ -45,6 +43,8 @@ static std::atomic<int> g_pendingWork{0}; // 0=none, 1=proactive mi_collect, 2=f
 // Forward declarations
 extern "C" void Log(const char* fmt, ...);
 extern "C" void mi_collect(bool force);
+#include <mimalloc.h>
+#include "crash_dumper.h"
 
 // Get largest free virtual memory block
 static SIZE_T GetLargestFreeBlock() {
@@ -87,7 +87,10 @@ static void ForceHeapCompaction() {
     
     // Also trigger mimalloc collection
     // (mimalloc is our global allocator replacement)
-    mi_collect(true);
+    {
+        StallProbe probe("ForceHeapCompaction mi_collect", 4.0);
+        mi_collect(true);
+    }
 }
 
 // Forward declaration for loading mode check
@@ -120,8 +123,16 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         // Check thresholds — only *request* compaction here; the main thread
         // performs the actual heap mutation (see HeapCompactor_RunPendingWork).
         if (largestFree < CRITICAL_THRESHOLD) {
-            Log("[HeapCompactor] CRITICAL: LargestFreeBlock=%uMB (<%dMB) - requesting compaction",
-                (unsigned)(largestFree / (1024*1024)), (int)(CRITICAL_THRESHOLD / (1024*1024)));
+            // Rate-limited: this fires every monitor tick once the process is out
+            // of address space, and a tester log shows it repeating unchanged for
+            // five minutes. One line per 30s is enough to establish the state.
+            static DWORD lastCriticalTick = 0;
+            DWORD nowTick = GetTickCount();
+            if (nowTick - lastCriticalTick > 30000) {
+                Log("[HeapCompactor] CRITICAL: LargestFreeBlock=%uMB (<%dMB) - requesting compaction",
+                    (unsigned)(largestFree / (1024*1024)), (int)(CRITICAL_THRESHOLD / (1024*1024)));
+                lastCriticalTick = nowTick;
+            }
             g_pendingWork.store(2, std::memory_order_release);
         } else if (largestFree < WARNING_THRESHOLD) {
             // Proactively compact before reaching critical threshold
@@ -150,13 +161,34 @@ extern "C" void HeapCompactor_RunPendingWork() {
 
     if (work == 2) {
         SIZE_T before = GetLargestFreeBlock();
+
+        // mimalloc runs with purge_decommits off, so a purge resets pages but
+        // leaves them committed - physical RAM comes back, address space does not.
+        // That is the right trade in normal play (the comment at the option's
+        // setting explains the driver-fault reasoning), and exactly the wrong one
+        // here: this branch only runs because the process has no address space
+        // left, which is the one resource resetting cannot return.
+        //
+        // A tester's session climbed to 3533 MB of mimalloc commit with 223 MB of
+        // VA free and a 1 MB largest block, and every compaction pass achieved
+        // nothing. Decommit for the duration of this pass only, then restore.
+        {
+            StallProbe probe("critical mi_collect (decommit)", 4.0);
+            mi_option_set(mi_option_purge_decommits, 1);
+            mi_collect(true);
+            mi_option_set(mi_option_purge_decommits, 0);
+        }
+
         ForceHeapCompaction();
         g_compactionsTriggered++;
         SIZE_T after = GetLargestFreeBlock();
         Log("[HeapCompactor] After compaction: LargestFreeBlock=%uMB (%+dMB)",
             (unsigned)(after / (1024*1024)), (int)((after - before) / (1024*1024)));
     } else {
-        mi_collect(true);
+        {
+            StallProbe probe("compaction mi_collect", 4.0);
+            mi_collect(true);
+        }
         g_compactionsTriggered++;
     }
 }

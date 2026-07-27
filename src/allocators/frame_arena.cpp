@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: frame_arena.cpp
-// Description: Supporting utility functions for `frame_arena.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "frame_arena.h"

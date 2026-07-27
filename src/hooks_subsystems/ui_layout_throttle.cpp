@@ -43,4 +43,5 @@ namespace UILayoutThrottle {
         WinLockGuard lock(g_throttleMutex);
         g_frameUpdateCounts.clear();
     }
+
 }

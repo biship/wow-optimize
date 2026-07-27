@@ -2,26 +2,14 @@
 
 // ============================================================================
 // Module: sampling_profiler.h
-// Description: Supporting utility functions for `sampling_profiler.h`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 
-/**
- * @domain: Client Optimizer Support Subsystem
- * @architecture: Implements helper methods and utility wrappers for `sampling_profiler.h`.
- * @thread_affinity: Main Loop / Thread-Safe worker constraints
- * @regression_hazard: Address validation checks must range up to 0xFFE00000 to support high-address LAA allocations.
- */
 
 
 
-/**
- * @domain: Memory Watchdog and Diagnostic Telemetry
- * @architecture: Implements minidump capture routines and watches CVars to log crash events.
- * @thread_affinity: Main Loop / Telemetry Threads
- * @regression_hazard: Exception handlers must not allocate memory during diagnostic recording to prevent nested exceptions.
- */
+
+
 
 
 
@@ -58,5 +46,10 @@ bool IsActive();
 
 // Get total number of samples collected (for diagnostics).
 uint64_t GetSampleCount();
+
+// Dump the current top-50 hot functions to the log without stopping sampling.
+// Called from the periodic stats dump so the profile is captured even when the
+// fast process-exit path skips Shutdown().
+void DumpNow();
 
 } // namespace SamplingProfiler

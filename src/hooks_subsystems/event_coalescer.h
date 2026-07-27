@@ -2,32 +2,25 @@
 
 // ============================================================================
 // Module: event_coalescer.h
-// Description: Supporting utility functions for `event_coalescer.h`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
-
-
-/**
- * @domain: Client Optimizer Support Subsystem
- * @architecture: Implements helper methods and utility wrappers for `event_coalescer.h`.
- * @thread_affinity: Main Loop / Thread-Safe worker constraints
- * @regression_hazard: Address validation checks must range up to 0xFFE00000 to support high-address LAA allocations.
- */
-
-
-
-/**
- * @domain: Game Graphics, I/O and Subsystem Hooks
- * @architecture: Intercepts system APIs and resource loader loops to apply caching, coalescing and throttling.
- * @thread_affinity: Main Loop / Asynchronous Queue Execution
- * @regression_hazard: Invalid file handles or incorrect return value propagation will cause memory leaks or game client hangs.
- */
-
-
 
 extern "C" void EventCoalescer_Flush();
 
 namespace EventCoalescer {
     bool Init();
     void Shutdown();
+
+    // True once Init() has armed the frame-scoped dedup queue. The detour itself
+    // lives in LoadingState, which only routes events here while this is true.
+    //
+    // Exposed as the flag rather than a getter because the check sits on the
+    // event-signal path, which the profile shows is one of the hottest pages of
+    // this DLL. A cross-module call to read a bool that TEST_DISABLE_EVENT_COALESCER
+    // pins to false is pure overhead on every event the client signals.
+    extern bool g_active;
+    inline bool IsActive() { return g_active; }
+
+    // Returns true if the event was queued/dropped and must NOT reach the client.
+    // Called from the LoadingState detour with the raw vararg block.
+    bool TryQueue(int eventId, const char* format, void* vaStart);
 }

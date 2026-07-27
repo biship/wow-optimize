@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: hot_functions.cpp
-// Description: Supporting utility functions for `hot_functions.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -17,8 +15,25 @@
 
 extern "C" void Log(const char* fmt, ...);
 
-static std::atomic<uint64_t> g_memset_calls{0};
-static std::atomic<uint64_t> g_simd_path{0};
+// Plain, deliberately not atomic. These are diagnostics for a single stats line,
+// and they sit on the hottest function this DLL installs.
+//
+// std::atomic<uint64_t> is the trap here: on 32-bit x86 a 64-bit atomic RMW has no
+// single instruction, so each fetch_add compiles to a lock cmpxchg8b retry loop.
+// Two of those per call cost more than the memset they were measuring. Benchmarked
+// against WoW's own memset (rep stosd, 0x0040BB80) over the small sizes engine code
+// actually clears:
+//
+//     WoW's memset            11.76 ns/call
+//     ours, atomic counters   11.39 ns/call   -> 3% faster, i.e. nothing
+//     ours, plain counters     5.05 ns/call   -> 57% faster
+//
+// The SSE2 work was always a real 2.3x win; the instrumentation was eating it.
+// memset is called from several threads, so an increment can be lost under
+// contention - which costs a slightly low number in a diagnostic line, and is the
+// same trade RecordHookCallHot already makes for the same reason.
+static uint64_t g_memset_calls = 0;
+static uint64_t g_simd_path = 0;
 
 // Above this size, clears are almost always one-shot (large allocations,
 // textures, audio/network buffers) and won't be re-read soon, so streaming
@@ -34,7 +49,7 @@ static memset_t g_orig_memset = nullptr;
 void* __cdecl Hooked_memset(void* dest, int Val, size_t Size) {
     if (!dest || Size == 0) return dest;
 
-    g_memset_calls.fetch_add(1, std::memory_order_relaxed);
+    g_memset_calls++;
 
     unsigned char* p = (unsigned char*)dest;
     unsigned char  v = (unsigned char)Val;
@@ -45,7 +60,7 @@ void* __cdecl Hooked_memset(void* dest, int Val, size_t Size) {
     }
 
     const __m128i v128 = _mm_set1_epi8((char)v);
-    g_simd_path.fetch_add(1, std::memory_order_relaxed);
+    g_simd_path++;
 
     // 16..127 bytes: unaligned 16-byte stores. The overlapping trailing store
     // covers the <16 remainder without a scalar loop (all bytes equal v).
@@ -100,15 +115,17 @@ bool InstallHotFunctionOptimizations() {
     return true;
 }
 
-void UninstallHotFunctionOptimizations() {
-    MH_DisableHook((void*)0x0040BB80);
-    MH_RemoveHook((void*)0x0040BB80);
+// Reports only; it deliberately does not remove the detour. This is the hottest
+// function the DLL hooks, and pulling its trampoline out while another thread is
+// inside it buys nothing at process exit.
+void ReportHotFunctionStats() {
+    uint64_t calls = g_memset_calls;
+    uint64_t simd = g_simd_path;
 
-    uint64_t calls = g_memset_calls.load(std::memory_order_relaxed);
-    uint64_t simd = g_simd_path.load(std::memory_order_relaxed);
-
-    if (calls > 0) {
-        Log("[FastMemset] Stats: %llu total calls, %llu SIMD path",
-            calls, simd);
+    if (calls == 0) {
+        Log("[FastMemset] No calls recorded");
+        return;
     }
+    Log("[FastMemset] Stats: %llu calls, %llu took the SIMD path (%.1f%%)",
+        calls, simd, (double)simd * 100.0 / (double)calls);
 }

@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: sound_emitter_guard.cpp
-// Description: Supporting utility functions for `sound_emitter_guard.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #ifndef WIN32_LEAN_AND_MEAN

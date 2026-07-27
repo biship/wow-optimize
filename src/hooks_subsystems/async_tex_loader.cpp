@@ -280,105 +280,17 @@ int Call_Orig_TexCreateBLP(unsigned int flags, char* path, void* a3, int a4) {
 int __stdcall Handle_TexCreateBLP(unsigned int flags, char* path, void* a3, int a4) {
     if (!path) return 0;
 
-    if (LoadingDefrag::IsLoadingActive() || !IsCacheableAsset(path)) {
-        if (Config::g_settings.OptOomGovernor && CheckMemoryOomPressure() && IsCacheableAsset(path)) {
-            std::string normPath = path;
-            for (char& c : normPath) {
-                if (c == '/') c = '\\';
-                else c = tolower(c);
-            }
-            
-            bool alreadyCached = false;
-            {
-                WinLockGuard cacheLock(g_fileCacheMutex);
-                if (g_fileMemoryCache.count(normPath)) {
-                    alreadyCached = true;
-                }
-            }
-            
-            if (!alreadyCached) {
-                std::vector<char> fileData;
-                bool loaded = false;
-                for (HANDLE hArchive : g_privateArchives) {
-                    HANDLE hFile = nullptr;
-                    if (pSFileOpenFileEx(hArchive, path, 0, &hFile)) {
-                        DWORD size = GetFileSize(hFile, NULL);
-                        if (size != INVALID_FILE_SIZE && size > 0) {
-                            fileData.resize(size);
-                            DWORD read = 0;
-                            if (pSFileReadFile(hFile, fileData.data(), size, &read, NULL) && read == size) {
-                                loaded = true;
-                            }
-                        }
-                        pSFileCloseFile(hFile);
-                    }
-                    if (loaded) break;
-                }
-                
-                if (loaded) {
-                    DownscaleBLPInPlace(fileData, path);
-                    {
-                        WinLockGuard cacheLock(g_fileCacheMutex);
-                        g_fileMemoryCache[normPath] = std::move(fileData);
-                    }
-                }
-            }
-        }
-        return Call_Orig_TexCreateBLP(flags, path, a3, a4);
-    }
-
     std::string realPath(path);
 
-    // Check if successfully swapped already
+    // Queue real file read in background for prefetching
     {
-        WinLockGuard lock(g_swapMutex);
-        if (g_hotSwapTextures.count(realPath)) {
-            return Call_Orig_TexCreateBLP(flags, path, a3, a4);
-        }
+        WinLockGuard qLock(g_queueMutex);
+        g_prefetchQueue.push(realPath);
+        g_queueCv.notify_one();
     }
 
-    // Check if already in progress
-    {
-        WinLockGuard lock(g_swapMutex);
-        if (g_placeholderMap.count(realPath)) {
-            return g_placeholderMap[realPath].placeholderHandle;
-        }
-    }
-
-    // Allocate placeholder white texture bytes initially under the target path
-    {
-        WinLockGuard cacheLock(g_fileCacheMutex);
-        g_fileMemoryCache[realPath] = g_whiteTextureBytes;
-    }
-
-    int placeholder = Call_Orig_TexCreateBLP(flags, path, a3, a4);
-    if (!placeholder) {
-        return 0;
-    }
-
-    // Set real path in HTEXTURE name buffer (offset 108)
-    char* nameBuf = (char*)(placeholder + 108);
-    strncpy_s(nameBuf, 256, path, _TRUNCATE);
-
-    // Queue real file read in background
-    {
-        WinLockGuard lock(g_swapMutex);
-        PlaceholderEntry entry;
-        entry.placeholderHandle = placeholder;
-        entry.realPath = realPath;
-        entry.flags = flags;
-        entry.a3 = a3;
-        entry.a4 = a4;
-        g_placeholderMap[realPath] = entry;
-
-        {
-            WinLockGuard qLock(g_queueMutex);
-            g_prefetchQueue.push(realPath);
-            g_queueCv.notify_one();
-        }
-    }
-
-    return placeholder;
+    // Always create texture with real MPQ data directly to eliminate white texture flashing
+    return Call_Orig_TexCreateBLP(flags, path, a3, a4);
 }
 
 // Naked detour wrapper to preserve registers and calling conventions

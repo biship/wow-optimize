@@ -1,0 +1,26 @@
+name: Optimization idea
+description: Suggest something to make faster, or a feature to add
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What should be faster, or what is missing
+      description: >
+        If you know the part of the client involved - a function address, an
+        addon that triggers it, a situation where the game visibly struggles -
+        say so. That is usually the difference between an idea and something
+        that can be acted on.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Anything measured
+      description: >
+        Optional. FrameBench percentiles, a profiler section from your log, or
+        just "this route drops to 20 fps every time". Numbers move an idea up
+        the list quickly.
+    validations:
+      required: false

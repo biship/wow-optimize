@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: cache_governor.cpp
-// Description: Supporting utility functions for `cache_governor.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "cache_governor.h"

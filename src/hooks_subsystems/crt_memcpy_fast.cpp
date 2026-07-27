@@ -23,10 +23,6 @@ static uint64_t g_sse2_path = 0;
 static uint64_t g_nt_path = 0;
 static uint64_t g_fallback_path = 0;
 
-// Above this size a non-overlapping copy is almost always one-shot bulk data
-// (textures, model/sound buffers, decompressed MPQ blocks). WoW's VEC memcpy
-// uses plain movdqa there; streaming (non-temporal) stores avoid evicting the
-// working set, which matters most during loading screens.
 static const size_t NT_THRESHOLD = 256 * 1024;
 
 typedef void* (__cdecl *orig_memcpy_t)(void*, const void*, size_t);
@@ -56,31 +52,26 @@ static void* __cdecl Hooked_memcpy(void* dest, const void* src, size_t Size)
     const unsigned char* d = (const unsigned char*)dest;
     const unsigned char* s = (const unsigned char*)src;
 
-    // Overlap → fall through to original (preserves memmove semantics)
     if (ranges_overlap_up(d, s, Size) || ranges_overlap_down(d, s, Size)) {
         g_fallback_path++;
         return g_orig_memcpy(dest, src, Size);
     }
 
-    // < 16B → original dword-scalar path is fine
     if (Size < 16) {
         g_fallback_path++;
         return g_orig_memcpy(dest, src, Size);
     }
 
-    // Very large non-overlapping copy: let original handle
     if (Size >= NT_THRESHOLD) {
         g_fallback_path++;
         return g_orig_memcpy(dest, src, Size);
     }
 
-    // 256B .. NT_THRESHOLD → let original handle (VEC/SSE2 path already fast)
     if (Size >= 256) {
         g_fallback_path++;
         return g_orig_memcpy(dest, src, Size);
     }
 
-    // 16-255B non-overlapping: SSE2 copy via compiler intrinsics (no inline asm to prevent register corruption)
     g_total_calls++;
     g_sse2_path++;
 
@@ -135,3 +126,5 @@ void UninstallMemcpyFast()
             total, g_sse2_path, g_nt_path, g_fallback_path, 100.0 * g_sse2_path / total);
     }
 }
+
+

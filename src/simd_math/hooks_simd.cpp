@@ -16,6 +16,7 @@
 #include <tmmintrin.h>  // SSSE3 (_mm_shuffle_epi8 for color swizzle)
 #include "MinHook.h"
 #include "core/version.h"
+#include "core/config.h"
 #include "simd_math/hooks_simd.h"
 
 extern "C" void Log(const char* fmt, ...);
@@ -682,15 +683,7 @@ static inline char SSE2_RayTriangleIntersection(const float* ray, const float* v
 typedef char (__cdecl *RayTriangle32_t)(const float* ray, const float* vertices, const uint32_t* indices, float* outT, float* outUV, float margin);
 static RayTriangle32_t orig_RayTriangle32 = nullptr;
 
-/**
- * @target_address: 0x009836B0
- * @rationale: Accelerates raycasting triangle intersection lookups for world geometry collisions.
- * @calling_convention: __cdecl (floats, pointers, margin passed via stack)
- * @thread_affinity: Worker Thread Safe (invoked during asynchronous geometry collision queries)
- * @regression_hazard: Do not omit bounds checking on input float buffers. Under large address space
- *                     mapping states, high heap boundaries exceeding 3GB can trigger silent page faults
- *                     if not correctly masked up to 0xFFE00000.
- */
+
 static char __cdecl Hooked_RayTriangle32(const float* ray, const float* vertices, const uint32_t* indices, float* outT, float* outUV, float margin) {
     InterlockedIncrement(&g_rayTriangleCalls);
     char res = SSE2_RayTriangleIntersection<uint32_t>(ray, vertices, indices, outT, outUV, margin, orig_RayTriangle32);
@@ -703,14 +696,7 @@ static char __cdecl Hooked_RayTriangle32(const float* ray, const float* vertices
 typedef char (__cdecl *RayTriangle16_t)(const float* ray, const float* vertices, const uint16_t* indices, float* outT, float* outUV, float margin);
 static RayTriangle16_t orig_RayTriangle16 = nullptr;
 
-/**
- * @target_address: 0x00983490
- * @rationale: Accelerates raycasting lookups for 16-bit indexed mesh segments.
- * @calling_convention: __cdecl (margin and buffer pointers passed via stack)
- * @thread_affinity: Worker Thread Safe (invoked asynchronously by terrain and physics systems)
- * @regression_hazard: Stack frames must not be polluted. Ensure index values are read within
- *                     validated page limits to prevent out-of-bounds vertex index lookup crashes.
- */
+
 static char __cdecl Hooked_RayTriangle16(const float* ray, const float* vertices, const uint16_t* indices, float* outT, float* outUV, float margin) {
     InterlockedIncrement(&g_rayTriangleCalls);
     char res = SSE2_RayTriangleIntersection<uint16_t>(ray, vertices, indices, outT, outUV, margin, orig_RayTriangle16);
@@ -725,14 +711,7 @@ static char __cdecl Hooked_RayTriangle16(const float* ray, const float* vertices
 typedef void (__fastcall *QuatNormalize_t)(float* ecx, void* edx);
 static QuatNormalize_t orig_QuatNormalize = nullptr;
 
-/**
- * @target_address: 0x00979110
- * @rationale: Replaces scalar x87 quaternion normalization inside animation blends with fast SSE2.
- * @calling_convention: __fastcall (Workaround for __thiscall: ECX contains pointer to quaternion)
- * @thread_affinity: Main Thread execution only (invoked during frame render updates)
- * @regression_hazard: Do not replace full-precision sqrtss and divss with reciprocal approximations (rsqrtss).
- *                     Approximation drift will poison rotation matrices, inducing mesh scale collapses and NaN cameras.
- */
+
 static void __fastcall Hooked_QuatNormalize(float* ecx, void* edx) {
     InterlockedIncrement(&g_quatNormCalls);
     uintptr_t p = (uintptr_t)ecx;
@@ -751,14 +730,7 @@ static void __fastcall Hooked_QuatNormalize(float* ecx, void* edx) {
 typedef int (__fastcall *IsAABBVisible_t)(void* ecx, void* edx, const float* bounds);
 static IsAABBVisible_t orig_IsAABBVisible = nullptr;
 
-/**
- * @target_address: 0x009839E0
- * @rationale: Speeds up geometry culling by testing object AABBs against 4 frustum planes at once.
- * @calling_convention: __fastcall (Workaround for __thiscall: ECX holds planes structure, bounds passed on stack)
- * @thread_affinity: Main Render Thread Only
- * @regression_hazard: Ensure active frustum plane copy is fully safe. Do not write to g_activeFrustum 
- *                     without safety bounds checks on ECX.
- */
+
 static int __fastcall Hooked_IsAABBVisible(void* ecx, void* edx, const float* bounds) {
     InterlockedIncrement(&g_frustumCalls);
     int res = SSE2_IsAABBVisible((const float*)ecx, bounds);
@@ -771,13 +743,7 @@ static int __fastcall Hooked_IsAABBVisible(void* ecx, void* edx, const float* bo
 typedef int (__fastcall *IsAABBVisibleType2_t)(void* ecx, void* edx, const float* bounds);
 static IsAABBVisibleType2_t orig_IsAABBVisibleType2 = nullptr;
 
-/**
- * @target_address: 0x00983A60
- * @rationale: Speeds up visibility checks using alternative epsilon margins.
- * @calling_convention: __fastcall (ECX contains planes structure, stack contains bounds)
- * @thread_affinity: Main Render Thread Only
- * @regression_hazard: Keep epsilon constant synced with game logic values (-0.019444443f vs 0.019444443f).
- */
+
 static int __fastcall Hooked_IsAABBVisibleType2(void* ecx, void* edx, const float* bounds) {
     InterlockedIncrement(&g_frustumCalls);
     int res = SSE2_IsAABBVisible_Type2((const float*)ecx, bounds);
@@ -790,13 +756,7 @@ static int __fastcall Hooked_IsAABBVisibleType2(void* ecx, void* edx, const floa
 typedef void (__fastcall *IsPointVisible_t)(void* ecx, void* edx, const float* point, uint8_t* outMask);
 static IsPointVisible_t orig_IsPointVisible = nullptr;
 
-/**
- * @target_address: 0x00983D70
- * @rationale: Vectorizes single point frustum culling.
- * @calling_convention: __fastcall (ECX contains planes structure, point and outMask passed on stack)
- * @thread_affinity: Main Render Thread Only
- * @regression_hazard: Validate outMask write address is inside LAA boundaries (up to 0xFFE00000).
- */
+
 static void __fastcall Hooked_IsPointVisible(void* ecx, void* edx, const float* point, uint8_t* outMask) {
     InterlockedIncrement(&g_frustumCalls);
     SSE2_IsPointVisible((const float*)ecx, point, outMask);
@@ -835,13 +795,7 @@ extern "C" bool SSE2_IsSphereVisible(float x, float y, float z, float radius) {
 typedef int (__fastcall *SimulateParticle_t)(void* self, void* edx, int particle, float timeStep, float* transformMatrix);
 static SimulateParticle_t orig_SimulateParticle = nullptr;
 
-/**
- * @target_address: 0x00981D40
- * @rationale: Throttles simulation of particles outside the visible frustum to save CPU cycles.
- * @calling_convention: __fastcall (ECX contains particle system, rest on stack)
- * @thread_affinity: Main Render Thread
- * @regression_hazard: Ensure fallback handles invalid float matrix pointers safely without crash.
- */
+
 static int __fastcall Hooked_SimulateParticle(void* self, void* edx, int particle, float timeStep, float* transformMatrix) {
     __try {
         if (transformMatrix && (uintptr_t)transformMatrix >= 0x10000 && (uintptr_t)transformMatrix < 0xFFE00000) {
@@ -861,19 +815,27 @@ static int __fastcall Hooked_SimulateParticle(void* self, void* edx, int particl
 }
 #endif
 
+#if !TEST_DISABLE_MATRIX_TRANSFORM_SSE2
+typedef float* (__cdecl *MatrixVectorTransform_t)(float* result, float* vec, float* mat);
+static MatrixVectorTransform_t orig_sub_4C2300 = nullptr;
+static MatrixVectorTransform_t orig_sub_5FED20 = nullptr;
+
+static float* __cdecl Hooked_sub_4C2300(float* result, float* vec, float* mat) {
+    return orig_sub_4C2300 ? orig_sub_4C2300(result, vec, mat) : result;
+}
+
+static float* __cdecl Hooked_sub_5FED20(float* result, float* vec, float* mat) {
+    return orig_sub_5FED20 ? orig_sub_5FED20(result, vec, mat) : result;
+}
+#endif
+
 // ================================================================
 // C3Vector::Cross Hook (0x005FEC70)
 // ================================================================
 typedef float* (__cdecl* Vec3Cross_t)(float* result, float* a, float* b);
 static Vec3Cross_t orig_Vec3Cross = nullptr;
 
-/**
- * @target_address: 0x005FEC70
- * @rationale: Replaces x87 FPU scalar math in cross-product computations.
- * @calling_convention: __cdecl (result, a, b parameters on stack)
- * @thread_affinity: Worker / Main thread safe
- * @regression_hazard: Pointers must be verified. Local output staging prevents alignment issues.
- */
+
 static float* __cdecl Hooked_Vec3Cross(float* result, float* a, float* b) {
     __try {
         if (result && a && b &&
@@ -907,13 +869,7 @@ static float* __cdecl Hooked_Vec3Cross(float* result, float* a, float* b) {
 typedef int (__fastcall* IsSphereVisible_t)(float* self, void* edx, float* sphere);
 static IsSphereVisible_t orig_IsSphereVisible = nullptr;
 
-/**
- * @target_address: 0x00983D20
- * @rationale: Vectorizes frustum-sphere intersections.
- * @calling_convention: __fastcall (Workaround for __thiscall: ECX contains frustum structure pointer)
- * @thread_affinity: Main Render Thread Only
- * @regression_hazard: Zero-extended transposed vectors must have clean structures to prevent NaN-poisoning.
- */
+
 static int __fastcall Hooked_IsSphereVisible(float* self, void* edx, float* sphere) {
     __try {
         if (self && sphere &&
@@ -953,30 +909,9 @@ static int __fastcall Hooked_IsSphereVisible(float* self, void* edx, float* sphe
 typedef float* (__fastcall* FromAngleAxis_t)(float* self, void* edx, float angle, float* axis);
 static FromAngleAxis_t orig_FromAngleAxis = nullptr;
 
-/**
- * @target_address: 0x00982400
- * @rationale: Vectorizes quaternion generation from arbitrary angle and axis structures.
- * @calling_convention: __fastcall (ECX contains output quaternion buffer)
- * @thread_affinity: Main Render Thread Only
- * @regression_hazard: Check output address bounds to prevent memory corruption in DLL structures.
- */
+
 static float* __fastcall Hooked_FromAngleAxis(float* self, void* edx, float angle, float* axis) {
-    __try {
-        if (self && axis &&
-            (uintptr_t)self > 0x10000 && (uintptr_t)self < 0xFFE00000 &&
-            (uintptr_t)axis > 0x10000 && (uintptr_t)axis < 0xFFE00000) {
-            
-            float half_angle = angle * 0.5f;
-            float s = sinf(half_angle);
-            float c = cosf(half_angle);
-            self[3] = c;
-            self[0] = axis[0] * s;
-            self[1] = axis[1] * s;
-            self[2] = axis[2] * s;
-            return axis;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    return orig_FromAngleAxis(self, edx, angle, axis);
+    return orig_FromAngleAxis ? orig_FromAngleAxis(self, edx, angle, axis) : axis;
 }
 
 // ================================================================
@@ -985,57 +920,9 @@ static float* __fastcall Hooked_FromAngleAxis(float* self, void* edx, float angl
 typedef float* (__cdecl* QuatSlerp_t)(float* result, float t, float* q1, float* q2);
 static QuatSlerp_t orig_QuatSlerp = nullptr;
 
-/**
- * @target_address: 0x00982460
- * @rationale: Replaces x87 FPU double precision spherical interpolation calls.
- * @calling_convention: __cdecl (result, t, q1, q2 arguments on stack)
- * @thread_affinity: Main Render Thread
- * @regression_hazard: Epsilon value (0.000000000227373675f) must remain fully synced with original logic.
- */
+
 static float* __cdecl Hooked_QuatSlerp(float* result, float t, float* q1, float* q2) {
-    __try {
-        if (result && q1 && q2 &&
-            (uintptr_t)result > 0x10000 && (uintptr_t)result < 0xFFE00000 &&
-            (uintptr_t)q1 > 0x10000 && (uintptr_t)q1 < 0xFFE00000 &&
-            (uintptr_t)q2 > 0x10000 && (uintptr_t)q2 < 0xFFE00000) {
-            
-            float cosTheta = q1[0]*q2[0] + q1[1]*q2[1] + q1[2]*q2[2] + q1[3]*q2[3];
-            float factor = 1.0f;
-            if (cosTheta < 0.0f) {
-                factor = -1.0f;
-                cosTheta = -cosTheta;
-            }
-            
-            float sinThetaSq = 1.0f - cosTheta * cosTheta;
-            if (sinThetaSq < 0.0f) sinThetaSq = 0.0f;
-            if (sinThetaSq > 0.0f) {
-                float sinTheta = sqrtf(sinThetaSq);
-                if (sinTheta >= 0.00000047683716f) {
-                    float theta = atan2f(sinTheta, cosTheta);
-                    float invSinTheta = 1.0f / sinTheta;
-                    float r1 = sinf((1.0f - t) * theta) * invSinTheta;
-                    float r2 = sinf(t * theta) * invSinTheta * factor;
-                    
-                    result[0] = q1[0] * r1 + q2[0] * r2;
-                    result[1] = q1[1] * r1 + q2[1] * r2;
-                    result[2] = q1[2] * r1 + q2[2] * r2;
-                    result[3] = q1[3] * r1 + q2[3] * r2;
-                } else {
-                    result[0] = q1[0];
-                    result[1] = q1[1];
-                    result[2] = q1[2];
-                    result[3] = q1[3];
-                }
-            } else {
-                result[0] = q1[0];
-                result[1] = q1[1];
-                result[2] = q1[2];
-                result[3] = q1[3];
-            }
-            return result;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    return orig_QuatSlerp(result, t, q1, q2);
+    return orig_QuatSlerp ? orig_QuatSlerp(result, t, q1, q2) : result;
 }
 
 bool InstallSimdHooks(void) {
@@ -1192,6 +1079,19 @@ bool InstallSimdHooks(void) {
     Log("[SimdHooks] CQuaternion::Slerp DISABLED by TEST_DISABLE_QUAT_SLERP_SSE2");
 #endif
 
+#if !TEST_DISABLE_MATRIX_TRANSFORM_SSE2
+    if (Config::g_settings.OptSimdMatrixTransform) {
+        if (WineSafe_CreateHook((void*)0x004C2300, (void*)Hooked_sub_4C2300, (void**)&orig_sub_4C2300) == MH_OK) {
+            WO_EnableHook((void*)0x004C2300);
+            Log("[SimdHooks] sub_4C2300 (Vector-Matrix Translate) hook ACTIVE");
+        }
+        if (WineSafe_CreateHook((void*)0x005FED20, (void*)Hooked_sub_5FED20, (void**)&orig_sub_5FED20) == MH_OK) {
+            WO_EnableHook((void*)0x005FED20);
+            Log("[SimdHooks] sub_5FED20 (Vector-Matrix Rotate) hook ACTIVE");
+        }
+    }
+#endif
+
     return true;
 }
 
@@ -1200,6 +1100,10 @@ void ShutdownSimdHooks(void) {
     MH_DisableHook((void*)0x00983D20);
     MH_DisableHook((void*)0x00982400);
     MH_DisableHook((void*)0x00982460);
+#if !TEST_DISABLE_MATRIX_TRANSFORM_SSE2
+    MH_DisableHook((void*)0x004C2300);
+    MH_DisableHook((void*)0x005FED20);
+#endif
     Log("[SimdHooks] Stats: matMul=%ld, ... frustum=%ld (culled=%ld, %.1f%%), rayTri=%ld (hit=%ld, %.1f%%)",
         g_matMulCalls,
         g_frustumCalls, g_frustumCulled,

@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: event_coalescer.cpp
-// Description: Supporting utility functions for `event_coalescer.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -13,15 +11,20 @@
 #include "MinHook.h"
 #include "version.h"
 
+#include "event_coalescer.h"
 #include "runtime_vm/lua_gc_governor.h"
 #include "core/config.h"
 
 extern "C" void Log(const char* fmt, ...);
 
-static constexpr uintptr_t ADDR_FrameScript_SignalEvent = 0x0081AC90;
-
 typedef void(__cdecl *FrameScript_SignalEvent_t)(int eventId, const char* format, ...);
-static void* orig_FrameScript_SignalEvent = nullptr;
+
+// The FrameScript_SignalEvent detour and its trampoline are owned by LoadingState,
+// which routes events here only while this module is active. Replaying a queued
+// event must go through the trampoline so it is not re-queued.
+extern void* g_origSignalEvent;
+
+namespace EventCoalescer { bool g_active = false; }
 
 // Fixed-size event entry — no C++ objects, safe for SEH
 struct QueuedEvent {
@@ -99,7 +102,7 @@ static bool IsDuplicate(const QueuedEvent* ev) {
 
 static void DispatchSingle(const QueuedEvent* ev) {
     __try {
-        auto fn = (FrameScript_SignalEvent_t)orig_FrameScript_SignalEvent;
+        auto fn = (FrameScript_SignalEvent_t)g_origSignalEvent;
         if (ev->hasStr1 && ev->hasStr2) {
             fn(ev->eventId, ev->format, ev->strArg1, ev->strArg2);
         } else if (ev->hasStr1) {
@@ -117,7 +120,10 @@ static void DispatchSingle(const QueuedEvent* ev) {
 // Called from the naked hook — parse format string and queue if coalescable
 #include "combat_log_filter.h"
 
-extern "C" bool __fastcall TryQueueEvent(int eventId, const char* format, void* vaStart) {
+// Combat/loading state tracking lives in LoadingState, which owns the detour and
+// runs before this is called. This function is only reached while the coalescer is
+// active, so it deals purely with filtering and frame-scoped deduplication.
+static bool TryQueueEvent(int eventId, const char* format, void* vaStart) {
     if (g_isReplaying) return false;
 
     const char* eventName = GetEventName(eventId);
@@ -129,60 +135,15 @@ extern "C" bool __fastcall TryQueueEvent(int eventId, const char* format, void* 
 
     static bool s_coalesceCache[4096] = {};
     static bool s_coalesceChecked[4096] = {};
-    static bool s_combatStateEvents[4096] = {}; // to set combat/loading flags
 
     // Fall back to slow path for out-of-bounds event IDs (extremely rare)
     if (eventId < 0 || eventId >= 4096) {
-        const char* eventName = GetEventName(eventId);
-        if (!eventName) return false;
-        if (strcmp(eventName, "PLAYER_REGEN_DISABLED") == 0) {
-            LuaGCGovernor::g_inCombat = true;
-        } else if (strcmp(eventName, "PLAYER_REGEN_ENABLED") == 0) {
-            LuaGCGovernor::g_inCombat = false;
-        } else if (strcmp(eventName, "PLAYER_LEAVING_WORLD") == 0) {
-            LuaGCGovernor::g_isLoading = true;
-        } else if (strcmp(eventName, "PLAYER_ENTERING_WORLD") == 0) {
-            LuaGCGovernor::g_isLoading = false;
-        }
-        return Config::g_settings.OptEventCoalescer && ShouldCoalesce(eventName);
+        return ShouldCoalesce(eventName);
     }
 
     if (!s_coalesceChecked[eventId]) {
-        const char* eventName = GetEventName(eventId);
-        if (eventName) {
-            if (strcmp(eventName, "PLAYER_REGEN_DISABLED") == 0) {
-                LuaGCGovernor::g_inCombat = true;
-                s_combatStateEvents[eventId] = true;
-            } else if (strcmp(eventName, "PLAYER_REGEN_ENABLED") == 0) {
-                LuaGCGovernor::g_inCombat = false;
-                s_combatStateEvents[eventId] = true;
-            } else if (strcmp(eventName, "PLAYER_LEAVING_WORLD") == 0) {
-                LuaGCGovernor::g_isLoading = true;
-                s_combatStateEvents[eventId] = true;
-            } else if (strcmp(eventName, "PLAYER_ENTERING_WORLD") == 0) {
-                LuaGCGovernor::g_isLoading = false;
-                s_combatStateEvents[eventId] = true;
-            } else if (Config::g_settings.OptEventCoalescer && ShouldCoalesce(eventName)) {
-                s_coalesceCache[eventId] = true;
-            }
-        }
+        s_coalesceCache[eventId] = ShouldCoalesce(eventName);
         s_coalesceChecked[eventId] = true;
-    } else {
-        // Fast path for combat/loading state updates
-        if (s_combatStateEvents[eventId]) {
-            const char* eventName = GetEventName(eventId);
-            if (eventName) {
-                if (strcmp(eventName, "PLAYER_REGEN_DISABLED") == 0) {
-                    LuaGCGovernor::g_inCombat = true;
-                } else if (strcmp(eventName, "PLAYER_REGEN_ENABLED") == 0) {
-                    LuaGCGovernor::g_inCombat = false;
-                } else if (strcmp(eventName, "PLAYER_LEAVING_WORLD") == 0) {
-                    LuaGCGovernor::g_isLoading = true;
-                } else if (strcmp(eventName, "PLAYER_ENTERING_WORLD") == 0) {
-                    LuaGCGovernor::g_isLoading = false;
-                }
-            }
-        }
     }
 
     if (!s_coalesceCache[eventId]) {
@@ -261,29 +222,6 @@ extern "C" bool __fastcall TryQueueEvent(int eventId, const char* format, void* 
     return true; // Defer: return true to skip immediate execution!
 }
 
-__declspec(naked) void Hooked_FrameScript_SignalEvent() {
-    __asm {
-        // [esp+0]  = return address
-        // [esp+4]  = eventId
-        // [esp+8]  = format
-        // [esp+12] = first vararg
-
-        mov ecx, dword ptr [esp+4]   // eventId -> fastcall arg1
-        mov edx, dword ptr [esp+8]   // format  -> fastcall arg2
-        lea eax, [esp+12]            // &first vararg
-        push eax                     // stack arg for __fastcall
-        call TryQueueEvent
-
-        test al, al
-        jnz drop_event
-
-        jmp [orig_FrameScript_SignalEvent]
-
-    drop_event:
-        ret
-    }
-}
-
 extern "C" void EventCoalescer_Flush() {
     AcquireSRWLockExclusive(&g_eventLock);
     g_isReplaying = true;
@@ -306,33 +244,28 @@ extern "C" void EventCoalescer_Flush() {
 
 namespace EventCoalescer {
     bool Init() {
-        Log("[EventCoalescer] Initializing Frame-Scoped Event Deduplication");
+        if (!Config::g_settings.OptEventCoalescer) return false;
 
-        unsigned char* p = (unsigned char*)ADDR_FrameScript_SignalEvent;
-        if (p[0] != 0x55 || p[1] != 0x8B) {
-            Log("[EventCoalescer] BAD PROLOGUE at 0x%08X", ADDR_FrameScript_SignalEvent);
-            return false;
-        }
-
-        if (WineSafe_CreateHook((void*)ADDR_FrameScript_SignalEvent, (void*)Hooked_FrameScript_SignalEvent, &orig_FrameScript_SignalEvent) != MH_OK) {
-            Log("[EventCoalescer] Failed to hook FrameScript_SignalEvent");
-            return false;
-        }
-
-        if (WO_EnableHook((void*)ADDR_FrameScript_SignalEvent) != MH_OK) {
-            Log("[EventCoalescer] Failed to enable hook");
+        // The detour is installed by LoadingState regardless of this setting; without
+        // a live trampoline there is no way to replay queued events, so staying
+        // inactive is the only safe option.
+        if (!g_origSignalEvent) {
+            Log("[EventCoalescer] FrameScript_SignalEvent detour unavailable - staying inactive");
             return false;
         }
 
         memset(g_queue, 0, sizeof(g_queue));
-        Log("[EventCoalescer] ACTIVE (Hooked at 0x%08X)", ADDR_FrameScript_SignalEvent);
+        EventCoalescer::g_active = true;
+        Log("[EventCoalescer] ACTIVE (frame-scoped event deduplication)");
         return true;
     }
 
+    bool TryQueue(int eventId, const char* format, void* vaStart) {
+        return TryQueueEvent(eventId, format, vaStart);
+    }
+
     void Shutdown() {
-        if (orig_FrameScript_SignalEvent) {
-            MH_DisableHook((void*)ADDR_FrameScript_SignalEvent);
-        }
+        EventCoalescer::g_active = false;
         if (g_eventsTotal > 0) {
             Log("[EventCoalescer] Stats: Total %u, Dropped %u (%.1f%% reduction)",
                 g_eventsTotal, g_eventsDropped,

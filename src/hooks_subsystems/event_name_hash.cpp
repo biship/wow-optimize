@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: event_name_hash.cpp
-// Description: Supporting utility functions for `event_name_hash.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #ifndef WIN32_LEAN_AND_MEAN

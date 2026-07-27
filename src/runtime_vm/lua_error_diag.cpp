@@ -18,8 +18,11 @@ extern void LogFlushImmediate();
 // The old address 0x84F610 was sub_84F610(size_t Size) = luaL_addvalue, NOT lua_error.
 // Using 0x84F610 caused all error reads to show <unable to read> (arg is size_t, not L).
 
-// Max errors to log before stopping (prevents recursive error flooding)
+// Max unhandled errors to log before stopping (prevents recursive error flooding)
 #define MAX_DIAG_ERRORS 50
+
+// Max unhandled errors that additionally carry the full feature/hook-state snapshot
+#define MAX_FULL_STATE_DUMPS 3
 
 typedef int(__cdecl *lua_error_t)(uintptr_t L);
 static lua_error_t s_origLuaError = nullptr;
@@ -83,8 +86,7 @@ static void LogLuaTraceback(uintptr_t L) {
 }
 
 static int __cdecl DiagLuaError(uintptr_t L) {
-    LONG errNum = InterlockedIncrement(&g_errorCount);
-    if (errNum > MAX_DIAG_ERRORS) return s_origLuaError(L);
+    if (g_errorCount >= MAX_DIAG_ERRORS) return s_origLuaError(L);
 
     uintptr_t useL = L;
     if (L < 0x10000 || L > 0xFFE00000) {
@@ -95,9 +97,15 @@ static int __cdecl DiagLuaError(uintptr_t L) {
     bool isCaught = false;
     if (useL) {
         __try {
-            // Offset 0x74 is L->errorJmp in Lua 5.1 32-bit structure.
-            uintptr_t errorJmp = *(uintptr_t*)(useL + 0x74);
-            if (errorJmp != 0) {
+            // L->errorJmp lives at +0x70 in WoW's Lua 5.1 lua_State layout.
+            // Disassembly-verified against luaD_throw (sub_8562E0):
+            //   v2 = *(_DWORD *)(L + 112); if (v2) { *(v2 + 68) = status; longjmp(v2 + 4, 1); }
+            // The previous offset 0x74 was L->errfunc, read by luaG_errormsg
+            // (sub_850830) as `a1[29]`. errfunc is 0 for every ordinary pcall, so
+            // every *caught* error was misclassified as unhandled and triggered the
+            // full multi-line diagnostic dump below.
+            uintptr_t errorJmp = *(uintptr_t*)(useL + 0x70);
+            if (errorJmp >= 0x10000 && errorJmp <= 0xFFE00000) {
                 isCaught = true;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -110,10 +118,15 @@ static int __cdecl DiagLuaError(uintptr_t L) {
     if (!errMsg) errMsg = "<unable to read>";
 
     if (isCaught) {
-        // Silently log caught errors as a single line to avoid log flooding
+        // Caught errors are handled by the surrounding pcall - the game recovers on
+        // its own. Log a single INFO line (no synchronous disk flush) so an addon
+        // probing the API through pcall cannot stall the main thread.
         LogEx(LOG_LEVEL_INFO, "LUA", "[LuaError] Caught exception: %s", errMsg);
         return s_origLuaError(L);
     }
+
+    LONG errNum = InterlockedIncrement(&g_errorCount);
+    if (errNum > MAX_DIAG_ERRORS) return s_origLuaError(L);
 
     LogEx(LOG_LEVEL_ERROR, "LUA", "=== UNHANDLED LUA ERROR #%d ===", (int)errNum);
     LogEx(LOG_LEVEL_ERROR, "LUA", "  lua_State param: 0x%08X  global: 0x%08X", (unsigned)L, (unsigned)useL);
@@ -123,15 +136,38 @@ static int __cdecl DiagLuaError(uintptr_t L) {
         LogLuaTraceback(useL);
     }
 
-    LogEx(LOG_LEVEL_ERROR, "LUA", "  DLL optimization features status:");
-    FeatureState features[64];
-    int fcount = CrashDumper::GetFeatureStates(features, 64);
+    CrashDumper::Trace("LUA error: %.80s", errMsg);
+
+    // Only the first few errors carry the state snapshot. Every ERROR line is
+    // written through to disk, so repeating the snapshot per error costs real
+    // main-thread time, and consecutive errors report near-identical state.
+    if (errNum > MAX_FULL_STATE_DUMPS) {
+        LogEx(LOG_LEVEL_ERROR, "LUA", "=== END LUA ERROR #%d (state snapshot omitted) ===", (int)errNum);
+        return s_origLuaError(L);
+    }
+
+    // What ran before the error, in order. This replaces a full dump of the
+    // feature table: FeatureCall() is wired into almost nothing, so that table
+    // printed ~70 lines of "calls=0" that said nothing about the failure. Only
+    // features that actually recorded activity are worth a line.
+    LogEx(LOG_LEVEL_ERROR, "LUA", "  Recent events:");
+    CrashDumper::DumpTrace(16);
+
+    LogEx(LOG_LEVEL_ERROR, "LUA", "  Features with recorded activity:");
+    FeatureState features[MAX_TRACKED_FEATURES];
+    int fcount = CrashDumper::GetFeatureStates(features, MAX_TRACKED_FEATURES);
+    int reported = 0;
     for (int i = 0; i < fcount; i++) {
+        if (features[i].callCount == 0 && features[i].errorCount == 0) continue;
         LogEx(LOG_LEVEL_ERROR, "LUA", "    %-28s active=%d calls=%lld errors=%lld",
             features[i].name ? features[i].name : "(null)",
             features[i].active ? 1 : 0,
             features[i].callCount,
             features[i].errorCount);
+        reported++;
+    }
+    if (reported == 0) {
+        LogEx(LOG_LEVEL_ERROR, "LUA", "    (none)");
     }
 
     LogEx(LOG_LEVEL_ERROR, "LUA", "  Last 32 hook calls:");

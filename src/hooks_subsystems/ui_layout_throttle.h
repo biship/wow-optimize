@@ -6,4 +6,5 @@ namespace UILayoutThrottle {
     void Shutdown();
     bool ShouldThrottle(void* frame);
     void ResetFrameCounter();
+
 }

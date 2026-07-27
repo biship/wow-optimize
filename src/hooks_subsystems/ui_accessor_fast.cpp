@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: ui_accessor_fast.cpp
-// Description: Supporting utility functions for `ui_accessor_fast.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include <windows.h>
@@ -122,8 +120,8 @@ typedef int (__cdecl* IsShown_t)(uintptr_t L);
 static IsShown_t orig_IsShown = nullptr;
 
 static int __cdecl hook_IsShown(uintptr_t L) {
-    CrashDumper::RecordHookCall("UIAccessor_IsShown", (uintptr_t)L);
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    CrashDumper::RecordHookCallHot("UIAccessor_IsShown", (uintptr_t)L);
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return orig_IsShown(L);
 
     ++g_isshown_calls;
@@ -150,8 +148,8 @@ typedef int (__cdecl* IsVisible_t)(uintptr_t L);
 static IsVisible_t orig_IsVisible = nullptr;
 
 static int __cdecl hook_IsVisible(uintptr_t L) {
-    CrashDumper::RecordHookCall("UIAccessor_IsVisible", (uintptr_t)L);
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    CrashDumper::RecordHookCallHot("UIAccessor_IsVisible", (uintptr_t)L);
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return orig_IsVisible(L);
 
     ++g_isvisible_calls;
@@ -178,8 +176,8 @@ typedef int (__cdecl* GetAlpha_t)(uintptr_t L);
 static GetAlpha_t orig_GetAlpha = nullptr;
 
 static int __cdecl hook_GetAlpha(uintptr_t L) {
-    CrashDumper::RecordHookCall("UIAccessor_GetAlpha", (uintptr_t)L);
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    CrashDumper::RecordHookCallHot("UIAccessor_GetAlpha", (uintptr_t)L);
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return orig_GetAlpha(L);
 
     ++g_getalpha_calls;
@@ -206,8 +204,8 @@ typedef int (__cdecl* GetScale_t)(uintptr_t L);
 static GetScale_t orig_GetScale = nullptr;
 
 static int __cdecl hook_GetScale(uintptr_t L) {
-    CrashDumper::RecordHookCall("UIAccessor_GetScale", (uintptr_t)L);
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    CrashDumper::RecordHookCallHot("UIAccessor_GetScale", (uintptr_t)L);
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return orig_GetScale(L);
 
     ++g_getscale_calls;
@@ -230,7 +228,7 @@ typedef int (__cdecl* GetWidth_t)(uintptr_t L);
 static GetWidth_t orig_GetWidth = nullptr;
 
 static int __cdecl c_hook_GetWidth(uintptr_t L) {
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return -1;
 
     ++g_getwidth_calls;
@@ -304,7 +302,7 @@ typedef int (__cdecl* GetHeight_t)(uintptr_t L);
 static GetHeight_t orig_GetHeight = nullptr;
 
 static int __cdecl c_hook_GetHeight(uintptr_t L) {
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return -1;
 
     ++g_getheight_calls;
@@ -378,8 +376,8 @@ typedef int (__cdecl* Frame_IsShown_t)(uintptr_t L);
 static Frame_IsShown_t orig_Frame_IsShown = nullptr;
 
 static int __cdecl hook_Frame_IsShown(uintptr_t L) {
-    CrashDumper::RecordHookCall("UIAccessor_FrameIsShown", (uintptr_t)L);
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    CrashDumper::RecordHookCallHot("UIAccessor_FrameIsShown", (uintptr_t)L);
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return orig_Frame_IsShown(L);
 
     ++g_frame_isshown_calls;
@@ -406,8 +404,8 @@ typedef int (__cdecl* Frame_IsVisible_t)(uintptr_t L);
 static Frame_IsVisible_t orig_Frame_IsVisible = nullptr;
 
 static int __cdecl hook_Frame_IsVisible(uintptr_t L) {
-    CrashDumper::RecordHookCall("UIAccessor_FrameIsVisible", (uintptr_t)L);
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    CrashDumper::RecordHookCallHot("UIAccessor_FrameIsVisible", (uintptr_t)L);
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return orig_Frame_IsVisible(L);
 
     ++g_frame_isvisible_calls;
@@ -434,8 +432,8 @@ typedef int (__cdecl* Frame_GetAlpha_t)(uintptr_t L);
 static Frame_GetAlpha_t orig_Frame_GetAlpha = nullptr;
 
 static int __cdecl hook_Frame_GetAlpha(uintptr_t L) {
-    CrashDumper::RecordHookCall("UIAccessor_FrameGetAlpha", (uintptr_t)L);
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    CrashDumper::RecordHookCallHot("UIAccessor_FrameGetAlpha", (uintptr_t)L);
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return orig_Frame_GetAlpha(L);
 
     ++g_frame_getalpha_calls;
@@ -458,8 +456,8 @@ typedef int (__cdecl* Frame_GetFrameLevel_t)(uintptr_t L);
 static Frame_GetFrameLevel_t orig_Frame_GetFrameLevel = nullptr;
 
 static int __cdecl hook_Frame_GetFrameLevel(uintptr_t L) {
-    CrashDumper::RecordHookCall("UIAccessor_FrameGetLevel", (uintptr_t)L);
-    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping()) 
+    CrashDumper::RecordHookCallHot("UIAccessor_FrameGetLevel", (uintptr_t)L);
+    if (IsTeardownState() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || LuaOpt::IsLoadingMode()) 
         return orig_Frame_GetFrameLevel(L);
 
     ++g_frame_getframelevel_calls;
@@ -561,3 +559,4 @@ void ShutdownUIAccessorFast() {
         g_isshown_calls, g_isvisible_calls, g_getalpha_calls, g_getscale_calls,
         g_getwidth_calls, g_getheight_calls, g_frame_isshown_calls, g_frame_isvisible_calls, g_frame_getalpha_calls, g_frame_getframelevel_calls);
 }
+

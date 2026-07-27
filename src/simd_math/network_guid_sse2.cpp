@@ -15,13 +15,7 @@
 extern "C" void Log(const char* fmt, ...);
 
 #pragma region Local Data Types & Structs
-/**
- * @domain: Network GUID Serialization
- * @target_address: N/A
- * @rationale: Matches the client's internal dynamic bytebuffer structure for network stream processing.
- * @constraints: Virtual table offset and alignment must remain identical to 32-bit compilation layout.
- * @regression_hazard: Field offsets (e.g., buffer at +0x04, write_pos at +0x10) must never change.
- */
+
 struct CDataStore {
     void**   vtable;         // +0x00: vtable pointer
     uint8_t* buffer;         // +0x04: data buffer base
@@ -90,15 +84,7 @@ uint32_t FastUnpackGuidSSE2(const uint8_t* buffer, uint32_t remaining, uint64_t*
 #pragma endregion
 
 #pragma region API Hook Intercepts
-/**
- * @domain: Network GUID Serialization
- * @target_address: 0x0076DC20
- * @rationale: Speeds up unpacking of network GUIDs in dynamic datastores (hottest parsing path in client networking).
- * @calling_convention: __cdecl (arguments passed via stack)
- * @thread_affinity: Worker thread safe (often invoked by async network parsing threads)
- * @regression_hazard: Validate pointer ranges against the 4GB LAA limit (0xFFE00000). Bypassing checks
- *                     could cause access violations if packet buffers cross allocator page boundaries.
- */
+
 CDataStore* __cdecl Hooked_GetWowGUID(CDataStore* self, uint64_t* outGuid) {
     __try {
         if (self && outGuid && (uintptr_t)self >= 0x10000 && (uintptr_t)self < 0xFFE00000 &&

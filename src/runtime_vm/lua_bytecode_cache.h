@@ -7,21 +7,11 @@
 // ============================================================================
 
 
-/**
- * @domain: Lua VM Caching Subsystem
- * @architecture: Caches Lua runtime execution structures in `lua_bytecode_cache.h` to avoid redundant operations.
- * @thread_affinity: Main Loop / Thread-Safe worker constraints
- * @regression_hazard: Stale table pointers must be invalidated upon GC cycles or rehashes to prevent stale memory access.
- */
 
 
 
-/**
- * @domain: Lua Virtual Machine Engine
- * @architecture: Fastpath detour hooks mapping hottest Lua VM interpreter instructions directly to C-level structures.
- * @thread_affinity: Main Loop / Thread-Safe worker constraints
- * @regression_hazard: Incorrect Lua stack balance adjustments or thread-local storage collisions will result in UI freeze and transition crashes.
- */
+
+
 
 
 

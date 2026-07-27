@@ -16,9 +16,9 @@ static int g_targetLevel = 3; // 3 = Ultra/High, 0 = Off/Low
 static int g_actualLevel = 3;
 
 void RegisterCVar(const char* name, void* cvar) {
-    if (name && strcmp(name, "extShadowQuality") == 0) {
+    if (name && (strcmp(name, "extShadowQuality") == 0 || strcmp(name, "shadowLevel") == 0)) {
         g_shadowQualityCVar = cvar;
-        Log("[DynamicShadowScaler] Captured extShadowQuality CVar pointer: 0x%p", g_shadowQualityCVar);
+        Log("[DynamicShadowScaler] Captured shadow CVar pointer: %s -> 0x%p", name, g_shadowQualityCVar);
     }
 }
 

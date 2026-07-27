@@ -38,6 +38,7 @@ void Shutdown() {
     Log("[DbcFileCache] Stats: %lld hits, %lld misses", g_dbcHits, g_dbcMisses);
 }
 
+
 void* LookupRecord(void* dbc, uint32_t id) {
     if (!dbc) return nullptr;
     DbcKey key = {dbc, id};

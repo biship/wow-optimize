@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: tls_object_cache.cpp
-// Description: Supporting utility functions for `tls_object_cache.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "tls_object_cache.h"

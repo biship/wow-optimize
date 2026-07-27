@@ -60,9 +60,10 @@ void OnFrame(float elapsedMs) {
         sprintf(buf, "%.2f", g_actualDensity);
         __try {
             orig_CVar_Set(g_particleDensityCVar, buf, 1, 0, 0, 0);
-            Log("[ParticleDensityScaler] Scaling particle density to: %s (FPS: %.1f)", buf, g_currentFps);
+            Log("[ParticleDensityScaler] Scaling particle density to: %.2f (FPS: %.1f)", g_actualDensity, g_currentFps);
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 }
+
 
 } // namespace ParticleDensityScaler

@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: api_cache.cpp
-// Description: Supporting utility functions for `api_cache.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "api_cache.h"

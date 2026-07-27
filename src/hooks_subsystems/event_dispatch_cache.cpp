@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: event_dispatch_cache.cpp
-// Description: Supporting utility functions for `event_dispatch_cache.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "event_dispatch_cache.h"

@@ -42,10 +42,17 @@ struct CacheSlot {
     } value;
     uint32_t type_tag;           // TValue type
     uint32_t taint;              // WoW UI taint tracking
+    uint32_t generation;         // generation this entry was stored under
 };
 
 static CacheSlot g_cache[CACHE_SIZE] = {};
 static SRWLOCK   g_cacheLock = SRWLOCK_INIT;
+
+// Bumping this orphans every entry at once. It replaces clearing the whole table
+// on each GC step: a lookup only accepts a slot stored under the current
+// generation, so the physical wipe was pure cost. See the same fix, and the
+// issue #46 evidence behind it, in ClearLuaVMEngineCaches().
+static volatile LONG g_cacheGeneration = 1;
 
 static volatile LONG64 g_hits   = 0;
 static volatile LONG64 g_misses = 0;
@@ -104,7 +111,8 @@ static void __cdecl Hooked_luaV_gettable(lua_State* L, void* table, void* key, v
 
     // Cache hit: return cached result
     AcquireSRWLockShared(&g_cacheLock);
-    if (g_cache[hash].combined == combined) {
+    if (g_cache[hash].combined == combined &&
+        g_cache[hash].generation == (uint32_t)g_cacheGeneration) {
         uint32_t tp = g_cache[hash].type_tag;
         *(uint32_t*)((char*)result)      = g_cache[hash].value.lo;
         *(uint32_t*)((char*)result + 4)  = g_cache[hash].value.hi;
@@ -137,6 +145,7 @@ static void __cdecl Hooked_luaV_gettable(lua_State* L, void* table, void* key, v
         g_cache[hash].value.hi  = *(uint32_t*)((char*)result + 4);
         g_cache[hash].type_tag  = result_tt;
         g_cache[hash].taint     = *(uint32_t*)((char*)result + 12);
+        g_cache[hash].generation = (uint32_t)g_cacheGeneration;
         ReleaseSRWLockExclusive(&g_cacheLock);
     }
 }
@@ -192,10 +201,18 @@ static lua_State* g_lastLuaState = nullptr;
 static void __cdecl Hooked_luaC_step(lua_State* L) {
     g_lastLuaState = L;
 
-    // Clear entire cache on GC sweeps to prevent UAF/stale GC object addresses
-    AcquireSRWLockExclusive(&g_cacheLock);
-    std::memset(g_cache, 0, sizeof(g_cache));
-    ReleaseSRWLockExclusive(&g_cacheLock);
+    // Invalidate the whole cache on GC sweeps to prevent UAF/stale GC object
+    // addresses. This runs on every GC step, so it must be O(1): bumping the
+    // generation does exactly what memsetting 96 KB under the exclusive lock did,
+    // without the wipe or the stall.
+    LONG gen = InterlockedIncrement(&g_cacheGeneration);
+    if (gen == 0) {
+        // Wrap-around is the only case where a stale entry could carry the
+        // current generation, so clear physically there.
+        AcquireSRWLockExclusive(&g_cacheLock);
+        std::memset(g_cache, 0, sizeof(g_cache));
+        ReleaseSRWLockExclusive(&g_cacheLock);
+    }
 
     // Also clear the VM inline cache!
     ClearLuaVMEngineCaches();

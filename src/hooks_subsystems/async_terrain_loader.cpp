@@ -1,14 +1,23 @@
+// ============================================================================
+// Module: async_terrain_loader.cpp
+// Description: Asynchronous Terrain Chunk (ADT) Mesh & Collision Compiler
+// Safety & Threading: Win32 CreateThread workers with safe SEH guards.
+// ============================================================================
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <cstdint>
+#include <atomic>
+#include <unordered_set>
+#include "MinHook.h"
 #include "async_terrain_loader.h"
 #include "terrain_height_cache.h"
 #include "core/config.h"
 #include "../allocators/loading_defrag.h"
 #include "../core/version.h"
-#include <windows.h>
 #include "win_mutex.h"
-#include <unordered_set>
-#include <thread>
-#include <atomic>
-#include "../../build/_deps/minhook-src/include/MinHook.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -36,13 +45,31 @@ bool IsGridLoading(void* grid) {
     return g_loadingGrids.count(grid) > 0;
 }
 
-// Separated helper function to comply with MSVC SEH constraints
 static void SafeLoadAdt(void* grid, sub_7D9A20_fn orig_fn) {
     __try {
-        orig_fn(grid);
+        if (orig_fn) orig_fn(grid);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         Log("[AsyncTerrainLoader] Exception in background ADT load");
     }
+}
+
+struct AdtWorkerParam {
+    void* grid;
+    sub_7D9A20_fn orig_fn;
+};
+
+static DWORD WINAPI AdtWorkerProc(LPVOID lpParam) {
+    AdtWorkerParam* p = (AdtWorkerParam*)lpParam;
+    if (p) {
+        SafeLoadAdt(p->grid, p->orig_fn);
+        {
+            WinLockGuard lock(g_loadingGridsMutex);
+            g_loadingGrids.erase(p->grid);
+        }
+        g_asyncLoadCount.fetch_sub(1, std::memory_order_relaxed);
+        delete p;
+    }
+    return 0;
 }
 
 int __cdecl Hooked_LoadAdt(void* grid) {
@@ -50,7 +77,7 @@ int __cdecl Hooked_LoadAdt(void* grid) {
 
     // If loading screen is active, perform load synchronously
     if (LoadingDefrag::IsLoadingActive()) {
-        return orig_sub_7D9A20(grid);
+        return orig_sub_7D9A20 ? orig_sub_7D9A20(grid) : 0;
     }
 
     {
@@ -63,15 +90,20 @@ int __cdecl Hooked_LoadAdt(void* grid) {
 
     g_asyncLoadCount.fetch_add(1, std::memory_order_relaxed);
 
-    std::thread([grid]() {
+    AdtWorkerParam* param = new AdtWorkerParam{ grid, orig_sub_7D9A20 };
+    HANDLE hThread = CreateThread(NULL, 0, AdtWorkerProc, param, 0, NULL);
+    if (hThread) {
+        CloseHandle(hThread);
+    } else {
+        // Fallback synchronous load if thread creation failed
         SafeLoadAdt(grid, orig_sub_7D9A20);
-
         {
             WinLockGuard lock(g_loadingGridsMutex);
             g_loadingGrids.erase(grid);
         }
         g_asyncLoadCount.fetch_sub(1, std::memory_order_relaxed);
-    }).detach();
+        delete param;
+    }
 
     return 1;
 }
@@ -89,31 +121,21 @@ int __cdecl Hooked_UnloadGrid(void* grid) {
             Sleep(1);
         }
     }
-    return orig_sub_7C3700(grid);
+    return orig_sub_7C3700 ? orig_sub_7C3700(grid) : 0;
 }
-
 
 int __cdecl Hooked_GetGroundElevation(float* pos, float* out_height, void** out_chunk) {
     if (pos && out_height) {
         if (::TerrainHeightCache::GetCachedHeight(pos[0], pos[1], *out_height)) {
-            if (out_chunk) *out_chunk = nullptr;
-            return 1;
-        }
-    }
-    int result = orig_sub_7C1660(pos, out_height, out_chunk);
-    if (!result) {
-        // If query failed but an async load is active, supply current Z position as height fallback
-        if (g_asyncLoadCount.load(std::memory_order_relaxed) > 0) {
-            if (out_height && pos) {
-                *out_height = pos[2];
-                if (out_chunk) *out_chunk = nullptr;
+            // Only return cached height if out_chunk is null or caller does not demand a chunk pointer
+            if (!out_chunk) {
                 return 1;
             }
         }
-    } else {
-        if (pos && out_height) {
-            ::TerrainHeightCache::AddToCache(pos[0], pos[1], *out_height);
-        }
+    }
+    int result = orig_sub_7C1660 ? orig_sub_7C1660(pos, out_height, out_chunk) : 0;
+    if (result && pos && out_height) {
+        ::TerrainHeightCache::AddToCache(pos[0], pos[1], *out_height);
     }
     return result;
 }
@@ -122,7 +144,7 @@ void* __fastcall Hooked_CMapGrid_Update(void* This, void* unused, int a2, void* 
     if (This && IsGridLoading(This)) {
         return a3; // Skip updating sub-chunks while ADT is still loading in background
     }
-    return orig_sub_7D6BF0(This, a2, a3);
+    return orig_sub_7D6BF0 ? orig_sub_7D6BF0(This, a2, a3) : a3;
 }
 
 bool Init() {
@@ -134,29 +156,20 @@ bool Init() {
     Log("[AsyncTerrainLoader] Disabled via TEST_DISABLE_ASYNC_TERRAIN");
     return true;
 #endif
-    Log("--- Asynchronous Terrain Mesh Loader & Collision Decoupler ---");
+    Log("[AsyncTerrainLoader] Initializing Asynchronous Terrain Mesh Loader & Collision Decoupler");
 
-    if (MH_CreateHook((LPVOID)0x007D9A20, (LPVOID)Hooked_LoadAdt, (LPVOID*)&orig_sub_7D9A20) != MH_OK) {
-        Log("[AsyncTerrainLoader] Failed to hook LoadAdt (0x7D9A20)");
-        return false;
-    }
-    if (MH_CreateHook((LPVOID)0x007C3700, (LPVOID)Hooked_UnloadGrid, (LPVOID*)&orig_sub_7C3700) != MH_OK) {
-        Log("[AsyncTerrainLoader] Failed to hook UnloadGrid (0x7C3700)");
-        return false;
-    }
-    if (MH_CreateHook((LPVOID)0x007C1660, (LPVOID)Hooked_GetGroundElevation, (LPVOID*)&orig_sub_7C1660) != MH_OK) {
-        Log("[AsyncTerrainLoader] Failed to hook GetGroundElevation (0x7C1660)");
-        return false;
-    }
-    if (MH_CreateHook((LPVOID)0x007D6BF0, (LPVOID)Hooked_CMapGrid_Update, (LPVOID*)&orig_sub_7D6BF0) != MH_OK) {
-        Log("[AsyncTerrainLoader] Failed to hook CMapGrid::Update (0x7D6BF0)");
+    if (WineSafe_CreateHook((LPVOID)0x007D9A20, (LPVOID)Hooked_LoadAdt, (LPVOID*)&orig_sub_7D9A20) != MH_OK ||
+        WineSafe_CreateHook((LPVOID)0x007C3700, (LPVOID)Hooked_UnloadGrid, (LPVOID*)&orig_sub_7C3700) != MH_OK ||
+        WineSafe_CreateHook((LPVOID)0x007C1660, (LPVOID)Hooked_GetGroundElevation, (LPVOID*)&orig_sub_7C1660) != MH_OK ||
+        WineSafe_CreateHook((LPVOID)0x007D6BF0, (LPVOID)Hooked_CMapGrid_Update, (LPVOID*)&orig_sub_7D6BF0) != MH_OK) {
+        Log("[AsyncTerrainLoader] Failed to create hooks");
         return false;
     }
 
-    if (MH_EnableHook((LPVOID)0x007D9A20) != MH_OK ||
-        MH_EnableHook((LPVOID)0x007C3700) != MH_OK ||
-        MH_EnableHook((LPVOID)0x007C1660) != MH_OK ||
-        MH_EnableHook((LPVOID)0x007D6BF0) != MH_OK) {
+    if (WO_EnableHook((LPVOID)0x007D9A20) != MH_OK ||
+        WO_EnableHook((LPVOID)0x007C3700) != MH_OK ||
+        WO_EnableHook((LPVOID)0x007C1660) != MH_OK ||
+        WO_EnableHook((LPVOID)0x007D6BF0) != MH_OK) {
         Log("[AsyncTerrainLoader] Failed to enable hooks");
         return false;
     }
@@ -175,7 +188,6 @@ void Shutdown() {
     MH_DisableHook((LPVOID)0x007C1660);
     MH_DisableHook((LPVOID)0x007D6BF0);
 
-    // Wait for all background loads to finish
     while (g_asyncLoadCount.load(std::memory_order_relaxed) > 0) {
         Sleep(1);
     }
@@ -183,5 +195,6 @@ void Shutdown() {
     WinLockGuard lock(g_loadingGridsMutex);
     g_loadingGrids.clear();
 }
+
 
 } // namespace AsyncTerrainLoader

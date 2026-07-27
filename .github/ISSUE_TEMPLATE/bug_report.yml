@@ -1,0 +1,90 @@
+name: Bug report
+description: Something crashes, stutters, flickers or renders wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two fields below decide whether this can be diagnosed at all: the build
+        hash and the log. Without them a report cannot be matched to source, and
+        a fix may already exist in a build newer than the one you ran.
+
+  - type: input
+    id: build
+    attributes:
+      label: Build hash
+      description: >
+        The first lines of the log read
+        `wow_optimize.dll v3.17.0 (build abc1234)`. Paste that whole line.
+      placeholder: wow_optimize.dll v3.17.0 (build abc1234) BY SUPREMATIST
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: >
+        Steps, and how reliably it happens - every time, or once in a while.
+        "After a /reload with all addons loaded" is far more useful than "sometimes".
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: >
+        Attach `Logs\wow_optimize_<date>_<time>.log` from your WoW folder. Drag the
+        file into this box rather than pasting an excerpt - the useful parts are
+        usually not the ones that look relevant. Please do not trim the first lines.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: renderer
+    attributes:
+      label: Renderer
+      options:
+        - DXVK (d3d9.dll proxy in the game folder)
+        - Stock DirectX 9
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: fps
+    attributes:
+      label: Frame rate when it happens
+      description: >
+        Roughly, and whether vsync or a frame limiter is on. Several bugs only
+        appear above ~120 fps, so this narrows things down quickly.
+      placeholder: "~140 fps, vsync off, no limiter"
+    validations:
+      required: true
+
+  - type: input
+    id: server
+    attributes:
+      label: Server
+      description: Which 3.3.5a server. Note that this tool must not be used on Warmane.
+    validations:
+      required: false
+
+  - type: textarea
+    id: settings
+    attributes:
+      label: Non-default settings
+      description: >
+        Which launcher options you turned on or off. If you are unsure, attach
+        `wow_opt.ini` instead.
+    validations:
+      required: false

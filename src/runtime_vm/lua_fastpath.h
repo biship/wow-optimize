@@ -7,21 +7,11 @@
 // ============================================================================
 
 
-/**
- * @domain: Lua VM C-API Fast Path
- * @architecture: Optimizes C-API transitions for Lua state queries in `lua_fastpath.h`.
- * @thread_affinity: Main Loop / Thread-Safe worker constraints
- * @regression_hazard: Always maintain the Lua stack index alignment to prevent top index desynchronization.
- */
 
 
 
-/**
- * @domain: Lua Virtual Machine Engine
- * @architecture: Fastpath detour hooks mapping hottest Lua VM interpreter instructions directly to C-level structures.
- * @thread_affinity: Main Loop / Thread-Safe worker constraints
- * @regression_hazard: Incorrect Lua stack balance adjustments or thread-local storage collisions will result in UI freeze and transition crashes.
- */
+
+
 
 
 #ifndef LUA_FASTPATH_H
@@ -32,6 +22,17 @@
 // Forward declaration
 typedef struct lua_State lua_State;
 
+// True if WoW will accept `fn` as a lua_CFunction.
+//
+// The client validates every C function pointer handed to the Lua VM against
+// [dword_D415B8, dword_D415BC) in sub_86B5A0, and kills the process outright with
+// ERROR #134 "Invalid function pointer: %p" when it falls outside. That range
+// covers Wow.exe's own code, so a pointer into this DLL is only accepted when
+// something has widened it. Anything registering our functions into Lua must ask
+// this first and skip the registration when it returns false - the failure mode is
+// a fatal error box at login, which no SEH guard can catch.
+bool LuaCFunctionAccepted(const void* fn);
+
 namespace LuaFastPath {
 
 // Phase 1: Hook string.format (hardcoded address, called during DLL init)
@@ -39,8 +40,6 @@ bool Init();
 
 // Phase 2: Discover and hook more functions at runtime (called after Lua state ready)
 bool InitPhase2(lua_State* L);
-// Allow Phase 2 discovery to re-run after lua_State / VM change
-void ResetPhase2Discovery();
 
 // Phase 3: WoW C-level API hooks (permanently disabled)
 bool InitWoWHooks(lua_State* L);

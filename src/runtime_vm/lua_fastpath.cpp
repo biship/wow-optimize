@@ -55,6 +55,28 @@ static fn_lua_pushboolean lua_pushboolean_ = (fn_lua_pushboolean)0x0084E4D0;
 static fn_lua_settop      lua_settop_      = (fn_lua_settop)0x0084DBF0;
 static fn_lua_getfield    lua_getfield_    = (fn_lua_getfield)0x0084E590;
 static fn_lua_pushcclosure lua_pushcclosure_ = (fn_lua_pushcclosure)0x0084E400;
+
+// Bounds the client checks every lua_CFunction pointer against (see sub_86B5A0).
+// They are initialized lazily by the client; zero means "not established yet".
+static constexpr uintptr_t ADDR_CFUNC_RANGE_LO = 0x00D415B8;
+static constexpr uintptr_t ADDR_CFUNC_RANGE_HI = 0x00D415BC;
+
+bool LuaCFunctionAccepted(const void* fn) {
+    __try {
+        uintptr_t lo = *(uintptr_t*)ADDR_CFUNC_RANGE_LO;
+        uintptr_t hi = *(uintptr_t*)ADDR_CFUNC_RANGE_HI;
+
+        // Not initialized yet: we cannot tell, and guessing wrong is a hard crash,
+        // so stay out. Registration always happens long after the client has
+        // registered its own C functions, which is what establishes the range.
+        if (lo == 0 || hi == 0 || hi <= lo) return false;
+
+        uintptr_t p = (uintptr_t)fn;
+        return p >= lo && p < hi;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 static fn_lua_replace     lua_replace_     = (fn_lua_replace)0x0084DD70;
 static fn_lua_insert      lua_insert_      = (fn_lua_insert)0x0084DCC0;
 static fn_lua_remove      lua_remove_      = (fn_lua_remove)0x0084DC50;
@@ -3338,9 +3360,9 @@ bool Init() {
     Log("[FastPath] ====================================");
 
     __try {
-        // Use MinHook on native Windows, or on Wine/Rosetta when JIT cache is disabled
-        // (CrossOver on Apple Silicon runs WoW.exe through Rosetta underneath)
-        bool useMinHook = g_rosettaCacheDisabled || (!IsWine() && !IsRosetta());
+        // On Wine/Rosetta, we defer string.format to Phase 2 to hook it safely via Lua API path
+        // rather than doing unsafe code patching that requires thread freezing and Rosetta cache flushes.
+        bool useMinHook = !IsWine() && !IsRosetta();
 
         if (!useMinHook) {
             // Legacy Rosetta-safe path: defer string.format hook to Phase 2 (Lua API path)
@@ -3372,7 +3394,7 @@ bool Init() {
 
     g_active = true;
     Log("[FastPath]  Phase 1 [ OK ] - string.format %s",
-        (g_rosettaCacheDisabled || (!IsWine() && !IsRosetta())) ? "hooked" : "deferred to Phase 2");
+        (!IsWine() && !IsRosetta()) ? "hooked" : "deferred to Phase 2");
     Log("[FastPath]  Phase 2 will run after Lua state ready");
     Log("[FastPath] ====================================");
     return true;
@@ -3492,9 +3514,10 @@ bool InitPhase2(lua_State* L) {
         }
 
         __try {
-            // Use MinHook on native Windows, or on Wine/Rosetta when JIT cache is disabled
-            // (CrossOver on Apple Silicon runs WoW.exe through Rosetta underneath)
-            bool useMinHook = g_rosettaCacheDisabled || (!IsWine() && !IsRosetta());
+            // On Wine/Rosetta, named functions are hooked via the Lua API path (modifying table data).
+            // This is 100% safe, does not freeze threads (preventing Wine deadlocks), and is transparent to JIT.
+            // For unnamed functions (like ipairsaux at address 0x00854720), we must fall back to MinHook.
+            bool useMinHook = (!IsWine() && !IsRosetta()) || (e.name == nullptr);
 
             if (!useMinHook) {
                 // ============================================================
@@ -3544,6 +3567,16 @@ bool InitPhase2(lua_State* L) {
                 }
                 lua_settop_(L, -2); // pop old function, keep table
 
+                // The client kills the process if it is handed a lua_CFunction
+                // outside its accepted range, so this must be checked before the
+                // push, not guarded around it.
+                if (!LuaCFunctionAccepted(e.hookFn)) {
+                    lua_settop_(L, -2); // pop table
+                    Log("[FastPath]   %-8s.%-8s  SKIP (hook at 0x%08X outside WoW's lua_CFunction range)",
+                        e.table ? e.table : "_G", e.name, (unsigned)(uintptr_t)e.hookFn);
+                    continue;
+                }
+
                 // Push our hook as a C closure with original as upvalue
                 lua_pushcclosure_(L, (int(__cdecl*)(lua_State*))e.hookFn, 0);
                 lua_setfield_(L, -2, e.name);
@@ -3591,14 +3624,6 @@ bool InitPhase2(lua_State* L) {
         hookedTotal, discoveredTotal, hookedNow);
     return g_phase2Active;
 #endif // TEST_DISABLE_ALL_PHASE2
-}
-
-void ResetPhase2Discovery() {
-#if !TEST_DISABLE_ALL_PHASE2
-    // Do NOT remove already installed hooks.
-    // We only want late rediscovery for functions that were not found in glue VM.
-    g_layout.valid = false;
-#endif
 }
 
 void Shutdown() {
@@ -3703,7 +3728,14 @@ bool InitWoWHooks(lua_State* L) {
 }
 
 void InvalidateWoWCache() {
-    // No-op — reserved for future use
+    // Reset hooked status for named hooks only.
+    // Unnamed hooks (MinHook inline hooks) are persistent in process memory
+    // and do not need to be re-created on lua_State swap.
+    for (int i = 0; i < NUM_FUNC_HOOKS; i++) {
+        if (g_funcHooks[i].name != nullptr) {
+            g_funcHooks[i].hooked = false;
+        }
+    }
 }
 
 Stats GetStats() {

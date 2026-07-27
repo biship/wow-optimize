@@ -22,36 +22,32 @@ namespace Config {
         bool OptHardwareCursor = false;
         bool OptSamplingProfiler = false;
         bool OptMimallocLarge = false;
+        bool OptVaArena = false;   // EXPERIMENTAL opt-in: segregated VirtualAlloc arena (anti-fragmentation)
+        bool OptCompatMode = false; // Compatibility: skip aggressive CPU-priority/affinity/working-set tweaks (for VMs/HyperV where they break the connection)
 
         // UI & Lua
         bool OptUIFrameBatch = false;
         bool OptAddonDispatcher = false;
         bool OptUIFrameAccessorFast = false;
         bool OptFontMetricsFast = false;
-        bool OptFontMetricsLockFree = false;
-        bool OptFrameXmlCoalesce = false;
-        bool OptAddonTickGovernor = false;
-        bool OptTooltipCache = false;
-        bool OptLuaFileCache = false;
+        bool OptModuleHandleCache = false;
         bool OptFrameScriptDispatch = false;
         bool OptLuaNumConvFast = false;
         bool OptLuaOpcache = false;
         bool OptLuaGcCoalesce = false;
         bool OptLuaJIT = false;
+        bool OptLuaGetTimeFast = false;
+        bool OptSimdMatrixTransform = false;
         bool OptAsyncTexLoader = false;
         bool OptAsyncTerrainLoader = false;
         bool OptRcuObjMgr = false;
-        bool OptM2LodBias = false;
         bool OptMipBiasGovernor = false;
-        bool OptSpatialCulling = false;
         
         // Combat & Network
+        bool OptCombatLogLeakFix = true; // Proven fix: extend combat log retention 300s->1800s (writes the retention CVar). Default on.
         bool OptCombatLogParser = false;
         bool OptCombatLogIncremental = false;
         bool OptEventCoalescer = false;
-        bool OptNetPacketCoalesce = false;
-        bool OptUnitAuraCoalesce = false;
-        bool OptNetAddonCoalescer = false;
         bool OptSavedVarsSerializer = false;
         bool OptSavedVarsAsync = false;
         bool OptSavedVarsPretoken = false;
@@ -62,6 +58,16 @@ namespace Config {
         bool OptNameplateMT = false;
 
         // Graphics & Sound
+        // Hooks luaS_newlstr, through which every Lua string in the game is
+        // interned. Default off: it duplicates work the engine already does
+        // (hash, bucket walk, compare) and falls through to the original on a
+        // miss, so a miss costs both - and its value has never been measured.
+        // Both of these had a launcher switch whose ini key nothing read, so the
+        // hooks installed regardless and a tester bisecting string corruption got
+        // no signal from turning them off.
+        bool OptFastMemsetOpt = true;    // SSE2 memset replacement (0x0040BB80)
+        bool OptFastStrnicmpOpt = true;  // SSE2 _strnicmp replacement (0x0076E780)
+        bool OptLuaSNewLstrFast = false;
         bool OptStrStrSse2 = false;
         bool OptStrCatFast = false;
         bool OptSoundMixerOpt = false;
@@ -71,7 +77,6 @@ namespace Config {
         bool OptD3d9RenderThread = false;
 
         // 10 new features
-        bool OptLoadingScreenOpt = true;
         bool OptCombatLogFilter = true;
         bool OptSoundVolumeLimit = true;
         bool OptUILayoutThrottle = true;
@@ -82,27 +87,50 @@ namespace Config {
         bool OptMovementSmoothing = true;
         bool OptFontAlphaFastpath = true;
 
-        // 20 new colossal features (Features 31-50)
         bool OptPacketProcessingThrottle = true;
         bool OptNameplateCulling = true;
         bool OptTextureUnloadDelay = false;
         bool OptM2MatrixSimd = true;
+        bool OptM2BoneMt = false;
+        bool OptMpqAsyncDecompress = false;
         bool OptMinimapRefreshGovernor = true;
         bool OptSpellEffectCulling = true;
         bool OptLuaStringCompareFast = true;
         bool OptDbcRowCaching = true;
         bool OptNetworkStringDedup = true;
-        bool OptCameraCollisionThrottle = true;
         bool OptSoundFreqCoalesce = true;
         bool OptAuraUpdateDedup = true;
         bool OptUiTextureCaching = true;
         bool OptWmoCullingOpt = true;
         bool OptFastFloatParse = true;
         bool OptHeapAllocationTracker = true;
+        bool OptCrtMimalloc = false;
         bool OptSpellCooldownCache = true;
         bool OptGuidStringCache = true;
         bool OptFrameScriptMemOpt = true;
         bool OptCombatEventLimit = true;
+
+        // Previously Init'd unconditionally (ignored their launcher toggles).
+        // Default true = preserve the old always-on behavior; now disableable.
+        bool OptAddonMsgLimiter = true;
+        bool OptAuraPreloadCache = true;
+        bool OptCDataStoreBuffering = true;
+        bool OptCameraShakeOpt = true;
+        bool OptCombatLogAsync = true;
+        bool OptCombatTextFont = true;
+        bool OptDbcFileCache = true;
+        bool OptDynamicShadowScaler = true;
+        bool OptFontOutlineCache = true;
+        bool OptMouseClipRelease = true;
+        bool OptMouseCursorSmooth = true;
+        bool OptNameplateDistanceCvar = true;
+        bool OptParticleDensityScaler = true;
+        bool OptSavedVarsBackup = true;
+        bool OptSoundCoalescer = true;
+        bool OptSpellOverlayPreload = true;
+        bool OptUnitMaxPowerCache = true;
+        bool OptVertexBufferPrealloc = true;
+        bool OptWorldObjectOpt = true;
     };
 
     extern Settings g_settings;

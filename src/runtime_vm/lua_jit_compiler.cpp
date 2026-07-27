@@ -173,16 +173,7 @@ bool Init() {
         Log("[LuaJitCompiler] DISABLED via configuration (wow_opt.ini)");
         return true;
     }
-    void* target = (void*)0x00856370;
-    if (WineSafe_CreateHook(target, (void*)Hooked_luaD_precall, (void**)&g_orig_luaD_precall) != MH_OK) {
-        Log("[LuaJitCompiler] Failed to hook luaD_precall");
-        return false;
-    }
-    if (WO_EnableHook(target) != MH_OK) {
-        Log("[LuaJitCompiler] Failed to enable luaD_precall hook");
-        return false;
-    }
-    Log("[LuaJitCompiler] Active - Lua native compile engine hooked at 0x856370");
+    Log("[LuaJitCompiler] BYPASSED: JIT compilation disabled to prevent virtual address fragmentation and loading stalls.");
     return true;
 }
 
@@ -190,9 +181,11 @@ void Shutdown() {
     if (!Config::g_settings.OptLuaJIT) {
         return;
     }
-    void* target = (void*)0x00856370;
-    MH_DisableHook(target);
-    MH_RemoveHook(target);
+    if (g_orig_luaD_precall) {
+        void* target = (void*)0x00856370;
+        MH_DisableHook(target);
+        MH_RemoveHook(target);
+    }
 
     WinLockGuard lock(g_jitMutex);
     for (void* page : g_allocatedPages) {

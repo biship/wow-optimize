@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: unitaura_fastpath.cpp
-// Description: Supporting utility functions for `unitaura_fastpath.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "windows.h"

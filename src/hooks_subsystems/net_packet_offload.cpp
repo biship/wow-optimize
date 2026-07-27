@@ -50,8 +50,8 @@ static std::atomic<bool> g_shutdown{false};
 static WinMutex g_cvMutex;
 static WinCondVar g_cv;
 
-// O(1) Fast lookup cache structures
-static std::unordered_map<int, void*> g_criteriaCache;
+// O(1) Direct Array lookup cache structure for achievement criteria
+static void* g_flatCriteriaCache[65536] = {};
 static void* g_lastListHead = nullptr;
 
 static bool IsReadablePtr(const void* ptr, size_t size) {
@@ -68,29 +68,29 @@ static bool IsReadablePtr(const void* ptr, size_t size) {
 }
 
 static void* FindCriteriaHandlerFast(int criteriaId) {
+    if (criteriaId <= 0 || criteriaId >= 65536) return nullptr;
+    
     void** pHead = (void**)0x00ACFDC4;
     if (!pHead || !IsReadablePtr(pHead, sizeof(void*)) || !*pHead) return nullptr;
     
     void* currentHead = *pHead;
     if (currentHead != g_lastListHead) {
-        g_criteriaCache.clear();
+        memset(g_flatCriteriaCache, 0, sizeof(g_flatCriteriaCache));
         g_lastListHead = currentHead;
         
-        // Walk the criteria linked list to populate cache
+        // Walk the criteria linked list to populate direct array cache
         int* curr = (int*)currentHead;
         while (curr && (((uintptr_t)curr & 1) == 0)) {
             if (!IsReadablePtr(curr, 12)) break; // Each node has at least 3 dwords (12 bytes)
             int cid = curr[2];
-            g_criteriaCache[cid] = curr;
+            if (cid > 0 && cid < 65536) {
+                g_flatCriteriaCache[cid] = curr;
+            }
             curr = (int*)curr[1];
         }
     }
     
-    auto it = g_criteriaCache.find(criteriaId);
-    if (it != g_criteriaCache.end()) {
-        return it->second;
-    }
-    return nullptr;
+    return g_flatCriteriaCache[criteriaId];
 }
 
 // Simple custom inflate/decompress function (Zlib wrapper or lightweight mock decompressor)
@@ -219,5 +219,6 @@ void Shutdown() {
     }
     MH_DisableHook((void*)0x005B2CB0);
 }
+
 
 } // namespace NetPacketOffload

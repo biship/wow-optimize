@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: combatlog_optimize.cpp
-// Description: Supporting utility functions for `combatlog_optimize.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "combatlog_optimize.h"
@@ -177,8 +175,12 @@ void ProcessUnifiedFrameTicks(int luaState, DWORD mainThreadId) {
     if (Config::g_settings.OptCombatLogIncremental) {
         CombatLogIncremental::OnFrame(luaState);
     }
-    if (Config::g_settings.OptCombatLogParser) {
+    // Retention leak-fix keeps re-applying the 1800s CVar on its own default-on
+    // flag; the buffer governor is part of the aggressive aggregator.
+    if (Config::g_settings.OptCombatLogLeakFix || Config::g_settings.OptCombatLogParser) {
         CombatLogOpt::OnFrame(mainThreadId);
+    }
+    if (Config::g_settings.OptCombatLogParser) {
         CombatLogBuffer::OnFrame(mainThreadId);
     }
 }

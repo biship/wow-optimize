@@ -2,8 +2,6 @@
 
 // ============================================================================
 // Module: regex_cache.h
-// Description: Supporting utility functions for `regex_cache.h`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include <cstdint>

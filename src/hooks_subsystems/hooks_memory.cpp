@@ -12,6 +12,8 @@
 #include <intrin.h>
 #include "MinHook.h"
 #include "version.h"
+#include "core/config.h"
+#include <mimalloc.h>
 #include "hooks_memory.h"
 
 extern "C" void Log(const char* fmt, ...);
@@ -376,6 +378,48 @@ static void StaleCleanupGuidCache(size_t startIdx, size_t count) {
 // ================================================================
 // Public API
 // ================================================================
+#if !TEST_DISABLE_CRT_MIMALLOC
+typedef void* (__cdecl* malloc_t)(size_t);
+typedef void (__cdecl* free_t)(void*);
+typedef void* (__cdecl* realloc_t)(void*, size_t);
+
+static malloc_t orig_malloc = nullptr;
+static free_t orig_free = nullptr;
+static realloc_t orig_realloc = nullptr;
+
+static void* __cdecl Hooked_malloc(size_t size) {
+    void* p = mi_malloc(size);
+    if (!p) {
+        return orig_malloc(size);
+    }
+    return p;
+}
+
+static void __cdecl Hooked_free(void* ptr) {
+    if (ptr) {
+        if (mi_is_in_heap_region(ptr)) {
+            mi_free(ptr);
+        } else {
+            orig_free(ptr);
+        }
+    }
+}
+
+static void* __cdecl Hooked_realloc(void* ptr, size_t size) {
+    if (!ptr) return Hooked_malloc(size);
+    if (size == 0) {
+        Hooked_free(ptr);
+        return nullptr;
+    }
+    
+    if (mi_is_in_heap_region(ptr)) {
+        return mi_realloc(ptr, size);
+    }
+    
+    return orig_realloc(ptr, size);
+}
+#endif
+
 static volatile DWORD g_memFrameIndex = 0;
 
 bool InstallMemoryHooks(void) {
@@ -399,6 +443,11 @@ bool InstallMemoryHooks(void) {
         Log("[MemoryHooks] Object creation: fill ADDR_OBJECT_CREATED to populate cache");
     if (!ADDR_OBJECT_DESTROYED)
         Log("[MemoryHooks] Object destruction: fill ADDR_OBJECT_DESTROYED to invalidate cache");
+
+#if !TEST_DISABLE_CRT_MIMALLOC
+    Log("[MemoryHooks] OptCrtMimalloc setting status: %s (handled via CRT Allocator Bridge in dllmain)",
+        Config::g_settings.OptCrtMimalloc ? "ACTIVE" : "DISABLED");
+#endif
 
     Log("[MemoryHooks] Initialized");
     return true;
@@ -428,6 +477,12 @@ void ShutdownMemoryHooks(void) {
         g_guidLookups, g_guidHits,
         g_guidLookups ? 100.0 * g_guidHits / g_guidLookups : 0.0,
         g_guidEvictions, g_guidStaleCheck);
+
+#if !TEST_DISABLE_CRT_MIMALLOC
+    MH_DisableHook((void*)0x00415074);
+    MH_DisableHook((void*)0x00412FC7);
+    MH_DisableHook((void*)0x00416A95);
+#endif
 }
 
 void ClearGuidHashTable(void) {

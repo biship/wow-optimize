@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: format_validator_cache.cpp
-// Description: Supporting utility functions for `format_validator_cache.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "format_validator_cache.h"

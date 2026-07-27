@@ -254,3 +254,4 @@ void ShutdownSavedVarsAsync() {
 void FlushSavedVarsAsyncSynchronously() {
     // No-op
 }
+

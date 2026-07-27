@@ -1,4 +1,5 @@
 build/
+build_*/
 out/
 x64/
 x86/
@@ -28,3 +29,5 @@ tools/*.py
 tools/
 src/disabled_features/
 scratch/
+wow_opt.ini
+*.ini

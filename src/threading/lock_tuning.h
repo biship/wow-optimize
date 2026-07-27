@@ -2,26 +2,14 @@
 
 // ============================================================================
 // Module: lock_tuning.h
-// Description: Supporting utility functions for `lock_tuning.h`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 
-/**
- * @domain: Client Optimizer Support Subsystem
- * @architecture: Implements helper methods and utility wrappers for `lock_tuning.h`.
- * @thread_affinity: Main Loop / Thread-Safe worker constraints
- * @regression_hazard: Address validation checks must range up to 0xFFE00000 to support high-address LAA allocations.
- */
 
 
 
-/**
- * @domain: Asynchronous Worker Thread Pools
- * @architecture: Manages lock-free task queuing and dispatches work asynchronously to worker threads.
- * @thread_affinity: Lock-Free Async Worker Pool
- * @regression_hazard: Thread synchronization issues or data race conditions will cause thread deadlocks or memory corruption.
- */
+
+
 
 
 

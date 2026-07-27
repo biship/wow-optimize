@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: trig_lut.cpp
-// Description: Supporting utility functions for `trig_lut.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #ifndef WIN32_LEAN_AND_MEAN

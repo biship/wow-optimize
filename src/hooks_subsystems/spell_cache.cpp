@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: spell_cache.cpp
-// Description: Supporting utility functions for `spell_cache.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "spell_cache.h"

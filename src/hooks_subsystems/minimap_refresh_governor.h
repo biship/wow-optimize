@@ -5,4 +5,5 @@ namespace MinimapRefreshGovernor {
     bool Init();
     void Shutdown();
     bool ShouldSkipRefresh();
+
 }

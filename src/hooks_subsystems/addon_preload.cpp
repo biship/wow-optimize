@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: addon_preload.cpp
-// Description: Supporting utility functions for `addon_preload.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "addon_preload.h"
@@ -214,11 +212,13 @@ bool InitAddonPreload() {
     char* lastSep = strrchr(exePath, '\\');
     if (lastSep) *lastSep = 0;
     g_addonDir = std::string(exePath) + "\\Interface\\AddOns";
+    std::string wtfDir = std::string(exePath) + "\\WTF\\Account";
 
-    Log("[AddonPreload] Scanning: %s", g_addonDir.c_str());
+    Log("[AddonPreload] Scanning: %s and %s", g_addonDir.c_str(), wtfDir.c_str());
 
-    // Scan addon directory
+    // Scan addon directory and SavedVariables directory
     ScanAddonDir(g_addonDir, 0);
+    ScanAddonDir(wtfDir, 0);
     LONG total = g_filesToLoad;
     Log("[AddonPreload] Found %d files to preload", total);
     if (total == 0) return true;

@@ -40,7 +40,7 @@ namespace TerrainHeightCache {
     bool GetCachedHeight(float x, float y, float& outZ) {
         if (!g_enabled) return false;
 
-        AcquireSRWLockExclusive(&g_cacheLock);
+        AcquireSRWLockShared(&g_cacheLock);
         unsigned int idx = GetHash(x, y);
         bool found = false;
         if (g_cache[idx].valid) {
@@ -49,7 +49,7 @@ namespace TerrainHeightCache {
                 found = true;
             }
         }
-        ReleaseSRWLockExclusive(&g_cacheLock);
+        ReleaseSRWLockShared(&g_cacheLock);
         return found;
     }
 

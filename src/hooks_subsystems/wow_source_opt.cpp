@@ -171,8 +171,10 @@ static int __fastcall Hooked_DsLookup(void* This, void* unused, int index, void*
 //
 // Original: TEB → TLS array → offset+8 → offset+192
 // Called on EVERY game object access. This is the single most-called
-// function in WoW.exe. Already partially optimized by tls_cache.cpp
-// but we add an additional inline fast path here.
+// function in WoW.exe, and nothing hooks it - the tls_cache.cpp this note
+// used to defer to never installed anything. Being the most-called leaf is
+// the reason to leave it alone: a trampoline on every game object access
+// costs more than the TEB walk it would skip.
 //
 // Optimization: Direct TLS read with cached TEB pointer.
 // ================================================================
@@ -388,8 +390,11 @@ namespace WowSourceOpt {
         
         // DISABLED hooks with calling convention mismatches:
         // S1 (0x4CFBB0): already hooked by WowOpt W1 - CreateHook fails (duplicate)
-        // S2 (0x4CFD20): already hooked by HotPatch N1 - CreateHook fails (duplicate)
-        // S3 (0x4D3790): already hooked by TLSCache - CreateHook fails (duplicate)
+        // S2 (0x4CFD20): already hooked by dbc_lookup_cache and WowPerf P4
+        //     (this used to credit HotPatch N1, which was never installed)
+        // S3 (0x4D3790): nothing hooks it. The claim that TLSCache held it was
+        //     false - that module installed no hooks - but S3 stays disabled on
+        //     its own merits, see the note at its definition above.
         // S4 (0x708C20): __thiscall with 3 args, __fastcall wrapper corrupts FPU/stack
         // S6 (0x7317A0): __thiscall with float arg on FPU stack, __fastcall wrapper CRASHES
         // S7 (0x4ED900): __thiscall, __fastcall wrapper may corrupt This pointer

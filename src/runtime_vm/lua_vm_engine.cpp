@@ -105,9 +105,29 @@ static inline void ICInvalidate() {
     InterlockedIncrement(&g_icGeneration);
 }
 
+// Invalidating the whole inline cache is an O(1) operation: a lookup only accepts
+// a way whose stored generation equals the current one, so bumping the generation
+// orphans every entry at once.
+//
+// This used to memset the entire table first - 8192 sites x 4 ways x 32 bytes =
+// exactly 1 MB - and it is called from the luaH_resize hook, i.e. once per Lua
+// table growth. Addon load resizes tables tens of thousands of times, so the main
+// thread spent whole seconds inside a memcpy loop clearing a cache the very next
+// instruction was about to invalidate anyway. That is the "world loads but the
+// loading screen never goes away" freeze in issue #46: the game keeps running
+// (addons execute, events fire) while the frame loop cannot advance. A tester
+// profile had 52% of all steady-state samples inside VCRUNTIME140, reached
+// through this function, with a 39.7 s and a 95.7 s frame either side of it.
 void ClearLuaVMEngineCaches() {
-    memset(g_inlineCache, 0, sizeof(g_inlineCache));
-    InterlockedIncrement(&g_icGeneration);
+    LONG gen = InterlockedIncrement(&g_icGeneration);
+
+    // The one case the counter cannot cover on its own: on wrap-around a stale
+    // entry could carry a generation equal to the new current one. Physically
+    // clearing there keeps the invariant exact, and costs 1 MB once per 2^32
+    // invalidations.
+    if (gen == 0) {
+        memset(g_inlineCache, 0, sizeof(g_inlineCache));
+    }
 }
 
 void LuaVMEngine_FrameTick() {

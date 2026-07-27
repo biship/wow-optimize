@@ -1,7 +1,9 @@
-# wow_optimize 
+> [!CAUTION]
+> **Do not use this on Warmane.** Their anti-cheat flags performance injectors and
+> memory optimization tools as illegal software regardless of intent, and the
+> result is a permanent ban on your account.
 
-# DO NOT USE ON WARMANE -- CAUSE BAN 
-
+# wow_optimize
 
 Performance optimization DLL for World of Warcraft 3.3.5a (WotLK)
 Author: SUPREMATIST
@@ -17,7 +19,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
-* [What's New in v3.16.3](#whats-new-in-v3163)
+* [What's New in v3.17.0](#whats-new-in-v3170)
 * [Reviews & Acknowledgments](#reviews)
 * [Current Feature Set](#current-feature-set)
 * [Installation](#installation)
@@ -30,7 +32,79 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
-## What's New in v3.16.3
+## What's New in v3.17.0
+
+A bug fix release, driven mostly by issue #46.
+
+Most of what is fixed below started as an issue filed by [txtsd](https://github.com/txtsd),
+who then ran the testing rounds that confirmed each fix and caught the ones that
+were not fixed yet. This release exists because of that. Thank you.
+
+**Fixed**
+
+- Loading screen no longer stays up after the world has finished loading
+- Fatal `ERROR #134 Invalid function pointer` at login on clients that don't load a third-party Lua extension library
+- Multi-second freezes during addon loading and `/reload`
+- Async frustum culling no longer makes objects pop in and out at the wrong distance, or models flicker at the draw distance, above ~125 fps
+- Loading-screen detection no longer requires the `!LuaBoost` addon — it now works on any install, and the initial login load is covered too
+- Screen flicker and darkening with an overlay running (RTSS, Afterburner, Steam) above ~120 fps. The D3D9 render-state cache was cleared on a timer capped near 125 times a second instead of once per frame, so past that frame rate it stopped keeping up and the device held whatever state the overlay left behind
+- Addon list rendering with overlapping text after a `/reload`, and those entries refusing to toggle
+- The end of the session log is no longer lost when the game exits
+
+**Faster**
+
+- The SSE2 `memset` replacement now actually delivers its win. Its own two diagnostic counters were costing more than the work they measured; the function is about 2.3x faster than the client's `rep stosd` instead of 3%.
+
+**Removed**
+
+Three features shipped on the same assumption — that skipping an engine call per frame only skips work — and all three were wrong about what that call does. Each was reported as visual corruption by testers before it was understood:
+
+- **Animation LOD.** The bone-update call it skipped also applies each model's *placement*, so throttled models held stale positions and juddered whenever the camera moved.
+- **Async Frustum Culling.** It precomputed visibility on worker threads against a frustum the frame had not established yet, so objects popped in and out at the wrong distance and models flickered at the draw distance — above about 125 fps, where several frames shared one cache generation.
+- **Nameplate Throttle.** The call it skipped drives shared UI and render state rather than one nameplate's cosmetics, which is how it managed to break Skada as well as make nameplates blink.
+
+And a set of features that never did anything at all. Some had a switch the DLL never read; some hooked an address that was not the start of the function they meant; one printed "Subsystem Active" in every log while never installing its hook:
+
+- Camera Collision Raycast Throttle, Floating Combat Text Coalescer, Addon Message Coalescing, plus internal modules for aura coalescing, mesh skinning (three separate ones) and the SavedVariables serializer.
+
+Every hook address in the DLL has since been verified against the binary, every launcher switch is now read by the code behind it, and a build-time check keeps it that way.
+
+**Restored**
+
+- **Lua C-API inline cache suite** and **adaptive Lua GC governor**, both removed by mistake in an earlier audit (both still opt-in).
+
+**Diagnostics**
+
+This release adds the thing the project never had: a way to tell whether a change helped.
+
+- **Frame-time benchmark.** Every presented frame is measured at `IDirect3DDevice9::Present` and reported as a distribution, not an average — an average hides exactly the stutters players report:
+
+  ```
+  73581 frames over 183.5s, source: D3D9 Present, config CDFBB03D, build 3.17.0
+  avg 2.49 ms (401.0 fps)   p50 2.40   p95 3.50   p99 4.20   p99.9 17.40   max 1975.45
+  janky frames: >33ms 38 (0.05%)  >50ms 25 (0.03%)  >100ms 15 (0.02%)
+  ```
+
+  The report carries a fingerprint of your settings, so two runs can be compared and each proven to have used the configuration it claims.
+
+- **Slow frames explain themselves.** A frame that runs far past the session's own median pulls the recent event trace, so a hitch comes with what happened during it — a device reset, a UI reload, a cache invalidation.
+
+- Crash reports, Lua error dumps and stutter dumps all open with that same event trace, instead of ~70 lines of unused counters.
+- The sampling profiler resolves hot code to individual functions rather than 4 KB pages, for both the client and this DLL.
+- The startup banner reports the exact build a log came from.
+
+### Upgrading
+
+Settings carry over. Nothing needs to be reset — keys for removed features are simply ignored from now on.
+
+One rename is worth knowing about: `LuaFileCache` gated a module-handle cache rather than anything to do with Lua files, and is now `ModuleHandleCache`. If you had it on, turn the new one on.
+
+If you had **Animation LOD**, **Async Frustum Culling** (previously "Spatial Culling & Parallel Frustum Culler") or **Nameplate Throttle** enabled, those are gone; the artifacts they caused go with them and there is nothing to re-enable.
+
+**Still open:** a crash reported a while after `alt+F4`. If you hit it, please attach `Crashes\wow_crash_*.dmp` and the timestamped `Logs\wow_optimize_<date>_<time>.log`.
+
+<details>
+<summary><b>Previously — v3.16.3</b></summary>
 
 A reliability pass driven mostly by your bug reports (issues #34–#42):
 
@@ -45,18 +119,27 @@ A reliability pass driven mostly by your bug reports (issues #34–#42):
 
 **Known issue:** on some DXVK setups, UI text can garble after a windowed↔maximized switch — still under investigation.
 
+</details>
+
 Older releases: see the [Releases page](https://github.com/suprepupre/wow-optimize/releases) for the full version history.
 
 ![wow_optimize Launcher Dashboard](images/launcher_screenshot.jpg)
 
 ## Current Status
 
-### Performance Metrics (Real-World Testing)
-- **Frame time**: Smoother frametimes in addon-heavy raids
-- **CPU usage**: Noticeable reduction in addon-heavy gameplay
-- **Lua operations**: Faster table lookups (getstr/rawgeti caches) and library fast paths
-- **Timing cache**: High QPC cache hit rate
-- **String formatting**: High fast path hit rate
+### Performance
+
+**`memset` replacement** — 2.3x faster than the client's own `rep stosd` at the
+sizes engine code clears: 5.05 ns/call against 11.76, measured over 4.8M calls per
+variant. The client reaches that one function from 1108 call sites.
+
+Everything else is opt-in, and v3.17.0 lets you settle it on your own hardware,
+with your own addons, instead of taking anyone's word for it. Play a session, quit
+the game normally, and read the `[FrameBench]` block at the end of
+`Logs\wow_optimize_<date>_<time>.log`. Compare `p95` and `p99` between runs rather
+than the average, which hides the stutters you actually feel — and the `config`
+fingerprint on that line proves two runs differed only where you meant them to.
+A/B testing a single toggle is two logs on the same route.
 
 ---
 
@@ -73,7 +156,7 @@ See what other players say: [Reviews and Testimonials](https://github.com/suprep
 This project wouldn't exist without the community. Every crash report, every bisection test, every "hey this broke my addon" message directly shaped the release. 
 
 Special thanks to:
-Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd
+Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude
 
 </details>
 
@@ -236,14 +319,15 @@ Replacements for WoW's own statically-linked CRT routines at verified addresses:
 - SSE2 frustum AABB-vs-4-planes cull
 - SSE2 BGRA↔ARGB batch swap, premultiplied alpha
 - Network GUID SSE2 unpacking — `CDataStore::GetWowGUID` (0x76DC20)
-- SSE2 quaternion normalize *(enabled — robust double-precision math)*
+- SSE2 quaternion normalize *(enabled — normalizes in double precision)*
 - Particle simulation throttling — `CParticleEmitter::SimulateParticle` (0x981D40) *(disabled — 0x981D40 is the particle spawn/init routine, not a skippable advance; throttling it left particles uninitialized, rendering as colored flashes)*
 
 > The generic msvcrt CRT mem/char SSE2 paths (`crt_mem_fastpath`, `crt_char_fast`) are **disabled** — WoW links its CRT statically, so hooking msvcrt exports had little effect and risked VA exhaustion.
 
 ### Lua Event Coalescing *(disabled)*
-- Hooks `FrameScript_SignalEvent` (0x81AC90) to buffer and deduplicate high-frequency UI events per frame
+- Buffers and deduplicates high-frequency UI events per frame
 - **Disabled**: suppressing and re-emitting events a frame later changes event timing/ordering and was unvalidated across the in-world → glue teardown where char-switch crashes occur. Stability outranks the dedup win until it can be confirmed in-game.
+- The `FrameScript_SignalEvent` (0x81AC90) detour it used to own now belongs to the loading/combat state detector, which is always installed. The dedup queue is a consumer of that detour, so it stays switched off without taking the state tracking down with it.
 
 ### Kernel-call caches (38 hooks)
 Batch 1-8: `GetSystemTimeAsFileTime` (QPC-based 1ms refresh), `GetACP`, `GetUserDefaultLangID`, `GetProcessHeap`, `CharUpperA/W`, `CharLowerA/W`, `MapVirtualKeyA`, `GetThreadPriority`
@@ -255,8 +339,9 @@ Batch 21-26: `GetTickCount64` (QPC-backed), `ShowCursor`, `GetVersionExA`, `GetS
 Batch 31-38: `GetCurrentProcess`, `GetCurrentThread`, `GetCPInfo` and related kernel caches
 
 ### Loading screen optimization
-- Skips UR arena reserve on HD clients (>500MB working set)
-- Dynamic VA arena: reserves 256MB during loading, releases after
+- Loading state is detected natively from the client's own event stream (`PLAYER_LEAVING_WORLD` → `PLAYER_ENTERING_WORLD`), so it works with or without the `!LuaBoost` addon. Many subsystems use it as a "bypass this while the world is loading" gate: deferred field updates, the DBC lookup cache, the Lua opcache and the texture unload queue
+- Dynamic VA arena: reserves 256MB during loading, releases after. The reservation is skipped on HD clients (>500MB working set), but the loading state itself is always published
+- A watchdog force-exits the loading state after 30s, so a missed end event can never pin the process in loading mode
 - Sleep hook: bulk Sleep for waits >16ms (less CPU during idle)
 
 ### VA Arena (Virtual Address Arena)
@@ -340,13 +425,13 @@ Then inject after WoW starts.
 
 ### Supported Clients & Private Servers
 The optimization suite is compatible with any standard or customized WotLK 3.3.5a client (build 12340), including private servers using custom executables:
-* **Warmane** (Icecrown, Lordaeron, Onyxia) -- DO NOT USE, CAUSE BAN
+* **Warmane** (Icecrown, Lordaeron, Onyxia) — **STRICTLY PROHIBITED (WILL RESULT IN A PERMANENT BAN)**
 * **Project Ascension** (supporting custom `Ascension.exe` launches)
 * **WoW Circle** (supporting `WoWCircle.exe` launches)
 * **EZ WoW**
 * **WoW Sirus** (supporting `Sirus.exe` or custom `run.exe` launches)
 * **UWow** / **Firestorm** (supporting `run.exe` launches)
-* **ChromieCraft 3.3.5a** 
+* **ChromieCraft 3.3.5a**
 
 1. Install the `!LuaBoost` addon into `Interface\AddOns\`.
 2. **Disable conflicting addons:** Remove or disable any third-party GC optimizers (`GarbageProtector`, `GarbageCollector`, `SmartGC`, etc.) and combat log fixes (`CombatLogFix`, etc.). The DLL handles these natively; running both causes duplicate hooks, memory corruption, or crashes.
@@ -499,6 +584,32 @@ The Makefile drives `clang-cl` (Homebrew `llvm`) and `lld-link` (Homebrew `lld`)
 
 ## Troubleshooting
 
+### Reporting a problem
+
+Two things make a report actionable, and both are easy to get wrong:
+
+1. **Send `Logs\wow_optimize_<date>_<time>.log`**, not `Logs\wow_optimize.log`. The second one is overwritten on every launch.
+2. **Quit the game normally** — not `alt+F4` — after reproducing the problem, so the end of the log reaches disk.
+
+If the game crashed, attach `Crashes\wow_crash_*.dmp` (or the text report written next to it under Wine) as well.
+
+Every crash report, Lua error dump and stutter dump starts with an event trace — the state transitions leading up to the problem, newest first — which is usually the part that explains it:
+
+```
+Recent events:
+    -    23ms  TID=900   LUA state swap (UI reload) - new VM settling
+    - 27810ms  TID=900   LOADING begin (PLAYER_LEAVING_WORLD)
+    -110351ms  TID=900   D3D9 device Reset (dev=0x0EB1AA90)
+```
+
+The startup banner reports the exact build the log came from (`v3.17.0 (build abc1234)`), so please don't trim the first lines.
+
+If the complaint is stuttering rather than a crash, look for `slow frame` lines — each one names how far past your session's own median that frame ran, and what was happening during it:
+
+```
+[FrameBench] slow frame: 102.9 ms (16.3x the 6.30 ms median) - recent events:
+```
+
 | Problem | Solution |
 |---------|----------|
 | Proxy DLL doesn't load (no log file) | Use `wow_loader.exe`, or uncheck **"Disable fullscreen optimizations"** in `Wow.exe` properties:<br>![Wow.exe Properties](images/wow.exe_properties.png) |
@@ -572,3 +683,14 @@ wow-optimize/
 ## License
 
 MIT License - use, modify, and distribute freely.
+
+---
+
+## Also for WoW 3.3.5a
+
+| Project | What it does |
+|---|---|
+| [LuaBoost](https://github.com/suprepupre/LuaBoost) | Addon-side GC control, loading-screen helpers, shared APIs for addon authors |
+| [WA_SafeGuard](https://github.com/suprepupre/WA_SafeGuard) | Backs up WeakAuras so a forced disconnect cannot wipe your auras |
+| [DefileAlert](https://github.com/suprepupre/DefileAlert) | Instant Defile target callout for the Lich King encounter |
+

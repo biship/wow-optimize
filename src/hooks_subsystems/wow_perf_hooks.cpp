@@ -63,10 +63,23 @@ static int __cdecl Hooked_LuaPushString(int L, const char* s) {
             // Push empty string directly - avoid strlen call
             return orig_LuaPushString(L, s);
         }
-        // For short strings, try cache
-        if (s[0] && s[1] && !s[31]) { // likely <32 chars
-            uint32_t h = 0x811C9DC5;
-            for (const char* p = s; *p; p++) { h ^= (uint8_t)*p; h *= 0x01000193; }
+        // Length-classify the string by walking it up to 32 bytes. This must
+        // STOP at the null terminator — the previous code read s[31] blindly to
+        // test "is it < 32 chars", which for a short string sitting within 31
+        // bytes of a page boundary read into an unmapped page and hard-crashed
+        // (0xC0000005 while serializing combat-log unit/spell names — random
+        // crashes on the first raid pull). Walking to the terminator only ever
+        // touches bytes inside the string's own allocation, so it's page-safe.
+        uint32_t h = 0x811C9DC5;
+        int n = 0;
+        for (; n < 32; n++) {
+            char c = s[n];
+            if (!c) break;           // reached terminator — within the string
+            h ^= (uint8_t)c;
+            h *= 0x01000193;
+        }
+        // Only short (2..31 char, null within 32) strings use the cache.
+        if (n >= 2 && n < 32) {
             uint32_t idx = h & (PUSHSTR_SHORT_CACHE - 1);
             if (g_shortStrCache[idx].hash == h && g_shortStrCache[idx].ptr == s) {
                 _InterlockedIncrement(&g_p1Hits);

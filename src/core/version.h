@@ -2,8 +2,6 @@
 
 // ============================================================================
 // Module: version.h
-// Description: Supporting utility functions for `version.h`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 
@@ -11,11 +9,11 @@
 
 
 #define WOW_OPTIMIZE_VERSION_MAJOR  3
-#define WOW_OPTIMIZE_VERSION_MINOR  16
-#define WOW_OPTIMIZE_VERSION_PATCH  3
+#define WOW_OPTIMIZE_VERSION_MINOR  17
+#define WOW_OPTIMIZE_VERSION_PATCH  0
 #define WOW_OPTIMIZE_VERSION_BUILD  0
 
-#define WOW_OPTIMIZE_VERSION_STR    "3.16.3"
+#define WOW_OPTIMIZE_VERSION_STR    "3.17.0"
 #define WOW_OPTIMIZE_AUTHOR         "SUPREMATIST"
 
 #ifndef CRASH_TEST_DISABLE_PHASE2
@@ -47,13 +45,17 @@
 // Lua VM GC optimizer + mimalloc allocator replacement
 #define TEST_DISABLE_LUA_VM_OPT         0
 
-// The old ALL-allocations CRT→mimalloc redirect was removed for repeatedly
-// breaking server connections. v3.16.3 reintroduces a deliberately narrower,
-// opt-in version (Config::OptMimallocLarge, launcher default OFF): only main-
-// thread allocations >= 1 MB, kept below 2 GB, are routed to mimalloc — see the
-// InstallMimallocLargeHooks comment in dllmain.cpp for the full rationale. This
-// compile flag hard-disables that feature regardless of the config toggle.
-#define TEST_DISABLE_MIMALLOC_LARGE 0
+// HARD-DISABLED after a heap-corruption crash. The large-only opt-in redirect
+// still hits the same fundamental flaw as the original full CRT redirect: a
+// >=1MB block allocated through our malloc hook but freed through a path we do
+// NOT hook (operator delete / _free_base / _aligned_free / a driver's own free)
+// reaches ntdll's HeapFree as a mimalloc pointer and corrupts the heap free-list
+// — observed as a 0xC0000005 in ntdll's free-list splice during raid-exit
+// teardown (mass frees). Covering every free path safely is a large, risky
+// surface, and the sampling profiler showed the allocator/CPU path is not the
+// frame-time bottleneck (WoW-side code is <1% each), so the redirect is not
+// worth its crash risk. Removed from the launcher; keep the code for reference.
+#define TEST_DISABLE_MIMALLOC_LARGE 1
 
 // Gate for the Lua error diagnostic hook. The hook targets 0x84F610 which
 // disassembly-verified is sub_84F610(size_t Size) — luaL_addvalue, NOT lua_error.
@@ -160,7 +162,7 @@
 // teardown/reload/swap bypass. Exposed as a launcher checkbox (General/
 // ObjVisCache), default OFF/opt-in since it's an unverified hot path — enable
 // it in the launcher and watch for unit/object misbehavior or hangs.
-#define TEST_DISABLE_OBJ_VIS_CACHE      0
+#define TEST_DISABLE_OBJ_VIS_CACHE      1
 
 // Deferred unit field update queue v2 - Lock-free SPSC batch processor.
 // STALE COMMENT WARNING: the paragraph below describes a v2 fix for an
@@ -292,7 +294,7 @@
 // SSE2 4x4 matrix multiply (sub_4C1F00, result = A*B). Disassembly-verified row-major
 // convention identical to the scalar original; pointer-validated + SEH-guarded.
 // Set to 1 if any rendering/transform artifact is observed.
-#define TEST_DISABLE_MATRIX_MULTIPLY         1
+#define TEST_DISABLE_MATRIX_MULTIPLY         0
 
 // SSE2 Matrix-Vector Transformations (sub_4C21B0 / sub_4C2270).
 // Vectorized 3D point and 4D vector matrix transformations using SSE2.
@@ -304,7 +306,7 @@
 // (NOT rsqrt approximation -- that NaN-poisoned the quaternion path), and
 // replicates each function's guard exactly. Pointer-validated + SEH-guarded with
 // fallback to the original. Set to 1 to revert to the FPU scalar implementation.
-#define TEST_DISABLE_VEC_NORMALIZE_SSE2  1
+#define TEST_DISABLE_VEC_NORMALIZE_SSE2  0
 
 // SSE2 CMatrix transpose (sub_4C23D0, _MM_TRANSPOSE4_PS, bit-identical) and the
 // in-place 3D point * 4x4 transform (sub_4C2300, ~65 callers; same math as the
@@ -325,8 +327,8 @@
 #define TEST_DISABLE_STREAM_FASTPATH         0
 // shipped MatVec3Mul). Pointer-validated + SEH-guarded with fallback. Completes
 // SSE2 coverage of the transform library. Set to 1 to revert to FPU scalar.
-#define TEST_DISABLE_MATRIX_EXT_SSE2         1
-#define TEST_DISABLE_MATRIX_COPY             1
+#define TEST_DISABLE_MATRIX_EXT_SSE2         0
+#define TEST_DISABLE_MATRIX_COPY             0
 
 // SSE2 rigid-transform inverse builder (sub_4C2FC0, ~34 callers across render +
 // world code). out_R = transpose(R); out[12..14] = -(R_row_i . t); homogeneous
@@ -335,7 +337,7 @@
 // (sub_4C51B0) is bypassed since it only re-packs those same elements. Same
 // products + summation order as the FPU original (sub-ULP delta only). Pointer-
 // validated + SEH-guarded with fallback. Dedicated flag for in-game isolation.
-#define TEST_DISABLE_MATRIX_INVERT_SSE2         1
+#define TEST_DISABLE_MATRIX_INVERT_SSE2         0
 
 // SSE2 misc transform ops: sub_4C2120 (scalar * 4x4, 16 fmul -> 4 mul_ps) and
 // sub_4C2210 (row-major affine 3D point transform: out_i = row_i[0..2].p + row_i[3],
@@ -522,7 +524,12 @@
 // Worker thread pool (2 threads), lock-free queues (4096 entries each)
 // Priority system: Target > Focus > Nearby > Distant
 // Emergency disable flag: set to 1 to disable NAMEPLATE_MT entirely
-#define TEST_DISABLE_NAMEPLATE_MT       0
+// HARD-DISABLED: the design is thread-safe but ADDITIVE, not a speedup — the
+// hook runs the full native nameplate update AND then re-gathers + re-applies
+// name/color via a worker + main-thread OnFrame, so it only adds main-thread
+// work with no FPS benefit (profiling confirmed WoW-side code is <1% each;
+// the cost is system/GPU/memory, not nameplates). Removed from the launcher.
+#define TEST_DISABLE_NAMEPLATE_MT       1
 
 // Frame-Scoped Event Coalescing (Synchronous Deduplication)
 // DISABLED again: suppresses whitelisted events and re-emits them a frame later from
@@ -583,6 +590,22 @@
 #define TEST_DISABLE_AUDIO_DECODE_MT           0  // enabled: parallel sound wave pre-decoding and cache
 #define TEST_DISABLE_DEFRAG_LF                 0  // enabled: lock-free main thread heap defragmentation
 #define TEST_DISABLE_LUA_GC_GOVERNOR            0  // enabled: adaptive Lua GC governor
+#define TEST_DISABLE_LUA_GETTIME_FAST           0  // disabled by default: Lua GetTime Frame Cache
+#define TEST_DISABLE_MATRIX_TRANSFORM_SSE2      1  // disabled: SIMD Matrix Vector Transforms
+// HARD-DISABLED: this is the same all-allocations CRT->mimalloc redirect that was
+// removed in v3.16.3 for breaking server connections ("unable to connect"). The
+// opt-in large-allocation redirect (OptMimallocLarge) is the safe replacement.
+#define TEST_DISABLE_CRT_MIMALLOC               1  // disabled: CRT Allocator Redirect (connection breaker)
+// HARD-DISABLED: the multithreaded UpdateBones hook is broken by design — it
+// dispatches to a worker then immediately blocks waiting on it (no parallelism,
+// pure overhead), and on the 10ms wait timeout it frees the ring slot while the
+// worker is still running orig_UpdateBones on it (use-after-free), and runs
+// non-thread-safe M2 transform code on a worker thread (game-state race). Address
+// 0x0082F0F0 is correct, but the design provides no benefit and crashes. Needs a
+// full rewrite (in-place SSE bone math, no threads) before it can be re-enabled.
+#define TEST_DISABLE_M2_BONE_MT                 1  // disabled: broken multithreaded UpdateBones
+#define TEST_DISABLE_MPQ_ASYNC_DECOMPRESS       0  // enabled: Asynchronous MPQ File Decompressor
+#define TEST_DISABLE_RCU_OBJ_MGR                0  // enabled: Lock-Free Read-Copy-Update (RCU) Object Manager
 #define TEST_DISABLE_M2_LOD_BIAS                1  // disabled: M2 LOD Bias Control
 #define TEST_DISABLE_UNIT_AURA_COALESCE         1  // enabled: Unit Aura Coalescer
 #define TEST_DISABLE_D3D9_VB_CACHE              1  // disabled: D3D9 VB Shadow Cache
@@ -777,6 +800,22 @@ static inline bool IsRosetta() {
 #endif
 
 // ================================================================
+// Translation layer (Wine on Linux, Rosetta 2 on macOS ARM).
+// Our worker-thread / parallel features dispatch work to background threads and
+// then BLOCK the main thread waiting for them (some with INFINITE timeouts).
+// Under x86->ARM/native translation those workers are themselves translated and
+// slow/starved, so the main-thread wait turns into a multi-second freeze
+// (observed: 11.7s stall, stack = our DLL -> WaitForSingleObject). These
+// features also give little to no benefit under translation (SSE/AVX2 emulated,
+// extra threads compete for translation resources). So on a translation layer we
+// simply don't run them - a freeze becomes "feature just doesn't run", which is
+// strictly better. Native Windows (the primary target) is unaffected.
+#ifndef WOWOPT_ISTRANSLATED_DEFINED
+#define WOWOPT_ISTRANSLATED_DEFINED
+static inline bool RunningUnderTranslation() { return IsWine() || IsRosetta(); }
+#endif
+
+// ================================================================
 // Wine/Rosetta safe hook wrapper
 // MinHook patching WoW .text section (0x00400000-0x00FFFFFF) may
 // invalidate JIT translations. System DLL hooks are safe (separate modules).
@@ -846,7 +885,7 @@ static inline MH_STATUS WO_EnableHook(void* target) {
 
 #define CRASH_TEST_DISABLE_GLOBALALLOC         1
 
-#define CRASH_TEST_DISABLE_VA_ARENA         1
+#define CRASH_TEST_DISABLE_VA_ARENA         0   // compiled in; activation is runtime opt-in via Config OptVaArena (default off). This is the authoritative definition (included before dllmain's #ifndef fallback).
 
 #define CRASH_TEST_DISABLE_ISBADPTR         1
 

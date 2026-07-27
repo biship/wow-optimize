@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: cvar_null_guard.cpp
-// Description: Supporting utility functions for `cvar_null_guard.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include <windows.h>

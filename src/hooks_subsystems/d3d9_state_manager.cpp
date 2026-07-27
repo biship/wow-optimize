@@ -17,8 +17,13 @@
 #include "d3d9_state_cache.h"
 #include "render_state_dedup.h"
 #include "win_mutex.h"
+#include "diagnostics/crash_dumper.h"
+#include "diagnostics/frame_bench.h"
 
 extern "C" void Log(const char* fmt, ...);
+
+// Per-frame work that must run on a true frame boundary (see dllmain).
+extern "C" void WowOpt_OnFrameBoundary();
 
 // ================================================================
 // Memory validation
@@ -50,15 +55,17 @@ enum {
     V_SETVERTEXSHADER      = 92,
     V_SETTEXTURE           = 65,
     V_RESET                = 16,
+    V_PRESENT              = 17,
 };
 
-static constexpr int NUM_HOOKS = 15;
+static constexpr int NUM_HOOKS = 16;
 static int g_vtableIndices[NUM_HOOKS] = {
     V_SETRENDERSTATE, V_SETTEXTURESTAGESTATE, V_SETSAMPLERSTATE,
     V_SETTEXTURE, V_SETTRANSFORM, V_SETMATERIAL,
     V_SETVIEWPORT, V_SETSCISSORRECT, V_SETSTREAMSOURCE,
     V_SETINDICES, V_SETVERTEXDECLARATION, V_SETFVF,
-    V_SETVERTEXSHADER, V_SETPIXELSHADER, V_RESET
+    V_SETVERTEXSHADER, V_SETPIXELSHADER, V_RESET,
+    V_PRESENT
 };
 
 static void* g_vtableOriginals[NUM_HOOKS] = {};
@@ -88,7 +95,8 @@ static const char* g_statNames[NUM_HOOKS] = {
     "SetTexture", "SetTransform", "SetMaterial",
     "SetViewport", "SetScissorRect", "SetStreamSource",
     "SetIndices", "SetVertexDeclaration", "SetFVF",
-    "SetVertexShader", "SetPixelShader", "Reset"
+    "SetVertexShader", "SetPixelShader", "Reset",
+    "Present"
 };
 
 static volatile LONG64 g_totalFrames = 0;
@@ -140,6 +148,7 @@ static inline void CheckDeviceChange(void* dev) {
     // race that DXVKBridge::IsActive() was introduced to dodge is fixed at
     // the source now (g_vtableMutex in PatchDeviceVTable/UnpatchDeviceVTable).
     if (dev && dev != g_pDevice) {
+        CrashDumper::Trace("D3D9 device pointer changed %p -> %p", g_pDevice, dev);
         Log("[D3D9State] Real-time Device pointer change detected (old: %p, new: %p).", g_pDevice, dev);
         
         InterlockedIncrement(&g_deviceResetCounter);
@@ -228,6 +237,9 @@ static SetPixelShader_t g_orig_SetPixelShader = nullptr;
 typedef HRESULT (__stdcall *Reset_t)(void* dev, D3DPRESENT_PARAMETERS* params);
 static Reset_t g_orig_Reset = nullptr;
 
+typedef HRESULT (__stdcall *PresentFn)(void* dev, const RECT* src, const RECT* dst,
+                                       HWND hOverride, const RGNDATA* dirty);
+
 // ================================================================
 // Hooked functions
 // ================================================================
@@ -236,7 +248,12 @@ static HRESULT __stdcall Hooked_SetRenderState(void* dev, DWORD state, DWORD val
     CheckDeviceChange(dev);
     InterlockedIncrement64(&g_statCalls[0]);
     
-    if (state < 256 && g_rsValid[state] && g_rsCache[state] == value) {
+    bool isCriticalState = (state == D3DRS_ALPHABLENDENABLE || state == D3DRS_SRCBLEND || 
+                           state == D3DRS_DESTBLEND || state == D3DRS_ALPHATESTENABLE || 
+                           state == D3DRS_ALPHAREF || state == D3DRS_ALPHAFUNC ||
+                           state == D3DRS_ZWRITEENABLE || state == D3DRS_ZENABLE);
+
+    if (state < 256 && !isCriticalState && g_rsValid[state] && g_rsCache[state] == value) {
         InterlockedIncrement64(&g_statSkipped[0]);
         return 0;
     }
@@ -292,26 +309,7 @@ static HRESULT __stdcall Hooked_SetTexture(void* dev, DWORD stage, void* tex) {
 static HRESULT __stdcall Hooked_SetTransform(void* dev, DWORD state, const void* matrix) {
     CheckDeviceChange(dev);
     InterlockedIncrement64(&g_statCalls[4]);
-    
-    if (!matrix) {
-        if (state < 32) g_xformValid[state] = false;
-        return g_orig_SetTransform(dev, state, matrix);
-    }
-
-    DWORD idx = state;
-    if (idx < 32) {
-        uint64_t hash = QuickMatrixHash((const float*)matrix);
-        if (g_xformValid[idx] && g_xformHash[idx] == hash) {
-            InterlockedIncrement64(&g_statSkipped[4]);
-            return 0;
-        }
-        HRESULT hr = g_orig_SetTransform(dev, state, matrix);
-        if (SUCCEEDED(hr)) {
-            g_xformHash[idx] = hash;
-            g_xformValid[idx] = true;
-        }
-        return hr;
-    }
+    // Always call original transform setter to guarantee 100% world matrix accuracy on weapon sub-meshes
     return g_orig_SetTransform(dev, state, matrix);
 }
 
@@ -440,6 +438,7 @@ static HRESULT __stdcall Hooked_SetPixelShader(void* dev, void* ps) {
 static HRESULT __stdcall Hooked_Reset(void* dev, D3DPRESENT_PARAMETERS* params) {
     CheckDeviceChange(dev);
     InterlockedIncrement64(&g_statCalls[14]);
+    CrashDumper::Trace("D3D9 device Reset (dev=%p)", dev);
     Log("[D3D9State] Device Reset detected! Invalidating all caches and flushing delayed textures...");
     InvalidateAllCaches();
     RenderStateDedup_ClearCache();
@@ -468,6 +467,53 @@ static HRESULT __stdcall Hooked_Reset(void* dev, D3DPRESENT_PARAMETERS* params) 
     return hr;
 }
 
+// The frame boundary for every D3D9 client, which on Windows is all of them.
+//
+// The frame benchmark was originally fed from the client's swap function
+// (sub_69E220). That turned out to be the OpenGL present path - its body calls
+// wglSwapLayerBuffers and glFinish - so under D3D9 it is never reached, and the
+// benchmark silently recorded nothing even with the hook reporting ACTIVE.
+// IDirect3DDevice9::Present is the real boundary, and this vtable is patched
+// unconditionally, so the measurement now exists in every configuration.
+static PresentFn g_orig_Present = nullptr;
+
+static HRESULT __stdcall Hooked_Present(void* dev, const RECT* src, const RECT* dst,
+                                        HWND hOverride, const RGNDATA* dirty) {
+    CheckDeviceChange(dev);
+    InterlockedIncrement64(&g_statCalls[15]);
+    FrameBench::OnPresent(FrameBench::Source::D3D9Present);
+    WowOpt_OnFrameBoundary();
+
+    HRESULT hr = g_orig_Present(dev, src, dst, hOverride, dirty);
+
+    // Drop the shadow state at the real frame boundary.
+    //
+    // The caches above answer "is this state already set?" by returning S_OK
+    // without touching the device. That is only sound while this DLL is the sole
+    // writer of device state, and it is not: any overlay injected into the
+    // process - RTSS, Afterburner, Steam, Discord, OBS - issues its own D3D9
+    // calls around Present. Once one changes a state we believe is current, every
+    // later SetRenderState for it is skipped and the device keeps the overlay's
+    // value. Wrong lighting, fog or colour-write state darkens the whole frame.
+    //
+    // OnFrameD3D9StateManager already invalidated per frame for exactly this
+    // reason, but it runs from hooked_Sleep, which is gated to one tick every
+    // SleepPrecisionValue ms (8 by default). That caps it near 125 ticks/second
+    // while frames keep coming, and a client with frames to spare barely calls
+    // Sleep at all - so above roughly 125 fps the per-frame invalidation quietly
+    // stops being per-frame. That matches the report this fixes: flicker and a
+    // darkened screen with an overlay running above 120 fps.
+    //
+    // Present is the one place that is a frame, at any frame rate. The Sleep-side
+    // call stays as the fallback for the OpenGL swap path, where this hook never
+    // runs. Done after the original returns, so whatever the overlay drew for
+    // this frame is already behind us.
+    InvalidateAllCaches();
+    RenderStateDedup_ClearCache();
+
+    return hr;
+}
+
 // ================================================================
 // VTable patching
 // ================================================================
@@ -486,7 +532,8 @@ static void* g_hookFuncs[NUM_HOOKS] = {
     (void*)Hooked_SetFVF,
     (void*)Hooked_SetVertexShader,
     (void*)Hooked_SetPixelShader,
-    (void*)Hooked_Reset
+    (void*)Hooked_Reset,
+    (void*)Hooked_Present
 };
 
 static void SetHookOrigin(int idx, void* orig) {
@@ -506,6 +553,7 @@ static void SetHookOrigin(int idx, void* orig) {
         case 12: g_orig_SetVertexShader       = (SetVertexShader_t)orig; break;
         case 13: g_orig_SetPixelShader        = (SetPixelShader_t)orig; break;
         case 14: g_orig_Reset                 = (Reset_t)orig; break;
+        case 15: g_orig_Present               = (PresentFn)orig; break;
         default: break;
     }
 }
@@ -765,6 +813,12 @@ void OnFrameD3D9StateManager(DWORD mainThreadId) {
 
     // Invalidate state cache every frame to ensure synchronization with device resets,
     // window resizing, resolution changes, and DXVK state updates!
+    //
+    // This is the fallback path. It runs from hooked_Sleep, which is gated to one
+    // tick every SleepPrecisionValue ms, so it stops keeping up with frames above
+    // roughly 125 fps. Hooked_Present carries the same invalidation and is a true
+    // frame boundary at any frame rate; this call still matters for the OpenGL
+    // swap path, where Present is never reached.
     InvalidateAllCaches();
 
     CheckWindowSizeChange();

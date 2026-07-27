@@ -6,4 +6,5 @@ namespace LuaStringPoolFast {
     void Shutdown();
     void* GetSymbol(const std::string& str);
     void InsertSymbol(const std::string& str, void* luaStringObj);
+
 }

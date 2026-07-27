@@ -1,7 +1,5 @@
 // ============================================================================
 // Module: dxvk_bridge.cpp
-// Description: Supporting utility functions for `dxvk_bridge.cpp`.
-// Safety & Threading: Verify pointer validation boundaries range up to 0xFFE00000.
 // ============================================================================
 
 #include "dxvk_bridge.h"

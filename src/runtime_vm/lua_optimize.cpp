@@ -5,6 +5,7 @@
 // ============================================================================
 
 #include "lua_optimize.h"
+#include "diagnostics/crash_dumper.h"
 #include "../allocators/loading_defrag.h"
 #include "combatlog_optimize.h"
 #include "ui_cache.h"
@@ -15,7 +16,6 @@
 #include "lua_bytecode_cache.h"
 #include "addon_preload.h"
 #include "event_dispatch_cache.h"
-#include "addon_tick_governor.h"
 
 // VA Arena helpers (defined in dllmain.cpp)
 extern "C" void ReserveLoadingArena();
@@ -1241,6 +1241,16 @@ static int __cdecl LuaBoostC_GetFastPathStats_cb(lua_State* L) {
 
 static void RegisterLuaFunction(lua_State* L, const char* name, void* fn) {
     if (!Api.lua_pushcclosure || !Api.lua_setfield) return;
+
+    // Handing the VM a C function outside the client's accepted pointer range is a
+    // fatal ERROR #134, raised by the client itself - the SEH block below cannot
+    // catch it, so the check has to happen before the push.
+    if (!LuaCFunctionAccepted(fn)) {
+        Log("[LuaOpt] Skipping global '%s': 0x%08X is outside WoW's lua_CFunction range",
+            name, (unsigned)(uintptr_t)fn);
+        return;
+    }
+
     __try {
         Api.lua_pushcclosure(L, fn, 0);
         Api.lua_setfield(L, LUA_GLOBALSINDEX, name);
@@ -1731,6 +1741,7 @@ void OnMainThreadSleep(DWORD mainThreadId, double frameMs) {
             g_pendingLuaState = currentL;
             g_pendingLuaStateTick = nowTick;
             g_pendingLuaStateFrames = 1;
+            CrashDumper::Trace("LUA state swap (UI reload) - new VM settling");
             Log("[LuaOpt] lua_State changed (UI reload) - waiting for new VM to settle");
 
             // CRITICAL FIX: Set swapping flag BEFORE cache invalidation so inline
@@ -1754,7 +1765,9 @@ void OnMainThreadSleep(DWORD mainThreadId, double frameMs) {
             ClearAddonPreload();
 
             State.gcOptimized = false;
+            LARGE_INTEGER collectStart = StallProbeBegin();
             mi_collect(true);
+            StallProbeEnd("lua_State swap mi_collect", collectStart, 4.0);
 
             g_pendingInjectState = currentL;
             InterlockedExchange(&g_frameScriptInjected, 0);
@@ -1791,6 +1804,7 @@ void OnMainThreadSleep(DWORD mainThreadId, double frameMs) {
         g_pendingLuaStateTick = 0;
         g_pendingLuaStateFrames = 0;
         g_luaInterfaceRetryCount = 0;
+        CrashDumper::Trace("LUA state swap - reinitializing stable VM");
         Log("[LuaOpt] lua_State changed (UI reload) - reinitializing stable VM");
 
         // Re-initialization about to begin — keep swapping flag set until
@@ -1853,6 +1867,11 @@ void OnMainThreadSleep(DWORD mainThreadId, double frameMs) {
             LuaBytecodeCache::OnLuaStateSwap();
             ClearAddonPreload();
             SetupLuaInterface(Api.L);
+            __try {
+                LuaFastPath::InitPhase2(Api.L);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                Log("[LuaOpt] EXCEPTION in LuaFastPath::InitPhase2 during swap");
+            }
             if (!CheckAndRestoreLuaInterface(Api.L)) {
                 Log("[LuaOpt] Subsequent swap: interface verification failed, will retry");
             } else {

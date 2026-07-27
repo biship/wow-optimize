@@ -67,8 +67,9 @@ void OnFrame(double frameMs) {
 #define LUA_GCSETSTEPMUL 7
 
     if (g_isLoading) {
-        g_lua_gc(L, LUA_GCSETSTEPMUL, 300); // LUA_GCSETSTEPMUL = 300
-        g_lua_gc(L, 5, 2048); // LUA_GCSTEP
+        // Relax GC during loading screen to accelerate addon instantiation without freezing VM
+        g_lua_gc(L, LUA_GCSETPAUSE, 160);
+        g_lua_gc(L, LUA_GCSETSTEPMUL, 150);
         return;
     }
 

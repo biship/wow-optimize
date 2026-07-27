@@ -16,7 +16,6 @@ namespace WowOptimizeLauncher {
         public string Key;
         public bool DefaultVal;
         public CheckBox Ctrl;
-        public CheckBox RecentCtrl;
         public string Tooltip;
 
         public SettingItem(string section, string key, bool defaultVal, CheckBox ctrl, string tooltip) {
@@ -24,7 +23,6 @@ namespace WowOptimizeLauncher {
             Key = key;
             DefaultVal = defaultVal;
             Ctrl = ctrl;
-            RecentCtrl = null;
             Tooltip = tooltip;
         }
     }
@@ -246,7 +244,7 @@ namespace WowOptimizeLauncher {
         // remote version.txt to decide whether to show the update notification,
         // and shown in the version label. Keep in sync with version.txt and
         // src/core/version.h on every release.
-        private const string APP_VERSION = "3.16.3";
+        private const string APP_VERSION = "3.17.0";
 
         private string iniPath;
         private Dictionary<string, SettingItem> settingsMap;
@@ -262,13 +260,11 @@ namespace WowOptimizeLauncher {
         private DarkButton btnEnableUiLua;
         private DarkButton btnEnableCombatNet;
         private DarkButton btnEnableGfx;
-        private DarkButton btnEnableRecent;
 
         private FlowLayoutPanel generalFlow;
         private FlowLayoutPanel uiLuaFlow;
         private FlowLayoutPanel combatNetFlow;
         private FlowLayoutPanel graphicsSoundFlow;
-        private FlowLayoutPanel recentNewFlow;
         private TextBox searchBox;
 
         // Background image
@@ -313,42 +309,30 @@ namespace WowOptimizeLauncher {
                 { "Null Pointer CVar Safeguard", new SettingItem("General", "CvarNullGuard", true, null, "Critical safety hooks to prevent client crashes caused by uninitialized global variables and CVars.") },
                 { "Frame Rate Limiter Override", new SettingItem("General", "FrameLimiter", false, null, "Overrides WoW's built-in frame limiter with a high-precision spin-wait sleep loop.") },
                 { "Memory-Mapped MPQ VFS", new SettingItem("General", "MpqMmapVfs", false, null, "Maps all main MPQ files to memory using map views to speed up asset load times and parallelize decompression.") },
-                { "Lock-Free Object Manager", new SettingItem("General", "RcuObjMgr", false, null, "Replaces linear linked-list entity loops with atomic pointer mirror arrays to remove object manager locks in raids.") },
                 { "Predictive MPQ Prefetcher", new SettingItem("General", "MpqPrefetch", false, null, "Tracks zone transitions and speculatively pre-caches MPQ asset files in background threads before you arrive.") },
                 { "Memory-Mapped DBC RAM Cache", new SettingItem("General", "DbcPreload", false, null, "Pre-loads and decompresses all major client database files (.dbc) into RAM at startup for near-instant loading screens.") },
                 { "32-bit OOM VRAM Governor", new SettingItem("General", "OomGovernor", false, null, "Dynamically downscales texture mipmaps when the 32-bit client's virtual address space usage approaches critical OOM levels.") },
-                { "Object Manager Lookup Cache", new SettingItem("General", "ObjVisCache", false, null, "Caches GUID-to-object manager lookups per frame with GUID re-verification. Read-only result cache (never mutates the object table). Hot path - test in-game before relying on it.") },
                 { "Hardware Cursor Fix", new SettingItem("General", "HardwareCursor", false, null, "Resets cursor visibility and releases any cursor clip region on startup (no engine byte patches, no hooks). Helps if the cursor is hidden or trapped after alt-tab.") },
+                { "Mouse Clip Release on Alt-Tab", new SettingItem("General", "MouseClipRelease", false, null, "Frees the mouse cursor whenever WoW loses window focus, so it is never trapped inside the game window after alt-tab. Polls focus each frame and only ever RELEASES the clip (never applies one), so it cannot cause cursor/camera issues.") },
+                { "SavedVariables Backup on Startup", new SettingItem("General", "SavedVarsBackup", false, null, "At startup, copies each WTF\\Account SavedVariables .lua to a .lua.bak so you have the last-good config if a session corrupts it. Runs once on a background thread; only ever copies existing files, never modifies your live SavedVariables.") },
                 { "Sampling Profiler (diagnostic)", new SettingItem("General", "SamplingProfiler", false, null, "Developer tool: a background thread samples the main-thread instruction pointer ~1000x/sec and logs the top 50 hot functions on exit. Read-only, no gameplay effect. Leave off for normal play.") },
-                { "Large-Allocation mimalloc (experimental)", new SettingItem("General", "MimallocLarge", false, null, "EXPERIMENTAL - test that you can still connect before relying on it. Routes only large (>=1MB) main-thread allocations to mimalloc, kept below 2GB, to reduce 32-bit address-space fragmentation over long sessions. Small and network buffers are untouched. If you can't connect after enabling, turn this back off.") },
+                { "Compatibility Mode (fixes VM/connection issues)", new SettingItem("General", "CompatMode", false, null, "Turn ON if the game will not connect with the DLL loaded, especially inside a VM or with HyperV/virtual switches enabled. Skips the aggressive CPU-priority, affinity and working-set tweaks that can starve the network in virtualized environments. Small performance cost; leave OFF on normal setups.") },
 
                 // UI & Lua
                 { "Fast UI Frame Accessors", new SettingItem("UI_Lua", "UIFrameAccessorFast", false, null, "Bypasses standard Lua stack queries to retrieve UI frame parameters (IsShown, GetAlpha) instantly.") },
                 { "Fast FontString Metrics & Glyph Cache", new SettingItem("UI_Lua", "FontMetricsFast", false, null, "Provides high-speed text measurements and caches rasterized font glyph textures to eliminate render-time layout freezes.") },
-                { "Lock-Free Font Metrics", new SettingItem("UI_Lua", "FontMetricsLockFree", false, null, "Uses a read-copy-update styled font metrics cache to eliminate font locks during rendering.") },
-                { "Coalesced FrameXML Updates", new SettingItem("UI_Lua", "FrameXmlCoalesce", false, null, "Deduplicates multiple layout recalculations in a single frame tick, stopping layout micro-freezes.") },
-                { "Addon Tick Governor", new SettingItem("UI_Lua", "AddonTickGovernor", false, null, "Caps excessive addon update execution rates to prevent CPU bottlenecks.") },
-                { "Tooltip Cache", new SettingItem("UI_Lua", "TooltipCache", false, null, "Caches formatted tooltips (spells, items) to avoid invoking slow script layout logic repeatedly.") },
-                { "Lua File Reading Cache", new SettingItem("UI_Lua", "LuaFileCache", false, null, "Keeps parsed Lua scripts in memory, bypassing disk disk reads and string parsing on UI reloads.") },
                 { "FrameScript FNV-1a Dispatcher", new SettingItem("UI_Lua", "FrameScriptDispatch", false, null, "Uses an O(1) hash map lookup for script handlers instead of linear string matching.") },
                 { "Lua Number Conversion Fast Path", new SettingItem("UI_Lua", "LuaNumConvFast", false, null, "Inlines common Lua stack value queries (tonumber, gettop, settop) to bypass stack checking overhead.") },
-                { "Lua VM Cache & Regex Cache", new SettingItem("UI_Lua", "LuaOpcache", false, null, "Provides a fast lookup cache for VM table indexing and caches compiled regex patterns to speed up string matching/gsub APIs.") },
-                { "Coalesced Lua Garbage Collection", new SettingItem("UI_Lua", "LuaGcCoalesce", false, null, "Bundles tiny incremental garbage collection steps to execute during empty frame budgets.") },
-                { "Lua VM Bytecode JIT Compiler", new SettingItem("UI_Lua", "LuaJIT", false, null, "Hooks standard call preparation to redirect and execute compiled Lua bytecode JIT stubs.") },
+                { "Lua GetTime Frame Cache", new SettingItem("UI_Lua", "LuaGetTimeFast", false, null, "Caches the GetTime() Lua API value within a single frame tick to avoid redundant OS-level high-precision timer calls.") },
+                { "Lua C-API Inline Cache Suite", new SettingItem("UI_Lua", "LuaOpcache", false, null, "Master switch for the Lua C-API fast paths: luaH_getstr and rawgeti inline caches, table/string/buffer fast paths, VM table indexing and the compiled regex cache.") },
+                { "Adaptive Lua GC Governor", new SettingItem("UI_Lua", "LuaGcCoalesce", false, null, "Paces incremental garbage collection per frame from the live game state - relaxed while a loading screen is up, stopped in combat below 256MB, aggressive while idle.") },
+                { "Module Handle Cache", new SettingItem("UI_Lua", "ModuleHandleCache", false, null, "Caches GetModuleHandle results, which the client queries repeatedly for already-loaded modules.") },
                 
                 // Combat & Net
-                { "Aggregated Combat Log Parser", new SettingItem("Combat_Net", "CombatLogParser", false, null, "C++ level combat log aggregator that intercepts and summarizes events, bypassing slow Lua parsers.") },
+                { "Combat Log Leak Fix (retention 1800s)", new SettingItem("Combat_Net", "CombatLogLeakFix", true, null, "Fixes the 16-year-old WoW combat log memory leak by extending event retention from 300s to 1800s (writes the retention CVar). Proven and stable - on by default.") },
+                { "Combat Log Aggregator", new SettingItem("Combat_Net", "CombatLogParser", false, null, "C++ combat log aggregator + buffer governor that intercepts and summarizes events instead of the slow Lua path. More aggressive than the leak fix above; opt-in.") },
                 { "Incremental Combat Log parsing", new SettingItem("Combat_Net", "CombatLogIncremental", false, null, "Splits large combat updates into small steps, preventing massive spikes in large-scale combat.") },
-                { "Coalesced Network Packets", new SettingItem("Combat_Net", "NetPacketCoalesce", false, null, "Groups incoming game packets before processing to reduce context switching and network thread latency.") },
-                { "Addon Message Coalescing", new SettingItem("Combat_Net", "NetAddonCoalescer", false, null, "Groups chat/addon network communications to reduce the volume of individual messages.") },
-                { "SavedVariables Serializer", new SettingItem("Combat_Net", "SavedVarsSerializer", false, null, "Serializes and writes addon variables incrementally in a lock-free worker thread.") },
-                { "SavedVariables Async Writer", new SettingItem("Combat_Net", "SavedVarsAsync", false, null, "Performs SavedVariables file flushing asynchronously in the background to prevent logout freezes.") },
-                { "SavedVariables Preloader", new SettingItem("Combat_Net", "SavedVarsPretoken", false, null, "Pre-loads and parses addon configuration files during the early loading screen sequence.") },
-                { "UnitAura Fast Path", new SettingItem("Combat_Net", "UnitAuraFast", false, null, "Vectorizes UnitAura query evaluations at the C++ level to speed up unit frames updates.") },
                 { "SSE2 Network GUID Unpacking", new SettingItem("Combat_Net", "NetworkGuidSse2", false, null, "Vectorizes the unpacking of network entity GUIDs inside network data streams.") },
-                { "GetSpellInfo Cache", new SettingItem("Combat_Net", "GetSpellInfoCache", false, null, "Caches spells details to prevent repeated DBC lookups by complex combat macros and WA addons.") },
-                { "Parallel Packet Offloader", new SettingItem("Combat_Net", "PacketOffload", false, null, "Offloads incoming network packet decompression and deserialization to helper cores.") },
-                { "Multithreaded Nameplate Renderer", new SettingItem("Combat_Net", "NameplateMT", false, null, "Calculates nameplate positions and layouts on background threads to maximize combat FPS.") },
 
                 // Graphics & Sound
                 { "SSE2 Boyer-Moore strstr", new SettingItem("Graphics_Sound", "StrStrSse2", false, null, "Optimizes string sub-searches (such as font names, textures) using vectorized SIMD algorithms.") },
@@ -357,62 +341,20 @@ namespace WowOptimizeLauncher {
                 { "Parallel Sound Wave Decoding", new SettingItem("Graphics_Sound", "AudioDecodeMt", false, null, "Decodes sound assets in background threads to eliminate latency when playing fresh audio clips.") },
                 { "DBC Data Lookup Cache", new SettingItem("Graphics_Sound", "DbcLookupCache", false, null, "Speeds up data reading from internal database files (.dbc) for models, items, and spells.") },
                 { "Asynchronous Texture Loader", new SettingItem("Graphics_Sound", "AsyncTexLoader", false, null, "Asynchronously loads and decompresses BLP textures in background worker threads, hot-swapping them on frame boundaries to prevent stutters.") },
-                { "Texture Smart Unload Delay", new SettingItem("Graphics_Sound", "TextureUnloadDelay", true, null, "[NEW] Delays texture unloading during camera turnarounds to prevent immediate load micro-stutters.") },
-                { "Asynchronous Terrain Loader", new SettingItem("Graphics_Sound", "AsyncTerrainLoader", false, null, "Offloads ADT terrain file loading and collision mesh compiling to helper cores.") },
-                { "M2 Model LOD Bias Control", new SettingItem("Graphics_Sound", "M2LodBias", false, null, "Dynamically scales 3D model level-of-detail bias depending on active rendering frametimes.") },
+                { "Texture Smart Unload Delay", new SettingItem("Graphics_Sound", "TextureUnloadDelay", false, null, "Delays texture unloading during camera turnarounds to prevent immediate load micro-stutters.") },
                 { "Mipmap Bias Governor", new SettingItem("Graphics_Sound", "MipBiasGovernor", false, null, "Adjusts mipmap texture bias dynamically based on virtual memory pressure to prevent allocation spikes.") },
-                { "Spatial Culling & Parallel Frustum Culler", new SettingItem("Graphics_Sound", "SpatialCulling", false, null, "Speculatively culls off-screen models and parallelizes frustum plane intersection queries using helper threads.") },
-                { "Direct3D 9 Render-Thread Offloading", new SettingItem("Graphics_Sound", "D3d9RenderThread", false, null, "Offloads draw dispatches and state updates to an asynchronous render thread to prevent driver bottlenecks.") },
-
-                // 10 New Features
-                { "Dynamic Shadow Quality Auto-Scaler", new SettingItem("Graphics_Sound", "DynamicShadowScaler", false, null, "[NEW] Dynamically scales shadow quality and resolution depending on the active frame rate.") },
-                { "Advanced Sound Channels Coalescer", new SettingItem("Graphics_Sound", "SoundCoalescer", false, null, "[NEW] Coalesces rapid duplicated sound plays to prevent channel exhaustion under AOE spam.") },
-                { "Aura / Buff Textures Preload Cache", new SettingItem("Combat_Net", "AuraPreloadCache", false, null, "[NEW] Pre-caches spell/aura icons at zone transitions to eliminate micro-freezes during combat.") },
-                { "DBC File Query Cache", new SettingItem("Graphics_Sound", "DbcFileCache", false, null, "[NEW] High-performance cache for record retrieval from client DBC files (items, spells, etc.).") },
-                { "Font Glyph Outline Cache", new SettingItem("UI_Lua", "FontOutlineCache", false, null, "[NEW] Caches glyph outline bitmaps to accelerate formatted text rendering.") },
-                { "LUA GC Budget Governor", new SettingItem("UI_Lua", "LuaGcGovernor", false, null, "[NEW] Runs GC step cycles dynamically, matching the exact frame time budget to prevent spikes.") },
-                { "Particle Density Dynamic Scaler", new SettingItem("Graphics_Sound", "ParticleDensityScaler", false, null, "[NEW] Dynamically scales down particle density in heavy raid environments to keep FPS high.") },
-                { "Addon Message Rate Limiter", new SettingItem("Combat_Net", "AddonMsgLimiter", false, null, "[NEW] Intercepts and rate-limits outbound addon sync messages to prevent disconnection #36.") },
-                { "Hardware Mouse Smoothing & Edge Lock", new SettingItem("General", "MouseCursorSmooth", false, null, "[NEW] Smooths mouse coordinates and locks the cursor inside the window during mouselook.") },
-                { "Model Vertex Buffers Pre-Allocator", new SettingItem("General", "VertexBufferPrealloc", false, null, "[NEW] Pre-allocates memory slabs for dynamic vertex updates using memory pools to stop stutters.") },
-
-                // 10 Additional New Features
-                { "World Object Render Optimizer", new SettingItem("Graphics_Sound", "WorldObjectOpt", false, null, "[NEW] Caches visibility state of non-interactive far world objects to skip drawing when camera is static.") },
-                { "Nameplate Render Distance CVar", new SettingItem("Combat_Net", "NameplateDistanceCvar", false, null, "[NEW] Enables customizable rendering distance bounds on unit nameplates.") },
-                { "Combat Log File Async Flusher", new SettingItem("Combat_Net", "CombatLogAsync", false, null, "[NEW] Writes combat log files to disk asynchronously in a background thread to prevent lag.") },
-                { "CDataStore Payload Buffering", new SettingItem("Combat_Net", "CDataStoreBuffering", false, null, "[NEW] Caches data buffer pointers to prevent redundant dereferences on packets.") },
-                { "Camera Shake Reducer", new SettingItem("General", "CameraShakeOpt", false, null, "[NEW] Filters out excessive camera shakes to stabilize rendering during heavy combat.") },
-                { "Combat Floating Text Font Optimizer", new SettingItem("UI_Lua", "CombatTextFont", false, null, "[NEW] Caches fonts and metrics specifically for floating scrolling damage/heal strings.") },
-                { "Spell Overlay Preload Cache", new SettingItem("Combat_Net", "SpellOverlayPreload", false, null, "[NEW] Preloads visual spell overlays at zone transitions to stop combat freezes.") },
-                { "Addon SavedVariables Backup Engine", new SettingItem("General", "SavedVarsBackup", false, null, "[NEW] Automatically duplicates saved variables into a backup file to prevent loss on crash.") },
-                { "Unit Max Power Cache", new SettingItem("UI_Lua", "UnitMaxPowerCache", false, null, "[NEW] Caches maximum unit power limits to bypass Lua-to-C client API query overhead.") },
-                { "Mouse Clip Release", new SettingItem("General", "MouseClipRelease", false, null, "[NEW] Releases coordinate boundaries locks automatically when WoW loses window focus.") },
-                { "Loading Screen Render Optimizer", new SettingItem("Graphics_Sound", "LoadingScreenOpt", false, null, "[NEW] Bypasses heavy 3D rendering calls during loading screens to improve loading speeds.") },
-                { "Combat Log Range Filter", new SettingItem("Combat_Net", "CombatLogFilter", false, null, "[NEW] Discards out-of-range combat log events between distant non-grouped units to reduce CPU load.") },
-                { "Overlapping Sound Volume Limiter", new SettingItem("Graphics_Sound", "SoundVolumeLimit", false, null, "[NEW] Limits and clamps volume for overlapping duplicate sound effects to prevent clipping and audio driver lag.") },
-                { "UI Layout Recalculation Throttle", new SettingItem("UI_Lua", "UILayoutThrottle", false, null, "[NEW] Prevents frame layout loops and limits redundant recalculation checks per tick.") },
-                { "Terrain Height Cache", new SettingItem("Graphics_Sound", "TerrainHeightCache", false, null, "[NEW] Caches terrain elevation queries within the frame to minimize CPU map collisions query time.") },
-                { "Addon SavedVariables Optimizer", new SettingItem("General", "SavedVarsOpt", false, null, "[NEW] Compacts serialization of addon configurations on exit to speed up logout and reduce file size.") },
-                { "Font Alpha Blending Fastpath", new SettingItem("UI_Lua", "FontAlphaFastpath", false, null, "[NEW] Bypasses alpha blending render states for fully opaque or fully transparent UI and nameplate text.") },
-
-                // 20 new colossal features (Features 31-50)
-                { "Network Packet Processing Throttle", new SettingItem("Combat_Net", "PacketProcessingThrottle", false, null, "[NEW] Limits processing rate of non-essential social/guild status packets in combat.") },
-                { "Nameplate Occlusion Culler", new SettingItem("Combat_Net", "NameplateCulling", false, null, "[NEW] Culls processing and drawing of nameplates that are behind obstacles or out of range.") },
-                { "Minimap Refresh Rate Governor", new SettingItem("UI_Lua", "MinimapRefreshGovernor", false, null, "[NEW] Caps minimap radar updates frequency to prevent client rendering overload during fast runs.") },
-                { "Spell Visual Effects Culler", new SettingItem("Graphics_Sound", "SpellEffectCulling", true, null, "[NEW] Dynamically scales down particle density and minor spell impact effects in large raids.") },
-                { "Lua Fast String Compare", new SettingItem("UI_Lua", "LuaStringCompareFast", false, null, "[NEW] Accelerates Lua string comparison using hardware-inlined vector instructions.") },
-                { "DBC Data Row Offset Caching", new SettingItem("Graphics_Sound", "DbcRowCaching", false, null, "[NEW] Speeds up database queries by caching resolved row pointer offsets in DBC files.") },
-                { "Social Packet String Pooling", new SettingItem("Combat_Net", "NetworkStringDedup", false, null, "[NEW] De-duplicates incoming packet strings to minimize memory allocation overhead.") },
-                { "Camera Collision Check Throttle", new SettingItem("General", "CameraCollisionThrottle", false, null, "[NEW] Rate-limits camera collision terrain raycasts when camera is static.") },
-                { "FMOD Sound Play Rate Limit", new SettingItem("Graphics_Sound", "SoundFreqCoalesce", false, null, "[NEW] Coalesces rapid duplicated sound plays that share exact pitch/frequency.") },
-                { "Static UI Artwork Texture Cache", new SettingItem("UI_Lua", "UiTextureCaching", false, null, "[NEW] Cache loaded UI texture references in memory to avoid repetitive disk loads.") },
-                { "Portal Occluder WMO Culler", new SettingItem("Graphics_Sound", "WmoCullingOpt", false, null, "[NEW] Aggressively culls hidden interior structures of world objects (WMOs).") },
-                { "Fast Float String Parser", new SettingItem("UI_Lua", "FastFloatParse", false, null, "[NEW] Bypasses slow standard CRT float conversion during UI asset parsing.") },
-                { "Proactive Heap Leak Tracker", new SettingItem("General", "HeapAllocationTracker", false, null, "[NEW] Continuously monitors heap usage to flag memory leak sources before OOM.") },
-                { "Spell Cooldown Frame Cache", new SettingItem("UI_Lua", "SpellCooldownCache", false, null, "[NEW] Caches cooldown timers status updates to speed up action bar updates.") },
-                { "Combat GUID Hex String Pool", new SettingItem("Combat_Net", "GuidStringCache", false, null, "[NEW] Caches formatted hex string GUIDs to speed up combat log parsers.") },
-                { "FrameScript Block Recycling", new SettingItem("UI_Lua", "FrameScriptMemOpt", false, null, "[NEW] Recycles script block allocations to bypass heap allocator serialize bottlenecks.") },
-                { "Non-Vital Combat Event Screener", new SettingItem("Combat_Net", "CombatEventLimit", false, null, "[NEW] Dynamically filters minor combat events when active client rendering FPS is low.") }
+                { "SIMD Matrix Vector Transforms", new SettingItem("Graphics_Sound", "SimdMatrixTransform", false, null, "Vectorizes 3D coordinate and matrix-vector calculations using SSE2 SIMD instructions to accelerate particle updates.") },
+                { "Dynamic Shadow Quality Auto-Scaler", new SettingItem("Graphics_Sound", "DynamicShadowScaler", false, null, "Dynamically scales shadow quality and resolution depending on the active frame rate.") },
+                { "Advanced Sound Channels Coalescer", new SettingItem("Graphics_Sound", "SoundCoalescer", false, null, "Coalesces rapid duplicated sound plays to prevent channel exhaustion under AOE spam.") },
+                { "Particle Density Dynamic Scaler", new SettingItem("Graphics_Sound", "ParticleDensityScaler", false, null, "Dynamically scales down particle density in heavy raid environments to keep FPS high.") },
+                { "Overlapping Sound Volume Limiter", new SettingItem("Graphics_Sound", "SoundVolumeLimit", false, null, "Limits and clamps volume for overlapping duplicate sound effects to prevent clipping and audio driver lag.") },
+                { "Terrain Height Cache", new SettingItem("Graphics_Sound", "TerrainHeightCache", false, null, "Caches terrain elevation queries within the frame to minimize CPU map collisions query time.") },
+                { "Spell Visual Effects Culler", new SettingItem("Graphics_Sound", "SpellEffectCulling", false, null, "Dynamically scales down particle density and minor spell impact effects in large raids.") },
+                { "Lua String Interning Fast Path", new SettingItem("UI_Lua", "LuaSNewLstrFast", false, null, "Intercepts luaS_newlstr (0x00856C80), which every Lua string in the game passes through, and looks the string up in the VM's string table itself. Experimental: on a miss the engine repeats the same work, and it is under investigation as a possible cause of corrupted addon names. Leave off unless testing.") },
+                { "Fast SSE2 Memory Clear (FastMemset)", new SettingItem("Graphics_Sound", "FastMemsetOpt", true, null, "SSE2 non-temporal memset replacement for large memory clears at 0x0040BB80.") },
+                { "Fast Case-Insensitive String Compare", new SettingItem("UI_Lua", "FastStrnicmpOpt", true, null, "SSE2 ASCII case-insensitive string comparison replacement at 0x0076E780.") },
+                { "Minimap Blip Refresh Governor", new SettingItem("UI_Lua", "MinimapRefreshGovernor", true, null, "Throttles minimap blip refresh calls at 0x00923D50 to eliminate minimap CPU overhead.") },
+                { "UI Layout Recalculation Throttle", new SettingItem("UI_Lua", "UILayoutThrottle", true, null, "Governs UI layout recalculations at 0x00865270 during heavy addon updates.") },
             };
 
             // Window Setup
@@ -786,20 +728,17 @@ namespace WowOptimizeLauncher {
             TabPage tpUiLua = CreateTabPage("UI & LUA");
             TabPage tpCombatNet = CreateTabPage("COMBAT & NET");
             TabPage tpGraphicsSound = CreateTabPage("GRAPHICS & SOUND");
-            TabPage tpRecentNew = CreateTabPage("RECENT & NEW");
 
             tabs.TabPages.Add(tpGeneral);
             tabs.TabPages.Add(tpUiLua);
             tabs.TabPages.Add(tpCombatNet);
             tabs.TabPages.Add(tpGraphicsSound);
-            tabs.TabPages.Add(tpRecentNew);
 
             // Get the scroll panels from each tab page
             generalFlow = (FlowLayoutPanel)((Panel)tpGeneral.Controls[0]).Controls[0];
             uiLuaFlow = (FlowLayoutPanel)((Panel)tpUiLua.Controls[0]).Controls[0];
             combatNetFlow = (FlowLayoutPanel)((Panel)tpCombatNet.Controls[0]).Controls[0];
             graphicsSoundFlow = (FlowLayoutPanel)((Panel)tpGraphicsSound.Controls[0]).Controls[0];
-            recentNewFlow = (FlowLayoutPanel)((Panel)tpRecentNew.Controls[0]).Controls[0];
 
             // Add "ENABLE ALL IN ..." buttons at top of each flow
             btnEnableGeneral = CreateCategoryButton("ENABLE ALL IN GENERAL");
@@ -817,10 +756,6 @@ namespace WowOptimizeLauncher {
             btnEnableGfx = CreateCategoryButton("ENABLE ALL IN GRAPHICS & SOUND");
             btnEnableGfx.Click += delegate { ToggleCategoryAction("Graphics_Sound", btnEnableGfx, "GRAPHICS & SOUND"); };
             graphicsSoundFlow.Controls.Add(btnEnableGfx);
-
-            btnEnableRecent = CreateCategoryButton("ENABLE ALL NEW FEATURES");
-            btnEnableRecent.Click += delegate { ToggleRecentAction(btnEnableRecent); };
-            recentNewFlow.Controls.Add(btnEnableRecent);
 
             // Populate checkboxes
             foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
@@ -846,19 +781,6 @@ namespace WowOptimizeLauncher {
                         graphicsSoundFlow.Controls.Add(chk);
                         break;
                 }
-
-                // If feature is new, create synced duplicate in RECENT & NEW tab
-                if (data.Tooltip.StartsWith("[NEW]")) {
-                    DarkCheckBox recentChk = CreateStyledCheckBox(name, data.Tooltip);
-                    data.RecentCtrl = recentChk;
-
-                    // Use a helper object to avoid closure capture issues with C# 5
-                    SyncHelper helper = new SyncHelper(chk, recentChk);
-                    chk.CheckedChanged += helper.OnMainChanged;
-                    recentChk.CheckedChanged += helper.OnRecentChanged;
-
-                    recentNewFlow.Controls.Add(recentChk);
-                }
             }
 
             Controls.Add(tabs);
@@ -878,8 +800,8 @@ namespace WowOptimizeLauncher {
                 }
             }
 
-            if (generalFlow == null || uiLuaFlow == null || combatNetFlow == null || 
-                graphicsSoundFlow == null || recentNewFlow == null) {
+            if (generalFlow == null || uiLuaFlow == null || combatNetFlow == null ||
+                graphicsSoundFlow == null) {
                 return;
             }
 
@@ -888,14 +810,12 @@ namespace WowOptimizeLauncher {
             uiLuaFlow.Controls.Clear();
             combatNetFlow.Controls.Clear();
             graphicsSoundFlow.Controls.Clear();
-            recentNewFlow.Controls.Clear();
 
             // Category buttons visibility
             if (btnEnableGeneral != null) btnEnableGeneral.Visible = !hasSearch;
             if (btnEnableUiLua != null) btnEnableUiLua.Visible = !hasSearch;
             if (btnEnableCombatNet != null) btnEnableCombatNet.Visible = !hasSearch;
             if (btnEnableGfx != null) btnEnableGfx.Visible = !hasSearch;
-            if (btnEnableRecent != null) btnEnableRecent.Visible = !hasSearch;
 
             // Put category buttons back if not searching
             if (!hasSearch) {
@@ -903,7 +823,6 @@ namespace WowOptimizeLauncher {
                 uiLuaFlow.Controls.Add(btnEnableUiLua);
                 combatNetFlow.Controls.Add(btnEnableCombatNet);
                 graphicsSoundFlow.Controls.Add(btnEnableGfx);
-                recentNewFlow.Controls.Add(btnEnableRecent);
             }
 
             foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
@@ -920,9 +839,6 @@ namespace WowOptimizeLauncher {
                     } else if (data.Ctrl != null) {
                         data.Ctrl.Visible = false;
                     }
-                    if (data.RecentCtrl != null) {
-                        data.RecentCtrl.Visible = false;
-                    }
                 } else {
                     // Restore to original tab flows
                     if (data.Ctrl != null) {
@@ -934,38 +850,6 @@ namespace WowOptimizeLauncher {
                             case "Graphics_Sound": graphicsSoundFlow.Controls.Add(data.Ctrl); break;
                         }
                     }
-                    if (data.RecentCtrl != null && data.Tooltip != null && data.Tooltip.StartsWith("[NEW]")) {
-                        data.RecentCtrl.Visible = true;
-                        recentNewFlow.Controls.Add(data.RecentCtrl);
-                    }
-                }
-            }
-        }
-
-        // Helper class for checkbox syncing (avoids C# 5 closure issues)
-        private class SyncHelper {
-            private CheckBox main;
-            private CheckBox recent;
-            private bool syncing;
-
-            public SyncHelper(CheckBox mainChk, CheckBox recentChk) {
-                main = mainChk;
-                recent = recentChk;
-            }
-
-            public void OnMainChanged(object sender, EventArgs e) {
-                if (!syncing) {
-                    syncing = true;
-                    recent.Checked = main.Checked;
-                    syncing = false;
-                }
-            }
-
-            public void OnRecentChanged(object sender, EventArgs e) {
-                if (!syncing) {
-                    syncing = true;
-                    main.Checked = recent.Checked;
-                    syncing = false;
                 }
             }
         }
@@ -1071,24 +955,6 @@ namespace WowOptimizeLauncher {
             UpdateCategoryButtonTexts();
         }
 
-        private void ToggleRecentAction(DarkButton btn) {
-            bool allChecked = true;
-            foreach (SettingItem item in settingsMap.Values) {
-                if (item.RecentCtrl != null && !item.RecentCtrl.Checked) {
-                    allChecked = false;
-                    break;
-                }
-            }
-
-            bool nextState = !allChecked;
-            foreach (SettingItem item in settingsMap.Values) {
-                if (item.RecentCtrl != null) {
-                    item.RecentCtrl.Checked = nextState;
-                }
-            }
-            UpdateCategoryButtonTexts();
-        }
-
         private void UpdateCategoryButtonTexts() {
             if (settingsMap == null) return;
 
@@ -1134,17 +1000,6 @@ namespace WowOptimizeLauncher {
                     }
                 }
                 btnEnableGfx.Text = all ? "DISABLE ALL IN GRAPHICS & SOUND" : "ENABLE ALL IN GRAPHICS & SOUND";
-            }
-
-            if (btnEnableRecent != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.RecentCtrl != null && !item.RecentCtrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableRecent.Text = all ? "DISABLE ALL NEW FEATURES" : "ENABLE ALL NEW FEATURES";
             }
         }
 
