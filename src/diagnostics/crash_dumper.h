@@ -17,7 +17,10 @@
 
 // Feature tracking for crash diagnosis
 // Each optimization registers itself so crash dumps show exactly what was active
-#define MAX_TRACKED_FEATURES 128
+// The 3.17.0 logs registered exactly 128 - the old cap - so the registry was full
+// and possibly already dropping names. Overflow is now logged rather than silent;
+// raise this again when that line appears.
+#define MAX_TRACKED_FEATURES 192
 
 struct FeatureState {
     const char*  name;        // Feature name (e.g., "AdaptiveGC", "GetStrInline")

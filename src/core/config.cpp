@@ -71,6 +71,7 @@ namespace Config {
             WritePrivateProfileStringA("General", "SleepPrecisionValue", "8", iniPath.c_str());
             WritePrivateProfileStringA("General", "SessionLogs", "1", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "LuaStackFast", "0", iniPath.c_str());
+            WritePrivateProfileStringA("Graphics_Sound", "QualityGovernor", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "SessionLogsToKeep", "10", iniPath.c_str());
             WritePrivateProfileStringA("General", "MemoryPressure", "1", iniPath.c_str());
             WritePrivateProfileStringA("General", "HeapCompactor", "1", iniPath.c_str());
@@ -173,6 +174,7 @@ namespace Config {
         g_settings.SleepPrecisionValue    = GetPrivateProfileIntA("General", "SleepPrecisionValue", 8, iniPath.c_str());
         g_settings.OptSessionLogs         = GetPrivateProfileIntA("General", "SessionLogs", 1, iniPath.c_str()) != 0;
         g_settings.OptLuaStackFast        = GetPrivateProfileIntA("UI_Lua", "LuaStackFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptQualityGovernor     = GetPrivateProfileIntA("Graphics_Sound", "QualityGovernor", 0, iniPath.c_str()) != 0;
         g_settings.SessionLogsToKeep      = GetPrivateProfileIntA("General", "SessionLogsToKeep", 10, iniPath.c_str());
         g_settings.OptMemoryPressure      = GetPrivateProfileIntA("General", "MemoryPressure", 1, iniPath.c_str()) != 0;
         g_settings.OptHeapCompactor       = GetPrivateProfileIntA("General", "HeapCompactor", 1, iniPath.c_str()) != 0;
@@ -301,7 +303,6 @@ namespace Config {
         g_settings.OptFontOutlineCache     = GetPrivateProfileIntA("UI_Lua", "FontOutlineCache", 0, iniPath.c_str()) != 0;
         g_settings.OptMouseClipRelease     = GetPrivateProfileIntA("General", "MouseClipRelease", 0, iniPath.c_str()) != 0;
         g_settings.OptNameplateDistanceCvar= GetPrivateProfileIntA("Combat_Net", "NameplateDistanceCvar", 0, iniPath.c_str()) != 0;
-        g_settings.OptParticleDensityScaler= GetPrivateProfileIntA("Graphics_Sound", "ParticleDensityScaler", 0, iniPath.c_str()) != 0;
         g_settings.OptSavedVarsBackup      = GetPrivateProfileIntA("General", "SavedVarsBackup", 0, iniPath.c_str()) != 0;
         g_settings.OptSoundCoalescer       = GetPrivateProfileIntA("Graphics_Sound", "SoundCoalescer", 0, iniPath.c_str()) != 0;
         g_settings.OptSpellOverlayPreload  = GetPrivateProfileIntA("Combat_Net", "SpellOverlayPreload", 0, iniPath.c_str()) != 0;

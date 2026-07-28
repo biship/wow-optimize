@@ -96,6 +96,7 @@ static double        g_ioMsThisLoad = 0.0;
 static uint64_t      g_ioBytesThisLoad = 0;
 static uint64_t      g_ioReadsThisLoad = 0;
 
+static bool     g_readHookOn  = false;
 static int      g_loadCount   = 0;
 static double   g_loadMsTotal = 0.0;
 static double   g_loadMsWorst = 0.0;
@@ -133,11 +134,16 @@ static void LoadTimerEnd() {
     g_ioBytesTotal += g_ioBytesThisLoad;
     if (ms > g_loadMsWorst) g_loadMsWorst = ms;
 
-    Log("[LoadingState] Load took %.0f ms - %.0f ms (%.0f%%) inside ReadFile, "
-        "%llu reads, %.1f MB",
-        ms, g_ioMsThisLoad, (ms > 0.0) ? (100.0 * g_ioMsThisLoad / ms) : 0.0,
-        (unsigned long long)g_ioReadsThisLoad,
-        (double)g_ioBytesThisLoad / (1024.0 * 1024.0));
+    if (!g_readHookOn) {
+        Log("[LoadingState] Load took %.0f ms - disk share not measured "
+            "(the ReadFile hook is not installed in this build)", ms);
+    } else {
+        Log("[LoadingState] Load took %.0f ms - %.0f ms (%.0f%%) inside ReadFile, "
+            "%llu reads, %.1f MB",
+            ms, g_ioMsThisLoad, (ms > 0.0) ? (100.0 * g_ioMsThisLoad / ms) : 0.0,
+            (unsigned long long)g_ioReadsThisLoad,
+            (double)g_ioBytesThisLoad / (1024.0 * 1024.0));
+    }
 }
 
 void ApplyEventKind(EventKind kind) {
@@ -234,6 +240,10 @@ __declspec(naked) static void Hooked_FrameScript_SignalEvent() {
 
 namespace LoadingState {
 
+void SetReadHookInstalled(bool installed) {
+    g_readHookOn = installed;
+}
+
 void NoteRead(double ms, unsigned int bytes) {
     g_ioMsThisLoad += ms;
     g_ioBytesThisLoad += bytes;
@@ -247,11 +257,17 @@ void ReportLoadTimes() {
     }
     Log("[LoadingState] %d load(s): %.1fs total, %.0f ms average, %.0f ms worst",
         g_loadCount, g_loadMsTotal / 1000.0, g_loadMsTotal / g_loadCount, g_loadMsWorst);
-    Log("[LoadingState]   of that, %.1fs was ReadFile (%.0f%%) moving %.1f MB - "
-        "prefetch and archive work can only ever address that share",
-        g_ioMsTotal / 1000.0,
-        (g_loadMsTotal > 0.0) ? (100.0 * g_ioMsTotal / g_loadMsTotal) : 0.0,
-        (double)g_ioBytesTotal / (1024.0 * 1024.0));
+    if (!g_readHookOn) {
+        Log("[LoadingState]   How much of that was the disk is unknown: the ReadFile"
+            " hook feeding this report is compiled out of this build, so nothing"
+            " counted the reads. Not the same as none.");
+    } else {
+        Log("[LoadingState]   of that, %.1fs was ReadFile (%.0f%%) moving %.1f MB - "
+            "prefetch and archive work can only ever address that share",
+            g_ioMsTotal / 1000.0,
+            (g_loadMsTotal > 0.0) ? (100.0 * g_ioMsTotal / g_loadMsTotal) : 0.0,
+            (double)g_ioBytesTotal / (1024.0 * 1024.0));
+    }
 }
 
 

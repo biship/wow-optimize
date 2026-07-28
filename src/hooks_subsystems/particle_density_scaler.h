@@ -1,9 +1,8 @@
 #pragma once
 #include <windows.h>
+#include <cstring>
 
 namespace ParticleDensityScaler {
-    bool Init();
-    void Shutdown();
-    void OnFrame(float elapsedMs);
-
+    // Records the particleDensity CVar object when the client registers it.
+    void RegisterCVar(const char* name, void* cvar);
 }

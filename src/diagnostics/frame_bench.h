@@ -42,4 +42,15 @@ void OnPresent(Source src);
 // the whole session so far.
 void Report(const char* reason);
 
+// 95th percentile frame time over the last few seconds, or 0 before enough frames
+// have been seen.
+//
+// Anything that reacts to how the game is running needs this rather than an
+// instantaneous frame rate. The scalers in this project each smooth 1000/elapsed
+// with their own EMA and switch on thresholds crossed by a single frame, which is
+// how one of them ended up changing shadow quality several times a minute while a
+// player walked around. What players notice is the tail, and the tail is what this
+// returns.
+double RecentP95Ms();
+
 } // namespace FrameBench

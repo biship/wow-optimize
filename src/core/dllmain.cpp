@@ -91,6 +91,7 @@
 #include "hooks_subsystems/nameplate_culling.h"
 #include "hooks_subsystems/texture_unload_delay.h"
 #include "hooks_subsystems/minimap_refresh_governor.h"
+#include "hooks_subsystems/quality_governor.h"
 #include "hooks_subsystems/spell_effect_culling.h"
 #include "hooks_subsystems/lua_string_compare_fast.h"
 #include "hooks_subsystems/dbc_row_caching.h"
@@ -1562,14 +1563,12 @@ static void WINAPI hooked_Sleep(DWORD ms) {
             OnFrameRenderHooks(g_mainThreadId);
             OnFrameLogicHooks(g_mainThreadId);
             OnFrameAsyncHooks(g_mainThreadId);
-            ParticleDensityScaler::OnFrame((float)elapsedMs);
             // LuaGcGovernor::OnFrame((float)elapsedMs); // Disabled duplicate governor
 #if !TEST_DISABLE_LUA_GC_GOVERNOR
             LuaGCGovernor::OnFrame(elapsedMs);
 #endif
 #if !TEST_DISABLE_ADAPTIVE_FARCLIP
-            AdaptiveFarclip::OnFrame((float)elapsedMs);
-#endif
+        #endif
 #if !TEST_DISABLE_NET_ADDON_COALESCER
 #endif
 #if !TEST_DISABLE_MIP_BIAS_GOVERNOR
@@ -2417,6 +2416,43 @@ static BOOL WINAPI hooked_ReadFile_Inner(HANDLE hFile, LPVOID lpBuffer,
         ReleaseSRWLockExclusive(&cache->lock);
         return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
     }
+}
+
+// Times reads during a loading screen and does nothing else - straight through to
+// the original, no cache, no locks, no read-ahead, no prefetch queue.
+//
+// The MPQ cache above is compiled out by CRASH_TEST_DISABLE_READFILE because it
+// serialized on a lock and froze landings. That switch also removed the only thing
+// counting reads, so the load report had no way to say how much of a load is the
+// disk - and one tester log shows a single load taking 32 seconds with no way to
+// look inside it. Measuring does not require the cache, so this path keeps the
+// measurement and leaves the cache switched off.
+static BOOL WINAPI hooked_ReadFile_TimingOnly(HANDLE hFile, LPVOID lpBuffer,
+    DWORD nBytesToRead, LPDWORD lpBytesRead, LPOVERLAPPED lpOverlapped)
+{
+    if (!LoadingState::IsLoading())
+        return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
+
+    static LARGE_INTEGER freq = {};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    BOOL r = orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
+    QueryPerformanceCounter(&b);
+    if (freq.QuadPart) {
+        double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        LoadingState::NoteRead(ms, (lpBytesRead && r) ? *lpBytesRead : 0u);
+    }
+    return r;
+}
+
+static bool InstallReadFileTimingHook() {
+    void* p = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "ReadFile");
+    if (!p) return false;
+    if (MH_CreateHook(p, (void*)hooked_ReadFile_TimingOnly, (void**)&orig_ReadFile) != MH_OK) return false;
+    if (WO_EnableHook(p) != MH_OK) return false;
+    Log("ReadFile hook: TIMING ONLY (MPQ cache stays off; measures the disk share of a load)");
+    return true;
 }
 
 static bool InstallReadFileHook() {
@@ -4751,6 +4787,8 @@ extern "C" void WowOpt_OnFrameBoundary() {
     LuaVMEngine_FrameTick();
     ObjVisCache::OnFrame();
     FontMetrics_OnFrame();
+    QualityGovernor::OnFrame();
+    CvarWatchdog_Check();
 #if !TEST_DISABLE_PARTICLE_THROTTLE
     IncrementParticleFrameCount();
 #endif
@@ -6691,9 +6729,13 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #if !CRASH_TEST_DISABLE_READFILE
     bool readOk  = (Config::g_settings.OptDbcLookupCache || Config::g_settings.OptSavedVarsPretoken) && InstallReadFileHook();
 #else
-    bool readOk  = false;
-    Log("ReadFile hook: DISABLED via CRASH_TEST_DISABLE_READFILE");
+    // The cache stays off; the measurement does not have to go with it.
+    bool readOk  = InstallReadFileTimingHook();
+    if (!readOk) Log("ReadFile hook: DISABLED via CRASH_TEST_DISABLE_READFILE");
 #endif
+    // The load report counts time spent in the ReadFile hook. If that hook is not
+    // in, the report must say so rather than print a confident zero.
+    LoadingState::SetReadHookInstalled(readOk);
     bool closeOk = (Config::g_settings.OptDbcLookupCache || Config::g_settings.OptSavedVarsPretoken) && InstallCloseHandleHook();
     bool flushOk = (Config::g_settings.OptDbcLookupCache || Config::g_settings.OptSavedVarsPretoken) && InstallFlushFileBuffersHook();
     Log("--- Async MPQ I/O ---");
@@ -7883,7 +7925,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     if (Config::g_settings.OptDbcFileCache) DbcFileCache::Init();
     if (Config::g_settings.OptFontOutlineCache) FontOutlineCache::Init();
     // LuaGcGovernor::Init(); // Disabled duplicate governor
-    if (Config::g_settings.OptParticleDensityScaler) ParticleDensityScaler::Init();
     if (Config::g_settings.OptAddonMsgLimiter) AddonMsgLimiter::Init();
     if (Config::g_settings.OptVertexBufferPrealloc) VertexBufferPrealloc::Init();
     if (Config::g_settings.OptWorldObjectOpt) WorldObjectOpt::Init();
@@ -7911,6 +7952,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     if (Config::g_settings.OptPacketProcessingThrottle) PacketProcessingThrottle::Init();
     if (Config::g_settings.OptNameplateCulling) NameplateCulling::Init();
     if (Config::g_settings.OptTextureUnloadDelay) TextureUnloadDelay::Init();
+    QualityGovernor::Init();
     if (Config::g_settings.OptMinimapRefreshGovernor) MinimapRefreshGovernor::Init();
     if (Config::g_settings.OptSpellEffectCulling) SpellEffectCulling::Init();
     if (Config::g_settings.OptLuaStringCompareFast) LuaStringCompareFast::Init();
@@ -9902,6 +9944,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             FontAlphaFastpath::Shutdown();
             MinimapThrottle::Shutdown();
             DbcLookupCacheFast::Shutdown();
+            QualityGovernor::Shutdown();
             HotPatch::ShutdownAll();
             ReportHotFunctionStats();
             CrashDumper::ReportFeatureActivity();

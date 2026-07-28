@@ -27,6 +27,13 @@ namespace LoadingState {
     // Only called while IsLoading() is true, so gameplay pays nothing.
     void NoteRead(double ms, unsigned int bytes);
 
+    // Whether the ReadFile hook that feeds NoteRead is actually installed. It is
+    // compiled out by CRASH_TEST_DISABLE_READFILE in the shipped build, and the
+    // first real log carrying this report said "0 ms (0%) inside ReadFile" for
+    // every load - which reads as a measurement of the loading path and is
+    // nothing of the kind. Unobserved and zero have to look different.
+    void SetReadHookInstalled(bool installed);
+
     // Session summary: how many loads, how long, and how much of it was I/O.
     void ReportLoadTimes();
 }

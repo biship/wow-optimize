@@ -17,6 +17,12 @@ namespace Config {
         // default: an error of one slot there moves every later argument, and the
         // logs of two testers running it are full of exactly that shape of failure.
         bool OptLuaStackFast = false;
+
+        // Lowers shadow quality when the frame-time tail says the machine cannot
+        // keep up, and puts the player's own value back when it can. Off by
+        // default: it changes a graphics setting the player chose, which is worth
+        // being asked for rather than assumed.
+        bool OptQualityGovernor = false;
         // How many session logs to keep. The oldest beyond this are deleted at
         // startup, so the folder stops growing without anyone having to tidy it.
         int SessionLogsToKeep = 10;
@@ -135,7 +141,6 @@ namespace Config {
         bool OptFontOutlineCache = true;
         bool OptMouseClipRelease = true;
         bool OptNameplateDistanceCvar = true;
-        bool OptParticleDensityScaler = true;
         bool OptSavedVarsBackup = true;
         bool OptSoundCoalescer = true;
         bool OptSpellOverlayPreload = true;

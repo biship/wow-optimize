@@ -919,7 +919,18 @@ int RegisterFeature(const char* name) {
         s_features[idx].lastError = nullptr;
     }
     ReleaseSRWLockExclusive(&s_featureLock);
-    return (idx < MAX_TRACKED_FEATURES) ? (int)idx : -1;
+    if (idx >= MAX_TRACKED_FEATURES) {
+        // Silently dropping it would make the activity report quietly incomplete -
+        // the feature would simply be absent, indistinguishable from one nobody
+        // wired up, which is exactly the ambiguity that report exists to remove.
+        if (idx == MAX_TRACKED_FEATURES) {
+            Log("[CrashDumper] Feature registry full at %d; '%s' and any after it "
+                "are untracked. Raise MAX_TRACKED_FEATURES.",
+                MAX_TRACKED_FEATURES, name ? name : "(unnamed)");
+        }
+        return -1;
+    }
+    return (int)idx;
 }
 
 int FeatureTokenForCounting(const char* name) {

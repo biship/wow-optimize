@@ -375,6 +375,14 @@ static uint32_t g_wowFineCounts[WOW_FINE_SLOTS];
 // Prints the top SELF_FINE_TOP buckets of a histogram, largest first. Selection is
 // an insertion pass over a 20-entry list rather than a sort of the whole array,
 // which would mean copying 16-32K entries inside a diagnostic dump.
+static bool IsWaitSymbol(const char* n) {
+    if (!n) return false;
+    if (n[0] != 'N' || n[1] != 't') return false;
+    return strncmp(n, "NtWaitFor", 9) == 0 ||
+           strncmp(n, "NtDelayExecution", 16) == 0 ||
+           strncmp(n, "NtRemoveIoCompletion", 20) == 0;
+}
+
 static void DumpFineHistogram(const uint32_t* counts, int slots, int shift,
                               uint64_t total, const char* title,
                               const char* addrFormat, uintptr_t addrBase) {
@@ -656,6 +664,11 @@ static void DumpResults() {
                   return a.count > b.count;
               });
 
+    // A blocked thread is not a hot function, and must never be ranked as one.
+    // The first version of this report excluded waits from the denominator but
+    // still listed them, so NtDelayExecution appeared in a table of hot functions
+    // holding "17.42% of executing" - a share of exactly the thing it was not
+    // doing.
     // Separate "the thread was blocked" from "the thread was running code".
     //
     // Every sample landing in one of these is the main thread parked in the
@@ -671,14 +684,7 @@ static void DumpResults() {
     // work here can matter, so it is now the first thing the profile says.
     uint64_t waitSamples = 0;
     for (int i = 0; i < bucketCount; i++) {
-        const char* n = buckets[i].name;
-        if (!n) continue;
-        if (n[0] == 'N' && n[1] == 't' &&
-            (strncmp(n, "NtWaitFor", 9) == 0 ||
-             strncmp(n, "NtDelayExecution", 16) == 0 ||
-             strncmp(n, "NtRemoveIoCompletion", 20) == 0)) {
-            waitSamples += buckets[i].count;
-        }
+        if (IsWaitSymbol(buckets[i].name)) waitSamples += buckets[i].count;
     }
     uint64_t workSamples = (total > waitSamples) ? (total - waitSamples) : 0;
     double   workPct     = total ? (100.0 * (double)workSamples / (double)total) : 0.0;
@@ -728,10 +734,15 @@ static void DumpResults() {
             wsprintfA(label, "wow_region_0x%08X", (unsigned)buckets[i].addr);
             name = label;
         }
-        double workPctOfEntry = workSamples
-            ? (100.0 * (double)buckets[i].count / (double)workSamples) : 0.0;
-        Log("[SamplingProfiler] %3d. %-24s  %8llu samples (%5.2f%% total, %5.2f%% of executing)",
-            printed + 1, name, (unsigned long long)buckets[i].count, pct, workPctOfEntry);
+        if (IsWaitSymbol(buckets[i].name)) {
+            Log("[SamplingProfiler] %3d. %-24s  %8llu samples (%5.2f%% total, blocked - not executing)",
+                printed + 1, name, (unsigned long long)buckets[i].count, pct);
+        } else {
+            double workPctOfEntry = workSamples
+                ? (100.0 * (double)buckets[i].count / (double)workSamples) : 0.0;
+            Log("[SamplingProfiler] %3d. %-24s  %8llu samples (%5.2f%% total, %5.2f%% of executing)",
+                printed + 1, name, (unsigned long long)buckets[i].count, pct, workPctOfEntry);
+        }
         printed++;
     }
 

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include "MinHook.h"
 #include "version.h"
+#include "quality_governor.h"
 #include "cvar_null_guard.h"
 
 extern "C" void Log(const char* fmt, ...);
@@ -41,6 +42,16 @@ static char __fastcall Hooked_7668C0(void* ecx, void* edx, char* Str1, char a3, 
         }
     }
 #endif
+
+    // Every CVar the client sets passes here, which is the only place anything
+    // can learn what the player actually chose.
+    if (ecx && Str1) {
+        const char* nm = *(const char**)((char*)ecx + 20);
+        if (nm && (uintptr_t)nm >= 0x10000 && (uintptr_t)nm <= 0xFFE00000) {
+            QualityGovernor::NoteCVarObject(ecx, nm);
+            QualityGovernor::NoteCVarWrite(nm, Str1);
+        }
+    }
 
     return g_orig7668C0(ecx, edx, Str1, a3, a4, a5, a6);
 }

@@ -1,7 +1,21 @@
 // ============================================================================
 // Module: cvar_watchdog.cpp
-// Description: Protects game configuration variables (CVars) from null pointer exceptions and resets.
+// Description: Checks a list of globals the client is known to crash on when they
+//              are null, and says so. Runs once, after the client is up.
 // Safety & Threading: Main thread only.
+//
+// It used to run at injection, which is before the client has initialized any of
+// these. Every global was legitimately zero at that point, so the one scan it ever
+// performed reported nine "CORRUPT" findings about a game that had not started -
+// including "lua_State (global Lua state) is NULL", which is the plainest possible
+// statement that the scan was too early rather than that anything was wrong. Worse,
+// the repair path writes safeValue over what it judges corrupt, so any entry given
+// a non-zero safeValue would have planted a value into a global the client was
+// about to initialize itself. No entry has one today, which is the only reason that
+// never happened.
+//
+// The readiness signal is the global lua_State: once the client has one, it is far
+// enough along that a null in this list means something.
 // ============================================================================
 
 #include <windows.h>
@@ -56,14 +70,24 @@ static CvarWatchEntry g_watch[] = {
     { 0x00B31684, "_crtheap (CRT heap handle)",       0, false },
 };
 
-static bool g_initialized = false;
+// The global lua_State, which is also entry "lua_State* (global Lua state)" below.
+static const uintptr_t GLOBAL_LUA_STATE = 0x00D3F78C;
 
+static bool g_scanned = false;
+
+// Cheap enough to call every frame: one load and a compare until the client is up,
+// then one scan, then a single predictable branch forever after.
 void CvarWatchdog_Check()
 {
-    if (g_initialized) return;
-    g_initialized = true;
+    if (g_scanned) return;
 
-    Log("[CvarWatchdog] Scanning %d critical CVars...",
+    // Before the client has a Lua state, every global in the list is zero because
+    // nothing has set it yet. There is nothing to judge and no verdict to give.
+    if (*(uintptr_t*)GLOBAL_LUA_STATE < 0x10000) return;
+
+    g_scanned = true;
+
+    Log("[CvarWatchdog] Scanning %d critical CVars (client is up)...",
         (int)(sizeof(g_watch)/sizeof(g_watch[0])));
 
     int fixed = 0;
@@ -104,9 +128,10 @@ void CvarWatchdog_Check()
     }
 }
 
-// Called from dllmain.cpp near startup, after the 5s delay
+// Installs nothing. The scan itself is driven from the frame boundary, which is
+// the only place that can tell when the client has finished starting.
 bool InitCvarWatchdog()
 {
-    CvarWatchdog_Check();
+    Log("[CvarWatchdog] Armed; will scan once the client has a Lua state");
     return true;
 }

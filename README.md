@@ -19,7 +19,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
-* [What's New in v3.17.0](#whats-new-in-v3170)
+* [What's New in v3.18.0](#whats-new-in-v3180)
 * [Send me your log](#send-me-your-log)
 * [Reviews & Acknowledgments](#reviews)
 * [Current Feature Set](#current-feature-set)
@@ -33,7 +33,94 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
-## What's New in v3.17.0
+## What's New in v3.18.0
+
+Features that were quietly overwriting graphics settings you had chosen are gone,
+and one new feature replaces the lot of them. The rest of this release is the
+diagnostics catching themselves out — four cases of a log reporting something it
+had not actually measured.
+
+Thanks again to [txtsd](https://github.com/txtsd), whose testing rounds confirmed
+the 3.17.0 text-rendering fix and whose logs are where most of the problems below
+were found.
+
+**Your graphics settings are yours again**
+
+Three "adaptive" features scaled quality down when frame rate dropped. Each one
+started from a number written into the code rather than the number you had set, so
+turning them on could raise your settings instead of lowering them. **Dynamic Shadow
+Scaler** went in 3.17.0; the other two go now:
+
+- **Adaptive Farclip** assumed a draw distance of 1250. If yours was 500 — a common
+  choice on older hardware — it dragged you *up* toward 1250, making the game
+  heavier while claiming to make it lighter. It also moved on thresholds three
+  frames apart (below 55 fps, above 58), so anyone playing near 60 had it adjusting
+  constantly.
+- **Particle Density Scaler** assumed 1.0 and restored to 1.0, so a deliberate 0.5
+  was pushed back to full density.
+
+Neither survives. Nothing in the DLL now overwrites a setting it never read.
+
+**Adaptive Quality Governor** *(experimental, off by default)*
+
+What replaces them is one dial instead of three that argued with each other. It
+learns your ceiling by watching what the game writes when you change a setting, and
+treats that as a limit it will never exceed — the worst it can do is give back what
+it took.
+
+It reads the p95 of recent frames rather than an instant frame rate, so a single
+slow frame moves nothing. It degrades after 5 seconds past 33 ms and restores only
+after 30 seconds back under 20 ms; that asymmetry is deliberate, because quality
+flickering up and down is worse than quality being slightly too low. Order is
+particles, then shadows, then draw distance, on the assumption that you would rather
+see the world at full distance with fewer sparks.
+
+It has not been proven on anyone's machine yet. That is why it is opt-in and on the
+Experimental tab — if you run it, the `[FrameBench]` block in your log says whether
+it helped.
+
+**An Experimental tab in the launcher**
+
+Features that are new or unproven now live on their own tab, and **Enable All no
+longer switches them on**. Previously it did, which meant anyone testing "everything
+on" was also testing code that had never run in a game — and made their results
+impossible to interpret.
+
+**Diagnostics that stop reporting things they did not measure**
+
+Four of these, all found by reading logs testers sent in:
+
+- The CVar watchdog ran at injection, before the client had initialized anything it
+  inspects. Every one of its nine "CORRUPT" findings was a game that had not started
+  yet. It now waits until the client is up.
+- A 41.9-second loading screen was being recorded as a *frame*, which made `p99.9`
+  and `max` meaningless. Gaps over 2 seconds are now counted and reported separately
+  from frame times.
+- The profiler ranked `NtDelayExecution` — a thread doing nothing — as the second
+  hottest function, with a share of "executing" time it was by definition not using.
+- The loading report printed `0 ms inside ReadFile` in sessions where the ReadFile
+  hook was switched off and nothing had been measured at all.
+
+**Loading screens are now measurable**
+
+Logs show loading screens running past 30 seconds on some setups — on one tester's
+machine, 7 of 12 loads. The cause is not known yet. This release adds timing that
+separates disk time from everything else, without turning the MPQ cache back on to
+get it. If your loads are slow, your log now contains the evidence.
+
+### Upgrading
+
+Settings carry over. If you had **Adaptive Farclip** or **Particle Density Scaler**
+on, they are gone, and your `farclip` and `particleDensity` will stay wherever you
+set them from now on. Worth checking them once in the game's own video options —
+these features may have left them somewhere you did not choose, and that value
+persisted in your config after the feature stopped running.
+
+To try the replacement, turn on **Adaptive Quality Governor** on the Experimental
+tab.
+
+<details>
+<summary><b>Previously — v3.17.0</b></summary>
 
 A bug fix release, driven mostly by issue #46.
 
@@ -94,7 +181,7 @@ This release adds the thing the project never had: a way to tell whether a chang
 - The sampling profiler resolves hot code to individual functions rather than 4 KB pages, for both the client and this DLL.
 - The startup banner reports the exact build a log came from.
 
-### Upgrading
+**Upgrading**
 
 Settings carry over. Nothing needs to be reset — keys for removed features are simply ignored from now on.
 
@@ -103,6 +190,8 @@ One rename is worth knowing about: `LuaFileCache` gated a module-handle cache ra
 If you had **Animation LOD**, **Async Frustum Culling** (previously "Spatial Culling & Parallel Frustum Culler") or **Nameplate Throttle** enabled, those are gone; the artifacts they caused go with them and there is nothing to re-enable.
 
 **Still open:** a crash reported a while after `alt+F4`. If you hit it, please attach `Crashes\wow_crash_*.dmp` and the timestamped `Logs\wow_optimize_<date>_<time>.log`.
+
+</details>
 
 <details>
 <summary><b>Previously — v3.16.3</b></summary>
@@ -118,7 +207,7 @@ A reliability pass driven mostly by your bug reports (issues #34–#42):
 - **Better crash reports** — dumps now include a stack walk, so `EIP=0` null-call crashes are traceable.
 - **New opt-in toggles** (launcher → General, default off): Large-Allocation mimalloc *(experimental — confirm you can still connect)*, Object Manager Lookup Cache, Hardware Cursor Fix, Sampling Profiler.
 
-**Known issue:** on some DXVK setups, UI text can garble after a windowed↔maximized switch — still under investigation.
+**Known issue (resolved in 3.17.0):** on some DXVK setups, UI text could garble or overlap. The cause was font metrics being looked up with the wrong memory layout for this client's Lua build; confirmed fixed by a tester over a 5.5-hour session with 13 UI reloads.
 
 </details>
 
@@ -134,7 +223,7 @@ Older releases: see the [Releases page](https://github.com/suprepupre/wow-optimi
 sizes engine code clears: 5.05 ns/call against 11.76, measured over 4.8M calls per
 variant. The client reaches that one function from 1108 call sites.
 
-Everything else is opt-in, and v3.17.0 lets you settle it on your own hardware,
+Everything else is opt-in, and the frame-time benchmark lets you settle it on your own hardware,
 with your own addons, instead of taking anyone's word for it. Play a session, quit
 the game normally, and read the `[FrameBench]` block at the end of
 `Logs\wow_optimize_<date>_<time>.log`. Compare `p95` and `p99` between runs rather
@@ -637,7 +726,7 @@ Recent events:
     -110351ms  TID=900   D3D9 device Reset (dev=0x0EB1AA90)
 ```
 
-The startup banner reports the exact build the log came from (`v3.17.0 (build abc1234)`), so please don't trim the first lines.
+The startup banner reports the exact build the log came from (`v3.18.0 (build abc1234)`), so please don't trim the first lines.
 
 If the complaint is stuttering rather than a crash, look for `slow frame` lines — each one names how far past your session's own median that frame ran, and what was happening during it:
 
