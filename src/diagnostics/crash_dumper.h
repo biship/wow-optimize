@@ -64,8 +64,18 @@ namespace CrashDumper {
     // far more misleading than a lost increment under contention.
     void FeatureHit(int token);
 
+// How many features are actually registered. The startup banner used to print
+// MAX_TRACKED_FEATURES here, so it read "Registered 128 features" against a cap of
+// 128 and "Registered 192" against a cap of 192 - a constant wearing a count's
+// clothing, which looked exactly like a registry overflowing every time.
+int RegisteredFeatureCount();
+
     // Writes the "what actually ran" section to the log.
     void ReportFeatureActivity();
+
+// States how many handled fatal-class exceptions were seen, without printing one
+// line each - a single third-party module produced 8889 in one session.
+void ReportFirstChanceSummary();
 
     // Update feature state (call from hooks/fast-paths)
     void FeatureCall(const char* name);

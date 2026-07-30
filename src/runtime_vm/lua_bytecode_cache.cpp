@@ -200,6 +200,12 @@ bool Init() {
     return true;
 }
 
+// Printed from the periodic report. Shutdown does not run - the DLL exits via
+// TerminateProcess - so anything reported only from there is never seen.
+void LogStats() {
+    Log("[LuaBytecode] Shutdown: hits=%lld misses=%lld", g_hits, g_misses);
+}
+
 void Shutdown() {
     InterlockedExchange(&g_active, 0);
     if (orig_luaL_loadbuffer) MH_DisableHook((void*)ADDR_luaL_loadbuffer);
@@ -207,7 +213,7 @@ void Shutdown() {
     g_cache.clear();
     g_bytesCached = 0;
     ReleaseSRWLockExclusive(&g_cacheLock);
-    Log("[LuaBytecode] Shutdown: hits=%lld misses=%lld", g_hits, g_misses);
+    LogStats();
 }
 
 void OnLuaStateSwap() {

@@ -4,7 +4,6 @@
 #include "MinHook.h"
 #include "version.h"
 #include "font_glyph_cache.h"
-#include "font_outline_cache.h"
 
 extern "C" void Log(const char* fmt, ...);
 extern volatile LONG g_deviceResetCounter;
@@ -100,7 +99,6 @@ static char __cdecl Hooked_GxuLoadGlyph(void* fontObj, unsigned int charCode, in
                 lastResetCounter, currentResetCounter);
             lastResetCounter = currentResetCounter;
             ClearCache();
-            FontOutlineCache::ClearCache();
             deviceChangeTime = GetTickCount();
         }
 
@@ -194,13 +192,20 @@ bool Init() {
     return true;
 }
 
+// Printed from the periodic report, not only from Shutdown. The DLL exits
+// through TerminateProcess to avoid deadlocking on background threads, so
+// Shutdown does not run and these numbers reached no log at all - four tester
+// sessions contain none of them.
+void LogStats() {
+    Log("[FontGlyphCache] %lld hits, %lld misses (%.1f%% hit rate)",
+        g_hits, g_misses,
+        (g_hits + g_misses) ? (100.0 * g_hits / (g_hits + g_misses)) : 0.0);
+}
+
 void Shutdown() {
+    LogStats();
     MH_DisableHook((void*)0x006C8CC0);
-    
     ClearCache();
-    
-    Log("[FontGlyphCache] Stats: %lld hits, %lld misses (%.1f%% hit rate)", 
-        g_hits, g_misses, (g_hits + g_misses) ? (100.0 * g_hits / (g_hits + g_misses)) : 0.0);
 }
 
 void ClearCache() {

@@ -23,13 +23,13 @@ namespace ApiCache {
 
 bool Init();
 void Shutdown();
+void LogStats();
 void ClearCache();
 
 struct Stats {
     long itemHits;
     long itemMisses;
-    long spellHits;
-    long spellMisses;
+    long itemBypassed;   // argument too long to key on, or result too large to store
     bool active;
 };
 

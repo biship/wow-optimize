@@ -9,4 +9,7 @@ namespace LuaGCGovernor {
     bool Init();
     void Shutdown();
     void OnFrame(double frameMs);
+
+    // How much time the collection steps this module requests actually took.
+    void LogStats();
 }

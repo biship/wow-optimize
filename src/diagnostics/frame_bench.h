@@ -53,4 +53,9 @@ void Report(const char* reason);
 // returns.
 double RecentP95Ms();
 
+// Smoothed frame time in milliseconds, or 0.0 before any frame has been measured.
+// Constant time, unlike RecentP95Ms, so it is safe to consult on a per-frame or
+// per-Sleep path.
+double SmoothedFrameMs();
+
 } // namespace FrameBench

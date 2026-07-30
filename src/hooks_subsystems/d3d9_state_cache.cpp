@@ -422,8 +422,12 @@ static HRESULT WINAPI Hooked_Reset(IDirect3DDevice9* device, D3DPRESENT_PARAMETE
     return hr;
 }
 
+// Defined with the rest of the draw census, further down.
+void NoteFrameForDrawCensus();
+
 static HRESULT WINAPI Hooked_Present(IDirect3DDevice9* device, const RECT* src, const RECT* dest, HWND window, const RGNDATA* dirty) {
     InvalidateCache();
+    NoteFrameForDrawCensus();
 
     if (D3D9RenderThread::IsActive() && GetCurrentThreadId() == g_mainThreadId) {
         D3D9RenderThread::QueuePresent(device, src, dest, window, dirty);
@@ -486,6 +490,105 @@ bool Init() {
     return true;
 }
 
+// ---- draw-call census ------------------------------------------------------
+//
+// Direct3D 9 charges the CPU for every draw, and the usual explanation for a
+// city or raid dropping frames is that the client issues far too many small
+// ones. That may well be true here - but nothing in this project has ever
+// counted them, so any work on batching would start from a guess.
+//
+// This counts DrawPrimitive and DrawIndexedPrimitive per frame and reports the
+// distribution. Three hundred draws a frame means batching has nothing to find;
+// three thousand means it is the whole story.
+//
+// Off by default. It is a wrapper on the hottest call in the renderer, and the
+// point is to answer the question in one session and switch it back off - not to
+// carry a trampoline per draw forever. The counter is a plain increment because
+// draws come from one thread and an interlocked one here would cost more than it
+// measures.
+typedef HRESULT (WINAPI *DrawPrimitive_fn)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+typedef HRESULT (WINAPI *DrawIndexedPrimitive_fn)(IDirect3DDevice9*, D3DPRIMITIVETYPE,
+                                                  INT, UINT, UINT, UINT, UINT);
+
+static DrawPrimitive_fn        orig_DrawPrimitive        = nullptr;
+static DrawIndexedPrimitive_fn orig_DrawIndexedPrimitive = nullptr;
+
+static uint32_t g_drawsThisFrame = 0;
+
+// Buckets of 100 draws, up to 5000, then an overflow bin.
+static constexpr int DRAW_BUCKETS = 51;
+static uint32_t g_drawHistogram[DRAW_BUCKETS] = {};
+static uint32_t g_drawFrames  = 0;
+static uint32_t g_drawMax     = 0;
+static uint64_t g_drawTotal   = 0;
+
+static HRESULT WINAPI Hooked_DrawPrimitive(IDirect3DDevice9* device,
+                                           D3DPRIMITIVETYPE type,
+                                           UINT startVertex, UINT primCount) {
+    ++g_drawsThisFrame;
+    return orig_DrawPrimitive(device, type, startVertex, primCount);
+}
+
+static HRESULT WINAPI Hooked_DrawIndexedPrimitiveCount(IDirect3DDevice9* device,
+                                                       D3DPRIMITIVETYPE type,
+                                                       INT baseVertex, UINT minIndex,
+                                                       UINT numVertices, UINT startIndex,
+                                                       UINT primCount) {
+    ++g_drawsThisFrame;
+    return orig_DrawIndexedPrimitive(device, type, baseVertex, minIndex,
+                                     numVertices, startIndex, primCount);
+}
+
+// Called from the Present hook, which already runs once per presented frame.
+void NoteFrameForDrawCensus() {
+    if (!orig_DrawIndexedPrimitive) return;
+
+    uint32_t n = g_drawsThisFrame;
+    g_drawsThisFrame = 0;
+
+    g_drawFrames++;
+    g_drawTotal += n;
+    if (n > g_drawMax) g_drawMax = n;
+
+    int b = (int)(n / 100);
+    if (b >= DRAW_BUCKETS) b = DRAW_BUCKETS - 1;
+    g_drawHistogram[b]++;
+}
+
+void ReportDrawCensus() {
+    if (!orig_DrawIndexedPrimitive) {
+        Log("[DrawCensus] not installed - draws per frame were not counted");
+        return;
+    }
+    if (g_drawFrames == 0) {
+        Log("[DrawCensus] installed but no frame was presented");
+        return;
+    }
+
+    // Median from the histogram rather than a stored series.
+    uint32_t half = g_drawFrames / 2, seen = 0;
+    int medianBucket = 0;
+    for (int i = 0; i < DRAW_BUCKETS; i++) {
+        seen += g_drawHistogram[i];
+        if (seen >= half) { medianBucket = i; break; }
+    }
+
+    Log("[DrawCensus] %u frames: %.0f draws avg, ~%d median, %u peak",
+        g_drawFrames, (double)g_drawTotal / (double)g_drawFrames,
+        medianBucket * 100 + 50, g_drawMax);
+
+    Log("[DrawCensus]   distribution (draws per frame):");
+    for (int i = 0; i < DRAW_BUCKETS; i++) {
+        if (!g_drawHistogram[i]) continue;
+        if (i == DRAW_BUCKETS - 1)
+            Log("[DrawCensus]     %4d+      %6u frames (%5.1f%%)", i * 100,
+                g_drawHistogram[i], 100.0 * g_drawHistogram[i] / g_drawFrames);
+        else
+            Log("[DrawCensus]     %4d-%-4d  %6u frames (%5.1f%%)", i * 100, i * 100 + 99,
+                g_drawHistogram[i], 100.0 * g_drawHistogram[i] / g_drawFrames);
+    }
+}
+
 void OnCreateDevice(IDirect3DDevice9* device) {
     if (!device) return;
 
@@ -506,6 +609,26 @@ void OnCreateDevice(IDirect3DDevice9* device) {
     orig_SetSamplerState = (SetSamplerState_fn)vtable[69];
     orig_SetTextureStageState = (SetTextureStageState_fn)vtable[67];
     orig_SetVertexShader = (SetVertexShader_fn)vtable[92];
+
+    // 81 and 82 are DrawPrimitive and DrawIndexedPrimitive. Resolved always,
+    // hooked only when the census is switched on.
+    orig_DrawPrimitive        = (DrawPrimitive_fn)vtable[81];
+    orig_DrawIndexedPrimitive = (DrawIndexedPrimitive_fn)vtable[82];
+    if (Config::g_settings.OptDrawCensus) {
+        if (MH_CreateHook((void*)vtable[81], (void*)Hooked_DrawPrimitive,
+                          (void**)&orig_DrawPrimitive) == MH_OK &&
+            MH_CreateHook((void*)vtable[82], (void*)Hooked_DrawIndexedPrimitiveCount,
+                          (void**)&orig_DrawIndexedPrimitive) == MH_OK) {
+            MH_EnableHook((void*)vtable[81]);
+            MH_EnableHook((void*)vtable[82]);
+            Log("[DrawCensus] Counting draw calls per frame");
+        } else {
+            orig_DrawIndexedPrimitive = nullptr;
+            Log("[DrawCensus] ERROR: could not hook the draw calls");
+        }
+    } else {
+        orig_DrawIndexedPrimitive = nullptr;   // marks the census as not installed
+    }
 
     // Only install state cache hooks if it is actually enabled by the user config
     if (!Config::g_settings.OptVulkanDXVK && !Config::g_settings.OptD3d9RenderThread) {
@@ -556,11 +679,21 @@ void OnCreateDevice(IDirect3DDevice9* device) {
     Log("[D3D9StateCache] Active - Redundant render state filtering successfully hooked on main thread");
 }
 
+// Printed from the periodic report. Shutdown does not run - the DLL exits via
+// TerminateProcess - so anything reported only from there is never seen.
+void LogStats() {
+    Log("[D3D9StateCache] redundancy skips - textures %ld, render states %ld, "
+        "stage states %ld, samplers %ld, transforms %ld, viewports %ld, "
+        "vs constants %ld",
+        g_textureSkips.load(), g_renderStateSkips.load(), g_stageStateSkips.load(),
+        g_samplerSkips.load(), g_transformSkips.load(), g_viewportSkips.load(),
+        g_vsConstantSkips.load());
+}
+
 void Shutdown() {
     InvalidateLatencyQueries(false);
     CleanVBCache();
-    Log("[D3D9StateCache] Redundancy Skips: Textures: %ld, RenderStates: %ld, StageStates: %ld, Samplers: %ld, Transforms: %ld, Viewports: %ld, VSConstants: %ld",
-        g_textureSkips.load(), g_renderStateSkips.load(), g_stageStateSkips.load(), g_samplerSkips.load(), g_transformSkips.load(), g_viewportSkips.load(), g_vsConstantSkips.load());
+    LogStats();
 }
 
 void InvalidateAllCaches(bool safeToRelease) {

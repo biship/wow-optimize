@@ -1,3 +1,29 @@
+// ============================================================================
+// Module: combat_log_filter.cpp
+// Description: Drops COMBAT_LOG_EVENT_UNFILTERED by affiliation before it reaches
+//              Lua. Only reachable through the event coalescer.
+//
+// What this actually does, as opposed to what the launcher used to claim: it
+// reads the source and destination affiliation flags out of the varargs and drops
+// the event unless one of them is MINE, PARTY or RAID (mask 0x7). It has no
+// knowledge of what any addon subscribed to.
+//
+// So it is not a free reduction in work. Everything below stops reaching addons:
+//   * arena and battleground opponents fighting each other - both are OUTSIDER,
+//   * boss abilities aimed at other NPCs, and add-on-add damage,
+//   * anything at all between two units outside the player's group.
+//
+// A damage meter under-reports, and an arena addon watching an opponent's
+// cooldowns sees nothing. That is a behaviour change, not an optimisation, which
+// is why it is off by default and why the description says so plainly now.
+//
+// The vararg walk assumes the 3.3.5a COMBAT_LOG_EVENT_UNFILTERED prefix -
+// timestamp, event, sourceGUID, sourceName, sourceFlags, destGUID, destName,
+// destFlags - and reads the GUID width from the format string because it varies.
+// It is wrapped in __try because a format that does not match would otherwise
+// walk off the stack; on any exception it declines to filter.
+// ============================================================================
+
 #include "combat_log_filter.h"
 #include <string.h>
 #include <stdio.h>

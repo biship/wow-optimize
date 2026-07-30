@@ -1,5 +1,4 @@
 #include "d3d9_render_thread.h"
-#include "font_alpha_fastpath.h"
 #include "MinHook.h"
 #include "version.h"
 #include "config.h"
@@ -323,17 +322,23 @@ static DWORD WINAPI RenderThreadProc(LPVOID param) {
 }
 
 
-static DWORD g_lastTextureFactor = 0xFFFFFFFF;
 
+// A "font alpha fast path" used to sit here. It tracked the last TEXTUREFACTOR
+// and, whenever the client enabled ALPHABLENDENABLE, turned it back off if that
+// factor's alpha was 0xFF or 0x00.
+//
+// Neither case is a valid equivalence. Disabling the blend is only equivalent
+// when the per-pixel source alpha is 1 everywhere, and TEXTUREFACTOR is a stage
+// constant: under the usual MODULATE the source alpha is texture alpha times
+// factor alpha, so a factor of 0xFF leaves the texture's own alpha in charge. For
+// text that texture is almost entirely alpha - the glyph shape lives there - so
+// dropping the blend paints the whole quad and turns letters into solid
+// rectangles. The 0x00 case has no defence at all: source alpha becomes zero, so
+// the draw is invisible with blending and fully opaque without it.
+//
+// Removed along with the module behind it. The tracked factor went too, having no
+// other reader.
 void QueueSetRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state, DWORD value) {
-    if (state == D3DRS_TEXTUREFACTOR) {
-        g_lastTextureFactor = value;
-    } else if (state == D3DRS_ALPHABLENDENABLE && value == TRUE) {
-        if (::FontAlphaFastpath::ShouldApplyFastpath(g_lastTextureFactor)) {
-            value = FALSE;
-        }
-    }
-
     RenderCommand cmd;
     cmd.type = CMD_SET_RENDER_STATE;
     cmd.device = device;

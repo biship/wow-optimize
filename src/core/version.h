@@ -34,9 +34,20 @@
 // PRODUCTION FLAGS - stable configuration
 // ================================================================
 
-// GetItemInfo cache - breaks Aux / WCollections / ElvUI
+// GetItemInfo cache. This flag has been 0 - the cache enabled - for as long as
+// the comment above it said the cache "breaks Aux / WCollections / ElvUI",
+// which is not a note anyone should have left next to an enabled feature.
+//
+// The likely reason is now fixed. The cache is direct-mapped and compared its
+// string key after truncating to 255 characters, so two arguments sharing a
+// 255-character prefix compared equal and one item's data was served for
+// another. Aux walks tens of thousands of item links in a scan, which is the
+// workload that finds a collision of that kind. Keys that do not fit now bypass
+// the cache instead of being truncated. Also gone: an "is it loaded" test that
+// read return value four as the item level and refused to store anything with
+// an item level of zero, and a result count taken from how many values the
+// client pushed rather than how many it returned.
 #define TEST_DISABLE_GETITEMINFO_CACHE  0
-// GetSpellInfo hook also disabled below.
 #define TEST_DISABLE_ALL_APICACHE       0
 
 // Phase 2 Lua fast paths
@@ -90,9 +101,6 @@
 // Phase 2 DMA hooks (type, floor, ceil, abs, max, min, len, byte,
 // tostring, tonumber, select, rawequal)
 #define TEST_DISABLE_PHASE2_NEW_DMA     0
-
-// GetSpellInfo cache - icon corruption + relog crash
-#define TEST_DISABLE_GETSPELLINFO_CACHE 0
 
 // ================================================================
 // INDIVIDUAL PHASE 2 HOOK TOGGLES
@@ -373,7 +381,13 @@
 // On multi-client setups with shared disk, set to 1 to avoid I/O contention.
 #define TEST_DISABLE_LUA_PRECOMPILE      1
 
-#define TEST_DISABLE_QUAT_NORMALIZE         1
+// SSE2 quaternion normalize. Compiled in and gated at run time by the
+// QuatNormalizeSse2 setting (default off) rather than compiled out, so it can be
+// tested. The client's version at 0x00979110 is measured at 3.13% of main-thread
+// execution in a CPU-bound profile. The replacement was checked against it over
+// 400000 quaternions: worst per-component difference is one float ULP, the result
+// is unit to within 1.6 ULP, and the two never disagree about the epsilon cutoff.
+#define TEST_DISABLE_QUAT_NORMALIZE         0
 
 // Addon file RAM-disk - interferes with WoW file I/O
 #define TEST_DISABLE_ADDON_PRELOAD      1
@@ -382,14 +396,6 @@
 // Background writes are stabilized via handle duplication.
 #define TEST_DISABLE_SAVED_VARS_ASYNC   0
 
-// Spell Data Caching - cache spell coefficients, ranges, cooldowns
-// Target function uses __usercall calling convention (custom)
-// Hooking requires naked function with inline assembly.
-// DEAD FLAG — not referenced by any #if anywhere in src/. spell_cache.cpp's
-// Init() unconditionally logs "DISABLED" and returns false; the naked-function
-// thunk this comment describes was never written. Flipping this flag does
-// nothing. Either implement the __usercall thunk for real or delete the stub.
-#define TEST_DISABLE_SPELL_CACHE        1
 
 // Multithreaded Combat Log Parser - DISABLED.
 // The worker actually parses nothing: the queue (g_queueTail / entry->ready) is

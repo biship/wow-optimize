@@ -236,6 +236,12 @@ bool Init() {
     return true;
 }
 
+// Printed from the periodic report. Shutdown does not run - the DLL exits via
+// TerminateProcess - so anything reported only from there is never seen.
+void LogStats() {
+    Log("[AsyncSoundLoader] Stats: Preloaded %lld sound effects.", g_preloads);
+}
+
 void Shutdown() {
     if (!Config::g_settings.OptAudioDecodeMt) return;
     g_active = false;
@@ -248,7 +254,7 @@ void Shutdown() {
     }
     WinLockGuard lock(g_soundMutex);
     g_soundCache.clear();
-    Log("[AsyncSoundLoader] Stats: Preloaded %lld sound effects.", g_preloads);
+    LogStats();
 }
 
 

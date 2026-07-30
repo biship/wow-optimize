@@ -17,14 +17,11 @@
 extern "C" void Log(const char* fmt, ...);
 extern "C" void FlushCoalescedPackets();
 
-#include "ui_layout_throttle.h"
 
 static bool IsTeardownState();
 
 // ================================================================
 // Coalesced layout recalculation
-typedef int (__fastcall *LayoutRecalc_fn)(void* ecx, int edx, int a2);
-static LayoutRecalc_fn orig_LayoutRecalc = nullptr;
 
 static void* g_dirtyLayoutFrames[2048] = {};
 static int g_dirtyLayoutFramesCount = 0;
@@ -42,20 +39,16 @@ static bool IsValidFramePtr(void* ptr) {
     return false;
 }
 
-int __fastcall Hooked_LayoutRecalc(void* ecx, int edx, int a2) {
-    // Only apply layout loop throttling in the game world
-    uint64_t playerGuid = *(uint64_t*)0x00BD07A0;
-    if (playerGuid != 0) {
-        if (UILayoutThrottle::ShouldThrottle(ecx)) {
-            return 0;
-        }
-    }
-    return orig_LayoutRecalc(ecx, 0, a2);
-}
-
-void FlushLayoutUpdates() {
-    UILayoutThrottle::ResetFrameCounter();
-}
+// A LayoutRecalc detour used to sit here, to break UI layout loops by refusing a
+// frame more than 200 layout passes in one game frame. It never refused any: the
+// throttle behind it kept its own enable flag, that flag was initialised to false
+// and nothing ever set it, so ShouldThrottle returned on its first line every
+// time. The detour was left as a pass-through that read a global and called the
+// original.
+//
+// Removed rather than switched on. Declining a layout pass the client asked for
+// is the same bet as AnimationLod, AsyncCulling and NameplateThrottle, and all
+// three of those were removed after testers reported them as visual corruption.
 
 // Memory validation
 // ================================================================
@@ -823,12 +816,6 @@ bool InstallLogicHooks(void) {
     int installed = 0;
     Log("[LogicHooks] Invariant script cache hooks DISABLED (stack leak safety)");
 
-    if (WineSafe_CreateHook((void*)0x00489DE0, (void*)Hooked_LayoutRecalc, (void**)&orig_LayoutRecalc) == MH_OK) {
-        if (WO_EnableHook((void*)0x00489DE0) == MH_OK) {
-            installed++;
-            Log("[LogicHooks] Hooked LayoutRecalc at 0x00489DE0 (layout loop throttling active)");
-        }
-    }
 
     Log("[LogicHooks] Initialized — combat text batching, UI layout cache, "
         "network heartbeat filter, invariant script cache (%d hooks active)", installed);
@@ -870,8 +857,6 @@ void OnFrameLogicHooks(DWORD mainThreadId) {
 
     DWORD frameIdx = InterlockedIncrement((LONG*)&g_logicFrameIndex);
 
-    // Flush any pending coalesced layout updates
-    FlushLayoutUpdates();
 
     // Flush any coalesced network packets
     FlushCoalescedPackets();

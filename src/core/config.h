@@ -3,6 +3,16 @@
 #define WOW_OPT_CONFIG_H
 
 namespace Config {
+    // The initialisers below are not the defaults anyone actually gets. Load()
+    // overwrites every one of them from GetPrivateProfileIntA, whose own default
+    // argument is what applies when a key is absent from wow_opt.ini - which it
+    // is for anything the launcher never writes.
+    //
+    // They had drifted apart on ten settings, and reading this file instead of
+    // the ini call led me to state in the release notes that thirty-five removed
+    // features "ran on every install". They did not: their ini-read default was
+    // zero, so they were off for everyone. Keep these two in step, and when the
+    // question is what a player is actually running, read Load().
     struct Settings {
         // General & Memory
         bool OptSleepPrecision = true;
@@ -32,10 +42,12 @@ namespace Config {
         bool OptVulkanDXVK = false;
         bool OptTimingFix = false;
         bool OptCvarNullGuard = true; // Safe default: enabled
+        // Pins timingMethod to 2 and timingTestError to 0 whatever the client
+        // asks. On by default because it has shipped that way for a long time;
+        // it used to have no switch at all and lived inside CvarNullGuard.
+        bool OptTimingCvarPin = true;
         bool OptFrameLimiter = false;
-        bool OptMpqMmapVfs = false;
-        bool OptMpqPrefetch = false;
-        bool OptObjVisCache = false;
+        bool OptObjVisCache = true;
         bool OptDbcPreload = false;
         bool OptOomGovernor = false;
         bool OptHardwareCursor = false;
@@ -72,7 +84,14 @@ namespace Config {
         bool OptSavedVarsPretoken = false;
         bool OptUnitAuraFast = false;
         bool OptNetworkGuidSse2 = false;
-        bool OptGetSpellInfoCache = false;
+        // Caches GetItemInfo and GetSpellInfo. On by default because that is what
+        // every install has already been running: ApiCache::Init was called with no
+        // setting check at all. The switch named GetSpellInfoCache, which looked
+        // like it controlled this, gated a different module whose Init logged
+        // "DISABLED" and returned false - so a tester who turned the cache off
+        // still had the hook installed. This is the cache behind the WeakAuras
+        // icon that stays wrong after a talent switch.
+        bool OptApiCache = true;
         bool OptPacketOffload = false;
         bool OptNameplateMT = false;
 
@@ -96,57 +115,44 @@ namespace Config {
         bool OptD3d9RenderThread = false;
 
         // 10 new features
-        bool OptCombatLogFilter = true;
-        bool OptSoundVolumeLimit = true;
-        bool OptUILayoutThrottle = true;
-        bool OptTerrainHeightCache = true;
-        bool OptAnimBlendCache = true;
-        bool OptSavedVarsOpt = true;
-        bool OptItemDataPrefetch = true;
-        bool OptMovementSmoothing = true;
-        bool OptFontAlphaFastpath = true;
+        // Off by default. It drops events by affiliation, not by subscription, so
+        // anything happening between two units outside your group never reaches
+        // addons - see the note in combat_log_filter.cpp.
+        bool OptCombatLogFilter = false;
+        bool OptSoundVolumeLimit = false;
+        bool OptTerrainHeightCache = false;
 
-        bool OptPacketProcessingThrottle = true;
-        bool OptNameplateCulling = true;
         bool OptTextureUnloadDelay = false;
-        bool OptM2MatrixSimd = true;
-        bool OptM2BoneMt = false;
+        bool OptM2MatrixSimd = false;
         bool OptMpqAsyncDecompress = false;
-        bool OptMinimapRefreshGovernor = true;
-        bool OptSpellEffectCulling = true;
-        bool OptLuaStringCompareFast = true;
-        bool OptDbcRowCaching = true;
-        bool OptNetworkStringDedup = true;
-        bool OptSoundFreqCoalesce = true;
-        bool OptAuraUpdateDedup = true;
-        bool OptUiTextureCaching = true;
-        bool OptWmoCullingOpt = true;
-        bool OptFastFloatParse = true;
-        bool OptHeapAllocationTracker = true;
+        bool OptSpellEffectCulling = false;
+        // Drops a dead _msize from WoW's free wrapper. Measured at 8-10% of
+        // main-thread execution in two tester profiles.
+        // SSE2 quaternion normalize. Off by default: the client's version is
+        // 3.13% of execution in a CPU-bound profile and the replacement matches
+        // it to one ULP, but it has never been run in a game.
+        bool OptQuatNormalizeSse2 = false;
+        // SSE2 4x4 matrix multiply. Off by default for the same reason: verified
+        // against the client's version numerically, never run in a game.
+        bool OptMatrixMultiplySse2 = false;
+        // Counts draw calls per frame. A diagnostic, not an optimisation: it
+        // wraps the hottest call in the renderer, so it is meant to answer the
+        // question in one session and be switched off again.
+        bool OptDrawCensus = false;
+        // Counts Lua VM allocations by size through G->frealloc. A measurement,
+        // like the draw census - it decides whether a dedicated Lua arena is
+        // worth building.
+        bool OptLuaAllocCensus = false;
+        bool OptCrtFreeMsize = true;
+        bool OptCrtAllocMsize = true;
         bool OptCrtMimalloc = false;
-        bool OptSpellCooldownCache = true;
-        bool OptGuidStringCache = true;
-        bool OptFrameScriptMemOpt = true;
-        bool OptCombatEventLimit = true;
 
         // Previously Init'd unconditionally (ignored their launcher toggles).
         // Default true = preserve the old always-on behavior; now disableable.
-        bool OptAddonMsgLimiter = true;
-        bool OptAuraPreloadCache = true;
-        bool OptCDataStoreBuffering = true;
-        bool OptCameraShakeOpt = true;
-        bool OptCombatLogAsync = true;
-        bool OptCombatTextFont = true;
-        bool OptDbcFileCache = true;
-        bool OptFontOutlineCache = true;
-        bool OptMouseClipRelease = true;
-        bool OptNameplateDistanceCvar = true;
-        bool OptSavedVarsBackup = true;
-        bool OptSoundCoalescer = true;
-        bool OptSpellOverlayPreload = true;
-        bool OptUnitMaxPowerCache = true;
-        bool OptVertexBufferPrealloc = true;
-        bool OptWorldObjectOpt = true;
+        bool OptMouseClipRelease = false;
+        bool OptSavedVarsBackup = false;
+        bool OptSoundCoalescer = false;
+        bool OptVertexBufferPrealloc = false;
     };
 
     extern Settings g_settings;

@@ -36,13 +36,19 @@ bool Init() {
     return true;
 }
 
+// Printed from the periodic report. Shutdown does not run - the DLL exits via
+// TerminateProcess - so anything reported only from there is never seen.
+void LogStats() {
+    Log("[VertexBufferPrealloc] Stats: Serviced %lld allocations, %lld pool hits", g_allocations, g_poolHits);
+}
+
 void Shutdown() {
     SRWLockGuard lock(&g_poolLock);
     if (g_poolBuffer) {
         VirtualFree(g_poolBuffer, 0, MEM_RELEASE);
         g_poolBuffer = nullptr;
     }
-    Log("[VertexBufferPrealloc] Stats: Serviced %lld allocations, %lld pool hits", g_allocations, g_poolHits);
+    LogStats();
 }
 
 void* AllocateBuffer(size_t size) {

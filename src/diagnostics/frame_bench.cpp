@@ -46,6 +46,20 @@ static double    g_over33      = 0.0;   // counters kept as double to avoid cast
 static double    g_over50      = 0.0;
 static double    g_over100     = 0.0;
 
+// A smoothed frame time, updated in constant time.
+//
+// RecentP95Ms is the honest measure but it copies the window and sorts it, which
+// is fine on the quality governor's few-second cadence and far too expensive for
+// anything on a per-frame or per-Sleep path. This is the cheap companion: one
+// multiply-add per frame, one load to read.
+//
+// A torn read from another thread can only produce a value that is too large or
+// too small, and both callers treat either extreme as a safe default, so it is
+// deliberately unsynchronised.
+static double g_smoothedMs = 0.0;
+
+double SmoothedFrameMs() { return g_smoothedMs; }
+
 static LARGE_INTEGER g_freq  = {};
 static LARGE_INTEGER g_last  = {};
 static Source        g_source = Source::None;
@@ -120,6 +134,7 @@ void Init() {
     g_last.QuadPart = 0;
     g_source = Source::None;
     g_medianMs = 0.0;
+    g_smoothedMs = 0.0;
     g_medianAtFrame = 0;
     g_lastSlowReport = 0;
     g_slowFrames = 0;
@@ -161,6 +176,10 @@ double RecentP95Ms() {
 // percentiles it reports are checkable without running the game.
 static void Accumulate(double ms) {
     if (ms <= 0.0) return;
+
+    // ~50-frame time constant: long enough to ignore a single slow frame, short
+    // enough to notice a zone that is genuinely heavier within about a second.
+    g_smoothedMs = (g_smoothedMs <= 0.0) ? ms : (g_smoothedMs * 0.98 + ms * 0.02);
 
     g_frames++;
     g_sumMs += ms;

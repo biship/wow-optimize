@@ -22,6 +22,7 @@
 #include "ui_cache.h"
 #include "api_cache.h"
 #include "lua_fastpath.h"
+#include "lua_alloc_census.h"
 #include "lua_internals.h"
 #include "lua_vm_cache.h"
 #include "crash_dumper.h"
@@ -57,55 +58,19 @@
 #include "guid_lookup_cache.h"
 #include "simd_math_fast.h"
 #include "combatlog_incremental.h"
-#include "lua_alloc_pool.h"
 #include "world_state_coalesce.h"
 #include "hooks_subsystems/sound_coalescer.h"
-#include "hooks_subsystems/aura_preload_cache.h"
-#include "hooks_subsystems/dbc_file_cache.h"
-#include "hooks_subsystems/font_outline_cache.h"
-#include "hooks_subsystems/lua_gc_governor.h"
 #include "hooks_subsystems/particle_density_scaler.h"
-#include "hooks_subsystems/addon_msg_limiter.h"
 #include "hooks_subsystems/vertex_buffer_prealloc.h"
-#include "hooks_subsystems/world_object_opt.h"
-#include "hooks_subsystems/nameplate_distance_cvar.h"
-#include "hooks_subsystems/combat_log_async.h"
-#include "hooks_subsystems/cdatastore_buffering.h"
-#include "hooks_subsystems/camera_shake_opt.h"
-#include "hooks_subsystems/combat_text_font.h"
-#include "hooks_subsystems/spell_overlay_preload.h"
 #include "hooks_subsystems/saved_vars_backup.h"
-#include "hooks_subsystems/unit_max_power_cache.h"
 #include "hooks_subsystems/mouse_clip_release.h"
 #include "hooks_subsystems/combat_log_filter.h"
 #include "hooks_subsystems/sound_volume_limit.h"
-#include "hooks_subsystems/ui_layout_throttle.h"
 #include "hooks_subsystems/terrain_height_cache.h"
-#include "hooks_subsystems/anim_blend_cache.h"
-#include "hooks_subsystems/saved_vars_opt.h"
-#include "hooks_subsystems/item_data_prefetch.h"
-#include "hooks_subsystems/movement_smoothing.h"
-#include "hooks_subsystems/font_alpha_fastpath.h"
 
-#include "hooks_subsystems/packet_processing_throttle.h"
-#include "hooks_subsystems/nameplate_culling.h"
 #include "hooks_subsystems/texture_unload_delay.h"
-#include "hooks_subsystems/minimap_refresh_governor.h"
 #include "hooks_subsystems/quality_governor.h"
 #include "hooks_subsystems/spell_effect_culling.h"
-#include "hooks_subsystems/lua_string_compare_fast.h"
-#include "hooks_subsystems/dbc_row_caching.h"
-#include "hooks_subsystems/network_string_dedup.h"
-#include "hooks_subsystems/sound_freq_coalesce.h"
-#include "hooks_subsystems/aura_update_dedup.h"
-#include "hooks_subsystems/ui_texture_caching.h"
-#include "hooks_subsystems/wmo_culling_opt.h"
-#include "hooks_subsystems/fast_float_parse.h"
-#include "hooks_subsystems/heap_allocation_tracker.h"
-#include "hooks_subsystems/spell_cooldown_cache.h"
-#include "hooks_subsystems/guid_string_cache.h"
-#include "hooks_subsystems/frame_script_mem_opt.h"
-#include "hooks_subsystems/combat_event_limit.h"
 
 // Forward declaration - Log() defined later in this file
 extern "C" void Log(const char* fmt, ...);
@@ -146,6 +111,69 @@ static void FreezeClassifyAddr(uintptr_t addr, char* out) {
     }
     wsprintfA(out, "0x%08X", (unsigned)addr);
 }
+
+// What every other thread in the process was doing when the main thread stalled.
+//
+// A raid session produced seven real stalls, the longest 10.5 seconds - confirmed
+// independently by FrameBench, which counted them as gaps and kept them out of
+// the frame statistics. The main thread's stack named the waiter every time:
+// sub_774DA0, WoW's own lock, spinning and then waiting on an event. So the main
+// thread is blocked on something another thread holds, and the report said
+// nothing whatsoever about that other thread.
+//
+// That is the whole question. This answers it by naming, for every other thread
+// in the process, the module and offset it was executing.
+//
+// Safe to call here: the watchdog thread does nothing between the suspend and the
+// resume except read a register, so it cannot want a lock the suspended thread is
+// holding. The stall is already in progress, so a few microseconds of extra
+// suspension changes nothing.
+static void FreezeDumpOtherThreads(DWORD mainTid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        Log("!!!   (could not enumerate threads)");
+        return;
+    }
+
+    DWORD selfPid = GetCurrentProcessId();
+    DWORD watchdogTid = GetCurrentThreadId();
+    int reported = 0;
+
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        Log("!!!   OTHER THREADS AT THE MOMENT OF THE STALL:");
+        do {
+            if (te.th32OwnerProcessID != selfPid) continue;
+            if (te.th32ThreadID == mainTid || te.th32ThreadID == watchdogTid) continue;
+            if (reported >= 24) break;
+
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                  FALSE, te.th32ThreadID);
+            if (!h) continue;
+
+            uintptr_t eip = 0;
+            if (SuspendThread(h) != (DWORD)-1) {
+                CONTEXT c;
+                c.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(h, &c)) eip = (uintptr_t)c.Eip;
+                ResumeThread(h);
+            }
+            CloseHandle(h);
+
+            if (eip) {
+                char where[128];
+                FreezeClassifyAddr(eip, where);
+                Log("!!!     TID=%-6lu %s", te.th32ThreadID, where);
+                reported++;
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+
+    if (reported == 0) Log("!!!     (none could be read)");
+}
+
 
 // On a real freeze, snapshot WHERE the main thread is actually stuck. The EIP
 // tells us whether it's blocked in a syscall (ntdll = a wait) and the stack
@@ -265,6 +293,9 @@ static DWORD WINAPI FreezeWatchdogProc(LPVOID) {
                 }
                 if (suspects == 0)
                     Log("!!!   (no error/recently-active DLL feature -- stall is WoW-internal)");
+
+                FreezeDumpOtherThreads(g_mainThreadId);
+
                 Log("!!! END FREEZE REPORT !!!");
             }
 
@@ -293,7 +324,6 @@ static void StopFreezeWatchdog() {
 }
 
 #include "frame_throttle.h"
-#include "spell_cache.h"
 // #include "ui_frame_batch.h" // REMOVED - optimization disabled
 
 #include "MinHook.h"
@@ -303,8 +333,6 @@ static void StopFreezeWatchdog() {
 #include "combatlog_optimize.h"
 #include "combatlog_buffer.h"
 #include "addon_dispatcher.h"
-#include "mpq_prefetch.h"
-#include "mpq_mmap_vfs.h"
 #include "mpq_async_decompress.h"
 #include "obj_vis_cache.h"
 #include "nameplate_batch.h"
@@ -390,7 +418,6 @@ static void StopFreezeWatchdog() {
 #include "loading_state.h"
 #include "diagnostics/frame_bench.h"
 #include "luaS_newlstr_sse2.h"
-#include "lua_bytecode_pre_compiler.h"
 #include "hot_patch.h"
 #include "wow_opt_hooks.h"
 #include "wow_perf_hooks.h"
@@ -430,16 +457,8 @@ void ClearCombatLogCache();
 #include "mip_bias_governor.h"
 #include "perf_diagnostics.h"
 #include "adaptive_farclip.h"
-#include "m2_bone_simd.h"
 #include "font_glyph_cache.h"
-#include "saved_vars_preload_async.h"
-#include "minimap_throttle.h"
-#include "dbc_lookup_cache_fast.h"
-#include "world_to_screen_sse.h"
-#include "d3d9_tss_cache.h"
-#include "lua_string_pool_fast.h"
 #include "async_sound_loader.h"
-#include "lua_jit_compiler.h"
 #include "rcu_obj_mgr.h"
 #include "async_terrain_loader.h"
 
@@ -451,7 +470,6 @@ void ClearCombatLogCache();
 #include "hooks_memory.h"
 #include "hooks_async.h"
 
-extern "C" void IncrementParticleFrameCount();
 
 #include "version.h"
 #include "config.h"
@@ -883,7 +901,6 @@ extern "C" void ClearLuaOptCaches() {
     // the model-pointer table that used to hide corpses: a cache keyed by an
     // address the engine is free to reuse must be dropped when the owner dies.
     FontGlyphCache::ClearCache();
-    FontOutlineCache::ClearCache();
 }
 
 // Stats for new hooks (defined with implementations below)
@@ -1378,6 +1395,17 @@ static Sleep_fn orig_Sleep = nullptr;
 static double g_sleepFreq = 0.0;
 static double g_rdtscFreqMhz = 0.0;  // RDTSC frequency in MHz for easy calculation
 
+// Above this smoothed frame time the client is not holding a steady rate, and the
+// busy-wait in PreciseSleep stops paying for itself. 20ms is just under 50fps -
+// past that, precision is not what the frame is short of.
+static const double SPIN_ABORT_FRAME_MS = 20.0;
+
+// Non-atomic on purpose: these are diagnostic counts on the Sleep path, and a
+// lost increment costs a slightly low number where an interlocked operation
+// would cost time on every short sleep.
+static volatile LONG g_spinTaken   = 0;
+static volatile LONG g_spinSkipped = 0;
+
 static void PreciseSleep(double milliseconds) {
     // Use RDTSC for polling instead of QPC syscalls
     uint64_t startRDTSC = __rdtsc();
@@ -1539,12 +1567,6 @@ static void WINAPI hooked_Sleep(DWORD ms) {
                 AddonDispatcher::OnFrame(g_mainThreadId);
             }
 #endif
-#if !TEST_DISABLE_MPQ_PREFETCH
-            MPQPrefetch::OnFrame(g_mainThreadId);
-#endif
-            if (Config::g_settings.OptMpqMmapVfs) {
-                MpqMmapVfs::OnFrame();
-            }
             RcuObjMgr::OnFrame();
 #if !TEST_DISABLE_TEXTURE_DECODE_MT
             AsyncTexLoader::OnFrame();
@@ -1563,7 +1585,6 @@ static void WINAPI hooked_Sleep(DWORD ms) {
             OnFrameRenderHooks(g_mainThreadId);
             OnFrameLogicHooks(g_mainThreadId);
             OnFrameAsyncHooks(g_mainThreadId);
-            // LuaGcGovernor::OnFrame((float)elapsedMs); // Disabled duplicate governor
 #if !TEST_DISABLE_LUA_GC_GOVERNOR
             LuaGCGovernor::OnFrame(elapsedMs);
 #endif
@@ -1590,6 +1611,31 @@ static void WINAPI hooked_Sleep(DWORD ms) {
                 orig_Sleep(ms);
                 return;
             }
+
+            // PreciseSleep does not sleep - for a 1ms wait it spins
+            // SwitchToThread for most of it and then _mm_pause. That is a fair
+            // trade while frames are comfortably inside their budget, because
+            // sub-millisecond pacing is what stops a steady frame rate from
+            // wobbling.
+            //
+            // It stops being a fair trade the moment frames are late. Pacing a
+            // frame precisely does nothing for one that already missed, and the
+            // cycles burned spinning are exactly the cycles it needed. Worse, the
+            // cost lands hardest when the machine is CPU-bound, which is when it
+            // can least afford it.
+            //
+            // So above a smoothed frame time that means "not keeping up", hand
+            // the time back to the scheduler instead. The reading is 0.0 until
+            // enough frames have been measured, which keeps the old behaviour as
+            // the default rather than the exception.
+            double smoothed = FrameBench::SmoothedFrameMs();
+            if (smoothed > SPIN_ABORT_FRAME_MS) {
+                ++g_spinSkipped;
+                orig_Sleep(ms);
+                return;
+            }
+
+            ++g_spinTaken;
             PreciseSleep((double)ms);
             return;
         }
@@ -4372,17 +4418,6 @@ static void DumpPeriodicStats() {
     }
 
 
-    // Spell Cache stats
-    {
-        SpellCache::Stats stats;
-        SpellCache::GetStats(&stats);
-        if (stats.hits + stats.misses > 0) {
-            double hitRate = (double)stats.hits / (stats.hits + stats.misses) * 100.0;
-            Log("[Stats] Spell Cache: %ld hits, %ld misses, %ld evictions, %ld entries (%.1f%% hit rate)",
-                stats.hits, stats.misses, stats.evictions, stats.cacheSize, hitRate);
-        }
-    }
-
     // UI Frame Batch stats - REMOVED (optimization disabled)
     // {
     //     long batched = 0, iterations = 0, peak = 0;
@@ -4533,6 +4568,27 @@ static void DumpPeriodicStats() {
 #endif
     FrameBench::Report("periodic");
     CrashDumper::ReportFeatureActivity();
+    CrashDumper::ReportFirstChanceSummary();
+    PerfDiagnostics::LogStats();
+    LuaGCGovernor::LogStats();
+    LuaAllocCensus::LogStats();
+    ReportCrtFreeStats();
+    if (g_spinTaken > 0 || g_spinSkipped > 0) {
+        Log("[SleepPrecision] busy-wait taken %ld, handed back %ld (frames over "
+            "%.0f ms give the time to the scheduler instead)",
+            (long)g_spinTaken, (long)g_spinSkipped, SPIN_ABORT_FRAME_MS);
+    }
+    LuaFastPath::LogStats();
+    ObjVisCache::LogStats();
+    FontGlyphCache::LogStats();
+    ApiCache::LogStats();
+    D3D9StateCache::LogStats();
+    D3D9StateCache::ReportDrawCensus();
+    AsyncSoundLoader::LogStats();
+    VertexBufferPrealloc::LogStats();
+    LuaBytecodeCache::LogStats();
+    CombatLogBuffer::LogStats();
+    MpqAsyncDecompress::LogStats();
 }
 
 // ================================================================
@@ -4789,8 +4845,8 @@ extern "C" void WowOpt_OnFrameBoundary() {
     FontMetrics_OnFrame();
     QualityGovernor::OnFrame();
     CvarWatchdog_Check();
+    LuaAllocCensus::EnsureInstalled();
 #if !TEST_DISABLE_PARTICLE_THROTTLE
-    IncrementParticleFrameCount();
 #endif
 }
 
@@ -6593,7 +6649,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     CrashDumper::RegisterFeature("HardwareCursor");
     CrashDumper::RegisterFeature("FrameThrottle");
     CrashDumper::RegisterFeature("UIFrameBatch");
-    CrashDumper::RegisterFeature("SpellCache");
     CrashDumper::RegisterFeature("LuaRawGetICache");
     CrashDumper::RegisterFeature("CombatLogFullCache");
     CrashDumper::RegisterFeature("ThreadAffinity");
@@ -6609,8 +6664,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     CrashDumper::RegisterFeature("CombatLogBuffer");
     CrashDumper::RegisterFeature("ObjVisCache");
     CrashDumper::RegisterFeature("AddonDispatcher");
-    CrashDumper::RegisterFeature("MPQPrefetch");
-    CrashDumper::RegisterFeature("MpqMmapVfs");
     CrashDumper::RegisterFeature("NameplateMT");
     CrashDumper::RegisterFeature("NetworkGUID");
     CrashDumper::RegisterFeature("UICache");
@@ -6670,7 +6723,8 @@ static DWORD WINAPI MainThread(LPVOID param) {
     CrashDumper::RegisterFeature("MemoryOpt");
     CrashDumper::RegisterFeature("SourceOpt");
     CrashDumper::RegisterFeature("TlsObjectCache");
-    Log("[CrashDumper] Registered %d features for tracking", MAX_TRACKED_FEATURES);
+    Log("[CrashDumper] Registered %d features for tracking (capacity %d)",
+        CrashDumper::RegisteredFeatureCount(), MAX_TRACKED_FEATURES);
 
     Log("--- DXVK Vulkan Integration ---");
     Log("[VulkanDXVK] Config option: %s", Config::g_settings.OptVulkanDXVK ? "ENABLED (d3d9.dll proxy required in game directory)" : "DISABLED");
@@ -6853,6 +6907,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     // CRT Free Hook - 2901 callers (#2 most called)
     bool crtFreeOk = InstallCrtFreeHook();
+    InstallCrtAllocHook();
 
     // Aligned Allocator Cache - 1764 callers (thread-local pool for small allocations)
     bool alignedAllocOk = InstallAlignedAllocCache();
@@ -7349,7 +7404,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool frameThrottleOk = Config::g_settings.OptUIFrameBatch && InstallFrameThrottling();
 
     Log("--- Spell Data Caching ---");
-    bool spellCacheOk = Config::g_settings.OptGetSpellInfoCache && SpellCache::Init();
 
     // UI Frame Batching - REMOVED due to calling convention issues
     // Caused MoveAnything addon to break even when disabled
@@ -7438,15 +7492,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("");
     Log("--- Predictive MPQ Prefetching ---");
 #if !TEST_DISABLE_MPQ_PREFETCH
-    bool mpqPrefetchOk = Config::g_settings.OptMpqPrefetch && MPQPrefetch::Init();
 #else
-    Log("[MPQPrefetch] DISABLED via TEST_DISABLE_MPQ_PREFETCH");
     bool mpqPrefetchOk = false;
 #endif
 
     Log("");
     Log("--- Memory-Mapped MPQ VFS & Parallel Decompressor ---");
-    bool mpqMmapVfsOk = (Config::g_settings.OptMpqMmapVfs || Config::g_settings.OptDbcPreload) && MpqMmapVfs::Init();
     if (Config::g_settings.OptMpqAsyncDecompress) MpqAsyncDecompress::Init();
 
     Log("");
@@ -7644,7 +7695,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("[ApiCache] DISABLED (baseline test)");
     bool apiCacheOk = false;
 #else
-    bool apiCacheOk = ApiCache::Init();
+    bool apiCacheOk = Config::g_settings.OptApiCache && ApiCache::Init();
 #endif
 
     Log("--- Timing Method Fix ---");
@@ -7709,9 +7760,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool bytecodePreCompilerOk = false;
     Log("[LuaPreCompile] DISABLED (addon file-prefetch adds I/O pressure on VA-tight HD clients)");
 #else
-    bool bytecodePreCompilerOk = LuaBytecodePreCompiler::Init();
 #endif
-    CrashDumper::RegisterFeature("LuaBytecodePreCompiler");
 
     Log("--- Hot Patch ---");
     if (Config::g_settings.OptDbcLookupCache) HotPatch::InstallAll();
@@ -7873,7 +7922,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Thread-Local Lua Allocator Pool ---");
-    bool luaPoolOk = LuaAllocPool::Init();
 
     Log("");
     Log("--- Coalesced World State Updates ---");
@@ -7895,91 +7943,45 @@ static DWORD WINAPI MainThread(LPVOID param) {
     if (Config::g_settings.OptMemoryPressure) AdaptiveFarclip::Init();
 
     Log("");
-    Log("--- M2 Bone SIMD Acceleration ---");
-    if ((Config::g_settings.OptM2MatrixSimd || Config::g_settings.OptM2BoneMt) && !RunningUnderTranslation()) M2BoneSimd::Init();
-    else if (RunningUnderTranslation()) Log("[M2BoneSimd] DISABLED [forced off: Wine/Rosetta]");
-
-    Log("");
     Log("--- Font Glyph Cache ---");
     if (Config::g_settings.OptFontMetricsFast) FontGlyphCache::Init();
 
     Log("");
     Log("--- Async SavedVariables Preloader ---");
-    if (Config::g_settings.OptSavedVarsAsync && !RunningUnderTranslation()) SavedVarsPreloadAsync::Init();
 
     Log("");
     Log("--- Combat Text Coalescer ---");
 
     Log("");
     Log("--- Minimap Throttle ---");
-    if (Config::g_settings.OptEventCoalescer) MinimapThrottle::Init();
 
     Log("");
     Log("--- Fast DBC Lookup Cache ---");
-    if (Config::g_settings.OptDbcLookupCache) DbcLookupCacheFast::Init();
 
     Log("");
     Log("--- 20 New Subsystem Performance & Stability Features ---");
     if (Config::g_settings.OptSoundCoalescer) SoundCoalescer::Init();
-    if (Config::g_settings.OptAuraPreloadCache) AuraPreloadCache::Init();
-    if (Config::g_settings.OptDbcFileCache) DbcFileCache::Init();
-    if (Config::g_settings.OptFontOutlineCache) FontOutlineCache::Init();
-    // LuaGcGovernor::Init(); // Disabled duplicate governor
-    if (Config::g_settings.OptAddonMsgLimiter) AddonMsgLimiter::Init();
     if (Config::g_settings.OptVertexBufferPrealloc) VertexBufferPrealloc::Init();
-    if (Config::g_settings.OptWorldObjectOpt) WorldObjectOpt::Init();
-    if (Config::g_settings.OptNameplateDistanceCvar) NameplateDistanceCvar::Init();
-    if (Config::g_settings.OptCombatLogAsync) CombatLogAsync::Init();
-    if (Config::g_settings.OptCDataStoreBuffering) CDataStoreBuffering::Init();
-    if (Config::g_settings.OptCameraShakeOpt) CameraShakeOpt::Init();
-    if (Config::g_settings.OptCombatTextFont) CombatTextFont::Init();
-    if (Config::g_settings.OptSpellOverlayPreload) SpellOverlayPreload::Init();
     if (Config::g_settings.OptSavedVarsBackup) SavedVarsBackup::Init();
-    if (Config::g_settings.OptUnitMaxPowerCache) UnitMaxPowerCache::Init();
     if (Config::g_settings.OptMouseClipRelease) MouseClipRelease::Init();
 
     Log("--- 10 More New Performance & Stability Features ---");
     if (Config::g_settings.OptCombatLogFilter) CombatLogFilter::Init();
     if (Config::g_settings.OptSoundVolumeLimit) SoundVolumeLimit::Init();
-    if (Config::g_settings.OptUILayoutThrottle) UILayoutThrottle::Init();
     if (Config::g_settings.OptTerrainHeightCache) TerrainHeightCache::Init();
-    if (Config::g_settings.OptAnimBlendCache) AnimBlendCache::Init();
-    if (Config::g_settings.OptSavedVarsOpt) SavedVarsOpt::Init();
-    if (Config::g_settings.OptItemDataPrefetch) ItemDataPrefetch::Init();
-    if (Config::g_settings.OptMovementSmoothing) MovementSmoothing::Init();
-    if (Config::g_settings.OptFontAlphaFastpath) FontAlphaFastpath::Init();
 
-    if (Config::g_settings.OptPacketProcessingThrottle) PacketProcessingThrottle::Init();
-    if (Config::g_settings.OptNameplateCulling) NameplateCulling::Init();
     if (Config::g_settings.OptTextureUnloadDelay) TextureUnloadDelay::Init();
     QualityGovernor::Init();
-    if (Config::g_settings.OptMinimapRefreshGovernor) MinimapRefreshGovernor::Init();
     if (Config::g_settings.OptSpellEffectCulling) SpellEffectCulling::Init();
-    if (Config::g_settings.OptLuaStringCompareFast) LuaStringCompareFast::Init();
-    if (Config::g_settings.OptDbcRowCaching) DbcRowCaching::Init();
-    if (Config::g_settings.OptNetworkStringDedup) NetworkStringDedup::Init();
-    if (Config::g_settings.OptSoundFreqCoalesce) SoundFreqCoalesce::Init();
-    if (Config::g_settings.OptAuraUpdateDedup) AuraUpdateDedup::Init();
-    if (Config::g_settings.OptUiTextureCaching) UiTextureCaching::Init();
-    if (Config::g_settings.OptWmoCullingOpt) WmoCullingOpt::Init();
-    if (Config::g_settings.OptFastFloatParse) FastFloatParse::Init();
-    if (Config::g_settings.OptHeapAllocationTracker) HeapAllocationTracker::Init();
-    if (Config::g_settings.OptSpellCooldownCache) SpellCooldownCache::Init();
-    if (Config::g_settings.OptGuidStringCache) GuidStringCache::Init();
-    if (Config::g_settings.OptFrameScriptMemOpt) FrameScriptMemOpt::Init();
-    if (Config::g_settings.OptCombatEventLimit) CombatEventLimit::Init();
 
     Log("");
     Log("--- World-to-Screen SSE Math ---");
-    if (Config::g_settings.OptStrStrSse2) WorldToScreenSse::Init();
 
     Log("");
     Log("--- D3D9 Texture Stage State Cache ---");
-    if (Config::g_settings.OptVulkanDXVK) D3D9TssCache::Init();
 
     Log("");
     Log("--- Lua String Symbol Pool ---");
-    if (Config::g_settings.OptLuaOpcache) LuaStringPoolFast::Init();
 
     Log("");
     Log("--- Async Sound FX Loader ---");
@@ -7987,7 +7989,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Lua VM Bytecode JIT Compiler ---");
-    if (Config::g_settings.OptLuaJIT) LuaJitCompiler::Init();
 
     Log("");
     Log("--- RCU Object Manager Traverser ---");
@@ -8199,7 +8200,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("  [%s] Lua PushString (intern)",     luaPushStringOk ? " OK " : "SKIP");
     Log("  [%s] Lua RawGetI (int-key)",       luaRawGetIOk ? " OK " : "SKIP");
     Log("  [%s] CombatLog full cache",        combatLogFullCacheOk ? " OK " : "SKIP");
-    Log("  [%s] Spell data cache (LRU)",      spellCacheOk ? " OK " : "SKIP");
     Log("  [%s] Stream buffer fast path",     streamBufOk    ? " OK " : "SKIP");
     Log("  [%s] D3D9 State Manager (15 hooks)",   d3d9StateOk ? " OK " : "SKIP");
     Log("  [%s] Render Hooks (anim+backbuffer)",    renderHooksOk ? " OK " : "SKIP");
@@ -9866,12 +9866,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
                 AddonDispatcher::Shutdown();
             }
 #endif
-#if !TEST_DISABLE_MPQ_PREFETCH
-            MPQPrefetch::Shutdown();
-#endif
-            if (Config::g_settings.OptMpqMmapVfs) {
-                MpqMmapVfs::Shutdown();
-            }
 #if !TEST_DISABLE_OBJ_VIS_CACHE
             ObjVisCache::Shutdown();
 #endif
@@ -9925,35 +9919,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             GuidLookupCache::Shutdown();
             SimdMathFast::Shutdown();
             CombatLogIncremental::Shutdown();
-            LuaAllocPool::Shutdown();
             WorldStateCoalesce::Shutdown();
             SoundMixerOpt::Shutdown();
             LuaGCGovernor::Shutdown();
             AdaptiveFarclip::Shutdown();
-            M2BoneSimd::Shutdown();
             FontGlyphCache::Shutdown();
-            SavedVarsPreloadAsync::Shutdown();
             CombatLogFilter::Shutdown();
             SoundVolumeLimit::Shutdown();
-            UILayoutThrottle::Shutdown();
             TerrainHeightCache::Shutdown();
-            AnimBlendCache::Shutdown();
-            SavedVarsOpt::Shutdown();
-            ItemDataPrefetch::Shutdown();
-            MovementSmoothing::Shutdown();
-            FontAlphaFastpath::Shutdown();
-            MinimapThrottle::Shutdown();
-            DbcLookupCacheFast::Shutdown();
             QualityGovernor::Shutdown();
             HotPatch::ShutdownAll();
             ReportHotFunctionStats();
             CrashDumper::ReportFeatureActivity();
             LoadingState::ReportLoadTimes();
-            WorldToScreenSse::Shutdown();
-            D3D9TssCache::Shutdown();
-            LuaStringPoolFast::Shutdown();
             AsyncSoundLoader::Shutdown();
-            LuaJitCompiler::Shutdown();
             RcuObjMgr::Shutdown();
             AsyncTerrainLoader::Shutdown();
             AsyncTexLoader::Shutdown();
@@ -9962,10 +9941,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             PerfDiagnostics::Shutdown();
             CrashDumper::Shutdown();
             ShutdownFrameThrottling();
-            SpellCache::Shutdown();
             // ShutdownUIFrameBatching(); // REMOVED - optimization disabled
             ShutdownCombatLogParser();
-            LuaBytecodePreCompiler::Shutdown();
 #if !TEST_DISABLE_SAVED_VARS_ASYNC
             ShutdownSavedVarsAsync();
 #endif

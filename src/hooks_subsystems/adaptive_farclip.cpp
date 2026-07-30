@@ -22,7 +22,6 @@
 
 extern "C" void Log(const char* fmt, ...);
 extern "C" void RegisterParticleCVar(const char* name, void* cvar);
-extern "C" void RegisterNameplateCVar(const char* name, void* cvar);
 
 namespace AdaptiveFarclip {
 
@@ -39,7 +38,6 @@ static void* __cdecl Hooked_CVar_Register(const char* name, const char* defaultV
             Log("[AdaptiveFarclip] Captured farclip CVar pointer: 0x%p", g_farclipCVar);
         }
         RegisterParticleCVar(name, cvar);
-        RegisterNameplateCVar(name, cvar);
     }
     return cvar;
 }

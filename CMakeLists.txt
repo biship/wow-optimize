@@ -64,10 +64,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/combatlog_buffer.h
     src/threading/addon_dispatcher.cpp
     src/threading/addon_dispatcher.h
-    src/hooks_subsystems/mpq_prefetch.cpp
-    src/hooks_subsystems/mpq_prefetch.h
-    src/hooks_subsystems/mpq_mmap_vfs.cpp
-    src/hooks_subsystems/mpq_mmap_vfs.h
     src/hooks_subsystems/mpq_async_decompress.cpp
     src/hooks_subsystems/mpq_async_decompress.h
     src/hooks_subsystems/obj_vis_cache.cpp
@@ -84,6 +80,7 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/api_cache.cpp
     src/hooks_subsystems/api_cache.h
     src/runtime_vm/lua_fastpath.cpp
+    src/runtime_vm/lua_alloc_census.cpp
     src/runtime_vm/lua_fastpath.h
     src/runtime_vm/lua_internals.cpp
     src/runtime_vm/lua_internals.h
@@ -133,26 +130,10 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/async_tex_loader.h
     src/hooks_subsystems/adaptive_farclip.cpp
     src/hooks_subsystems/adaptive_farclip.h
-    src/simd_math/m2_bone_simd.cpp
-    src/simd_math/m2_bone_simd.h
     src/hooks_subsystems/quality_governor.cpp
     src/hooks_subsystems/quality_governor.h
     src/hooks_subsystems/font_glyph_cache.cpp
     src/hooks_subsystems/font_glyph_cache.h
-    src/runtime_vm/saved_vars_preload_async.cpp
-    src/runtime_vm/saved_vars_preload_async.h
-    src/hooks_subsystems/minimap_throttle.cpp
-    src/hooks_subsystems/minimap_throttle.h
-    src/hooks_subsystems/dbc_lookup_cache_fast.cpp
-    src/hooks_subsystems/dbc_lookup_cache_fast.h
-    src/simd_math/world_to_screen_sse.cpp
-    src/simd_math/world_to_screen_sse.h
-    src/hooks_subsystems/d3d9_tss_cache.cpp
-    src/hooks_subsystems/d3d9_tss_cache.h
-    src/runtime_vm/lua_string_pool_fast.cpp
-    src/runtime_vm/lua_string_pool_fast.h
-    src/runtime_vm/lua_jit_compiler.cpp
-    src/runtime_vm/lua_jit_compiler.h
     src/hooks_subsystems/async_sound_loader.cpp
     src/hooks_subsystems/async_sound_loader.h
     src/runtime_vm/saved_vars_pretoken.cpp
@@ -212,8 +193,6 @@ add_library(wow_optimize SHARED
     src/runtime_vm/regex_cache.h
     src/simd_math/trig_lut.cpp
     src/simd_math/trig_lut.h
-    src/hooks_subsystems/spell_cache.cpp
-    src/hooks_subsystems/spell_cache.h
     src/runtime_vm/lua_bytecode_cache.cpp
     src/runtime_vm/lua_bytecode_cache.h
     src/hooks_subsystems/addon_preload.cpp
@@ -280,8 +259,6 @@ add_library(wow_optimize SHARED
     src/simd_math/simd_math_fast.h
     src/hooks_subsystems/combatlog_incremental.cpp
     src/hooks_subsystems/combatlog_incremental.h
-    src/allocators/lua_alloc_pool.cpp
-    src/allocators/lua_alloc_pool.h
     src/hooks_subsystems/world_state_coalesce.cpp
     src/hooks_subsystems/world_state_coalesce.h
     src/hooks_subsystems/net_packet_offload.cpp
@@ -328,8 +305,6 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_gettable_cache.h
     src/hooks_subsystems/saved_vars_async.cpp
     src/hooks_subsystems/saved_vars_async.h
-    src/runtime_vm/lua_bytecode_pre_compiler.cpp
-    src/runtime_vm/lua_bytecode_pre_compiler.h
     src/hooks_subsystems/hot_patch.cpp
     src/hooks_subsystems/hot_patch.h
     src/hooks_subsystems/wow_opt_hooks.cpp
@@ -429,94 +404,24 @@ add_library(wow_optimize SHARED
 
     src/hooks_subsystems/sound_coalescer.cpp
     src/hooks_subsystems/sound_coalescer.h
-    src/hooks_subsystems/aura_preload_cache.cpp
-    src/hooks_subsystems/aura_preload_cache.h
-    src/hooks_subsystems/dbc_file_cache.cpp
-    src/hooks_subsystems/dbc_file_cache.h
-    src/hooks_subsystems/font_outline_cache.cpp
-    src/hooks_subsystems/font_outline_cache.h
-    src/hooks_subsystems/lua_gc_governor.cpp
-    src/hooks_subsystems/lua_gc_governor.h
     src/hooks_subsystems/particle_density_scaler.cpp
     src/hooks_subsystems/particle_density_scaler.h
-    src/hooks_subsystems/addon_msg_limiter.cpp
-    src/hooks_subsystems/addon_msg_limiter.h
     src/hooks_subsystems/vertex_buffer_prealloc.cpp
     src/hooks_subsystems/vertex_buffer_prealloc.h
-    src/hooks_subsystems/world_object_opt.cpp
-    src/hooks_subsystems/world_object_opt.h
-    src/hooks_subsystems/nameplate_distance_cvar.cpp
-    src/hooks_subsystems/nameplate_distance_cvar.h
-    src/hooks_subsystems/combat_log_async.cpp
-    src/hooks_subsystems/combat_log_async.h
-    src/hooks_subsystems/cdatastore_buffering.cpp
-    src/hooks_subsystems/cdatastore_buffering.h
-    src/hooks_subsystems/camera_shake_opt.cpp
-    src/hooks_subsystems/camera_shake_opt.h
-    src/hooks_subsystems/combat_text_font.cpp
-    src/hooks_subsystems/combat_text_font.h
-    src/hooks_subsystems/spell_overlay_preload.cpp
-    src/hooks_subsystems/spell_overlay_preload.h
     src/hooks_subsystems/saved_vars_backup.cpp
     src/hooks_subsystems/saved_vars_backup.h
-    src/hooks_subsystems/unit_max_power_cache.cpp
-    src/hooks_subsystems/unit_max_power_cache.h
     src/hooks_subsystems/mouse_clip_release.cpp
     src/hooks_subsystems/mouse_clip_release.h
     src/hooks_subsystems/combat_log_filter.cpp
     src/hooks_subsystems/combat_log_filter.h
     src/hooks_subsystems/sound_volume_limit.cpp
     src/hooks_subsystems/sound_volume_limit.h
-    src/hooks_subsystems/ui_layout_throttle.cpp
-    src/hooks_subsystems/ui_layout_throttle.h
     src/hooks_subsystems/terrain_height_cache.cpp
     src/hooks_subsystems/terrain_height_cache.h
-    src/hooks_subsystems/anim_blend_cache.cpp
-    src/hooks_subsystems/anim_blend_cache.h
-    src/hooks_subsystems/saved_vars_opt.cpp
-    src/hooks_subsystems/saved_vars_opt.h
-    src/hooks_subsystems/item_data_prefetch.cpp
-    src/hooks_subsystems/item_data_prefetch.h
-    src/hooks_subsystems/movement_smoothing.cpp
-    src/hooks_subsystems/movement_smoothing.h
-    src/hooks_subsystems/font_alpha_fastpath.cpp
-    src/hooks_subsystems/font_alpha_fastpath.h
-    src/hooks_subsystems/packet_processing_throttle.cpp
-    src/hooks_subsystems/packet_processing_throttle.h
-    src/hooks_subsystems/nameplate_culling.cpp
-    src/hooks_subsystems/nameplate_culling.h
     src/hooks_subsystems/texture_unload_delay.cpp
     src/hooks_subsystems/texture_unload_delay.h
-    src/hooks_subsystems/minimap_refresh_governor.cpp
-    src/hooks_subsystems/minimap_refresh_governor.h
     src/hooks_subsystems/spell_effect_culling.cpp
     src/hooks_subsystems/spell_effect_culling.h
-    src/hooks_subsystems/lua_string_compare_fast.cpp
-    src/hooks_subsystems/lua_string_compare_fast.h
-    src/hooks_subsystems/dbc_row_caching.cpp
-    src/hooks_subsystems/dbc_row_caching.h
-    src/hooks_subsystems/network_string_dedup.cpp
-    src/hooks_subsystems/network_string_dedup.h
-    src/hooks_subsystems/sound_freq_coalesce.cpp
-    src/hooks_subsystems/sound_freq_coalesce.h
-    src/hooks_subsystems/aura_update_dedup.cpp
-    src/hooks_subsystems/aura_update_dedup.h
-    src/hooks_subsystems/ui_texture_caching.cpp
-    src/hooks_subsystems/ui_texture_caching.h
-    src/hooks_subsystems/wmo_culling_opt.cpp
-    src/hooks_subsystems/wmo_culling_opt.h
-    src/hooks_subsystems/fast_float_parse.cpp
-    src/hooks_subsystems/fast_float_parse.h
-    src/hooks_subsystems/heap_allocation_tracker.cpp
-    src/hooks_subsystems/heap_allocation_tracker.h
-    src/hooks_subsystems/spell_cooldown_cache.cpp
-    src/hooks_subsystems/spell_cooldown_cache.h
-    src/hooks_subsystems/guid_string_cache.cpp
-    src/hooks_subsystems/guid_string_cache.h
-    src/hooks_subsystems/frame_script_mem_opt.cpp
-    src/hooks_subsystems/frame_script_mem_opt.h
-    src/hooks_subsystems/combat_event_limit.cpp
-    src/hooks_subsystems/combat_event_limit.h
 )
 
 target_link_libraries(wow_optimize PRIVATE

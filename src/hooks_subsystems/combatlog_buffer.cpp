@@ -107,10 +107,16 @@ void OnFrame(DWORD tid) {
     }
 }
 
+// Printed from the periodic report. Shutdown does not run - the DLL exits via
+// TerminateProcess - so anything reported only from there is never seen.
+void LogStats() {
+    Log("[CombatLogBuffer] total=%lld dropped=%lld flushes=%lld peak=%ld",
+        g_total, g_dropped, g_flushes, g_peak);
+}
+
 void Shutdown() {
     if (!g_init) return;
-    Log("[CombatLogBuffer] Stats: total=%lld dropped=%lld flushes=%lld peak=%ld",
-        g_total, g_dropped, g_flushes, g_peak);
+    LogStats();
     g_init = false;
 }
 

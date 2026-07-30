@@ -36,6 +36,7 @@ struct Stats {
 bool Init();
 void OnFrame(DWORD mainThreadId);
 void Shutdown();
+void LogStats();
 Stats GetStats();
 
 } // namespace CombatLogBuffer

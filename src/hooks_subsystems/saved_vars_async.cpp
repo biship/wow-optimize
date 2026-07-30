@@ -105,7 +105,6 @@ static BufferedWrite* GetOrCreateBuffer(HANDLE hFile) {
     return nullptr;
 }
 
-#include "saved_vars_opt.h"
 #include "saved_vars_backup.h"
 
 static void PerformSyncWrite(HANDLE hObject, void* data, size_t size) {
@@ -151,7 +150,6 @@ static BOOL WINAPI Hooked_CloseHandle(HANDLE hObject) {
                     if (strncmp(filePath, "\\\\?\\", 4) == 0) {
                         pathPtr += 4;
                     }
-                    SavedVarsOpt::OptimizeSerialization(pathPtr);
                     SavedVarsBackup::CreateBackup(pathPtr);
                 }
             }

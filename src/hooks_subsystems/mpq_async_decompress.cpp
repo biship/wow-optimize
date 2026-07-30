@@ -189,6 +189,12 @@ bool Init() {
     return true;
 }
 
+// Printed from the periodic report. Shutdown does not run - the DLL exits via
+// TerminateProcess - so anything reported only from there is never seen.
+void LogStats() {
+    Log("[MpqAsyncDecompress] hits=%lld, misses=%lld", g_asyncHits, g_asyncMisses);
+}
+
 void Shutdown() {
 #if !TEST_DISABLE_MPQ_ASYNC_DECOMPRESS
     if (g_workersRunning) {
@@ -212,7 +218,7 @@ void Shutdown() {
         }
     }
 
-    Log("[MpqAsyncDecompress] Stats: hits=%lld, misses=%lld", g_asyncHits, g_asyncMisses);
+    LogStats();
 #endif
 }
 

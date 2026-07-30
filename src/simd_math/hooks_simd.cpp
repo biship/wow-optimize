@@ -301,7 +301,12 @@ void SSE2_Vec3Cross(const float* __restrict a,
 }
 
 #ifndef ADDR_WOW_MATRIX_MULTIPLY
-#define ADDR_WOW_MATRIX_MULTIPLY 0x00000000
+// CMatrix::Multiply. The placeholder here was 0 for as long as the SSE2
+// implementation beside it has existed, so the hook was never installed and the
+// utility function had no caller. Verified from the binary: __cdecl, signature
+// float* (float* out, float* lhs, float* rhs), computing the standard
+// out[row][col] = sum over k of lhs[row][k] * rhs[k][col].
+#define ADDR_WOW_MATRIX_MULTIPLY 0x004C1F00
 #endif
 #ifndef ADDR_WOW_QUAT_NORMALIZE
 #define ADDR_WOW_QUAT_NORMALIZE 0x00979110
@@ -329,9 +334,6 @@ static volatile long g_matMulCalls    = 0;
 static volatile long g_quatNormCalls  = 0;
 static volatile long g_frustumCalls   = 0;
 static volatile long g_frustumCulled  = 0;
-static float g_activeFrustum[24] = {0};
-static bool g_hasActiveFrustum = false;
-static uint32_t g_particleFrameCount = 0;
 static volatile long g_rayTriangleCalls = 0;
 static volatile long g_rayTriangleIntersects = 0;
 
@@ -707,6 +709,22 @@ static char __cdecl Hooked_RayTriangle16(const float* ray, const float* vertices
 }
 #endif
 
+// Argument order differs from SSE2_MatrixMultiply, which takes (lhs, rhs, out)
+// while the client's takes (out, lhs, rhs). Getting that backwards would produce
+// a plausible-looking wrong matrix rather than a crash, so it is spelled out.
+//
+// Neither version tolerates the output aliasing an input - the client's writes
+// out[0] and then reads lhs[1] afterwards - so callers cannot be aliasing, and
+// this one loads all of rhs up front regardless.
+typedef float* (__cdecl *MatrixMultiply_t)(float* out, float* lhs, float* rhs);
+static MatrixMultiply_t orig_MatrixMultiply = nullptr;
+
+static float* __cdecl Hooked_MatrixMultiply(float* out, float* lhs, float* rhs) {
+    InterlockedIncrement(&g_matMulCalls);
+    SSE2_MatrixMultiply(lhs, rhs, out);
+    return out;
+}
+
 #if !TEST_DISABLE_QUAT_NORMALIZE
 typedef void (__fastcall *QuatNormalize_t)(float* ecx, void* edx);
 static QuatNormalize_t orig_QuatNormalize = nullptr;
@@ -766,54 +784,23 @@ static void __fastcall Hooked_IsPointVisible(void* ecx, void* edx, const float* 
 }
 #endif
 
-extern "C" void IncrementParticleFrameCount() {
-    g_particleFrameCount++;
-}
+// SSE2_IsSphereVisible and the per-frame particle counter went with the throttle
+// below - it was the only thing that read either of them, and the frustum they
+// tested against was never populated.
 
-extern "C" bool SSE2_IsSphereVisible(float x, float y, float z, float radius) {
-    if (!g_hasActiveFrustum) return true;
-    __try {
-        const float* planes = g_activeFrustum;
-        for (int i = 0; i < 6; ++i) {
-            float nx = planes[i * 4 + 0];
-            float ny = planes[i * 4 + 1];
-            float nz = planes[i * 4 + 2];
-            float d  = planes[i * 4 + 3];
-            
-            float dist = nx * x + ny * y + nz * z + d;
-            if (dist < -radius) {
-                return false;
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return true;
-    }
-    return true;
-}
-
-#if !TEST_DISABLE_PARTICLE_THROTTLE
-typedef int (__fastcall *SimulateParticle_t)(void* self, void* edx, int particle, float timeStep, float* transformMatrix);
-static SimulateParticle_t orig_SimulateParticle = nullptr;
-
-
-static int __fastcall Hooked_SimulateParticle(void* self, void* edx, int particle, float timeStep, float* transformMatrix) {
-    __try {
-        if (transformMatrix && (uintptr_t)transformMatrix >= 0x10000 && (uintptr_t)transformMatrix < 0xFFE00000) {
-            float x = transformMatrix[12];
-            float y = transformMatrix[13];
-            float z = transformMatrix[14];
-            
-            if (!SSE2_IsSphereVisible(x, y, z, 25.0f)) {
-                if ((g_particleFrameCount % 10) != 0) {
-                    return 0;
-                }
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-    return orig_SimulateParticle(self, edx, particle, timeStep, transformMatrix);
-}
-#endif
+// A particle throttle used to sit here: it hooked
+// CParticleEmitter::SimulateParticle and, for particles outside the view
+// frustum, simulated them only every tenth frame.
+//
+// It could never have done that. The test it relied on, SSE2_IsSphereVisible,
+// begins with "if (!g_hasActiveFrustum) return true" - and nothing ever set
+// that flag or filled g_activeFrustum, so every particle was reported visible
+// and the throttle never engaged. It was also compiled out.
+//
+// Not revived. Skipping an engine call per frame because the object looks
+// off-screen is the exact shape of AnimationLod, AsyncCulling and
+// NameplateThrottle, all three of which were removed after testers reported
+// them as visual corruption.
 
 #if !TEST_DISABLE_MATRIX_TRANSFORM_SSE2
 typedef float* (__cdecl *MatrixVectorTransform_t)(float* result, float* vec, float* mat);
@@ -925,19 +912,113 @@ static float* __cdecl Hooked_QuatSlerp(float* result, float t, float* q1, float*
     return orig_QuatSlerp ? orig_QuatSlerp(result, t, q1, q2) : result;
 }
 
+// Self-test against the function being replaced, on the machine it will run on.
+//
+// Both replacements were checked offline against a transcription of the original
+// - 400000 quaternions, 200000 matrices - and matched to within a float ULP. That
+// is a test of my reading of the disassembly, not of the client sitting in memory
+// right now. This calls the real function at the real address and compares, so a
+// wrong address, a differently-patched client or a bad transcription is caught
+// before the hook goes in rather than by a player.
+//
+// Run before MinHook touches anything, so the call reaches the original.
+static bool SelfTestQuatNormalize() {
+    typedef void (__fastcall *quat_fn)(float*, void*);
+    quat_fn original = (quat_fn)ADDR_WOW_QUAT_NORMALIZE;
+
+    // Deliberately awkward inputs: unnormalised, negative, and one below the
+    // epsilon where both versions must leave the value alone.
+    static const float cases[][4] = {
+        { 3.0f, 4.0f, 0.0f, 0.0f },
+        { -1.0f, 2.0f, -3.0f, 4.0f },
+        { 0.5f, 0.5f, 0.5f, 0.5f },
+        { 1e-5f, 0.0f, 0.0f, 0.0f },
+        { 0.0f, 0.0f, 0.0f, 0.0f },
+    };
+
+    for (int i = 0; i < 5; i++) {
+        float a[4], b[4];
+        for (int k = 0; k < 4; k++) { a[k] = cases[i][k]; b[k] = cases[i][k]; }
+
+        __try {
+            original(a, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[SimdHooks] Quaternion self-test: the original faulted - not hooking");
+            return false;
+        }
+        SSE2_QuatNormalize(b);
+
+        for (int k = 0; k < 4; k++) {
+            float d = a[k] - b[k];
+            if (d < 0.0f) d = -d;
+            // One ULP at unit scale, with room for the x87-versus-SSE difference.
+            if (d > 1e-5f) {
+                Log("[SimdHooks] Quaternion self-test FAILED on case %d component %d "
+                    "(client %.9g, ours %.9g) - not hooking", i, k, a[k], b[k]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool SelfTestMatrixMultiply() {
+    typedef float* (__cdecl *mat_fn)(float*, float*, float*);
+    mat_fn original = (mat_fn)ADDR_WOW_MATRIX_MULTIPLY;
+
+    float lhs[16], rhs[16], a[16], b[16];
+    for (int i = 0; i < 16; i++) {
+        lhs[i] = (float)((i * 7 % 13) - 6) * 0.5f;
+        rhs[i] = (float)((i * 5 % 11) - 5) * 0.25f;
+    }
+
+    __try {
+        original(a, lhs, rhs);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[SimdHooks] Matrix self-test: the original faulted - not hooking");
+        return false;
+    }
+    SSE2_MatrixMultiply(lhs, rhs, b);
+
+    for (int i = 0; i < 16; i++) {
+        float d = a[i] - b[i];
+        if (d < 0.0f) d = -d;
+        float scale = (a[i] < 0.0f ? -a[i] : a[i]);
+        if (scale < 1.0f) scale = 1.0f;
+        if (d > scale * 1e-5f) {
+            Log("[SimdHooks] Matrix self-test FAILED at element %d "
+                "(client %.9g, ours %.9g) - not hooking", i, a[i], b[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool InstallSimdHooks(void) {
     Log("[SimdHooks] SSE2 matrix multiply, quaternion normalize, "
         "frustum cull, BGRA/ARGB, premultiplied alpha ready");
 
-    if (ADDR_WOW_MATRIX_MULTIPLY)
-        Log("[SimdHooks] Matrix multiply hook target: 0x%08X", ADDR_WOW_MATRIX_MULTIPLY);
-    else
-        Log("[SimdHooks] Matrix multiply: fill ADDR_WOW_MATRIX_MULTIPLY");
+    if (!Config::g_settings.OptMatrixMultiplySse2) {
+        Log("[SimdHooks] Matrix multiply DISABLED via configuration");
+    } else if (!SelfTestMatrixMultiply()) {
+        // The message came from the self-test; nothing to add.
+    } else if (WineSafe_CreateHook((void*)ADDR_WOW_MATRIX_MULTIPLY,
+                                   (void*)Hooked_MatrixMultiply,
+                                   (void**)&orig_MatrixMultiply) == MH_OK) {
+        WO_EnableHook((void*)ADDR_WOW_MATRIX_MULTIPLY);
+        Log("[SimdHooks] Matrix multiply hook ACTIVE at 0x%08X", ADDR_WOW_MATRIX_MULTIPLY);
+    } else {
+        Log("[SimdHooks] Matrix multiply hook FAILED at 0x%08X", ADDR_WOW_MATRIX_MULTIPLY);
+    }
 
     if (ADDR_WOW_QUAT_NORMALIZE) {
         Log("[SimdHooks] Quaternion normalize hook target: 0x%08X", ADDR_WOW_QUAT_NORMALIZE);
 #if !TEST_DISABLE_QUAT_NORMALIZE
-        if (WineSafe_CreateHook((void*)ADDR_WOW_QUAT_NORMALIZE, (void*)Hooked_QuatNormalize, (void**)&orig_QuatNormalize) == MH_OK) {
+        if (!Config::g_settings.OptQuatNormalizeSse2) {
+            Log("[SimdHooks] Quaternion normalize DISABLED via configuration");
+        } else if (!SelfTestQuatNormalize()) {
+            // The message came from the self-test; nothing to add.
+        } else if (WineSafe_CreateHook((void*)ADDR_WOW_QUAT_NORMALIZE, (void*)Hooked_QuatNormalize, (void**)&orig_QuatNormalize) == MH_OK) {
             WO_EnableHook((void*)ADDR_WOW_QUAT_NORMALIZE);
             Log("[SimdHooks] Quaternion normalize hook ACTIVE");
         } else {
@@ -1026,18 +1107,6 @@ bool InstallSimdHooks(void) {
         Log("[SimdHooks] Ray-Triangle 16-bit: fill ADDR_WOW_RAY_TRIANGLE_16BIT");
     }
 
-#if !TEST_DISABLE_PARTICLE_THROTTLE
-    Log("[SimdHooks] Hooking CParticleEmitter::SimulateParticle at 0x00981D40");
-    if (WineSafe_CreateHook((void*)0x00981D40, (void*)Hooked_SimulateParticle, (void**)&orig_SimulateParticle) == MH_OK) {
-        if (WO_EnableHook((void*)0x00981D40) == MH_OK) {
-            Log("[SimdHooks] CParticleEmitter::SimulateParticle hook ACTIVE");
-        } else {
-            Log("[SimdHooks] CParticleEmitter::SimulateParticle hook enable FAILED");
-        }
-    } else {
-        Log("[SimdHooks] CParticleEmitter::SimulateParticle hook creation FAILED");
-    }
-#endif
 
     // Hooking 3D Vector Cross Product (0x005FEC70)
 #if !TEST_DISABLE_VEC3_CROSS_SSE2

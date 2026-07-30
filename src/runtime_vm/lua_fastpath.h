@@ -48,6 +48,11 @@ void InvalidateWoWCache();
 // Disable all hooks
 void Shutdown();
 
+// Prints the fast-path hit counters. Called from the periodic report, not only
+// from Shutdown - the process exits via TerminateProcess, so anything that only
+// prints at shutdown never prints at all.
+void LogStats();
+
 struct Stats {
     long formatFastHits;
     long formatFallbacks;

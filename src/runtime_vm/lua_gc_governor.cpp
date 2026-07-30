@@ -44,11 +44,57 @@ static double g_lastMemoryKB = 0.0;
 bool Init() {
     g_initialized = true;
     Log("[GCGovernor] Adaptive GC Governor Initialized");
+    // Stated once so a log says what this does without anyone reading the source.
+    // Lua 5.1 ships with a pause of 200, meaning a new cycle starts once memory
+    // has doubled. Everything below is more eager than that, which trades total
+    // collector work for a smaller and steadier heap - a reasonable trade on a
+    // 32-bit client, and one nobody has ever measured either way.
+    Log("[GCGovernor] pause/stepmul: loading 160/150, combat 100/110, "
+        "idle 110/400, otherwise 120/200 (stock Lua is 200/200)");
     return true;
 }
 
 void Shutdown() {
     g_initialized = false;
+}
+
+// Timing the collector.
+//
+// A tester profile put Lua's mark phase at 10.96%% of main-thread execution and
+// its sweep at 7.90%% - the largest single cost inside the client. Another
+// session with the same settings put the mark phase at 2.24%%. So the workload
+// decides, not the configuration, and any claim about whether this governor
+// helps or hurts is unfounded until the steps it asks for are timed.
+//
+// This times only the steps this module requests. Collection the VM starts on
+// its own is not counted here; the sampling profiler covers that.
+static double   g_gcStepMsTotal = 0.0;
+static uint64_t g_gcStepCount   = 0;
+static LARGE_INTEGER g_qpcFreq  = {};
+
+static inline void StepTimed(void* L, int kb) {
+    if (g_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&g_qpcFreq);
+
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    g_lua_gc(L, 5, kb);          // LUA_GCSTEP
+    QueryPerformanceCounter(&b);
+
+    if (g_qpcFreq.QuadPart > 0) {
+        g_gcStepMsTotal += (double)(b.QuadPart - a.QuadPart) * 1000.0
+                         / (double)g_qpcFreq.QuadPart;
+        g_gcStepCount++;
+    }
+}
+
+void LogStats() {
+    if (g_gcStepCount == 0) {
+        Log("[GCGovernor] no collection steps requested this session");
+        return;
+    }
+    Log("[GCGovernor] %llu steps requested, %.1f ms total, %.3f ms average",
+        (unsigned long long)g_gcStepCount, g_gcStepMsTotal,
+        g_gcStepMsTotal / (double)g_gcStepCount);
 }
 
 void OnFrame(double frameMs) {
@@ -80,7 +126,7 @@ void OnFrame(double frameMs) {
             g_lua_gc(L, 1, 0); // Ensure restarted
             g_lua_gc(L, LUA_GCSETPAUSE, 100);
             g_lua_gc(L, LUA_GCSETSTEPMUL, 110);
-            g_lua_gc(L, 5, 16);
+            StepTimed(L, 16);
         }
         return;
     }
@@ -90,7 +136,7 @@ void OnFrame(double frameMs) {
     if (g_isIdle && frameMs < 8.0) {
         g_lua_gc(L, LUA_GCSETPAUSE, 110);
         g_lua_gc(L, LUA_GCSETSTEPMUL, 400);
-        g_lua_gc(L, 5, 1024);
+        StepTimed(L, 1024);
     } else {
         g_lua_gc(L, LUA_GCSETPAUSE, 120);
         g_lua_gc(L, LUA_GCSETSTEPMUL, 200);
@@ -99,7 +145,7 @@ void OnFrame(double frameMs) {
         if (stepKB < 62) stepKB = 62;
         if (stepKB > 512) stepKB = 512;
         
-        g_lua_gc(L, 5, stepKB);
+        StepTimed(L, stepKB);
     }
 }
 

@@ -47,6 +47,7 @@ struct HookTraceEntry {
     uintptr_t   addr;       // Address being hooked or accessed
     DWORD       tick;       // GetTickCount when called
     DWORD       threadId;   // Thread that made the call
+    LONG        repeats;    // Consecutive identical calls collapsed into this slot
 };
 
 static HookTraceEntry s_hookTrace[HOOK_TRACE_SIZE] = {};
@@ -479,8 +480,8 @@ static void WriteHookTrace(HANDLE hFile) {
         HookTraceEntry& e = s_hookTrace[idx];
         if (!e.hookName) continue;
         int len = sprintf_s(buf, sizeof(buf),
-            "  [%02d] TID=%5lu tick=%10lu addr=0x%08X %s\n",
-            i, e.threadId, e.tick, (unsigned)e.addr, e.hookName);
+            "  [%02d] TID=%5lu tick=%10lu addr=0x%08X %s x%ld\n",
+            i, e.threadId, e.tick, (unsigned)e.addr, e.hookName, e.repeats + 1);
         if (len > 0) WriteFile(hFile, buf, (DWORD)strlen(buf), &written, NULL);
     }
 }
@@ -616,9 +617,9 @@ static void __cdecl Hooked_WowAssert(const char* msg, int arg1, int arg2) {
             int idx = (hpos - 1 - i) & HOOK_TRACE_MASK;
             HookTraceEntry& e = s_hookTrace[idx];
             if (e.hookName) {
-                Log("!!!   LAST HOOK[%d]: %s @ 0x%08X (TID=%lu, %ums ago)",
+                Log("!!!   LAST HOOK[%d]: %s @ 0x%08X (TID=%lu, %ums ago, x%ld)",
                     i, e.hookName, (unsigned)e.addr, e.threadId,
-                    GetTickCount() - e.tick);
+                    GetTickCount() - e.tick, e.repeats + 1);
             }
         }
 
@@ -653,9 +654,9 @@ static BOOL WINAPI Hooked_TerminateProcess(HANDLE hProcess, UINT uExitCode) {
                 int idx = (hpos - 1 - i) & HOOK_TRACE_MASK;
                 HookTraceEntry& e = s_hookTrace[idx];
                 if (e.hookName) {
-                    Log("!!!   LAST HOOK[%d]: %s @ 0x%08X (TID=%lu, %ums ago)",
+                    Log("!!!   LAST HOOK[%d]: %s @ 0x%08X (TID=%lu, %ums ago, x%ld)",
                         i, e.hookName, (unsigned)e.addr, e.threadId,
-                        GetTickCount() - e.tick);
+                        GetTickCount() - e.tick, e.repeats + 1);
                 }
             }
 
@@ -722,6 +723,140 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Hooked_SetUnhandledExceptionFilter(LP
 // ================================================================
 // Top-level unhandled exception filter
 // ================================================================
+// For an access violation the exception record carries the two facts that actually
+// identify the bug: whether the faulting instruction was reading or writing, and
+// which address it touched. Only the instruction pointer was ever logged, so a
+// crash inside memcpy could not be told apart from a crash writing into a device
+// surface - the difference between a bad source and a bad destination, which is the
+// difference between two entirely different features.
+static void LogAccessViolationDetail(EXCEPTION_RECORD* er) {
+    if (!er || er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return;
+    if (er->NumberParameters < 2) return;
+
+    ULONG_PTR op   = er->ExceptionInformation[0];
+    ULONG_PTR addr = er->ExceptionInformation[1];
+    const char* what = (op == 0) ? "READING from" :
+                       (op == 1) ? "WRITING to"   :
+                       (op == 8) ? "EXECUTING"    : "accessing";
+
+    // Naming the region turns the address into a cause rather than a number.
+    const char* region;
+    if (addr < 0x10000)             region = "null page - a null pointer plus a small offset";
+    else if (addr >= 0x80000000)    region = "kernel space - almost always a corrupted pointer";
+    else {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi)) == 0) region = "unqueryable";
+        else if (mbi.State == MEM_FREE)    region = "freed or never mapped - a stale pointer, or a view that was unmapped";
+        else if (mbi.State == MEM_RESERVE) region = "reserved but not committed";
+        else if (mbi.Protect & PAGE_NOACCESS) region = "committed but no-access";
+        else region = "mapped and committed - a length or stride overran it";
+    }
+
+    Log("!!! FAULT: %s 0x%08X (%s)", what, (unsigned)addr, region);
+}
+
+// ================================================================
+// First-chance probe
+//
+// SetUnhandledExceptionFilter only fires for exceptions nobody handles. Any
+// __except frame above the fault swallows it first, and the client has plenty of
+// those - so a crash can end the session with our filter never running at all.
+// A druid-shapeshift report looked exactly like that: the log stops mid-line, no
+// crash report, no shutdown notice, no TerminateProcess notice.
+//
+// A vectored handler runs before every frame-based handler and before the
+// unhandled filter, so it sees the fault whatever becomes of it afterwards. It
+// has to stay cheap - it is entered for every exception on every thread,
+// including ordinary handled ones - and it must never change what the process
+// does, hence EXCEPTION_CONTINUE_SEARCH on every path.
+// ================================================================
+static volatile LONG s_firstChanceLogged = 0;
+
+// Totals, so the log can state the scale without printing every occurrence.
+static volatile LONG g_firstChanceTotal   = 0;
+static volatile LONG g_firstChanceRepeats = 0;
+static const LONG FIRST_CHANCE_LOG_LIMIT = 8;
+
+static bool IsFatalClass(DWORD code) {
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_IN_PAGE_ERROR:
+        return true;
+    default:
+        return false;   // C++ throws, breakpoints, DXVK's own control flow
+    }
+}
+
+// Set while this thread is inside the probe. If reporting a fault somehow faults,
+// the second entry leaves at once instead of recursing.
+static __declspec(thread) bool t_inProbe = false;
+
+static LONG CALLBACK WowOpt_FirstChanceProbe(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (!IsFatalClass(code)) return EXCEPTION_CONTINUE_SEARCH;
+    if (t_inProbe) return EXCEPTION_CONTINUE_SEARCH;
+    t_inProbe = true;
+
+    uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+
+    // Always cheap: a mark in the ring costs no I/O and survives into whatever
+    // report does eventually get written.
+    // Only the first sighting of an address reaches the ring.
+    //
+    // The unbounded version of this cost a tester 14%% of their main thread. One
+    // third-party module raised the same handled access violation 8889 times in a
+    // session - it uses exceptions as control flow - and every one wrote an entry
+    // to the event ring. That ring is the flight recorder for state transitions,
+    // and the slow-frame attribution prints all of it every time it fires, so
+    // 1363 slow frames each dumped a ring made entirely of this noise.
+    //
+    // Which is precisely the mistake the hook trace had to be cured of, where
+    // UIAccessor_FrameIsShown crowded out everything rarer. I put a
+    // high-frequency event into a ring meant for rare ones, one ring over.
+    //
+    // A repeated fault at one address is one fact, so it is recorded once and
+    // counted thereafter.
+    static uintptr_t s_lastFaultAddr = 0;
+    ++g_firstChanceTotal;
+    if (at != s_lastFaultAddr) {
+        s_lastFaultAddr = at;
+        CrashDumper::Trace("first-chance %s at 0x%08X TID=%lu",
+                           ExceptionName(code), (unsigned)at, GetCurrentThreadId());
+    } else {
+        ++g_firstChanceRepeats;
+        t_inProbe = false;
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Log the first few properly, then fall silent, so a path that faults in a
+    // loop behind a __except cannot fill the disk.
+    if (InterlockedIncrement(&s_firstChanceLogged) <= FIRST_CHANCE_LOG_LIMIT) {
+        // Deliberately no GetModuleHandleExA here, unlike the unhandled filter.
+        // That call takes the loader lock, and this handler runs while the process
+        // is still alive - including on a fault raised by a thread that already
+        // holds that lock, which is exactly the startup and module-load case this
+        // was added to catch. The raw address resolves fine in a disassembler; a
+        // hang would not.
+        //
+        // Everything that remains is safe to call from here: the log path is
+        // lock-free (InterlockedCompareExchange into a ring, then WriteFile) and
+        // LogAccessViolationDetail only calls VirtualQuery.
+        Log("!!! FIRST-CHANCE %s at 0x%08X TID=%lu - handled or not, it happened",
+            ExceptionName(code), (unsigned)at, GetCurrentThreadId());
+        LogAccessViolationDetail(ep->ExceptionRecord);
+        LogFlushImmediate();
+    }
+
+    t_inProbe = false;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static LONG WINAPI WowOpt_UnhandledExceptionFilter(EXCEPTION_POINTERS* ep) {
     // One-shot: only dump the first unhandled crash
     if (InterlockedCompareExchange(&s_dumped, 1, 0) != 0)
@@ -736,6 +871,8 @@ static LONG WINAPI WowOpt_UnhandledExceptionFilter(EXCEPTION_POINTERS* ep) {
 
     Log("!!! CRASH !!! 0x%08X (%s) at 0x%08X TID=%lu",
         code, ExceptionName(code), crashAddr, GetCurrentThreadId());
+
+    LogAccessViolationDetail(ep->ExceptionRecord);
 
     if (ep->ContextRecord) {
         CONTEXT* ctx = ep->ContextRecord;
@@ -826,9 +963,9 @@ static LONG WINAPI WowOpt_UnhandledExceptionFilter(EXCEPTION_POINTERS* ep) {
         int idx = (hpos - 1 - i) & HOOK_TRACE_MASK;
         HookTraceEntry& e = s_hookTrace[idx];
         if (e.hookName) {
-            Log("!!! LAST HOOK[%d]: %s @ 0x%08X (TID=%lu, %ums ago)",
+            Log("!!! LAST HOOK[%d]: %s @ 0x%08X (TID=%lu, %ums ago, x%ld)",
                 i, e.hookName, (unsigned)e.addr, e.threadId,
-                GetTickCount() - e.tick);
+                GetTickCount() - e.tick, e.repeats + 1);
         }
     }
 
@@ -860,6 +997,10 @@ bool Init() {
     InterlockedExchange(&s_hookTracePos, 0);
 
     s_prevFilter = SetUnhandledExceptionFilter(WowOpt_UnhandledExceptionFilter);
+
+    // Runs ahead of every frame-based handler, so a fault that something else
+    // catches still leaves a record. See the note on WowOpt_FirstChanceProbe.
+    AddVectoredExceptionHandler(1, WowOpt_FirstChanceProbe);
 
     // Hook WoW's internal assertion handler (sub_8889B0)
     // This fires on ERROR #134 "Fatal Condition" which bypasses Windows exceptions
@@ -952,9 +1093,24 @@ int FeatureTokenForCounting(const char* name) {
     return token;
 }
 
+int RegisteredFeatureCount() {
+    LONG count = InterlockedCompareExchange(&s_featureCount, 0, 0);
+    if (count > MAX_TRACKED_FEATURES) count = MAX_TRACKED_FEATURES;
+    return (int)count;
+}
+
 void FeatureHit(int token) {
     if (token < 0 || token >= MAX_TRACKED_FEATURES) return;
     ++s_features[token].hits;
+}
+
+void ReportFirstChanceSummary() {
+    LONG total = g_firstChanceTotal;
+    if (total <= 0) return;
+    Log("[FirstChance] %ld fatal-class exceptions were raised and handled by "
+        "someone (%ld of them repeats of the previous address). These are not "
+        "crashes - something is using exceptions as control flow.",
+        total, (LONG)g_firstChanceRepeats);
 }
 
 void ReportFeatureActivity() {
@@ -1088,6 +1244,29 @@ int DumpTrace(int count, DWORD maxAgeMs) {
 }
 
 void RecordHookCall(const char* hookName, uintptr_t addr) {
+    // Collapse consecutive identical calls instead of letting them consume slots.
+    //
+    // The ring is meant to answer "what was happening just before the crash", and
+    // it could not: UIAccessor_IsShown is called often enough that even at the 1/64
+    // sampling below it filled all 256 slots, so every crash report in four tester
+    // logs showed the same hook in all five printed entries and nothing rarer
+    // survived. It read like evidence pointing at one module when it was only ever
+    // showing whichever hook ran most.
+    //
+    // The check races: two threads can both decide to extend the same slot, and the
+    // repeat count is then approximate. That is fine for a flight recorder, and far
+    // cheaper than serialising a path this hot.
+    LONG last = InterlockedCompareExchange(&s_hookTracePos, 0, 0);
+    if (last > 0) {
+        HookTraceEntry& prev = s_hookTrace[(last - 1) & HOOK_TRACE_MASK];
+        if (prev.hookName == hookName && prev.threadId == GetCurrentThreadId()) {
+            InterlockedIncrement(&prev.repeats);
+            prev.tick = GetTickCount();
+            prev.addr = addr;
+            return;
+        }
+    }
+
     // Lock-free: atomic increment gives us a unique slot
     LONG pos = InterlockedIncrement(&s_hookTracePos) - 1;
     int idx = pos & HOOK_TRACE_MASK;
@@ -1095,6 +1274,7 @@ void RecordHookCall(const char* hookName, uintptr_t addr) {
     s_hookTrace[idx].addr = addr;
     s_hookTrace[idx].tick = GetTickCount();
     s_hookTrace[idx].threadId = GetCurrentThreadId();
+    s_hookTrace[idx].repeats = 0;
 }
 
 void RecordHookCallHot(const char* hookName, uintptr_t addr) {

@@ -1,9 +1,45 @@
 // ============================================================================
 // Module: api_cache.cpp
+//
+// Caches GetItemInfo. It used to cache GetSpellInfo as well; that hook is gone,
+// because reading 0x00540A30 in the disassembler shows the function has no
+// cacheable result to speak of.
+//
+// Two independent reasons, either one sufficient:
+//
+// 1. A string or slot argument is resolved through the player's own spellbook.
+//    With exactly one numeric argument the client takes the value as a spell id
+//    directly; every other form calls sub_540670, which fills in a slot index,
+//    and the id then comes out of dword_BE6D88[slot] (count at dword_BE8D98) or
+//    the pet book dword_BE7D98[slot]. A talent switch rewrites those arrays, so
+//    the same name resolves to a different spell id - a different rank, with a
+//    different icon. That is precisely the bug three testers reported: a
+//    WeakAuras display stuck on the pre-switch icon until /reload, and /reload
+//    working only because a new lua_State was the one thing that cleared the
+//    cache. One of them bisected it to 3.10 correct, 3.18 wrong.
+//
+// 2. Even the plain numeric form is not stable. Once the Spell.dbc row is in
+//    hand the client calls sub_8012F0 and sub_7FF100 with the player object,
+//    and sub_8012F0 computes the power cost from live unit state: a virtual call
+//    at [[unit]+0x13C] for max power, then sub_71B770(unit, rec[0xA4]) scaled by
+//    rec[0x230] for the spell-school modifier, then a further aura-gated term.
+//    Cast time goes through the same shape, divided by sub_7FDE00. So cost and
+//    cast time move with buffs, gear and talents while the spell id stays put.
+//
+// A time-to-live was tried first and was the wrong shape of fix: it bounds how
+// long wrong data is served instead of not serving it. Nothing measured the
+// cache to be worth anything in the first place, so there is no benefit to
+// weigh against a WeakAuras display that shows the wrong spell.
+//
+// GetItemInfo (0x00516C60) is a different function entirely. Decompiled, every
+// value it pushes comes from the item record sub_67CA30 returns or from the
+// ItemClass/ItemSubClass tables - the player object never appears - and it
+// returns exactly 11 values on success or 0 when the item is not in the local
+// cache yet. That is genuinely cacheable, and the client's own return count is
+// a better success test than the heuristic this file used to apply.
 // ============================================================================
 
 #include "api_cache.h"
-#include "item_data_prefetch.h"
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -45,16 +81,14 @@ static inline RawTValue* GetStackBase(lua_State* L) {
 
 // TString layout:
 // Offset 0-7:   CommonHeader (gc header)
-// Offset 8:     len (int) - string length
-// Offset 12:    hash (unsigned int)
-// Offset 16:    str[0] - string data (flexible array member)
+// Offset 16:    len (int) - string length
+// Offset 20:    str[0] - string data
 static inline const char* ReadTStringDirect(RawTValue* tv, size_t* out_len) {
     if (tv->tt != 4) return NULL;  // LUA_TSTRING
 
     void* ts_ptr = tv->value.gc;
     if ((uintptr_t)ts_ptr < 0x10000 || (uintptr_t)ts_ptr >= 0xFFFFF000) return NULL;
 
-    // Read length directly from TString header (len is at offset 16 in WoW 3.3.5a)
     int len = *(int*)((char*)ts_ptr + 16);
     if (len < 0 || len > 1024) return NULL;
 
@@ -74,130 +108,114 @@ static inline double ReadTNumberDirect(RawTValue* tv) {
 
 typedef int (__cdecl *ScriptFunc_fn)(lua_State* L);
 
-typedef const char* (__cdecl *fn_lua_tolstring)(lua_State* L, int index, size_t* len);
 typedef lua_Number (__cdecl *fn_lua_tonumber)(lua_State* L, int index);
 typedef int        (__cdecl *fn_lua_gettop)(lua_State* L);
-typedef int        (__cdecl *fn_lua_type)(lua_State* L, int index);
 typedef void       (__cdecl *fn_lua_pushnumber)(lua_State* L, lua_Number n);
 typedef void       (__cdecl *fn_lua_pushstring)(lua_State* L, const char* s);
 typedef void       (__cdecl *fn_lua_pushboolean)(lua_State* L, int b);
 typedef void       (__cdecl *fn_lua_pushnil)(lua_State* L);
-typedef int        (__cdecl *fn_lua_toboolean)(lua_State* L, int index);
 
-// We still need API calls for pushing strings safely (interning).
-static fn_lua_tolstring   lua_tolstring_  = (fn_lua_tolstring)0x0084E0E0;
-static fn_lua_tonumber    lua_tonumber_   = (fn_lua_tonumber)0x0084E030;
+// Pushing goes through the API so strings are interned properly.
 static fn_lua_gettop      lua_gettop_     = (fn_lua_gettop)0x0084DBD0;
-static fn_lua_type        lua_type_       = (fn_lua_type)0x0084DEB0;
 static fn_lua_pushnumber  lua_pushnumber_ = (fn_lua_pushnumber)0x0084E2A0;
 static fn_lua_pushstring  lua_pushstring_ = (fn_lua_pushstring)0x0084E350;
 static fn_lua_pushboolean lua_pushboolean_= (fn_lua_pushboolean)0x0084E4D0;
 static fn_lua_pushnil     lua_pushnil_    = (fn_lua_pushnil)0x0084E280;
-static fn_lua_toboolean   lua_toboolean_  = (fn_lua_toboolean)0x0084E0B0;
-
-typedef void (__cdecl *fn_lua_pushcclosure)(lua_State* L, ScriptFunc_fn fn, int n);
-typedef void (__cdecl *fn_lua_setfield)(lua_State* L, int idx, const char* name);
-
-static fn_lua_pushcclosure lua_pushcclosure_ = (fn_lua_pushcclosure)0x0084E400;
-static fn_lua_setfield     lua_setfield_     = (fn_lua_setfield)0x0084E900;
 
 #define LUA_TNIL     0
 #define LUA_TBOOLEAN 1
 #define LUA_TNUMBER  3
 #define LUA_TSTRING  4
 
-static constexpr uintptr_t ADDR_GetItemInfo  = 0x00516C60;
-static constexpr uintptr_t ADDR_GetSpellInfo = 0x00540A30;
+static constexpr uintptr_t ADDR_GetItemInfo = 0x00516C60;
 
-static ScriptFunc_fn orig_GetItemInfo  = (ScriptFunc_fn)0x00516C60;
-static ScriptFunc_fn orig_GetSpellInfo = (ScriptFunc_fn)0x00540A30;
+static ScriptFunc_fn orig_GetItemInfo = (ScriptFunc_fn)0x00516C60;
 
 // ================================================================
-// Cache structures - 8192 slots per cache, direct-mapped.
+// Cache structure - direct-mapped.
+//
+// The previous layout was two 8192-slot arrays of entries holding sixteen
+// fixed 512-byte string buffers each: a little over 8.5 KB per entry, so
+// roughly 71 MB per cache and 143 MB of BSS for the pair. In a 32-bit client
+// whose address space this project exists to defend, that was by far the
+// largest single allocation the DLL made, and it was reserved whether or not
+// anything ever asked for an item.
+//
+// Deleting the spell cache removes half of it outright. The rest comes from
+// sizing the entry to the function instead of to a round number: GetItemInfo
+// returns eleven values, six of them strings that together run to about 300
+// bytes, so the strings share one blob per entry rather than each getting 512
+// bytes of their own. 4096 slots comfortably covers the few thousand distinct
+// items a session touches.
 // ================================================================
 
-static constexpr int CACHE_SIZE    = 8192;
+static constexpr int CACHE_SIZE    = 4096;
 static constexpr int CACHE_MASK    = CACHE_SIZE - 1;
-static constexpr int ITEM_RETVALS  = 16;  // Support up to 16 return values (LAA/HD safe)
-static constexpr int SPELL_RETVALS = 16;  // Support up to 16 return values (LAA/HD safe)
 
-struct CachedRetVal {
-    int    type;
-    double numVal;
-    char   strVal[512];
-};
+// GetItemInfo ends in `return 11` on every success path and `return 0` when
+// sub_67CA30 has no record for the item yet.
+static constexpr int ITEM_RETVALS  = 11;
 
-struct SpellCacheEntry {
-    uint32_t     keyHash;
-    bool         valid;
-    int          retCount;
-    int          pushed;
-    
-    // Key 1 details
-    int          keyType1;
-    double       keyNum1;
-    char         keyStr1[128];
-    
-    // Key 2 details
-    int          keyType2;
-    double       keyNum2;
-    char         keyStr2[64];
+// Item links run to about 130 characters at their longest - full enchant, gem
+// and suffix fields plus a long name. A key that does not fit is not cached
+// rather than truncated: the old code compared truncated keys, so two long
+// strings sharing a prefix could match each other and serve the wrong item.
+static constexpr int ITEM_KEY_MAX  = 192;
 
-    CachedRetVal vals[SPELL_RETVALS];
+// Name, link, class, subclass, equip location and texture path, back to back.
+static constexpr int ITEM_BLOB_MAX = 512;
+
+struct ItemRetVal {
+    double   numVal;
+    uint16_t strOff;   // offset into ItemCacheEntry::blob when type == LUA_TSTRING
+    uint8_t  type;
 };
 
 struct ItemCacheEntry {
-    uint32_t     keyHash;
-    bool         valid;
-    int          retCount;
-    int          pushed;
-
-    // Key 1 details
-    int          keyType1;
-    double       keyNum1;
-    char         keyStr1[256];
-
-    CachedRetVal vals[ITEM_RETVALS];
+    uint32_t   keyHash;
+    double     keyNum1;
+    int        keyType1;
+    uint16_t   blobUsed;
+    uint8_t    retCount;
+    bool       valid;
+    char       keyStr1[ITEM_KEY_MAX];
+    char       blob[ITEM_BLOB_MAX];
+    ItemRetVal vals[ITEM_RETVALS];
 };
 
-static ItemCacheEntry  g_itemCache[CACHE_SIZE]  = {};
-static SpellCacheEntry g_spellCache[CACHE_SIZE] = {};
+static ItemCacheEntry g_itemCache[CACHE_SIZE] = {};
 
-static long g_itemHits    = 0;
-static long g_itemMisses  = 0;
-static long g_spellHits   = 0;
-static long g_spellMisses = 0;
-static bool g_active      = false;
+static long g_itemHits     = 0;
+static long g_itemMisses   = 0;
+static long g_itemBypassed = 0;   // key or result too large to store
+static bool g_active       = false;
 
 static SRWLOCK g_itemCacheLock = SRWLOCK_INIT;
-static SRWLOCK g_spellCacheLock = SRWLOCK_INIT;
-
-void ClearCache();
 
 // ================================================================
-// FNV-1a Hash - limited length for long item links.
+// FNV-1a Hash
 // ================================================================
 
-static inline uint32_t HashStr(const char* s, size_t max_len) {
+static inline uint32_t HashStr(const char* s, size_t len) {
     uint32_t h = 0x811C9DC5;
-    size_t len = 0;
-    while (*s && len < max_len) {
-        h ^= (uint8_t)*s++;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
         h *= 0x01000193;
-        len++;
     }
     return h;
 }
 
-static inline uint32_t ComputeItemHash(lua_State* L, RawTValue* base, int nargs,
-                                      int& kType1, double& kNum1, char* kStr1) {
+// Returns false when the argument cannot be represented as a cache key, in
+// which case the caller must go straight to the original function.
+static inline bool ComputeItemKey(RawTValue* base, int nargs, uint32_t& hash,
+                                  int& kType1, double& kNum1, char* kStr1) {
     kType1 = LUA_TNIL; kNum1 = 0.0; kStr1[0] = '\0';
-    if (nargs < 1) return 0;
+    if (nargs < 1) return false;
 
     uint32_t h = 0x811C9DC5;
     RawTValue* arg1 = &base[0];
     kType1 = arg1->tt;
-    h ^= kType1;
+    h ^= (uint32_t)kType1;
     h *= 0x01000193;
 
     if (kType1 == LUA_TNUMBER) {
@@ -209,205 +227,104 @@ static inline uint32_t ComputeItemHash(lua_State* L, RawTValue* base, int nargs,
     } else if (kType1 == LUA_TSTRING) {
         size_t len = 0;
         const char* s = ReadTStringDirect(arg1, &len);
-        if (s) {
-            size_t copylen = len > 255 ? 255 : len;
-            memcpy(kStr1, s, copylen);
-            kStr1[copylen] = '\0';
-            h ^= HashStr(kStr1, copylen);
-            h *= 0x01000193;
-        }
-    }
-    return h;
-}
-
-static inline uint32_t ComputeSpellHash(lua_State* L, RawTValue* base, int nargs,
-                                       int& kType1, double& kNum1, char* kStr1,
-                                       int& kType2, double& kNum2, char* kStr2) {
-    kType1 = LUA_TNIL; kNum1 = 0.0; kStr1[0] = '\0';
-    kType2 = LUA_TNIL; kNum2 = 0.0; kStr2[0] = '\0';
-    if (nargs < 1) return 0;
-
-    uint32_t h = 0x811C9DC5;
-
-    // Process arg1
-    RawTValue* arg1 = &base[0];
-    kType1 = arg1->tt;
-    h ^= kType1;
-    h *= 0x01000193;
-
-    if (kType1 == LUA_TNUMBER) {
-        kNum1 = ReadTNumberDirect(arg1);
-        uint64_t u;
-        memcpy(&u, &kNum1, sizeof(u));
-        h ^= (uint32_t)u; h *= 0x01000193;
-        h ^= (uint32_t)(u >> 32); h *= 0x01000193;
-    } else if (kType1 == LUA_TSTRING) {
-        size_t len = 0;
-        const char* s = ReadTStringDirect(arg1, &len);
-        if (s) {
-            size_t copylen = len > 127 ? 127 : len;
-            memcpy(kStr1, s, copylen);
-            kStr1[copylen] = '\0';
-            h ^= HashStr(kStr1, copylen);
-            h *= 0x01000193;
-        }
-    }
-
-    // Process arg2
-    if (nargs >= 2) {
-        RawTValue* arg2 = &base[1];
-        kType2 = arg2->tt;
-        h ^= kType2;
+        if (!s) return false;
+        if (len >= ITEM_KEY_MAX) return false;   // do not truncate - bypass
+        memcpy(kStr1, s, len);
+        kStr1[len] = '\0';
+        h ^= HashStr(kStr1, len);
         h *= 0x01000193;
-        if (kType2 == LUA_TNUMBER) {
-            kNum2 = ReadTNumberDirect(arg2);
-            uint64_t u;
-            memcpy(&u, &kNum2, sizeof(u));
-            h ^= (uint32_t)u; h *= 0x01000193;
-            h ^= (uint32_t)(u >> 32); h *= 0x01000193;
-        } else if (kType2 == LUA_TSTRING) {
-            size_t len = 0;
-            const char* s = ReadTStringDirect(arg2, &len);
-            if (s) {
-                size_t copylen = len > 63 ? 63 : len;
-                memcpy(kStr2, s, copylen);
-                kStr2[copylen] = '\0';
-                h ^= HashStr(kStr2, copylen);
-                h *= 0x01000193;
-            }
-        }
+    } else {
+        return false;   // GetItemInfo only accepts a number or a string
     }
-    return h;
+
+    hash = h;
+    return true;
 }
 
 // ================================================================
-// Direct Memory Capture - reads return values from stack
-// using TValue* pointer math, NO lua API calls.
+// Capture - reads the results straight off the stack, no lua API calls.
+//
+// A Lua C function returning n means "the top n values", which is not
+// necessarily the first n the function pushed. The old code captured from
+// topBefore and returned the pushed count; this indexes from the top, so a
+// function that leaves scratch values below its results still replays right.
+//
+// Returns false and leaves the slot untouched if the strings do not fit, so a
+// partially written entry is never marked valid.
 // ================================================================
 
-static void CaptureItemReturnValues(lua_State* L, ItemCacheEntry* e,
-                                     uint32_t keyHash, int topBefore, int pushed,
-                                     int kType1, double kNum1, const char* kStr1) {
-    if (pushed > ITEM_RETVALS) pushed = ITEM_RETVALS;
-    e->keyHash   = keyHash;
-    e->valid     = true;
-    e->retCount  = pushed;  // Approximation, matches actual return count
-    e->pushed    = pushed;
-    
-    e->keyType1  = kType1;
-    e->keyNum1   = kNum1;
-    memcpy(e->keyStr1, kStr1, sizeof(e->keyStr1));
+static bool CaptureItemResults(lua_State* L, ItemCacheEntry* e,
+                               uint32_t keyHash, int topAfter, int ret,
+                               int kType1, double kNum1, const char* kStr1) {
+    ItemRetVal vals[ITEM_RETVALS];
+    char       blob[ITEM_BLOB_MAX];
+    uint16_t   used = 0;
 
-    RawTValue* base = GetStackBase(L);
+    RawTValue* base  = GetStackBase(L);
+    RawTValue* first = &base[topAfter - ret];
 
-    for (int i = 0; i < pushed; i++) {
-        RawTValue* val = &base[topBefore + i];
+    for (int i = 0; i < ret; i++) {
+        RawTValue* val = &first[i];
         int t = val->tt;
 
-        e->vals[i].type      = t;
-        e->vals[i].numVal    = 0.0;
-        e->vals[i].strVal[0] = '\0';
+        vals[i].numVal = 0.0;
+        vals[i].strOff = 0;
+        vals[i].type   = LUA_TNIL;
 
         switch (t) {
             case LUA_TSTRING: {
                 size_t slen = 0;
                 const char* s = ReadTStringDirect(val, &slen);
-                if (s && slen < sizeof(e->vals[i].strVal)) {
-                    memcpy(e->vals[i].strVal, s, slen);
-                    e->vals[i].strVal[slen] = '\0';
-                } else {
-                    e->vals[i].type = LUA_TNIL;  // Too long or invalid
-                }
+                if (!s) break;                                  // stays nil
+                if (used + slen + 1 > ITEM_BLOB_MAX) return false;
+                memcpy(blob + used, s, slen);
+                blob[used + slen] = '\0';
+                vals[i].strOff = used;
+                vals[i].type   = LUA_TSTRING;
+                used = (uint16_t)(used + slen + 1);
                 break;
             }
             case LUA_TNUMBER:
-                e->vals[i].numVal = ReadTNumberDirect(val);
+                vals[i].numVal = ReadTNumberDirect(val);
+                vals[i].type   = LUA_TNUMBER;
                 break;
             case LUA_TBOOLEAN:
-                e->vals[i].numVal = (val->value.gc != NULL) ? 1.0 : 0.0;
+                vals[i].numVal = (val->value.gc != NULL) ? 1.0 : 0.0;
+                vals[i].type   = LUA_TBOOLEAN;
                 break;
             default:
-                e->vals[i].type = LUA_TNIL;
-                break;
+                break;                                          // stays nil
         }
     }
-}
 
-static void CaptureSpellReturnValues(lua_State* L, SpellCacheEntry* e,
-                                      uint32_t keyHash, int topBefore, int pushed,
-                                      int kType1, double kNum1, const char* kStr1,
-                                      int kType2, double kNum2, const char* kStr2) {
-    if (pushed > SPELL_RETVALS) pushed = SPELL_RETVALS;
-    e->keyHash   = keyHash;
-    e->valid     = true;
-    e->retCount  = pushed;
-    e->pushed    = pushed;
-
-    e->keyType1  = kType1;
-    e->keyNum1   = kNum1;
-    memcpy(e->keyStr1, kStr1, sizeof(e->keyStr1));
-
-    e->keyType2  = kType2;
-    e->keyNum2   = kNum2;
-    memcpy(e->keyStr2, kStr2, sizeof(e->keyStr2));
-
-    RawTValue* base = GetStackBase(L);
-
-    for (int i = 0; i < pushed; i++) {
-        RawTValue* val = &base[topBefore + i];
-        int t = val->tt;
-
-        e->vals[i].type      = t;
-        e->vals[i].numVal    = 0.0;
-        e->vals[i].strVal[0] = '\0';
-
-        switch (t) {
-            case LUA_TSTRING: {
-                size_t slen = 0;
-                const char* s = ReadTStringDirect(val, &slen);
-                if (s && slen < sizeof(e->vals[i].strVal)) {
-                    memcpy(e->vals[i].strVal, s, slen);
-                    e->vals[i].strVal[slen] = '\0';
-                } else {
-                    e->vals[i].type = LUA_TNIL;
-                }
-                break;
-            }
-            case LUA_TNUMBER:
-                e->vals[i].numVal = ReadTNumberDirect(val);
-                break;
-            case LUA_TBOOLEAN:
-                e->vals[i].numVal = (val->value.gc != NULL) ? 1.0 : 0.0;
-                break;
-            default:
-                e->vals[i].type = LUA_TNIL;
-                break;
-        }
+    e->keyHash  = keyHash;
+    e->keyType1 = kType1;
+    e->keyNum1  = kNum1;
+    if (kType1 == LUA_TSTRING) {
+        size_t klen = strlen(kStr1);
+        memcpy(e->keyStr1, kStr1, klen + 1);
+    } else {
+        e->keyStr1[0] = '\0';
     }
+    memcpy(e->blob, blob, used);
+    e->blobUsed = used;
+    e->retCount = (uint8_t)ret;
+    memcpy(e->vals, vals, sizeof(ItemRetVal) * (size_t)ret);
+    e->valid    = true;
+    return true;
 }
 
 // ================================================================
-// Replay - uses API calls to safely push values (string interning).
+// Replay - the API pushes, so strings get interned in the current state.
 // ================================================================
 
-static inline void ReplayItemCachedValues(lua_State* L, ItemCacheEntry* e) {
-    for (int i = 0; i < e->pushed; i++) {
+static inline void ReplayItemResults(lua_State* L, const ItemCacheEntry* e) {
+    for (int i = 0; i < (int)e->retCount; i++) {
         switch (e->vals[i].type) {
-            case LUA_TSTRING:  lua_pushstring_(L, e->vals[i].strVal);       break;
-            case LUA_TNUMBER:  lua_pushnumber_(L, e->vals[i].numVal);       break;
-            case LUA_TBOOLEAN: lua_pushboolean_(L, (int)e->vals[i].numVal); break;
-            default:           lua_pushnil_(L);                              break;
-        }
-    }
-}
-
-static inline void ReplaySpellCachedValues(lua_State* L, SpellCacheEntry* e) {
-    for (int i = 0; i < e->pushed; i++) {
-        switch (e->vals[i].type) {
-            case LUA_TSTRING:  lua_pushstring_(L, e->vals[i].strVal);       break;
-            case LUA_TNUMBER:  lua_pushnumber_(L, e->vals[i].numVal);       break;
-            case LUA_TBOOLEAN: lua_pushboolean_(L, (int)e->vals[i].numVal); break;
-            default:           lua_pushnil_(L);                              break;
+            case LUA_TSTRING:  lua_pushstring_(L, e->blob + e->vals[i].strOff); break;
+            case LUA_TNUMBER:  lua_pushnumber_(L, e->vals[i].numVal);           break;
+            case LUA_TBOOLEAN: lua_pushboolean_(L, (int)e->vals[i].numVal);     break;
+            default:           lua_pushnil_(L);                                 break;
         }
     }
 }
@@ -415,7 +332,7 @@ static inline void ReplaySpellCachedValues(lua_State* L, SpellCacheEntry* e) {
 static lua_State* g_cacheLuaState = nullptr;
 
 // ================================================================
-// Hooked_GetItemInfo - Direct Memory Access version.
+// Hooked_GetItemInfo
 // ================================================================
 
 static int __cdecl Hooked_GetItemInfo(lua_State* L) {
@@ -428,14 +345,17 @@ static int __cdecl Hooked_GetItemInfo(lua_State* L) {
     if (nargs < 1) return orig_GetItemInfo(L);
 
     RawTValue* base = GetStackBase(L);
-    int keyType1;
-    double keyNum1;
-    char keyStr1[256];
-    
-    uint32_t keyHash = ComputeItemHash(L, base, nargs, keyType1, keyNum1, keyStr1);
-    if (keyType1 == LUA_TNIL) return orig_GetItemInfo(L);
+    uint32_t keyHash = 0;
+    int      keyType1;
+    double   keyNum1;
+    char     keyStr1[ITEM_KEY_MAX];
 
-    int slot = keyHash & CACHE_MASK;
+    if (!ComputeItemKey(base, nargs, keyHash, keyType1, keyNum1, keyStr1)) {
+        InterlockedIncrement(&g_itemBypassed);
+        return orig_GetItemInfo(L);
+    }
+
+    int slot = (int)(keyHash & CACHE_MASK);
     ItemCacheEntry* e = &g_itemCache[slot];
 
     ItemCacheEntry localEntry;
@@ -443,12 +363,9 @@ static int __cdecl Hooked_GetItemInfo(lua_State* L) {
 
     AcquireSRWLockShared(&g_itemCacheLock);
     if (e->valid && e->keyHash == keyHash && e->keyType1 == keyType1) {
-        bool match = true;
-        if (keyType1 == LUA_TNUMBER) {
-            if (e->keyNum1 != keyNum1) match = false;
-        } else if (keyType1 == LUA_TSTRING) {
-            if (strcmp(e->keyStr1, keyStr1) != 0) match = false;
-        }
+        bool match = (keyType1 == LUA_TNUMBER)
+                       ? (e->keyNum1 == keyNum1)
+                       : (strcmp(e->keyStr1, keyStr1) == 0);
         if (match) {
             localEntry = *e;
             found = true;
@@ -457,122 +374,26 @@ static int __cdecl Hooked_GetItemInfo(lua_State* L) {
     ReleaseSRWLockShared(&g_itemCacheLock);
 
     if (found) {
-        ReplayItemCachedValues(L, &localEntry);
+        ReplayItemResults(L, &localEntry);
         InterlockedIncrement(&g_itemHits);
-        return localEntry.retCount;
+        return (int)localEntry.retCount;
     }
 
-    if (keyType1 == LUA_TNUMBER && keyNum1 > 0) {
-        unsigned int itemId = (unsigned int)keyNum1;
-        ItemDataPrefetch::PrefetchItem(itemId + 1);
-        ItemDataPrefetch::PrefetchItem(itemId + 2);
-    }
-
-    int topBefore = lua_gettop_(L);
-    int ret = orig_GetItemInfo(L);
+    int ret      = orig_GetItemInfo(L);
     int topAfter = lua_gettop_(L);
-    int pushed = topAfter - topBefore;
 
-    // Only cache successful results with item name + type (first two returns are strings)
-    if (pushed >= 10 && pushed <= ITEM_RETVALS) {
-        RawTValue* base = GetStackBase(L); // Re-fetch in case stack reallocated
-        RawTValue* res1 = &base[topBefore];
-        RawTValue* res2 = &base[topBefore + 1];
-        if (res1->tt == LUA_TSTRING && res2->tt == LUA_TSTRING) {
-            RawTValue* res4 = &base[topBefore + 3];
-            bool isLoaded = (res4->tt == LUA_TNUMBER && ReadTNumberDirect(res4) >= 1.0);
-            if (isLoaded) {
-                AcquireSRWLockExclusive(&g_itemCacheLock);
-                CaptureItemReturnValues(L, e, keyHash, topBefore, pushed, keyType1, keyNum1, keyStr1);
-                ReleaseSRWLockExclusive(&g_itemCacheLock);
-            }
-        }
+    // ret == 0 is the client saying the item is not in its local cache yet, and
+    // a later call will succeed - so a failure must never be stored. Anything
+    // above zero came from a complete item record.
+    if (ret > 0 && ret <= ITEM_RETVALS && topAfter >= ret) {
+        AcquireSRWLockExclusive(&g_itemCacheLock);
+        bool stored = CaptureItemResults(L, e, keyHash, topAfter, ret,
+                                        keyType1, keyNum1, keyStr1);
+        ReleaseSRWLockExclusive(&g_itemCacheLock);
+        if (!stored) InterlockedIncrement(&g_itemBypassed);
     }
 
     InterlockedIncrement(&g_itemMisses);
-    return ret;
-}
-
-// ================================================================
-// Hooked_GetSpellInfo - Direct Memory Access version.
-// ================================================================
-
-static int __cdecl Hooked_GetSpellInfo(lua_State* L) {
-    if (L != g_cacheLuaState) {
-        g_cacheLuaState = L;
-        ApiCache::ClearCache();
-    }
-
-    int nargs = lua_gettop_(L);
-    if (nargs < 1) return orig_GetSpellInfo(L);
-
-    RawTValue* base = GetStackBase(L);
-    int keyType1, keyType2;
-    double keyNum1, keyNum2;
-    char keyStr1[128], keyStr2[64];
-
-    uint32_t keyHash = ComputeSpellHash(L, base, nargs, keyType1, keyNum1, keyStr1, keyType2, keyNum2, keyStr2);
-    if (keyType1 == LUA_TNIL) return orig_GetSpellInfo(L);
-
-    // Bypass caching for spellbook slot queries (slot number, book type)
-    if (keyType1 == LUA_TNUMBER && nargs >= 2) {
-        InterlockedIncrement(&g_spellMisses);
-        return orig_GetSpellInfo(L);
-    }
-
-    int slot = keyHash & CACHE_MASK;
-    SpellCacheEntry* e = &g_spellCache[slot];
-
-    SpellCacheEntry localEntry;
-    bool found = false;
-
-    AcquireSRWLockShared(&g_spellCacheLock);
-    if (e->valid && e->keyHash == keyHash &&
-        e->keyType1 == keyType1 && e->keyType2 == keyType2) {
-        
-        bool match = true;
-        if (keyType1 == LUA_TNUMBER) {
-            if (e->keyNum1 != keyNum1) match = false;
-        } else if (keyType1 == LUA_TSTRING) {
-            if (strcmp(e->keyStr1, keyStr1) != 0) match = false;
-        }
-
-        if (match && keyType2 == LUA_TNUMBER) {
-            if (e->keyNum2 != keyNum2) match = false;
-        } else if (match && keyType2 == LUA_TSTRING) {
-            if (strcmp(e->keyStr2, keyStr2) != 0) match = false;
-        }
-
-        if (match) {
-            localEntry = *e;
-            found = true;
-        }
-    }
-    ReleaseSRWLockShared(&g_spellCacheLock);
-
-    if (found) {
-        ReplaySpellCachedValues(L, &localEntry);
-        InterlockedIncrement(&g_spellHits);
-        return localEntry.retCount;
-    }
-
-    int topBefore = lua_gettop_(L);
-    int ret = orig_GetSpellInfo(L);
-    int topAfter = lua_gettop_(L);
-    int pushed = topAfter - topBefore;
-
-    // Only cache successful results (first return is spell name string)
-    if (pushed >= 3 && pushed <= SPELL_RETVALS) {
-        RawTValue* base = GetStackBase(L); // Re-fetch in case stack reallocated
-        RawTValue* res1 = &base[topBefore];
-        if (res1->tt == LUA_TSTRING) {
-            AcquireSRWLockExclusive(&g_spellCacheLock);
-            CaptureSpellReturnValues(L, e, keyHash, topBefore, pushed, keyType1, keyNum1, keyStr1, keyType2, keyNum2, keyStr2);
-            ReleaseSRWLockExclusive(&g_spellCacheLock);
-        }
-    }
-
-    InterlockedIncrement(&g_spellMisses);
     return ret;
 }
 
@@ -604,19 +425,30 @@ namespace ApiCache {
 bool Init() {
     g_active = true;
 
-    int hooked = 0;
 #if !TEST_DISABLE_GETITEMINFO_CACHE
-    if (HookFunc("GetItemInfo", ADDR_GetItemInfo, (void*)Hooked_GetItemInfo, (void**)&orig_GetItemInfo))
-        hooked++;
+    bool hooked = HookFunc("GetItemInfo", ADDR_GetItemInfo,
+                           (void*)Hooked_GetItemInfo, (void**)&orig_GetItemInfo);
+#else
+    bool hooked = false;
+    Log("[ApiCache]   GetItemInfo disabled at build time");
 #endif
 
-#if !TEST_DISABLE_GETSPELLINFO_CACHE
-    if (HookFunc("GetSpellInfo", ADDR_GetSpellInfo, (void*)Hooked_GetSpellInfo, (void**)&orig_GetSpellInfo))
-        hooked++;
-#endif
+    Log("[ApiCache] Init complete: GetItemInfo %s, %d slots, %u KB",
+        hooked ? "hooked" : "NOT hooked", CACHE_SIZE,
+        (unsigned)(sizeof(g_itemCache) / 1024));
+    return hooked;
+}
 
-    Log("[ApiCache] Init complete: %d/2 API cache hooks active", hooked);
-    return true;
+// Printed from the periodic report. Shutdown does not run - the DLL exits via
+// TerminateProcess - so anything reported only from there is never seen.
+void LogStats() {
+    long total = g_itemHits + g_itemMisses;
+    if (total > 0) {
+        Log("[ApiCache] GetItemInfo: %ld hits, %ld misses (%.1f%% hit rate), %ld bypassed",
+            g_itemHits, g_itemMisses, (double)g_itemHits / total * 100.0, g_itemBypassed);
+    } else if (g_active) {
+        Log("[ApiCache] GetItemInfo: no calls");
+    }
 }
 
 void Shutdown() {
@@ -624,41 +456,24 @@ void Shutdown() {
     g_active = false;
 
     MH_DisableHook((void*)ADDR_GetItemInfo);
-    MH_DisableHook((void*)ADDR_GetSpellInfo);
 
-    long itemTotal  = g_itemHits  + g_itemMisses;
-    long spellTotal = g_spellHits + g_spellMisses;
-
-    if (itemTotal > 0) {
-        Log("[ApiCache] GetItemInfo: %ld hits, %ld misses (%.1f%% hit rate)",
-            g_itemHits, g_itemMisses, (double)g_itemHits / itemTotal * 100.0);
-    }
-
-    if (spellTotal > 0) {
-        Log("[ApiCache] GetSpellInfo: %ld hits, %ld misses (%.1f%% hit rate)",
-            g_spellHits, g_spellMisses, (double)g_spellHits / spellTotal * 100.0);
-    }
+    LogStats();
 }
 
 void ClearCache() {
     AcquireSRWLockExclusive(&g_itemCacheLock);
-    memset(g_itemCache,  0, sizeof(g_itemCache));
+    memset(g_itemCache, 0, sizeof(g_itemCache));
     ReleaseSRWLockExclusive(&g_itemCacheLock);
 
-    AcquireSRWLockExclusive(&g_spellCacheLock);
-    memset(g_spellCache, 0, sizeof(g_spellCache));
-    ReleaseSRWLockExclusive(&g_spellCacheLock);
-
-    Log("[ApiCache] Cache cleared (item: %d entries, spell: %d entries)", CACHE_SIZE, CACHE_SIZE);
+    Log("[ApiCache] Cache cleared (%d item entries)", CACHE_SIZE);
 }
 
 Stats GetStats() {
     Stats s;
-    s.itemHits   = g_itemHits;
-    s.itemMisses = g_itemMisses;
-    s.spellHits  = g_spellHits;
-    s.spellMisses = g_spellMisses;
-    s.active     = g_active;
+    s.itemHits    = g_itemHits;
+    s.itemMisses  = g_itemMisses;
+    s.itemBypassed = g_itemBypassed;
+    s.active      = g_active;
     return s;
 }
 

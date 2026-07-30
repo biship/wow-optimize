@@ -221,13 +221,50 @@ void LogPerformanceSnapshot(double elapsedMs) {
     Log("[PerfDiag] ==================================================");
 }
 
+// A full snapshot is about twenty lines - sixteen hook calls, the VA reservation
+// table, player position. Printing one per stutter was fine in a smooth session
+// and ruinous in a rough one: a 7MB tester log contains 829 of them, and writing
+// them is itself work on the main thread, so the diagnostic was making the
+// stutters it reports worse.
+//
+// The first few say everything the later ones do. After that a stutter is worth
+// counting, not describing again.
+static constexpr DWORD STUTTER_QUIET_MS   = 30000;
+static constexpr LONG  STUTTER_MAX_REPORTS = 12;
+
+static DWORD s_lastStutterReport = 0;
+static LONG  s_stutterReports    = 0;
+static LONG  s_stuttersSeen      = 0;
+
 void OnFrame(double elapsedMs) {
     #if !TEST_DISABLE_SAMPLING_PROFILER
     // If a frame takes longer than 100ms (10 FPS or below), it's a severe stutter
     if (elapsedMs > 100.0) {
+        ++s_stuttersSeen;
+
+        if (s_stutterReports >= STUTTER_MAX_REPORTS) return;
+
+        DWORD now = GetTickCount();
+        if (s_lastStutterReport != 0 && now - s_lastStutterReport < STUTTER_QUIET_MS)
+            return;
+
+        s_lastStutterReport = now;
+        ++s_stutterReports;
         LogPerformanceSnapshot(elapsedMs);
+
+        if (s_stutterReports == STUTTER_MAX_REPORTS) {
+            Log("[PerfDiag] That is %d snapshots; further stutters are counted "
+                "only. See the summary at the end.", (int)STUTTER_MAX_REPORTS);
+        }
     }
     #endif
+}
+
+void LogStats() {
+    if (s_stuttersSeen > 0) {
+        Log("[PerfDiag] %ld frames over 100ms this session, %ld described in full",
+            (long)s_stuttersSeen, (long)s_stutterReports);
+    }
 }
 
 bool Init() {

@@ -26,6 +26,7 @@ namespace LuaBytecodeCache {
 
 bool Init();
 void Shutdown();
+void LogStats();
 void OnLuaStateSwap();
 
 struct Stats {

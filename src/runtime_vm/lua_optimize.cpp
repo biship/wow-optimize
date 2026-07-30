@@ -1143,8 +1143,7 @@ static void UpdateLuaStats(lua_State* L) {
         ApiCache::Stats apiStats = ApiCache::GetStats();
         WriteLuaGlobal_Number(L, "LUABOOST_DLL_APICACHE_ITEM_HITS",  (double)apiStats.itemHits);
         WriteLuaGlobal_Number(L, "LUABOOST_DLL_APICACHE_ITEM_MISSES", (double)apiStats.itemMisses);
-        WriteLuaGlobal_Number(L, "LUABOOST_DLL_APICACHE_SPELL_HITS", (double)apiStats.spellHits);
-        WriteLuaGlobal_Number(L, "LUABOOST_DLL_APICACHE_SPELL_MISSES",(double)apiStats.spellMisses);
+        WriteLuaGlobal_Number(L, "LUABOOST_DLL_APICACHE_ITEM_BYPASSED", (double)apiStats.itemBypassed);
         WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_APICACHE_ACTIVE", apiStats.active);
 
         LuaFastPath::Stats fpStats = LuaFastPath::GetStats();
@@ -1224,10 +1223,9 @@ static int __cdecl LuaBoostC_GetApiStats_cb(lua_State* L) {
     ApiCache::Stats s = ApiCache::GetStats();
     Api.lua_pushnumber(L, (lua_Number)s.itemHits);
     Api.lua_pushnumber(L, (lua_Number)s.itemMisses);
-    Api.lua_pushnumber(L, (lua_Number)s.spellHits);
-    Api.lua_pushnumber(L, (lua_Number)s.spellMisses);
+    Api.lua_pushnumber(L, (lua_Number)s.itemBypassed);
     Api.lua_pushboolean(L, s.active ? 1 : 0);
-    return 5;
+    return 4;
 }
 
 static int __cdecl LuaBoostC_GetFastPathStats_cb(lua_State* L) {

@@ -14,6 +14,7 @@
 
 extern "C" void Log(const char* fmt, ...);
 #include "crash_dumper.h"
+#include "sampling_profiler.h"
 
 #if !TEST_DISABLE_OBJ_VIS_CACHE
 
@@ -210,18 +211,27 @@ bool Init() {
     }
 
     g_featureToken = CrashDumper::FeatureTokenForCounting("ObjVisCache");
+    SamplingProfiler::RegisterSelfSymbol("objvis_lookup", (const void*)&hooked_HashLookup);
     Log("[ObjVisCache] [ OK ] Hooked lookup, static pool=%d threads (no alloc)", MAX_THREADS);
     return true;
 }
 
-void Shutdown() {
+// Printed from the periodic report, not only from Shutdown. The DLL exits
+// through TerminateProcess to avoid deadlocking on background threads, so
+// Shutdown does not run and these numbers reached no log at all - four tester
+// sessions contain none of them.
+void LogStats() {
     LONG hits = g_cacheHits;
     LONG misses = g_cacheMisses;
     LONG total = hits + misses;
     double rate = total > 0 ? (100.0 * hits / total) : 0.0;
 
-    Log("[ObjVisCache] Shutdown (hits=%d, misses=%d, rate=%.1f%%, exhausted=%d)",
+    Log("[ObjVisCache] hits=%d, misses=%d, rate=%.1f%%, exhausted=%d",
         hits, misses, rate, g_poolExhausted);
+}
+
+void Shutdown() {
+    LogStats();
 
     void* target = (void*)0x4D4BB0;
     void* teardownTarget = (void*)0x5D9D90;
@@ -246,6 +256,7 @@ void OnFrame() {
 namespace ObjVisCache {
 bool Init() { Log("[ObjVisCache] DISABLED (feature flag)"); return false; }
 void Shutdown() {}
+void LogStats() { Log("[ObjVisCache] compiled out - nothing measured"); }
 void OnFrame() {}
 } // namespace ObjVisCache
 

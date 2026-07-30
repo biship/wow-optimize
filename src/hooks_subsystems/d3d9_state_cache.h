@@ -12,6 +12,10 @@ bool Init();
 
 // Shut down the hooks and release resources
 void Shutdown();
+void LogStats();
+
+// Draw calls per frame, if the census was switched on.
+void ReportDrawCensus();
 
 // Handle device creation (resolve pointers and install hooks)
 void OnCreateDevice(struct IDirect3DDevice9* device);

@@ -4,5 +4,6 @@
 namespace FontGlyphCache {
     bool Init();
     void Shutdown();
+    void LogStats();
     void ClearCache();
 }
