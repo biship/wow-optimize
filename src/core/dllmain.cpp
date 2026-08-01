@@ -6897,7 +6897,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     // FrameScript hash dispatch - 18 handlers, O(1) vs O(n)
 #if !TEST_DISABLE_FRAME_SCRIPT_DISPATCH
-    bool fsDispatchOk = InstallFrameScriptDispatch();
+    bool fsDispatchOk = Config::g_settings.OptFrameScriptDispatch && InstallFrameScriptDispatch();
 #else
     bool fsDispatchOk = false;
     Log("[FrameScriptDispatch] DISABLED via feature flag");
@@ -7687,7 +7687,11 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("[NameplateMT] DISABLED (test toggle)");
     bool nameplateMTOk = false;
 #else
-    bool nameplateMTOk = NameplateMT::Init();
+    // NameplateMT spawns worker threads, and its launcher switch was read into
+    // the settings struct and then consulted by nothing at all - so it ran on
+    // every install and could not be turned off from the launcher that offered
+    // to turn it off.
+    bool nameplateMTOk = Config::g_settings.OptNameplateMT && NameplateMT::Init();
 #endif
 
     Log("");
@@ -7732,7 +7736,8 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     // Lua bytecode cache (skips script parsing on reload & addon load)
 #if !TEST_DISABLE_LUA_BYTECODE_CACHE
-    bool bytecodeOk = LuaBytecodeCache::Init();
+    // LuaOpcache gates about fifty other installs but had never gated this one.
+    bool bytecodeOk = Config::g_settings.OptLuaOpcache && LuaBytecodeCache::Init();
 #else
     bool bytecodeOk = false;
 #endif
@@ -7751,7 +7756,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("--- SavedVariables Async Writer ---");
 #if !TEST_DISABLE_SAVED_VARS_ASYNC
-    bool savedVarsAsyncOk = InstallSavedVarsAsync();
+    bool savedVarsAsyncOk = Config::g_settings.OptSavedVarsAsync && InstallSavedVarsAsync();
 #else
     bool savedVarsAsyncOk = false;
     Log("[SavedVarsAsync] DISABLED via feature flag");
@@ -7915,7 +7920,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Lock-Free Object GUID Lookup Cache ---");
-    bool guidCacheOk = GuidLookupCache::Init();
+    bool guidCacheOk = Config::g_settings.OptGuidLookupCache && GuidLookupCache::Init();
 
     Log("");
     Log("--- SSE2 Math Fast Paths ---");

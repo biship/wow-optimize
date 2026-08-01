@@ -38,7 +38,6 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "TimingCvarPin", &Settings::OptTimingCvarPin },
     { "General", "FrameLimiter", &Settings::OptFrameLimiter },
     { "General", "ObjVisCache", &Settings::OptObjVisCache },
-    { "General", "DbcPreload", &Settings::OptDbcPreload },
     { "General", "OomGovernor", &Settings::OptOomGovernor },
     { "General", "HardwareCursor", &Settings::OptHardwareCursor },
     { "General", "SamplingProfiler", &Settings::OptSamplingProfiler },
@@ -54,7 +53,6 @@ static const BoolSetting kBoolSettings[] = {
     { "UI_Lua", "LuaNumConvFast", &Settings::OptLuaNumConvFast },
     { "UI_Lua", "LuaOpcache", &Settings::OptLuaOpcache },
     { "UI_Lua", "LuaGcCoalesce", &Settings::OptLuaGcCoalesce },
-    { "UI_Lua", "LuaJIT", &Settings::OptLuaJIT },
     { "UI_Lua", "LuaGetTimeFast", &Settings::OptLuaGetTimeFast },
     { "UI_Lua", "AsyncTexLoader", &Settings::OptAsyncTexLoader },
     { "UI_Lua", "AsyncTerrainLoader", &Settings::OptAsyncTerrainLoader },
@@ -64,12 +62,12 @@ static const BoolSetting kBoolSettings[] = {
     { "Combat_Net", "CombatLogParser", &Settings::OptCombatLogParser },
     { "Combat_Net", "CombatLogIncremental", &Settings::OptCombatLogIncremental },
     { "Combat_Net", "EventCoalescer", &Settings::OptEventCoalescer },
-    { "Combat_Net", "SavedVarsSerializer", &Settings::OptSavedVarsSerializer },
     { "Combat_Net", "SavedVarsAsync", &Settings::OptSavedVarsAsync },
     { "Combat_Net", "SavedVarsPretoken", &Settings::OptSavedVarsPretoken },
     { "Combat_Net", "UnitAuraFast", &Settings::OptUnitAuraFast },
     { "Combat_Net", "NetworkGuidSse2", &Settings::OptNetworkGuidSse2 },
     { "Combat_Net", "ApiCache", &Settings::OptApiCache },
+    { "Combat_Net", "GuidLookupCache", &Settings::OptGuidLookupCache },
     { "Combat_Net", "PacketOffload", &Settings::OptPacketOffload },
     { "Combat_Net", "NameplateMT", &Settings::OptNameplateMT },
     { "Graphics_Sound", "FastMemsetOpt", &Settings::OptFastMemsetOpt },
@@ -274,7 +272,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptTimingCvarPin       = GetPrivateProfileIntA("General", "TimingCvarPin", 1, iniPath.c_str()) != 0;
         g_settings.OptFrameLimiter        = GetPrivateProfileIntA("General", "FrameLimiter", 0, iniPath.c_str()) != 0;
         g_settings.OptObjVisCache         = GetPrivateProfileIntA("General", "ObjVisCache", 1, iniPath.c_str()) != 0;
-        g_settings.OptDbcPreload          = GetPrivateProfileIntA("General", "DbcPreload", 0, iniPath.c_str()) != 0;
         g_settings.OptOomGovernor         = GetPrivateProfileIntA("General", "OomGovernor", 0, iniPath.c_str()) != 0;
         g_settings.OptHardwareCursor      = GetPrivateProfileIntA("General", "HardwareCursor", 0, iniPath.c_str()) != 0;
         g_settings.OptSamplingProfiler    = GetPrivateProfileIntA("General", "SamplingProfiler", 0, iniPath.c_str()) != 0;
@@ -301,7 +298,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptLuaNumConvFast      = GetPrivateProfileIntA("UI_Lua", "LuaNumConvFast", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaOpcache          = GetPrivateProfileIntA("UI_Lua", "LuaOpcache", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaGcCoalesce       = GetPrivateProfileIntA("UI_Lua", "LuaGcCoalesce", 0, iniPath.c_str()) != 0;
-        g_settings.OptLuaJIT              = GetPrivateProfileIntA("UI_Lua", "LuaJIT", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaGetTimeFast      = GetPrivateProfileIntA("UI_Lua", "LuaGetTimeFast", 0, iniPath.c_str()) != 0;
         g_settings.OptAsyncTexLoader      = GetPrivateProfileIntA("UI_Lua", "AsyncTexLoader", 0, iniPath.c_str()) != 0;
         g_settings.OptAsyncTerrainLoader  = GetPrivateProfileIntA("UI_Lua", "AsyncTerrainLoader", 0, iniPath.c_str()) != 0;
@@ -313,12 +309,12 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptCombatLogParser     = GetPrivateProfileIntA("Combat_Net", "CombatLogParser", 0, iniPath.c_str()) != 0;
         g_settings.OptCombatLogIncremental = GetPrivateProfileIntA("Combat_Net", "CombatLogIncremental", 0, iniPath.c_str()) != 0;
         g_settings.OptEventCoalescer      = GetPrivateProfileIntA("Combat_Net", "EventCoalescer", 0, iniPath.c_str()) != 0;
-        g_settings.OptSavedVarsSerializer = GetPrivateProfileIntA("Combat_Net", "SavedVarsSerializer", 0, iniPath.c_str()) != 0;
         g_settings.OptSavedVarsAsync      = GetPrivateProfileIntA("Combat_Net", "SavedVarsAsync", 0, iniPath.c_str()) != 0;
         g_settings.OptSavedVarsPretoken   = GetPrivateProfileIntA("Combat_Net", "SavedVarsPretoken", 0, iniPath.c_str()) != 0;
         g_settings.OptUnitAuraFast        = GetPrivateProfileIntA("Combat_Net", "UnitAuraFast", 0, iniPath.c_str()) != 0;
         g_settings.OptNetworkGuidSse2     = GetPrivateProfileIntA("Combat_Net", "NetworkGuidSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptApiCache   = GetPrivateProfileIntA("Combat_Net", "ApiCache", 1, iniPath.c_str()) != 0;
+        g_settings.OptGuidLookupCache   = GetPrivateProfileIntA("Combat_Net", "GuidLookupCache", 1, iniPath.c_str()) != 0;
         g_settings.OptPacketOffload       = GetPrivateProfileIntA("Combat_Net", "PacketOffload", 0, iniPath.c_str()) != 0;
         g_settings.OptNameplateMT         = GetPrivateProfileIntA("Combat_Net", "NameplateMT", 0, iniPath.c_str()) != 0;
 

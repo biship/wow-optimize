@@ -48,7 +48,6 @@ namespace Config {
         bool OptTimingCvarPin = true;
         bool OptFrameLimiter = false;
         bool OptObjVisCache = true;
-        bool OptDbcPreload = false;
         bool OptOomGovernor = false;
         bool OptHardwareCursor = false;
         bool OptSamplingProfiler = false;
@@ -66,7 +65,6 @@ namespace Config {
         bool OptLuaNumConvFast = false;
         bool OptLuaOpcache = false;
         bool OptLuaGcCoalesce = false;
-        bool OptLuaJIT = false;
         bool OptLuaGetTimeFast = false;
         bool OptSimdMatrixTransform = false;
         bool OptAsyncTexLoader = false;
@@ -79,7 +77,6 @@ namespace Config {
         bool OptCombatLogParser = false;
         bool OptCombatLogIncremental = false;
         bool OptEventCoalescer = false;
-        bool OptSavedVarsSerializer = false;
         bool OptSavedVarsAsync = false;
         bool OptSavedVarsPretoken = false;
         bool OptUnitAuraFast = false;
@@ -92,6 +89,10 @@ namespace Config {
         // still had the hook installed. This is the cache behind the WeakAuras
         // icon that stays wrong after a talent switch.
         bool OptApiCache = true;
+        // Lock-free GUID -> object lookup cache. On by default because it has
+        // always been installed unconditionally - it had no setting at all - and
+        // this only gives that behaviour a switch.
+        bool OptGuidLookupCache = true;
         bool OptPacketOffload = false;
         bool OptNameplateMT = false;
 
