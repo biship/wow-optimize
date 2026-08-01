@@ -771,9 +771,56 @@ typedef int (__fastcall *IsAABBVisible_t)(void* ecx, void* edx, const float* bou
 static IsAABBVisible_t orig_IsAABBVisible = nullptr;
 
 
+// Verified against the client's own routine on the client's own data, for the
+// first few thousand calls, and abandoned the moment the two disagree.
+//
+// This hook replaces the frustum test outright - it never calls the original -
+// and until now nothing checked that the replacement answers the same. That is
+// the arrangement that let the matrix multiply run for months a hundred times
+// outside its own declared tolerance. Here a wrong answer is not a rounding
+// difference: sub_9839E0 decides whether an object is drawn, so disagreeing
+// means scenery popping in and out, and the caller at sub_7BCC00 - about 3.45%
+// of main-thread execution, two calls per object per frame - is the world
+// traversal, so it would be everywhere at once.
+//
+// Synthetic input was the wrong way to test it. The plane set arrives as a
+// this-pointer whose layout is inferred, and building a wrong one produces a
+// failure that says nothing about the code. Real frustums and real bounding
+// boxes arrive by the thousand a frame at no cost but running both for a while.
+static volatile long g_frustumChecked   = 0;
+static volatile long g_frustumMismatch  = 0;
+static bool          g_frustumTrusted   = false;   // stop double-running once proven
+static bool          g_frustumAbandoned = false;   // disagreed: original from here on
+
+static constexpr long FRUSTUM_VERIFY_CALLS = 4096;
+
 static int __fastcall Hooked_IsAABBVisible(void* ecx, void* edx, const float* bounds) {
     InterlockedIncrement(&g_frustumCalls);
+
+    if (g_frustumAbandoned) {
+        return orig_IsAABBVisible(ecx, edx, bounds);
+    }
+
     int res = SSE2_IsAABBVisible((const float*)ecx, bounds);
+
+    if (!g_frustumTrusted) {
+        int theirs = orig_IsAABBVisible(ecx, edx, bounds);
+        long n = InterlockedIncrement(&g_frustumChecked);
+        if (theirs != res) {
+            InterlockedIncrement(&g_frustumMismatch);
+            g_frustumAbandoned = true;
+            Log("[SimdHooks] Frustum cull disagreed with the client on call %ld "
+                "(client %d, ours %d) - handing every call back to the original",
+                n, theirs, res);
+            return theirs;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_frustumTrusted = true;
+            Log("[SimdHooks] Frustum cull agreed with the client on %ld consecutive "
+                "real calls - running ours alone from here", n);
+        }
+    }
+
     if (res == 0) {
         InterlockedIncrement(&g_frustumCulled);
     }
