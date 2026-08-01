@@ -84,6 +84,8 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_fastpath.h
     src/runtime_vm/lua_internals.cpp
     src/runtime_vm/lua_internals.h
+    src/diagnostics/anim_census.cpp
+    src/diagnostics/anim_census.h
     src/diagnostics/crash_dumper.cpp
     src/hooks_subsystems/render_null_guard.cpp
     src/diagnostics/cvar_watchdog.cpp

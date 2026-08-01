@@ -148,6 +148,11 @@ namespace Config {
         // like the draw census - it decides whether a dedicated Lua arena is
         // worth building.
         bool OptLuaAllocCensus = false;
+        // Counts what the M2 animation update does per frame. A measurement in
+        // the same spirit as the draw and allocation censuses: it decides
+        // whether animation level-of-detail is worth building, and is meant to
+        // answer that in one session and be switched off again.
+        bool OptAnimCensus = false;
         bool OptCrtFreeMsize = true;
         bool OptCrtAllocMsize = true;
         bool OptCrtMimalloc = false;
