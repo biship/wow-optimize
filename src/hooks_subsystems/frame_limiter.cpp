@@ -40,6 +40,33 @@ void __cdecl Hooked_SleepHelper(DWORD ms) {
     orig_SleepHelper(ms);
 }
 
+// One timer per thread, created once and reused. CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+// arrived in Windows 10 1803; on anything older, and on Wine builds that do not
+// implement it, the flag makes the call fail and we fall back to a plain timer,
+// then to Sleep. A null return is a supported outcome, not an error worth logging
+// every frame.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+static HANDLE AcquireFrameTimer() {
+    static __declspec(thread) HANDLE t_timer = NULL;
+    static __declspec(thread) bool    t_tried = false;
+
+    if (!t_tried) {
+        t_tried = true;
+        t_timer = CreateWaitableTimerExW(NULL, NULL,
+                                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_ALL_ACCESS);
+        if (!t_timer) {
+            t_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+        }
+        Log("[FrameLimiter] Wait mode: %s",
+            t_timer ? "waitable timer" : "Sleep (no timer available)");
+    }
+    return t_timer;
+}
+
 // Detour for sub_6836D0
 unsigned int __fastcall Hooked_EngineFrameLimit(void* This, void* unused) {
     if (!This) {
@@ -98,19 +125,52 @@ unsigned int __fastcall Hooked_EngineFrameLimit(void* This, void* unused) {
             remaining = targetDuration - elapsed;
         }
 
-        // Coarse sleep first to yield CPU cycles
-        if (remaining > 0.002) {
-            DWORD sleepMs = (DWORD)((remaining - 0.0015) * 1000.0);
-            Sleep(sleepMs);
-        }
-
-        // Precision spin-yield loop
         LARGE_INTEGER targetTime;
         targetTime.QuadPart = g_frameStartQpc.QuadPart + (LONGLONG)(targetDuration * g_ticksPerSec);
+
+        // How much of the frame is spent spinning rather than sleeping. This used
+        // to be 1.5 ms, which is not a small number: the spin is entered on every
+        // frame, so at a 200 FPS cap - a 5 ms frame - it burned 1.5 ms of every 5
+        // in a loop that does nothing. That is 30% of a core given away for
+        // timing precision nobody asked for, and it matches a tester reporting
+        // CPU use going from about 15% to about 50% with no other change.
+        //
+        // SwitchToThread is what made it that expensive. It yields only to a
+        // thread already runnable on the same processor and returns immediately
+        // when there is none, so with an idle core the loop is a plain busy-wait.
+        // Under Wine, where this was measured, each call is also a good deal
+        // dearer than on Windows.
+        //
+        // A high-resolution waitable timer does the waiting in the kernel and
+        // wakes within a few hundred microseconds, so the spin only has to cover
+        // what it cannot. Where the timer is unavailable the old Sleep path
+        // remains, with a margin sized to Sleep's actual granularity.
+        static const double SPIN_MARGIN_SEC = 0.00025;   // 250 us
+
+        double toWait = (double)(targetTime.QuadPart - now.QuadPart) / g_ticksPerSec;
+        if (toWait > SPIN_MARGIN_SEC) {
+            double sleepSec = toWait - SPIN_MARGIN_SEC;
+            HANDLE timer = AcquireFrameTimer();
+            if (timer) {
+                LARGE_INTEGER due;
+                // Negative means relative, in 100 ns units.
+                due.QuadPart = -(LONGLONG)(sleepSec * 10000000.0);
+                if (due.QuadPart < 0 && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+                    WaitForSingleObject(timer, INFINITE);
+                }
+            } else if (sleepSec > 0.001) {
+                Sleep((DWORD)(sleepSec * 1000.0));
+            }
+        }
+
+        // Whatever is left after the wait, and it should now be under a
+        // millisecond. Pause rather than SwitchToThread: it does not enter the
+        // kernel and it tells the core this is a spin, which on a hyperthreaded
+        // part lets the sibling have the pipeline.
         while (true) {
             QueryPerformanceCounter(&now);
             if (now.QuadPart >= targetTime.QuadPart) break;
-            SwitchToThread();
+            YieldProcessor();
         }
         g_frameStartQpc = targetTime;
     } else {
