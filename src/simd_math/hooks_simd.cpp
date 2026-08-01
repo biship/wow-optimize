@@ -831,9 +831,38 @@ typedef int (__fastcall *IsAABBVisibleType2_t)(void* ecx, void* edx, const float
 static IsAABBVisibleType2_t orig_IsAABBVisibleType2 = nullptr;
 
 
+// Same arrangement and same treatment as IsAABBVisible above: a full
+// replacement that never called the original and was never checked against it.
+static volatile long g_frustum2Checked   = 0;
+static bool          g_frustum2Trusted   = false;
+static bool          g_frustum2Abandoned = false;
+
 static int __fastcall Hooked_IsAABBVisibleType2(void* ecx, void* edx, const float* bounds) {
     InterlockedIncrement(&g_frustumCalls);
+
+    if (g_frustum2Abandoned) {
+        return orig_IsAABBVisibleType2(ecx, edx, bounds);
+    }
+
     int res = SSE2_IsAABBVisible_Type2((const float*)ecx, bounds);
+
+    if (!g_frustum2Trusted) {
+        int theirs = orig_IsAABBVisibleType2(ecx, edx, bounds);
+        long n = InterlockedIncrement(&g_frustum2Checked);
+        if (theirs != res) {
+            g_frustum2Abandoned = true;
+            Log("[SimdHooks] Frustum cull (type 2) disagreed with the client on call "
+                "%ld (client %d, ours %d) - handing every call back to the original",
+                n, theirs, res);
+            return theirs;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_frustum2Trusted = true;
+            Log("[SimdHooks] Frustum cull (type 2) agreed with the client on %ld "
+                "consecutive real calls - running ours alone from here", n);
+        }
+    }
+
     if (res == 0) {
         InterlockedIncrement(&g_frustumCulled);
     }
@@ -844,9 +873,42 @@ typedef void (__fastcall *IsPointVisible_t)(void* ecx, void* edx, const float* p
 static IsPointVisible_t orig_IsPointVisible = nullptr;
 
 
+// This one writes its verdict through an out-parameter rather than returning it,
+// so the check compares what each wrote into the caller's byte.
+static volatile long g_pointChecked   = 0;
+static bool          g_pointTrusted   = false;
+static bool          g_pointAbandoned = false;
+
 static void __fastcall Hooked_IsPointVisible(void* ecx, void* edx, const float* point, uint8_t* outMask) {
     InterlockedIncrement(&g_frustumCalls);
+
+    if (g_pointAbandoned) {
+        orig_IsPointVisible(ecx, edx, point, outMask);
+        return;
+    }
+
     SSE2_IsPointVisible((const float*)ecx, point, outMask);
+
+    if (!g_pointTrusted && outMask) {
+        uint8_t ours = *outMask;
+        uint8_t theirs = 0;
+        orig_IsPointVisible(ecx, edx, point, &theirs);
+        long n = InterlockedIncrement(&g_pointChecked);
+        if (theirs != ours) {
+            g_pointAbandoned = true;
+            Log("[SimdHooks] Point visibility disagreed with the client on call %ld "
+                "(client 0x%02X, ours 0x%02X) - handing every call back to the "
+                "original", n, theirs, ours);
+            *outMask = theirs;
+            return;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_pointTrusted = true;
+            Log("[SimdHooks] Point visibility agreed with the client on %ld "
+                "consecutive real calls - running ours alone from here", n);
+        }
+    }
+
     if (outMask && *outMask != 0) {
         InterlockedIncrement(&g_frustumCulled);
     }
