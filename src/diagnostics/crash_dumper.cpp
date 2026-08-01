@@ -796,14 +796,69 @@ static bool IsFatalClass(DWORD code) {
 // the second entry leaves at once instead of recursing.
 static __declspec(thread) bool t_inProbe = false;
 
+// ClientExtensions.dll (Project Epoch) raises a deterministic
+// EXCEPTION_ILLEGAL_INSTRUCTION as an anti-debug / anti-tamper probe on every
+// launch and resolves it in its own __except frame. It is not a crash, but the
+// first-chance probe sees it before that frame does, so it spends one of only
+// eight log slots and a trace-ring entry on the same benign fault every session.
+//
+// The module's base address is resolved on the main thread and cached here. The
+// probe itself must not call GetModuleHandleExA - see the note further down
+// about the loader lock - so it compares against this instead, reaching the
+// allocation base through VirtualQuery, which this handler already relies on.
+// Zero means "not loaded / not resolved yet", and then nothing is suppressed.
+static volatile uintptr_t g_clientExtBase = 0;
+static volatile uintptr_t g_clientExtEnd  = 0;
+
+// Called from Init and from periodic main-thread maintenance, because the module
+// can appear after we do. Safe there: an ordinary thread, no fault in progress.
+void CrashDumper::RefreshBenignModuleRanges() {
+    HMODULE h = GetModuleHandleA("ClientExtensions.dll");
+    if (!h) {
+        g_clientExtBase = 0;
+        g_clientExtEnd  = 0;
+        return;
+    }
+    if ((uintptr_t)h == g_clientExtBase) return;   // already known
+
+    MODULEINFO mi;
+    if (GetModuleInformation(GetCurrentProcess(), h, &mi, sizeof(mi))) {
+        g_clientExtBase = (uintptr_t)mi.lpBaseOfDll;
+        g_clientExtEnd  = (uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage;
+        Log("[CrashDumper] ClientExtensions.dll at 0x%08X-0x%08X - its illegal-instruction "
+            "probe will not be reported as a fault",
+            (unsigned)g_clientExtBase, (unsigned)g_clientExtEnd);
+    }
+}
+
+// True when the faulting address lies inside ClientExtensions.dll. Uses
+// VirtualQuery rather than GetModuleHandleEx so no loader lock is taken; a
+// genuine illegal instruction anywhere else - Wow.exe, this DLL, any other
+// module, or a private shellcode page - still reports normally.
+static bool IsClientExtensionsProbe(DWORD code, uintptr_t at) {
+    if (code != EXCEPTION_ILLEGAL_INSTRUCTION) return false;
+    uintptr_t base = g_clientExtBase;
+    if (!base) return false;
+    if (at >= base && at < g_clientExtEnd) return true;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((LPCVOID)at, &mbi, sizeof(mbi)) == sizeof(mbi))
+        return (uintptr_t)mbi.AllocationBase == base;
+    return false;
+}
+
 static LONG CALLBACK WowOpt_FirstChanceProbe(EXCEPTION_POINTERS* ep) {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (!IsFatalClass(code)) return EXCEPTION_CONTINUE_SEARCH;
     if (t_inProbe) return EXCEPTION_CONTINUE_SEARCH;
-    t_inProbe = true;
 
     uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+
+    // A known anti-tamper probe is not a fault worth a log slot or a ring entry.
+    if (IsClientExtensionsProbe(code, at)) return EXCEPTION_CONTINUE_SEARCH;
+
+    t_inProbe = true;
 
     // Always cheap: a mark in the ring costs no I/O and survives into whatever
     // report does eventually get written.
@@ -1001,6 +1056,10 @@ bool Init() {
     // Runs ahead of every frame-based handler, so a fault that something else
     // catches still leaves a record. See the note on WowOpt_FirstChanceProbe.
     AddVectoredExceptionHandler(1, WowOpt_FirstChanceProbe);
+
+    // Resolve now if the module is already up; periodic maintenance retries in
+    // case it loads after we do.
+    RefreshBenignModuleRanges();
 
     // Hook WoW's internal assertion handler (sub_8889B0)
     // This fires on ERROR #134 "Fatal Condition" which bypasses Windows exceptions

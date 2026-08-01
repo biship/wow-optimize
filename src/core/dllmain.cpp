@@ -1465,6 +1465,10 @@ static void RunPeriodicMaintenanceOnMainThread() {
         g_nextStatsDumpTick = nowTick + 300000;
     }
 
+    // Cheap and idempotent: returns immediately once the module is known, and
+    // catches the case where it loads after we did.
+    CrashDumper::RefreshBenignModuleRanges();
+
     if (Config::g_settings.OptMemoryPressure) {
         TexCacheTuning_Tick();
     }
