@@ -282,6 +282,20 @@ This project wouldn't exist without the community. Every crash report, every bis
 Special thanks to:
 Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude, Houmbro
 
+### Code contributions
+
+- **[athei](https://github.com/athei)** (Alexander Theissen) — the macOS cross-compile
+  toolchain (`clang-cl` + `lld-link` + `xwin`, [#20](https://github.com/suprepupre/wow-optimize/pull/20)),
+  reliable `!LuaBoost` detection across `lua_State` swaps and fast logins
+  ([#19](https://github.com/suprepupre/wow-optimize/pull/19)), and the filter that stops
+  `ClientExtensions.dll`'s anti-tamper probe from being reported as a crash
+  ([#21](https://github.com/suprepupre/wow-optimize/pull/21)).
+- **[anzz1](https://github.com/anzz1)** — VS2019 build fix
+  ([#2](https://github.com/suprepupre/wow-optimize/pull/2)) and closing dangling thread
+  handles ([#7](https://github.com/suprepupre/wow-optimize/pull/7)).
+- **[POKOch](https://github.com/POKOch)** — selective rendering, spell visual blocking
+  and API caching ([#12](https://github.com/suprepupre/wow-optimize/pull/12)).
+
 </details>
 
 ---
