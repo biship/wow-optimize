@@ -75,6 +75,27 @@ unsigned int __fastcall Hooked_EngineFrameLimit(void* This, void* unused) {
     }
 
 #if !TEST_DISABLE_FRAME_LIMITER
+    // Everything this DLL does per frame - the liveness stamp the freeze
+    // watchdog reads, periodic maintenance, dropping caches when the lua_State
+    // changes, every subsystem's OnFrame - used to hang off the client calling
+    // Sleep, because that is where the hook was. This function's wait moved to a
+    // waitable timer, Sleep stopped being called on that path, and the heartbeat
+    // went with it.
+    //
+    // It has to be here, at the top, before anything can return. The first
+    // attempt at this put it beside the wait, inside the branch that only runs
+    // when there is time left in the frame, behind two earlier exits: one when
+    // no FPS cap is set at all, and one whenever a frame overruns its budget. A
+    // two-minute session with the cap raised produced 156 Sleep-hook calls and
+    // two freeze reports whose "silent for" figure matched the hook's last-call
+    // figure to the millisecond - the same signature as before the fix, because
+    // for that configuration the fix was never reached.
+    //
+    // This function is the client's own per-frame limiter, so it runs once a
+    // frame whatever it decides to do about pacing. The eight-millisecond gate
+    // inside the pump is what keeps two callers from doing the work twice.
+    WowOpt_MainThreadPump();
+
     typedef int (__cdecl *GetLimit_fn)();
     GetLimit_fn GetFGLimit = (GetLimit_fn)0x00681780;
     GetLimit_fn GetBGLimit = (GetLimit_fn)0x006817A0;
@@ -147,21 +168,6 @@ unsigned int __fastcall Hooked_EngineFrameLimit(void* This, void* unused) {
         // what it cannot. Where the timer is unavailable the old Sleep path
         // remains, with a margin sized to Sleep's actual granularity.
         static const double SPIN_MARGIN_SEC = 0.00025;   // 250 us
-
-        // Everything this DLL does per frame - the liveness stamp the freeze
-        // watchdog reads, periodic maintenance, dropping caches when the
-        // lua_State changes, every subsystem's OnFrame - used to hang off the
-        // client calling Sleep, because that is where the hook was. Replacing
-        // the wait below with a waitable timer stopped Sleep being called on
-        // this path and took the whole heartbeat with it: a freeze report every
-        // ten seconds for a game that was still drawing, caches never dropped
-        // across a reload or a character swap, and the swap detection never
-        // running at all.
-        //
-        // Pumped here so it does not matter which wait the pacing goes through.
-        // The eight-millisecond gate inside means calling it from two places
-        // does the work once.
-        WowOpt_MainThreadPump();
 
         double toWait = (double)(targetTime.QuadPart - now.QuadPart) / g_ticksPerSec;
         if (toWait > SPIN_MARGIN_SEC) {
