@@ -1058,17 +1058,22 @@ bool InstallSimdHooks(void) {
     Log("[SimdHooks] SSE2 matrix multiply, quaternion normalize, "
         "frustum cull, BGRA/ARGB, premultiplied alpha ready");
 
+    // 0x004C1F00 belongs to matrix_copy_sse2, which installs earlier and wins.
+    // This module used to try for it as well and log "hook FAILED" when MinHook
+    // answered ALREADY_CREATED - a line that reads like a defect, appeared in
+    // every tester log, and cost real time to chase down before it turned out
+    // to mean "someone else got here first".
+    //
+    // Two modules implementing the same optimisation at the same address is the
+    // actual problem, and the half that never ran is the half that was being
+    // maintained: the packed-double rewrite went in here first, where it could
+    // not reach anybody. The implementation now lives with the hook that
+    // installs, and the self-test below verifies that one.
     if (!Config::g_settings.OptMatrixMultiplySse2) {
         Log("[SimdHooks] Matrix multiply DISABLED via configuration");
-    } else if (!SelfTestMatrixMultiply()) {
-        // The message came from the self-test; nothing to add.
-    } else if (WineSafe_CreateHook((void*)ADDR_WOW_MATRIX_MULTIPLY,
-                                   (void*)Hooked_MatrixMultiply,
-                                   (void**)&orig_MatrixMultiply) == MH_OK) {
-        WO_EnableHook((void*)ADDR_WOW_MATRIX_MULTIPLY);
-        Log("[SimdHooks] Matrix multiply hook ACTIVE at 0x%08X", ADDR_WOW_MATRIX_MULTIPLY);
-    } else {
-        Log("[SimdHooks] Matrix multiply hook FAILED at 0x%08X", ADDR_WOW_MATRIX_MULTIPLY);
+    } else if (SelfTestMatrixMultiply()) {
+        Log("[SimdHooks] Matrix multiply is owned by MatrixSSE2 at 0x%08X - "
+            "verified here, hooked there", ADDR_WOW_MATRIX_MULTIPLY);
     }
 
     if (ADDR_WOW_QUAT_NORMALIZE) {
