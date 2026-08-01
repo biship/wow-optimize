@@ -4586,6 +4586,7 @@ static void DumpPeriodicStats() {
     ObjVisCache::LogStats();
     FontGlyphCache::LogStats();
     ApiCache::LogStats();
+    TextureUnloadDelay::LogStats();
     D3D9StateCache::LogStats();
     D3D9StateCache::ReportDrawCensus();
     AsyncSoundLoader::LogStats();

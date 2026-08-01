@@ -6,5 +6,6 @@ namespace TextureUnloadDelay {
     void Shutdown();
     void OnFrame();
     void Flush();
+    void LogStats();
     void Discard();
 }
