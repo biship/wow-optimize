@@ -832,6 +832,11 @@ static inline bool RunningUnderTranslation() { return IsWine() || IsRosetta(); }
 
 #define ALLOW_WOW_INTERNAL_HOOKS_ON_WINE 0
 
+// Counts and reports targets skipped because another party got there first.
+// Defined in dllmain.cpp; declared here because this header is included from
+// every translation unit that installs a hook.
+extern "C" void WowOpt_LogForeignDetour(void* target, unsigned char firstByte);
+
 static inline MH_STATUS WineSafe_CreateHook(void* target, void* detour, void** original) {
 #if ALLOW_WOW_INTERNAL_HOOKS_ON_WINE == 0
     // Block WoW .text hooks on Rosetta (WoWSilicon) unless ROSETTA_X87_DISABLE_CACHE=1 is set
@@ -851,6 +856,48 @@ static inline MH_STATUS WineSafe_CreateHook(void* target, void* detour, void** o
         }
     }
 #endif
+    // Refuse a target that somebody else has already detoured.
+    //
+    // A player on Ascension was kicked seconds after using an ability and then
+    // crashed on exit with a call through a null pointer. The addresses were not
+    // the problem - Ascension.exe is address-compatible with 3.3.5a, and the
+    // bytes on disk at every target checked are the expected 55 8B EC. At run
+    // time two of them were E9, a jmp rel32, because that client detours them
+    // itself before we initialise.
+    //
+    // Two modules happened to verify the prologue and stepped aside, saying so
+    // in the log. The other hundred and twenty-eight had no such check and
+    // installed over whatever was there. Hooking on top of a foreign detour
+    // breaks that chain, and a client that inspects its own bytes sees exactly
+    // what tampering looks like.
+    //
+    // The check belongs here rather than in each module: this is the wrapper
+    // 102 call sites already go through, and the two that got it right were
+    // right by accident of who wrote them.
+    unsigned char first = 0;
+    bool readable = false;
+    __try {
+        first = *(volatile unsigned char*)target;
+        readable = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        readable = false;
+    }
+
+    if (readable && (first == 0xE9 || first == 0xEB)) {
+        // Could be our own trampoline from another module rather than a
+        // stranger's, and those two cases deserve different answers. MinHook
+        // knows which: it reports ALREADY_CREATED for a target it owns.
+        MH_STATUS probe = MH_CreateHook(target, detour, original);
+        if (probe == MH_ERROR_ALREADY_CREATED) {
+            return probe;                       // ours; the caller's own problem
+        }
+        if (probe == MH_OK) {
+            MH_RemoveHook(target);              // created over a stranger - back out
+        }
+        WowOpt_LogForeignDetour(target, first);
+        return MH_ERROR_UNSUPPORTED_FUNCTION;
+    }
+
     return MH_CreateHook(target, detour, original);
 }
 

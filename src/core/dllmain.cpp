@@ -90,6 +90,32 @@ DWORD          g_mainThreadId = 0;
 // lua_optimize.h is included; definitions match that header.
 namespace LuaOpt { bool IsLoadingMode(); bool IsReloading(); bool IsSwapping(); DWORD GetLastSwapTick(); bool IsInitialized(); }
 
+// A target we declined because its first byte was a jump - somebody had already
+// detoured it. Reported once per address and then counted, because a client that
+// hooks a dozen functions would otherwise fill the log with the same finding.
+static volatile long g_foreignDetours = 0;
+
+extern "C" void WowOpt_LogForeignDetour(void* target, unsigned char firstByte) {
+    long n = InterlockedIncrement(&g_foreignDetours);
+    if (n <= 16) {
+        Log("[Hooks] 0x%08X already carries a %s (0x%02X) - another party hooked "
+            "it first, so this one is left alone",
+            (unsigned)(uintptr_t)target,
+            firstByte == 0xE9 ? "jmp rel32" : "short jmp", firstByte);
+    } else if (n == 17) {
+        Log("[Hooks] Further already-detoured targets will be counted, not listed");
+    }
+}
+
+extern "C" void WowOpt_ReportForeignDetours() {
+    long n = g_foreignDetours;
+    if (n > 0) {
+        Log("[Hooks] %ld hook target%s skipped because something else had already "
+            "detoured them. On a client that instruments itself this is expected; "
+            "installing over it is what breaks the chain.", n, n == 1 ? "" : "s");
+    }
+}
+
 static void UpdateMainThreadActivity() {
     g_lastMainThreadTick = GetTickCount();
     CrashDumper::FeatureCall("SleepHook");
@@ -4616,6 +4642,7 @@ static void DumpPeriodicStats() {
     LuaFastPath::LogStats();
     ObjVisCache::LogStats();
     FontGlyphCache::LogStats();
+    WowOpt_ReportForeignDetours();
     ApiCache::LogStats();
     TextureUnloadDelay::LogStats();
     AnimCensus::LogStats();
