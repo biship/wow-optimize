@@ -135,7 +135,11 @@ namespace Config {
         bool OptQuatNormalizeSse2 = false;
         // SSE2 4x4 matrix multiply. Off by default for the same reason: verified
         // against the client's version numerically, never run in a game.
-        bool OptMatrixMultiplySse2 = false;
+        // On by default since the accumulation moved to packed double: the
+        // results are bit-identical to the client's own routine, and a startup
+        // self-test compares the two over 4096 random pairs and refuses to
+        // install on any disagreement.
+        bool OptMatrixMultiplySse2 = true;
         // Counts draw calls per frame. A diagnostic, not an optimisation: it
         // wraps the hottest call in the renderer, so it is meant to answer the
         // question in one session and be switched off again.

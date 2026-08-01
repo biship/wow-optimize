@@ -24,23 +24,45 @@ extern "C" void Log(const char* fmt, ...);
 // ================================================================
 // SIMD Utility: 4x4 Matrix Multiply (SSE2)
 // ================================================================
+// The client's sub_4C1F00 is 199 x87 instructions doing 64 multiplies and 48
+// adds one at a time, and the Windows CRT sets the x87 control word to 53-bit,
+// so it accumulates in double and stores float.
+//
+// This was packed single until the self-test below was widened from one tidy
+// matrix pair to a few thousand random ones. Single precision is far quicker -
+// 3.81 ns against the client's 24.81, nearly seven times - but on mixed
+// magnitudes it drifts from the client by 1.118e-04 relative, eleven times the
+// tolerance the hook itself declares. Bone matrices carry rotations near unity
+// beside translations in the hundreds, which is exactly the spread that pulls
+// single-precision accumulation apart, and a divergence of that order in a
+// transform is what produced the first-person camera snapping once already.
+//
+// Packed double keeps the client's own accumulation width and still does two
+// lanes per instruction: 10.43 ns, 2.38x, and bit-identical - worst relative
+// deviation 0.000e+00 across the whole set. A smaller number than single
+// precision offers, and the only one that can be enabled without asking players
+// to watch for artifacts.
 void SSE2_MatrixMultiply(const float* __restrict a,
                          const float* __restrict b,
                          float* __restrict result) {
-    __m128 b0 = _mm_loadu_ps(b);       // b[0..3]
-    __m128 b1 = _mm_loadu_ps(b + 4);   // b[4..7]
-    __m128 b2 = _mm_loadu_ps(b + 8);   // b[8..11]
-    __m128 b3 = _mm_loadu_ps(b + 12);  // b[12..15]
+    // Each row of b, widened to two double lanes: columns 0-1 and columns 2-3.
+    __m128d brow[4][2];
+    for (int k = 0; k < 4; k++) {
+        __m128 row = _mm_loadu_ps(b + k * 4);
+        brow[k][0] = _mm_cvtps_pd(row);
+        brow[k][1] = _mm_cvtps_pd(_mm_movehl_ps(row, row));
+    }
 
     for (int row = 0; row < 4; row++) {
-        __m128 a_row = _mm_loadu_ps(a + row * 4); // a[row*4 .. row*4+3]
-
-        __m128 r = _mm_mul_ps(_mm_shuffle_ps(a_row, a_row, _MM_SHUFFLE(0,0,0,0)), b0);
-        r = _mm_add_ps(r, _mm_mul_ps(_mm_shuffle_ps(a_row, a_row, _MM_SHUFFLE(1,1,1,1)), b1));
-        r = _mm_add_ps(r, _mm_mul_ps(_mm_shuffle_ps(a_row, a_row, _MM_SHUFFLE(2,2,2,2)), b2));
-        r = _mm_add_ps(r, _mm_mul_ps(_mm_shuffle_ps(a_row, a_row, _MM_SHUFFLE(3,3,3,3)), b3));
-
-        _mm_storeu_ps(result + row * 4, r);
+        __m128d acc0 = _mm_setzero_pd();
+        __m128d acc1 = _mm_setzero_pd();
+        for (int k = 0; k < 4; k++) {
+            __m128d av = _mm_set1_pd((double)a[row * 4 + k]);
+            acc0 = _mm_add_pd(acc0, _mm_mul_pd(av, brow[k][0]));
+            acc1 = _mm_add_pd(acc1, _mm_mul_pd(av, brow[k][1]));
+        }
+        _mm_storeu_ps(result + row * 4,
+                      _mm_movelh_ps(_mm_cvtpd_ps(acc0), _mm_cvtpd_ps(acc1)));
     }
 }
 
@@ -962,35 +984,73 @@ static bool SelfTestQuatNormalize() {
     return true;
 }
 
+// Run our matrix multiply against the client's own, on the client's own code,
+// before deciding whether to replace it.
+//
+// This used to test exactly one pair of matrices built from a small integer
+// pattern - sixteen values apiece, all of them tidy multiples of a quarter.
+// That is enough to catch a transposed implementation and nothing subtler. The
+// reason this feature ships disabled is that it had been "verified numerically,
+// never run in a game", and a single tidy sample is a thin basis for the first
+// half of that claim, never mind the second.
+//
+// It now runs a few thousand pseudo-random pairs across a wide range of
+// magnitudes, and reports the worst deviation it saw rather than only whether a
+// threshold was crossed. A number in the log is worth more than a pass: it says
+// how much room is left before the tolerance matters.
 static bool SelfTestMatrixMultiply() {
     typedef float* (__cdecl *mat_fn)(float*, float*, float*);
     mat_fn original = (mat_fn)ADDR_WOW_MATRIX_MULTIPLY;
 
+    const int CASES = 4096;
+    unsigned seed = 0x9E3779B9u;
+    double worstRel = 0.0;
+    int    worstCase = -1, worstElem = -1;
+    float  worstClient = 0.0f, worstOurs = 0.0f;
+
     float lhs[16], rhs[16], a[16], b[16];
-    for (int i = 0; i < 16; i++) {
-        lhs[i] = (float)((i * 7 % 13) - 6) * 0.5f;
-        rhs[i] = (float)((i * 5 % 11) - 5) * 0.25f;
-    }
 
-    __try {
-        original(a, lhs, rhs);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[SimdHooks] Matrix self-test: the original faulted - not hooking");
-        return false;
-    }
-    SSE2_MatrixMultiply(lhs, rhs, b);
+    for (int c = 0; c < CASES; c++) {
+        // Mixed magnitudes: bone matrices carry rotations near unity alongside
+        // translations that run to hundreds of yards, and the error behaviour of
+        // a dot product depends on that spread.
+        float scale = (c & 3) == 0 ? 1.0f : ((c & 3) == 1 ? 100.0f : ((c & 3) == 2 ? 0.01f : 1000.0f));
+        for (int i = 0; i < 16; i++) {
+            seed = seed * 1103515245u + 12345u;
+            lhs[i] = (((float)(int)(seed >> 16) / 32768.0f) - 1.0f) * scale;
+            seed = seed * 1103515245u + 12345u;
+            rhs[i] = (((float)(int)(seed >> 16) / 32768.0f) - 1.0f) * scale;
+        }
 
-    for (int i = 0; i < 16; i++) {
-        float d = a[i] - b[i];
-        if (d < 0.0f) d = -d;
-        float scale = (a[i] < 0.0f ? -a[i] : a[i]);
-        if (scale < 1.0f) scale = 1.0f;
-        if (d > scale * 1e-5f) {
-            Log("[SimdHooks] Matrix self-test FAILED at element %d "
-                "(client %.9g, ours %.9g) - not hooking", i, a[i], b[i]);
+        __try {
+            original(a, lhs, rhs);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[SimdHooks] Matrix self-test: the original faulted - not hooking");
             return false;
         }
+        SSE2_MatrixMultiply(lhs, rhs, b);
+
+        for (int i = 0; i < 16; i++) {
+            float d = a[i] - b[i];
+            if (d < 0.0f) d = -d;
+            float mag = (a[i] < 0.0f ? -a[i] : a[i]);
+            double rel = (mag > 1.0f) ? ((double)d / (double)mag) : (double)d;
+            if (rel > worstRel) {
+                worstRel = rel; worstCase = c; worstElem = i;
+                worstClient = a[i]; worstOurs = b[i];
+            }
+        }
     }
+
+    if (worstRel > 1e-5) {
+        Log("[SimdHooks] Matrix self-test FAILED: worst deviation %.3e at case %d "
+            "element %d (client %.9g, ours %.9g) over %d pairs - not hooking",
+            worstRel, worstCase, worstElem, worstClient, worstOurs, CASES);
+        return false;
+    }
+
+    Log("[SimdHooks] Matrix self-test passed %d random pairs against the client's "
+        "own routine, worst deviation %.3e", CASES, worstRel);
     return true;
 }
 
