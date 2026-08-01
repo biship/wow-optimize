@@ -1509,103 +1509,132 @@ static void RunPeriodicMaintenanceOnMainThread() {
 static LARGE_INTEGER g_lastSleepTime = {};
 static double g_lastFrameMs = 0.0;
 
-static void WINAPI hooked_Sleep(DWORD ms) {
-    if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId) {
-        UpdateMainThreadActivity();
+// Everything this DLL does once per frame on the main thread: the liveness
+// stamp the freeze watchdog reads, the periodic maintenance, cache
+// invalidation when the lua_State changes, and every subsystem's OnFrame.
+//
+// This used to live inside hooked_Sleep, and so it ran only when the client
+// called Sleep. That held until the frame limiter stopped calling Sleep: its
+// wait moved to a waitable timer, and with it the whole heartbeat stopped.
+// The symptoms were a freeze report every ten seconds for a game that was
+// still rendering, caches never dropped across a reload or a character swap,
+// and the swap detection never running - one root cause behind several
+// reports that looked unrelated.
+//
+// It is called from hooked_Sleep and from the frame limiter now, so it does
+// not matter which of them the client's pacing happens to go through. The
+// eight-millisecond gate inside is what keeps two callers from doing the work
+// twice.
+static void MainThreadPump() {
+    UpdateMainThreadActivity();
 
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        double elapsedMs = 0.0;
-        if (g_lastSleepTime.QuadPart > 0 && g_sleepFreq > 0) {
-            elapsedMs = (double)(now.QuadPart - g_lastSleepTime.QuadPart) / g_sleepFreq;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsedMs = 0.0;
+    if (g_lastSleepTime.QuadPart > 0 && g_sleepFreq > 0) {
+        elapsedMs = (double)(now.QuadPart - g_lastSleepTime.QuadPart) / g_sleepFreq;
+    }
+    g_lastSleepTime = now;
+
+    // Gate frame ticks so they run at most once every 8ms
+    static LARGE_INTEGER lastFrameTickTime = {};
+    double msSinceLastTick = 0.0;
+    if (lastFrameTickTime.QuadPart > 0 && g_sleepFreq > 0) {
+        msSinceLastTick = (double)(now.QuadPart - lastFrameTickTime.QuadPart) / g_sleepFreq;
+    }
+
+    double targetPrecision = (double)(Config::g_settings.SleepPrecisionValue > 0 ? Config::g_settings.SleepPrecisionValue : 8);
+    if (lastFrameTickTime.QuadPart == 0 || msSinceLastTick >= targetPrecision) {
+        lastFrameTickTime = now;
+
+        RunPeriodicMaintenanceOnMainThread();
+
+        // Detect lua_State destruction (logout/exit) - clear caches
+        static uintptr_t g_lastLState = 0;
+        uintptr_t currentL = *(uintptr_t*)0x00D3F78C;  // lua_State* global
+        if (currentL != g_lastLState) {
+            ClearAssetPathCache();
+            ApiCache::ClearCache();
+            ClearCombatLogCache();
+            ClearTableCache();
+            ClearLuaPushStringCache();
+            ClearDbcLookupCache();
+            g_lastLState = currentL;
         }
-        g_lastSleepTime = now;
 
-        // Gate frame ticks so they run at most once every 8ms
-        static LARGE_INTEGER lastFrameTickTime = {};
-        double msSinceLastTick = 0.0;
-        if (lastFrameTickTime.QuadPart > 0 && g_sleepFreq > 0) {
-            msSinceLastTick = (double)(now.QuadPart - lastFrameTickTime.QuadPart) / g_sleepFreq;
-        }
-
-        double targetPrecision = (double)(Config::g_settings.SleepPrecisionValue > 0 ? Config::g_settings.SleepPrecisionValue : 8);
-        if (lastFrameTickTime.QuadPart == 0 || msSinceLastTick >= targetPrecision) {
-            lastFrameTickTime = now;
-
-            RunPeriodicMaintenanceOnMainThread();
-
-            // Detect lua_State destruction (logout/exit) - clear caches
-            static uintptr_t g_lastLState = 0;
-            uintptr_t currentL = *(uintptr_t*)0x00D3F78C;  // lua_State* global
-            if (currentL != g_lastLState) {
-                ClearAssetPathCache();
-                ApiCache::ClearCache();
-                ClearCombatLogCache();
-                ClearTableCache();
-                ClearLuaPushStringCache();
-                ClearDbcLookupCache();
-                g_lastLState = currentL;
-            }
-
-            LuaOpt::OnMainThreadSleep(g_mainThreadId, elapsedMs);
+        LuaOpt::OnMainThreadSleep(g_mainThreadId, elapsedMs);
 #if !TEST_DISABLE_LUA_GETTIME_FAST
-            if (Config::g_settings.OptLuaGetTimeFast) {
-                LuaGetTimeFast_NewFrame();
-            }
+        if (Config::g_settings.OptLuaGetTimeFast) {
+            LuaGetTimeFast_NewFrame();
+        }
 #endif
-            if (Config::g_settings.OptDefragLf) {
-                LoadingDefrag::OnFrame();
-            }
+        if (Config::g_settings.OptDefragLf) {
+            LoadingDefrag::OnFrame();
+        }
 #if !TEST_DISABLE_PREDICTIVE_PREFETCH
-            PredictivePrefetch::OnFrame();
+        PredictivePrefetch::OnFrame();
 #endif
-            FlushFieldUpdates();
-            CombatLogOpt::ProcessUnifiedFrameTicks((int)currentL, g_mainThreadId);
-            WorldStateCoalesce::OnFrame();
+        FlushFieldUpdates();
+        CombatLogOpt::ProcessUnifiedFrameTicks((int)currentL, g_mainThreadId);
+        WorldStateCoalesce::OnFrame();
 #if !TEST_DISABLE_HARDWARE_CURSOR
-            if (Config::g_settings.OptHardwareCursor) {
-                InitHardwareCursor();
-            }
+        if (Config::g_settings.OptHardwareCursor) {
+            InitHardwareCursor();
+        }
 #endif
 #if !TEST_DISABLE_ADDON_DISPATCHER
-            if (Config::g_settings.OptAddonDispatcher) {
-                AddonDispatcher::OnFrame(g_mainThreadId);
-            }
+        if (Config::g_settings.OptAddonDispatcher) {
+            AddonDispatcher::OnFrame(g_mainThreadId);
+        }
 #endif
-            RcuObjMgr::OnFrame();
+        RcuObjMgr::OnFrame();
 #if !TEST_DISABLE_TEXTURE_DECODE_MT
-            AsyncTexLoader::OnFrame();
+        AsyncTexLoader::OnFrame();
 #endif
-            TextureUnloadDelay::OnFrame();
-            AnimCensus::OnFrame();
-            SpellEffectCulling::OnFrame();
+        TextureUnloadDelay::OnFrame();
+        AnimCensus::OnFrame();
+        SpellEffectCulling::OnFrame();
 #if !TEST_DISABLE_NAMEPLATE_MT
-            NameplateMT::OnFrame(g_mainThreadId);
+        NameplateMT::OnFrame(g_mainThreadId);
 #endif
 #if !TEST_DISABLE_EVENT_COALESCER
-            EventCoalescer_Flush();
+        EventCoalescer_Flush();
 #endif
 
-            // Enable D3D9 State Manager frame update
-            OnFrameD3D9StateManager(g_mainThreadId);
-            OnFrameRenderHooks(g_mainThreadId);
-            OnFrameLogicHooks(g_mainThreadId);
-            OnFrameAsyncHooks(g_mainThreadId);
+        // Enable D3D9 State Manager frame update
+        OnFrameD3D9StateManager(g_mainThreadId);
+        OnFrameRenderHooks(g_mainThreadId);
+        OnFrameLogicHooks(g_mainThreadId);
+        OnFrameAsyncHooks(g_mainThreadId);
 #if !TEST_DISABLE_LUA_GC_GOVERNOR
-            LuaGCGovernor::OnFrame(elapsedMs);
+        LuaGCGovernor::OnFrame(elapsedMs);
 #endif
 #if !TEST_DISABLE_ADAPTIVE_FARCLIP
-        #endif
+    #endif
 #if !TEST_DISABLE_NET_ADDON_COALESCER
 #endif
 #if !TEST_DISABLE_MIP_BIAS_GOVERNOR
-            MipBiasGovernor::UpdateMipBias(elapsedMs);
+        MipBiasGovernor::UpdateMipBias(elapsedMs);
 #endif
-            if (Config::g_settings.OptMouseClipRelease) MouseClipRelease::OnFrame();
+        if (Config::g_settings.OptMouseClipRelease) MouseClipRelease::OnFrame();
 #if !TEST_DISABLE_PERF_DIAGNOSTICS
-            PerfDiagnostics::OnFrame(elapsedMs);
+        PerfDiagnostics::OnFrame(elapsedMs);
 #endif
-        }
+    }
+}
+
+// For the frame limiter, which waits without calling Sleep. Checks the thread
+// itself so a stray call from anywhere else cannot run main-thread-only work.
+extern "C" void WowOpt_MainThreadPump() {
+    if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId) {
+        MainThreadPump();
+    }
+}
+
+
+static void WINAPI hooked_Sleep(DWORD ms) {
+    if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId) {
+        MainThreadPump();
 
         if (ms == 0) {
             orig_Sleep(0);

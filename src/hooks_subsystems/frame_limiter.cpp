@@ -10,6 +10,7 @@
 #include <windows.h>
 
 extern "C" void Log(const char* fmt, ...);
+extern "C" void WowOpt_MainThreadPump();
 extern "C" void ProcessDeferredGC(double idleBudgetMs);
 
 namespace FrameLimiter {
@@ -147,6 +148,21 @@ unsigned int __fastcall Hooked_EngineFrameLimit(void* This, void* unused) {
         // remains, with a margin sized to Sleep's actual granularity.
         static const double SPIN_MARGIN_SEC = 0.00025;   // 250 us
 
+        // Everything this DLL does per frame - the liveness stamp the freeze
+        // watchdog reads, periodic maintenance, dropping caches when the
+        // lua_State changes, every subsystem's OnFrame - used to hang off the
+        // client calling Sleep, because that is where the hook was. Replacing
+        // the wait below with a waitable timer stopped Sleep being called on
+        // this path and took the whole heartbeat with it: a freeze report every
+        // ten seconds for a game that was still drawing, caches never dropped
+        // across a reload or a character swap, and the swap detection never
+        // running at all.
+        //
+        // Pumped here so it does not matter which wait the pacing goes through.
+        // The eight-millisecond gate inside means calling it from two places
+        // does the work once.
+        WowOpt_MainThreadPump();
+
         double toWait = (double)(targetTime.QuadPart - now.QuadPart) / g_ticksPerSec;
         if (toWait > SPIN_MARGIN_SEC) {
             double sleepSec = toWait - SPIN_MARGIN_SEC;
@@ -156,7 +172,17 @@ unsigned int __fastcall Hooked_EngineFrameLimit(void* This, void* unused) {
                 // Negative means relative, in 100 ns units.
                 due.QuadPart = -(LONGLONG)(sleepSec * 10000000.0);
                 if (due.QuadPart < 0 && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
-                    WaitForSingleObject(timer, INFINITE);
+                    // Bounded, never INFINITE. This runs on the main thread, and
+                    // an unbounded wait there means that if the timer ever fails
+                    // to signal - a driver quirk, an odd Wine build, the handle
+                    // being interfered with - the game stops for good rather than
+                    // for a frame. The cap is generous next to the longest wait
+                    // that can legitimately be asked for here, which is one frame
+                    // at the eight FPS floor enforced above, so overshooting it
+                    // costs the pacing of a single frame and nothing else.
+                    DWORD capMs = (DWORD)(sleepSec * 1000.0) + 50;
+                    if (capMs > 250) capMs = 250;
+                    WaitForSingleObject(timer, capMs);
                 }
             } else if (sleepSec > 0.001) {
                 Sleep((DWORD)(sleepSec * 1000.0));
