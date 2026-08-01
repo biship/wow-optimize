@@ -837,7 +837,7 @@ static inline bool RunningUnderTranslation() { return IsWine() || IsRosetta(); }
 // every translation unit that installs a hook.
 extern "C" void WowOpt_LogForeignDetour(void* target, unsigned char firstByte);
 
-static inline MH_STATUS WineSafe_CreateHook(void* target, void* detour, void** original) {
+static inline MH_STATUS WowOpt_CreateHookGuarded(void* target, void* detour, void** original) {
 #if ALLOW_WOW_INTERNAL_HOOKS_ON_WINE == 0
     // Block WoW .text hooks on Rosetta (WoWSilicon) unless ROSETTA_X87_DISABLE_CACHE=1 is set
     // Regular Wine (Linux) works fine with inline hooks
@@ -900,6 +900,22 @@ static inline MH_STATUS WineSafe_CreateHook(void* target, void* detour, void** o
 
     return MH_CreateHook(target, detour, original);
 }
+
+// Every direct MH_CreateHook in this project now goes through the same check.
+//
+// The guard was put in WineSafe_CreateHook because 102 call sites use it. The
+// other 221 call MinHook directly and sailed straight past it - which is why a
+// build carrying the guard still installed 127 hooks on a client that had
+// already detoured some of them, and still got the player kicked.
+//
+// Defined after the function above so the body's own call is the real MinHook
+// entry point and not this macro.
+// Kept as the name 102 call sites already use; the guard is the same one.
+static inline MH_STATUS WineSafe_CreateHook(void* target, void* detour, void** original) {
+    return WowOpt_CreateHookGuarded(target, detour, original);
+}
+
+#define MH_CreateHook WowOpt_CreateHookGuarded
 
 // Hook-enable batching shared across modules. Each MH_EnableHook freezes every
 // process thread (~20ms via a system-wide thread snapshot). During MainThread's
