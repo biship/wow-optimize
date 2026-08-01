@@ -35,14 +35,69 @@ The current public build is focused on real frametime stability, long-session sm
 
 ## What's New in v3.18.0
 
-Features that were quietly overwriting graphics settings you had chosen are gone,
-and one new feature replaces the lot of them. The rest of this release is the
-diagnostics catching themselves out — four cases of a log reporting something it
-had not actually measured.
+Forty-six modules were removed because they never ran, three optimizations went
+in because the logs said where the time actually goes, and the settings that were
+quietly overwriting your graphics options are gone. The rest of this release is
+the diagnostics catching themselves out — four cases of a log reporting something
+it had not actually measured.
 
-Thanks again to [txtsd](https://github.com/txtsd), whose testing rounds confirmed
-the 3.17.0 text-rendering fix and whose logs are where most of the problems below
-were found.
+Thanks to [txtsd](https://github.com/txtsd), **Signalborn Soulweaver**, **Morbent**,
+and **prince**, who between them put this build through raids and a good deal of
+open world, and reported what broke. Every measured item below came out of a log
+somebody sent in.
+
+**Forty-six modules that did nothing at all**
+
+They appeared in the log at startup and had settings behind them. None installed
+a hook, patched anything, or was called from anywhere. `Init()` was
+`return true;` and the rest of the module was never entered.
+
+Most had no launcher switch at all and read a default of off, so nobody was
+running them — dead weight rather than active mistakes. Two separate minimap
+throttles existed, neither wired to anything. A JIT compiler sat behind a LuaJIT
+setting on a client that has no JIT. Two files shared a name and a namespace
+differing by one letter's case, and only one of them was ever wired up.
+
+Three of them had callers and still did nothing: a throttle whose enable flag was
+initialised to false and never set, a particle skip that asked a frustum nobody
+filled, and a "font alpha fast path" that turned alpha blending off whenever it
+should have left it alone — which would have painted text as solid rectangles had
+anything reached it.
+
+Two looked alive on inspection and were not. `ItemDataPrefetch::PrefetchItem` was
+an empty body under a comment saying the work was unsafe, called twice per item
+lookup into nothing. `CDataStoreBuffering` read a buffer pointer from an offset
+that actually holds a length, so the first call would have dereferenced a number
+as a pointer — which is presumably why nothing ever called it.
+
+`MpqMmapVfs` and `MpqPrefetch` went too. Both look up StormLib through
+`Storm.dll`, and 3.3.5a links Storm into the executable — there is no such file.
+Every tester log says so outright.
+
+What is left is a much shorter list of things that actually run: eleven settings
+are on unless you turn them off, and every one of them now has a switch.
+
+**Three optimizations that came from measurements, not guesses**
+
+- **The client asks the heap how big every block is, then throws the answer
+  away.** Both the `free` wrapper and the allocation wrapper call `_msize` and
+  discard the result — a walk into the heap on every single allocation and every
+  deallocation, from over a hundred call sites. Two
+  independent profiles measured that call at 8.09% and 10.59% of the time the
+  main thread spent executing. Both are gone; nothing else about either call
+  changes. A three-minute session with the fix in place reports 67,776
+  allocations and 28,393 deallocations served without it.
+
+- **`tostring` on numbers is about 50x cheaper.** It was the single largest
+  target in this project's own domain — 10.74% of execution in a CPU-bound
+  session. There was already a "fast path" hooked onto it, and for numbers it
+  called `sprintf("%.14g")`, which is exactly what Lua does, so it took the call
+  and paid full price. Integral values now convert directly: 841 ns to 16 ns for
+  the formatting step, verified byte-identical against `%.14g` across 200,139
+  values before it was allowed anywhere near a build.
+
+  The formatting is one part of a `tostring` call, so the end-to-end gain is
+  smaller than 50x. Your log now says how many conversions took the fast route.
 
 **Your graphics settings are yours again**
 
