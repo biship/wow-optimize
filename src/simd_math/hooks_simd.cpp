@@ -1439,6 +1439,18 @@ bool InstallSimdHooks(void) {
             Log("[SimdHooks] sub_5FED20 (Vector-Matrix Rotate) hook ACTIVE");
         }
     }
+#else
+    // Every other compiled-out section in this file says so. This one did not,
+    // and it is the only one of them with a launcher switch: a player could turn
+    // SimdMatrixTransform on, see it echoed in the settings block at the top of
+    // their log, and get no further mention of it anywhere - because the code it
+    // controls is removed by the preprocessor and there was nothing left to run
+    // or to report. Silent is the worst of the three states a feature can be in.
+    if (Config::g_settings.OptSimdMatrixTransform) {
+        Log("[SimdHooks] SimdMatrixTransform is ON in your settings but the code is "
+            "excluded from this build (TEST_DISABLE_MATRIX_TRANSFORM_SSE2) - the "
+            "switch does nothing here");
+    }
 #endif
 
     return true;
