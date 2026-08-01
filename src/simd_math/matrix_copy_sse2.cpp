@@ -379,11 +379,68 @@ static inline void SSE2_Vec3NormalizeInPlace(float* v, bool guard) {
     v[2] = out_z;
 }
 
+// Both normalise hooks are shadow-checked against the client for their first few
+// thousand real calls, then run alone.
+//
+// The pointer guards above are not a correctness check - they catch an unmapped
+// page and defer, and say nothing about whether the answer matches. These are
+// the two normalise routines the log confirms are actually installed
+// (0x004C3420 and 0x004C3600), they replace the client's arithmetic outright,
+// and nothing has ever compared the results. The matrix multiply in this same
+// file was in that position and turned out to sit a hundred times outside its
+// own declared tolerance.
+//
+// A normalise feeds directions - camera, bone axes, lighting - so a wrong one
+// is a subtle visual defect rather than a crash, which is the kind that reaches
+// a bug report as "something looks off" and never gets attributed.
+static volatile long g_normChecked   = 0;
+static bool          g_normTrusted   = false;
+static bool          g_normAbandoned = false;
+
+static constexpr long NORM_VERIFY_CALLS = 4096;
+
+// The client writes in place, so comparing means giving it its own copy.
+static bool NormalizeAgreesWithClient(const float* before, const float* ours,
+                                      void (__fastcall* orig)(float*, void*), void* edx) {
+    float theirs[3] = { before[0], before[1], before[2] };
+    __try {
+        orig(theirs, edx);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;   // cannot compare; never report a false disagreement
+    }
+    for (int i = 0; i < 3; ++i) {
+        float d = theirs[i] - ours[i];
+        if (d < 0.0f) d = -d;
+        float mag = (theirs[i] < 0.0f ? -theirs[i] : theirs[i]);
+        double rel = (mag > 1.0f) ? ((double)d / (double)mag) : (double)d;
+        if (rel > 1e-5) return false;
+    }
+    return true;
+}
+
 static void __fastcall Hooked_Vec3Norm(float* self, void* edx) {
     ++g_vec3norm_calls;
+    if (g_normAbandoned) { pOrigVec3Norm(self, edx); return; }
     if ((uintptr_t)self > 0x10000 && (uintptr_t)self < 0xFFE00000) {
         __try {
+            float before[3] = { self[0], self[1], self[2] };
             SSE2_Vec3NormalizeInPlace(self, false);
+            if (!g_normTrusted) {
+                long n = InterlockedIncrement(&g_normChecked);
+                if (!NormalizeAgreesWithClient(before, self, pOrigVec3Norm, edx)) {
+                    g_normAbandoned = true;
+                    Log("[MatrixSSE2] C3Vector::Normalize disagreed with the client on call "
+                        "%ld - handing every call back to the original", n);
+                    self[0] = before[0]; self[1] = before[1]; self[2] = before[2];
+                    pOrigVec3Norm(self, edx);
+                    return;
+                }
+                if (n >= NORM_VERIFY_CALLS) {
+                    g_normTrusted = true;
+                    Log("[MatrixSSE2] Vector normalise agreed with the client on "
+                        "%ld consecutive real calls - running ours alone", n);
+                }
+            }
             return;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             // Bad pointer surfaced during the read -- nothing was written yet
@@ -396,9 +453,27 @@ static void __fastcall Hooked_Vec3Norm(float* self, void* edx) {
 
 static void __fastcall Hooked_Vec3NormSafe(float* self, void* edx) {
     ++g_vec3norm_calls;
+    if (g_normAbandoned) { pOrigVec3NormSafe(self, edx); return; }
     if ((uintptr_t)self > 0x10000 && (uintptr_t)self < 0xFFE00000) {
         __try {
+            float before[3] = { self[0], self[1], self[2] };
             SSE2_Vec3NormalizeInPlace(self, true);
+            if (!g_normTrusted) {
+                long n = InterlockedIncrement(&g_normChecked);
+                if (!NormalizeAgreesWithClient(before, self, pOrigVec3NormSafe, edx)) {
+                    g_normAbandoned = true;
+                    Log("[MatrixSSE2] C3Vector::Normalize(guarded) disagreed with the client on call "
+                        "%ld - handing every call back to the original", n);
+                    self[0] = before[0]; self[1] = before[1]; self[2] = before[2];
+                    pOrigVec3NormSafe(self, edx);
+                    return;
+                }
+                if (n >= NORM_VERIFY_CALLS) {
+                    g_normTrusted = true;
+                    Log("[MatrixSSE2] Vector normalise agreed with the client on "
+                        "%ld consecutive real calls - running ours alone", n);
+                }
+            }
             return;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }

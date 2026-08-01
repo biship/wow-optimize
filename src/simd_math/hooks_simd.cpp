@@ -703,14 +703,60 @@ static inline char SSE2_RayTriangleIntersection(const float* ray, const float* v
     }
 }
 
+// How many real calls a replacement must match the client's on before it is
+// trusted to run alone. Declared here because the ray-triangle checks below use
+// it and they sit above the frustum ones.
+static constexpr long FRUSTUM_VERIFY_CALLS = 4096;
+
 #if !TEST_DISABLE_RAY_TRIANGLE_SSE2
 typedef char (__cdecl *RayTriangle32_t)(const float* ray, const float* vertices, const uint32_t* indices, float* outT, float* outUV, float margin);
 static RayTriangle32_t orig_RayTriangle32 = nullptr;
 
 
+// Shared state for the ray-triangle shadow check. Both width variants feed one
+// verdict: they are the same algorithm over different index types, so a fault in
+// the maths shows in either and there is no reason to prove it twice.
+//
+// The pointer guards inside the template are not this. They catch an unmapped
+// page and hand the call back; they say nothing about whether the answer is the
+// one the client would have given. A wrong answer here is a mouse click that
+// does not land on the model under the cursor - silent, intermittent, and
+// impossible to attribute from a bug report.
+static volatile long g_rayChecked   = 0;
+static bool          g_rayTrusted   = false;
+static bool          g_rayAbandoned = false;
+
 static char __cdecl Hooked_RayTriangle32(const float* ray, const float* vertices, const uint32_t* indices, float* outT, float* outUV, float margin) {
     InterlockedIncrement(&g_rayTriangleCalls);
+
+    if (g_rayAbandoned && orig_RayTriangle32) {
+        return orig_RayTriangle32(ray, vertices, indices, outT, outUV, margin);
+    }
+
     char res = SSE2_RayTriangleIntersection<uint32_t>(ray, vertices, indices, outT, outUV, margin, orig_RayTriangle32);
+
+    if (!g_rayTrusted && orig_RayTriangle32) {
+        // The original writes through outT and outUV, so it gets its own copies
+        // and the caller keeps ours unless the two disagree.
+        float t = 0.0f, uv[2] = { 0.0f, 0.0f };
+        char theirs = orig_RayTriangle32(ray, vertices, indices, &t, uv, margin);
+        long n = InterlockedIncrement(&g_rayChecked);
+        if (theirs != res) {
+            g_rayAbandoned = true;
+            Log("[SimdHooks] Ray-triangle disagreed with the client on call %ld "
+                "(client %d, ours %d) - handing every call back to the original",
+                n, (int)theirs, (int)res);
+            if (outT) *outT = t;
+            if (outUV) { outUV[0] = uv[0]; outUV[1] = uv[1]; }
+            return theirs;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_rayTrusted = true;
+            Log("[SimdHooks] Ray-triangle agreed with the client on %ld consecutive "
+                "real calls - running ours alone from here", n);
+        }
+    }
+
     if (res) {
         InterlockedIncrement(&g_rayTriangleIntersects);
     }
@@ -723,7 +769,33 @@ static RayTriangle16_t orig_RayTriangle16 = nullptr;
 
 static char __cdecl Hooked_RayTriangle16(const float* ray, const float* vertices, const uint16_t* indices, float* outT, float* outUV, float margin) {
     InterlockedIncrement(&g_rayTriangleCalls);
+
+    if (g_rayAbandoned && orig_RayTriangle16) {
+        return orig_RayTriangle16(ray, vertices, indices, outT, outUV, margin);
+    }
+
     char res = SSE2_RayTriangleIntersection<uint16_t>(ray, vertices, indices, outT, outUV, margin, orig_RayTriangle16);
+
+    if (!g_rayTrusted && orig_RayTriangle16) {
+        float t = 0.0f, uv[2] = { 0.0f, 0.0f };
+        char theirs = orig_RayTriangle16(ray, vertices, indices, &t, uv, margin);
+        long n = InterlockedIncrement(&g_rayChecked);
+        if (theirs != res) {
+            g_rayAbandoned = true;
+            Log("[SimdHooks] Ray-triangle (16-bit indices) disagreed with the client "
+                "on call %ld (client %d, ours %d) - handing every call back to the "
+                "original", n, (int)theirs, (int)res);
+            if (outT) *outT = t;
+            if (outUV) { outUV[0] = uv[0]; outUV[1] = uv[1]; }
+            return theirs;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_rayTrusted = true;
+            Log("[SimdHooks] Ray-triangle agreed with the client on %ld consecutive "
+                "real calls - running ours alone from here", n);
+        }
+    }
+
     if (res) {
         InterlockedIncrement(&g_rayTriangleIntersects);
     }
@@ -792,7 +864,6 @@ static volatile long g_frustumMismatch  = 0;
 static bool          g_frustumTrusted   = false;   // stop double-running once proven
 static bool          g_frustumAbandoned = false;   // disagreed: original from here on
 
-static constexpr long FRUSTUM_VERIFY_CALLS = 4096;
 
 static int __fastcall Hooked_IsAABBVisible(void* ecx, void* edx, const float* bounds) {
     InterlockedIncrement(&g_frustumCalls);
