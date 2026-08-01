@@ -297,10 +297,34 @@ namespace WowOptimizeLauncher {
         private static readonly Color SubtextColor = Color.FromArgb(150, 150, 180);
         private static readonly Color SubHeaderColor = Color.FromArgb(150, 150, 180);
 
+        // Must agree with Config::ResolveIniPath in src/core/config.cpp. The two
+        // used to be written separately and only matched because the install
+        // instructions put this launcher in the game folder; with WTF in the
+        // search order, two independent implementations would drift for certain,
+        // and the symptom would be the launcher editing a file the DLL never
+        // reads. Keep them in step.
+        private static string ResolveIniPath() {
+            string env = Environment.GetEnvironmentVariable("WOW_OPT_CONFIG");
+            if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
+
+            string root = AppDomain.CurrentDomain.BaseDirectory;
+            string wtfDir   = Path.Combine(root, "WTF");
+            string wtfPath  = Path.Combine(wtfDir, "wow_opt.ini");
+            string rootPath = Path.Combine(root, "wow_opt.ini");
+
+            if (File.Exists(wtfPath)) return wtfPath;
+
+            // The DLL migrates on the next launch. The launcher only reads
+            // whichever file is live today, so a player who opens it before
+            // launching once still sees their real settings.
+            if (File.Exists(rootPath)) return rootPath;
+
+            return Directory.Exists(wtfDir) ? wtfPath : rootPath;
+        }
+
         public MainForm() {
             // Setup Paths
-            string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-            iniPath = Path.Combine(exeDir, "wow_opt.ini");
+            iniPath = ResolveIniPath();
 
             // Tooltip component
             toolTip = new ToolTip();
@@ -1076,6 +1100,7 @@ namespace WowOptimizeLauncher {
         }
 
         private void LoadSettings() {
+            iniPath = ResolveIniPath();   // re-resolve: the DLL may have migrated it into WTF since startup
             LoadSettingsFromPath(iniPath);
         }
 
@@ -1117,6 +1142,7 @@ namespace WowOptimizeLauncher {
         }
 
         private void SaveSettings() {
+            iniPath = ResolveIniPath();
             SaveSettingsToPath(iniPath);
         }
 
