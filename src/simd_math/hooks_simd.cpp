@@ -958,9 +958,33 @@ static bool SelfTestQuatNormalize() {
         { 0.0f, 0.0f, 0.0f, 0.0f },
     };
 
-    for (int i = 0; i < 5; i++) {
+    // The five above are kept as the awkward-shape cases; the rest are random,
+    // for the same reason the matrix self-test needed widening. Five tidy inputs
+    // catch a broken implementation and nothing finer, and on the matrix
+    // multiply exactly that gap hid a 1.118e-04 divergence from the client
+    // behind a comment claiming sub-ULP. This one is packed single against a
+    // client that works in x87 at 53-bit, which is the same configuration.
+    const int RANDOM_CASES = 4096;
+    unsigned seed = 0x9E3779B9u;
+    double worst = 0.0;
+    int worstCase = -1, worstComp = -1;
+    float worstClient = 0.0f, worstOurs = 0.0f;
+
+    for (int i = 0; i < 5 + RANDOM_CASES; i++) {
         float a[4], b[4];
-        for (int k = 0; k < 4; k++) { a[k] = cases[i][k]; b[k] = cases[i][k]; }
+        if (i < 5) {
+            for (int k = 0; k < 4; k++) { a[k] = cases[i][k]; b[k] = cases[i][k]; }
+        } else {
+            // Rotations sit near unit length; scaled ones and near-zero ones are
+            // where a normalise is most likely to disagree.
+            float scale = (i & 3) == 0 ? 1.0f : ((i & 3) == 1 ? 100.0f
+                                              : ((i & 3) == 2 ? 0.001f : 10.0f));
+            for (int k = 0; k < 4; k++) {
+                seed = seed * 1103515245u + 12345u;
+                a[k] = (((float)(int)(seed >> 16) / 32768.0f) - 1.0f) * scale;
+                b[k] = a[k];
+            }
+        }
 
         __try {
             original(a, nullptr);
@@ -974,13 +998,24 @@ static bool SelfTestQuatNormalize() {
             float d = a[k] - b[k];
             if (d < 0.0f) d = -d;
             // One ULP at unit scale, with room for the x87-versus-SSE difference.
-            if (d > 1e-5f) {
-                Log("[SimdHooks] Quaternion self-test FAILED on case %d component %d "
-                    "(client %.9g, ours %.9g) - not hooking", i, k, a[k], b[k]);
-                return false;
+            float mag = (a[k] < 0.0f ? -a[k] : a[k]);
+            double rel = (mag > 1.0f) ? ((double)d / (double)mag) : (double)d;
+            if (rel > worst) {
+                worst = rel; worstCase = i; worstComp = k;
+                worstClient = a[k]; worstOurs = b[k];
             }
         }
     }
+
+    if (worst > 1e-5) {
+        Log("[SimdHooks] Quaternion self-test FAILED: worst deviation %.3e at case %d "
+            "component %d (client %.9g, ours %.9g) over %d inputs - not hooking",
+            worst, worstCase, worstComp, worstClient, worstOurs, 5 + RANDOM_CASES);
+        return false;
+    }
+
+    Log("[SimdHooks] Quaternion self-test passed %d inputs against the client's own "
+        "routine, worst deviation %.3e", 5 + RANDOM_CASES, worst);
     return true;
 }
 
