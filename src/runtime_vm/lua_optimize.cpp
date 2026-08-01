@@ -1765,9 +1765,39 @@ void OnMainThreadSleep(DWORD mainThreadId, double frameMs) {
         DWORD nowTick = GetTickCount();
         if ((LONG)(nowTick - s_nextMarkerCheck) >= 0) {
             s_nextMarkerCheck = nowTick + 2000;
-            if (!g_isSwapping.load(std::memory_order_acquire) &&
-                !g_isReloading.load(std::memory_order_acquire) &&
-                !MarkerStillPresent(currentL)) {
+            // Require the marker to be missing twice in a row on the same state
+            // before believing it.
+            //
+            // A single look is not enough, and a log from Warmane shows why: the
+            // message fired on L=0x381817D8, and a moment later that state was
+            // replaced by 0x40BD8E90. A real reload tears the globals down before
+            // it swaps the pointer, so for a brief window the marker is gone from
+            // a state whose address has not changed yet - which is exactly what
+            // "rebuilt in place" was meant to detect, and is not it. The swapping
+            // and reloading flags do not help here because they are raised when
+            // the pointer changes, which is after this window.
+            //
+            // Two sightings two seconds apart cannot both land inside that
+            // window: a reload swaps the pointer in milliseconds, so the second
+            // look sees a different state and the count resets. Only a state that
+            // is genuinely staying put without our marker survives to act on.
+            static lua_State* s_missingOn   = nullptr;
+            static int        s_missingSeen = 0;
+
+            bool markerGone = !g_isSwapping.load(std::memory_order_acquire) &&
+                              !g_isReloading.load(std::memory_order_acquire) &&
+                              !MarkerStillPresent(currentL);
+
+            if (!markerGone || currentL != s_missingOn) {
+                s_missingOn   = markerGone ? currentL : nullptr;
+                s_missingSeen = markerGone ? 1 : 0;
+            } else {
+                ++s_missingSeen;
+            }
+
+            if (markerGone && s_missingSeen >= 2) {
+                s_missingOn   = nullptr;
+                s_missingSeen = 0;
                 Log("[LuaOpt] LUABOOST_DLL_LOADED is gone from an unchanged lua_State "
                     "(0x%08X) - the state was rebuilt in place, reinjecting markers",
                     (unsigned)(uintptr_t)currentL);
