@@ -64,7 +64,13 @@ static int          g_knownCount = 0;
 // is joined), so no synchronization is needed beyond the atomic
 // write index.
 static constexpr int RING_SIZE = 1 << 20;  // ~1M samples (~17 min at 1ms)
-static volatile uintptr_t g_ring[RING_SIZE];
+// Committed on Init rather than living in BSS. The profiler is off by default,
+// but a static array is committed the moment the DLL is mapped, so every player
+// who never turns it on was still paying four megabytes of a 32-bit address
+// space this project exists to defend. Null until Init succeeds; every write
+// site below is reachable only once the sampler thread is running.
+static volatile uintptr_t* g_ring = nullptr;
+static constexpr size_t RING_BYTES = (size_t)RING_SIZE * sizeof(uintptr_t);
 static volatile uint64_t  g_writeIdx = 0;
 static volatile uint64_t  g_totalSamples = 0;
 
@@ -981,6 +987,17 @@ static void DumpResults() {
 
 // ---- public API ---------------------------------------------------
 bool Init(HANDLE mainThread) {
+    if (!g_ring) {
+        // VirtualAlloc returns zeroed pages, which is what the ring wants anyway.
+        g_ring = (volatile uintptr_t*)VirtualAlloc(nullptr, RING_BYTES,
+                                                   MEM_COMMIT | MEM_RESERVE,
+                                                   PAGE_READWRITE);
+        if (!g_ring) {
+            Log("[SamplingProfiler] Could not commit %zu KB for the sample ring - disabled",
+                RING_BYTES / 1024);
+            return false;
+        }
+    }
     if (!mainThread) return false;
 
     // Duplicate so this module owns an independent, long-lived handle —
@@ -996,7 +1013,7 @@ bool Init(HANDLE mainThread) {
     g_totalSamples = 0;
     g_skippedSamples = 0;
     g_samplerStartTick = 0;  // re-arm the warmup window on (re)start
-    memset((void*)g_ring, 0, sizeof(g_ring));
+    if (g_ring) memset((void*)g_ring, 0, RING_BYTES);
     memset(g_pageCounts, 0, sizeof(g_pageCounts));
 
     BuildKnownFuncTable();

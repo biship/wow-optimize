@@ -179,12 +179,15 @@ typedef HRESULT (WINAPI *Clear_fn)(IDirect3DDevice9* device, DWORD Count, const 
 static Clear_fn orig_Clear = nullptr;
 
 static constexpr int RING_BUFFER_SIZE = 65536;
-static RenderCommand g_commandQueue[RING_BUFFER_SIZE];
+// Both buffers are committed on Init instead of sitting in BSS. This feature is
+// off by default, yet between them they reserved close to nine megabytes at DLL
+// load for every player, whether or not the render thread ever started.
+static RenderCommand* g_commandQueue = nullptr;
 static std::atomic<int> g_writeIndex{0};
 static std::atomic<int> g_readIndex{0};
 
 static constexpr int CONSTANT_POOL_SIZE = 65536 * 16;
-static float g_constantPool[CONSTANT_POOL_SIZE];
+static float* g_constantPool = nullptr;
 static std::atomic<uint32_t> g_constantPoolWriteIdx{0};
 
 static HANDLE g_renderThread = NULL;
@@ -582,6 +585,21 @@ static HRESULT WINAPI Hooked_Clear(IDirect3DDevice9* device, DWORD Count, const 
 }
 
 bool Init() {
+    if (!g_commandQueue) {
+        g_commandQueue = (RenderCommand*)VirtualAlloc(
+            nullptr, sizeof(RenderCommand) * RING_BUFFER_SIZE,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+    if (!g_constantPool) {
+        g_constantPool = (float*)VirtualAlloc(
+            nullptr, sizeof(float) * (size_t)CONSTANT_POOL_SIZE,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+    if (!g_commandQueue || !g_constantPool) {
+        Log("[D3D9RenderThread] Could not commit the command queue and constant "
+            "pool - disabled");
+        return false;
+    }
     if (!Config::g_settings.OptD3d9RenderThread) {
         Log("[D3D9RenderThread] DISABLED via configuration");
         return true;

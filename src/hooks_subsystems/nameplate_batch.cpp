@@ -87,8 +87,24 @@ static volatile LONG g_maxOutputQueueDepth = 0;
 // ================================================================
 // Lock-Free Queues (4096 entries each, ring buffer)
 // ================================================================
-static NameplateMT::NameplateTask g_inputQueue[QUEUE_SIZE] = {};
-static NameplateMT::NameplateResult g_outputQueue[QUEUE_SIZE] = {};
+// Committed on Init, not in BSS: this feature is off by default and the two
+// queues together reserved over a megabyte for every player regardless.
+static NameplateMT::NameplateTask*   g_inputQueue  = nullptr;
+static NameplateMT::NameplateResult* g_outputQueue = nullptr;
+
+static bool EnsureQueues() {
+    if (!g_inputQueue) {
+        g_inputQueue = (NameplateMT::NameplateTask*)VirtualAlloc(
+            nullptr, sizeof(NameplateMT::NameplateTask) * QUEUE_SIZE,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+    if (!g_outputQueue) {
+        g_outputQueue = (NameplateMT::NameplateResult*)VirtualAlloc(
+            nullptr, sizeof(NameplateMT::NameplateResult) * QUEUE_SIZE,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+    return g_inputQueue && g_outputQueue;
+}
 static volatile LONG g_inputHead = 0;  // Consumer index (worker threads)
 static volatile LONG g_inputTail = 0;  // Producer index (main thread)
 static volatile LONG g_outputHead = 0; // Consumer index (main thread)
@@ -556,6 +572,11 @@ bool Init() {
     Log("[NameplateMT] Disabled via TEST_DISABLE_NAMEPLATE_MT flag");
     return false;
     #endif
+
+    if (!EnsureQueues()) {
+        Log("[NameplateMT] Could not commit the task queues - disabled");
+        return false;
+    }
 
     Log("[NameplateMT] Init ");
 
