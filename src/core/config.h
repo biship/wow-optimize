@@ -158,6 +158,11 @@ namespace Config {
         // until a log shows the startup verification passing: it replaces a
         // culling routine, and a wrong answer is terrain that fails to draw.
         bool OptHorizonOcclusionSse2 = false;
+        // Passive watcher on the receive path. On by default: disconnects are
+        // the oldest unexplained complaint here, they happen once a session at
+        // most, and a diagnostic that is off when the thing it watches for
+        // happens is worth nothing. Costs four counters per receive.
+        bool OptNetDiag = true;
         bool OptCrtFreeMsize = true;
         bool OptCrtAllocMsize = true;
         bool OptCrtMimalloc = false;

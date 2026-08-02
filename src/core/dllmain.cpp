@@ -29,6 +29,7 @@
 #include "memory_pressure_governor.h"
 #include "sampling_profiler.h"
 #include "anim_census.h"
+#include "net_diag.h"
 #include "../simd_math/horizon_occlusion_sse2.h"
 #include "lua_getstr_inline.h"
 #include "lua_rawgeti_inline.h"
@@ -116,6 +117,10 @@ extern "C" void WowOpt_ReportForeignDetours() {
             "installing over it is what breaks the chain.", n, n == 1 ? "" : "s");
     }
 }
+
+// For the disconnect observer, which wants to say whether the main thread was
+// still ticking when the connection ended.
+extern "C" DWORD WowOpt_LastMainThreadTick() { return g_lastMainThreadTick; }
 
 static void UpdateMainThreadActivity() {
     g_lastMainThreadTick = GetTickCount();
@@ -4646,6 +4651,7 @@ static void DumpPeriodicStats() {
     WowOpt_ReportForeignDetours();
     ApiCache::LogStats();
     TextureUnloadDelay::LogStats();
+    NetDiag::LogStats();
     AnimCensus::LogStats();
     HorizonOcclusion::LogStats();
     D3D9StateCache::LogStats();
@@ -8042,6 +8048,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     if (Config::g_settings.OptTerrainHeightCache) TerrainHeightCache::Init();
 
     if (Config::g_settings.OptTextureUnloadDelay) TextureUnloadDelay::Init();
+    NetDiag::Init();
     AnimCensus::Init();
     HorizonOcclusion::Init();
     QualityGovernor::Init();
