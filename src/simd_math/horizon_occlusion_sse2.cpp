@@ -101,17 +101,31 @@ static void ProjectVertices(int xyBase, int zBase, const uint32_t* indices,
         p[1] = r[1];
         p[2] = r[2];
 
-        float invZ = 1.0f / p[2];
-        p[0] *= invZ;
-        p[1] *= invZ;
+        // The client computes this reciprocal in double - "double v10 = 1.0 /
+        // v8[2]" - and multiplies in double before the result lands back in a
+        // float. Doing it in float instead differs by about 6e-8, which sounds
+        // harmless and is not: the projected x feeds a column index through a
+        // truncation, so a difference in the last bits can move a segment's span
+        // by one column, and that column then takes its value from a different
+        // segment entirely. The first attempt at this function did it in float
+        // and disagreed with the client at column 106 on call one, by 2%.
+        double invZ = 1.0 / (double)p[2];
+        p[0] = (float)((double)p[0] * invZ);
+        p[1] = (float)(invZ * (double)p[1]);
     }
 }
 
 // Column range for a segment, with the original's swap-and-clamp order kept.
 static inline void ColumnRange(float x0, float x1, int& lo, int& hi) {
     float bias = *(const float*)ADDR_ColumnBias;
-    int a = (int)(x0 * 64.0f - bias) + COLUMN_ORIGIN;
-    int b = (int)(x1 * 64.0f - bias) + COLUMN_ORIGIN;
+    // Mirrors the client exactly: the scale is a double multiply whose result is
+    // stored to a float, and only then is the bias subtracted and the whole
+    // truncated. Folding those steps changes which side of an integer boundary a
+    // column lands on.
+    float t0 = (float)((double)x0 * 64.0);
+    float t1 = (float)((double)x1 * 64.0);
+    int a = (int)(t0 - bias) + COLUMN_ORIGIN;
+    int b = (int)(t1 - bias) + COLUMN_ORIGIN;
     if (b < a) { hi = a; lo = b; } else { lo = a; hi = b; }
     if (lo < 0) lo = 0;
     if (hi >= COLUMNS) hi = COLUMNS - 1;
@@ -234,14 +248,40 @@ static void __cdecl Hooked_HorizonBuild(int xyBase, int zBase, uint32_t* indices
     orig_HorizonBuild(xyBase, zBase, indices, count, offset, mode);
 
     long n = InterlockedIncrement(&g_checked);
+
+    // On a mismatch, report enough to identify the cause without another round
+    // trip. The first attempt gave one column and two values, which narrowed it
+    // to "a span boundary moved" and no further - so it also says how many
+    // columns differ, whether they are contiguous, and the inputs, because a
+    // single displaced column means a rounding difference at a truncation while
+    // a whole block means the geometry is being read wrongly.
+    int firstBad = -1, lastBad = -1, badCount = 0;
     for (int i = 0; i < COLUMNS; ++i) {
         if (horizon[i] != ours[i]) {
-            g_abandoned = true;
-            Log("[Horizon] Disagreed with the client at column %d on call %ld "
-                "(client %.9g, ours %.9g) - handing every call back to the original",
-                i, n, horizon[i], ours[i]);
-            return;   // the client's output is already in place
+            if (firstBad < 0) firstBad = i;
+            lastBad = i;
+            ++badCount;
         }
+    }
+
+    if (badCount > 0) {
+        g_abandoned = true;
+        Log("[Horizon] Disagreed with the client on call %ld: %d of %d columns "
+            "differ, first %d (client %.9g, ours %.9g), last %d - mode=%d, "
+            "vertices=%d",
+            n, badCount, COLUMNS, firstBad, horizon[firstBad], ours[firstBad],
+            lastBad, mode, count);
+
+        // The projected span of the first few segments, which is what the column
+        // index is derived from.
+        const float* scratch = (const float*)ADDR_Scratch;
+        int show = count < 4 ? count : 4;
+        for (int i = 0; i < show; ++i) {
+            Log("[Horizon]   vertex %d: x=%.9g y=%.9g z=%.9g",
+                i, scratch[i * 3], scratch[i * 3 + 1], scratch[i * 3 + 2]);
+        }
+        Log("[Horizon] Handing every call back to the original");
+        return;   // the client's output is already in place
     }
 
     if (n >= VERIFY_CALLS) {
