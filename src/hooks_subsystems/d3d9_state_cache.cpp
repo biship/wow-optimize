@@ -522,10 +522,38 @@ static uint32_t g_drawFrames  = 0;
 static uint32_t g_drawMax     = 0;
 static uint64_t g_drawTotal   = 0;
 
+// Batching a draw call is only possible when several small ones sit next to
+// each other. The count of draws per frame does not say whether any do, so it
+// cannot size the win - and building a batcher to find out is how this project
+// spent three days undoing features nobody had measured.
+//
+// A UI quad is two triangles. Anything at or below that is a candidate; a run
+// of them back to back is what a batcher would merge into one call. The longest
+// and the total run length bound the saving exactly: merging a run of n costs
+// one call instead of n.
+static constexpr UINT SMALL_PRIM_MAX = 2;
+static uint64_t g_smallDraws   = 0;   // draws of <= SMALL_PRIM_MAX primitives
+static uint64_t g_runDraws     = 0;   // small draws that were part of a run >= 2
+static uint64_t g_runs         = 0;   // number of such runs
+static uint32_t g_longestRun   = 0;
+static uint32_t g_currentRun   = 0;
+
+static inline void NoteDrawShape(UINT primCount) {
+    if (primCount <= SMALL_PRIM_MAX) {
+        ++g_smallDraws;
+        ++g_currentRun;
+        if (g_currentRun > g_longestRun) g_longestRun = g_currentRun;
+    } else {
+        if (g_currentRun >= 2) { ++g_runs; g_runDraws += g_currentRun; }
+        g_currentRun = 0;
+    }
+}
+
 static HRESULT WINAPI Hooked_DrawPrimitive(IDirect3DDevice9* device,
                                            D3DPRIMITIVETYPE type,
                                            UINT startVertex, UINT primCount) {
     ++g_drawsThisFrame;
+    NoteDrawShape(primCount);
     return orig_DrawPrimitive(device, type, startVertex, primCount);
 }
 
@@ -535,6 +563,7 @@ static HRESULT WINAPI Hooked_DrawIndexedPrimitiveCount(IDirect3DDevice9* device,
                                                        UINT numVertices, UINT startIndex,
                                                        UINT primCount) {
     ++g_drawsThisFrame;
+    NoteDrawShape(primCount);
     return orig_DrawIndexedPrimitive(device, type, baseVertex, minIndex,
                                      numVertices, startIndex, primCount);
 }
@@ -542,6 +571,10 @@ static HRESULT WINAPI Hooked_DrawIndexedPrimitiveCount(IDirect3DDevice9* device,
 // Called from the Present hook, which already runs once per presented frame.
 void NoteFrameForDrawCensus() {
     if (!orig_DrawIndexedPrimitive) return;
+
+    // A frame boundary ends whatever run was open.
+    if (g_currentRun >= 2) { ++g_runs; g_runDraws += g_currentRun; }
+    g_currentRun = 0;
 
     uint32_t n = g_drawsThisFrame;
     g_drawsThisFrame = 0;
@@ -563,6 +596,30 @@ void ReportDrawCensus() {
     if (g_drawFrames == 0) {
         Log("[DrawCensus] installed but no frame was presented");
         return;
+    }
+
+    // What a UI batcher could actually save, before one is written.
+    if (g_drawTotal > 0) {
+        double pctSmall = 100.0 * (double)g_smallDraws / (double)g_drawTotal;
+        Log("[DrawCensus] %llu of %llu draws were <= %u primitives (%.1f%%)",
+            (unsigned long long)g_smallDraws, (unsigned long long)g_drawTotal,
+            SMALL_PRIM_MAX, pctSmall);
+
+        if (g_runs > 0) {
+            double avgRun = (double)g_runDraws / (double)g_runs;
+            // Merging a run of n turns n calls into one, so the saving is
+            // runDraws - runs. Stated as calls per frame, which is the unit the
+            // rest of this block uses.
+            double savedPerFrame = (double)(g_runDraws - g_runs) / (double)g_drawFrames;
+            Log("[DrawCensus] %llu runs of consecutive small draws, average %.1f, "
+                "longest %u - batching them would remove about %.0f calls/frame "
+                "of the %.0f measured",
+                (unsigned long long)g_runs, avgRun, g_longestRun, savedPerFrame,
+                (double)g_drawTotal / (double)g_drawFrames);
+        } else {
+            Log("[DrawCensus] no runs of consecutive small draws - a UI batcher "
+                "would have nothing to merge here");
+        }
     }
 
     // Median from the histogram rather than a stored series.

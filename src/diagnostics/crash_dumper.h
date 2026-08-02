@@ -77,6 +77,12 @@ int RegisteredFeatureCount();
 // line each - a single third-party module produced 8889 in one session.
 void ReportFirstChanceSummary();
 
+// Caches the address range of modules whose deterministic exceptions are known
+// to be benign, so the first-chance probe can recognise them without taking the
+// loader lock. Call from the main thread - Init and periodic maintenance - since
+// such a module can load after we do.
+void RefreshBenignModuleRanges();
+
     // Update feature state (call from hooks/fast-paths)
     void FeatureCall(const char* name);
     void FeatureError(const char* name, const char* desc);

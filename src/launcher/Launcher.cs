@@ -256,7 +256,7 @@ namespace WowOptimizeLauncher {
         // remote version.txt to decide whether to show the update notification,
         // and shown in the version label. Keep in sync with version.txt and
         // src/core/version.h on every release.
-        private const string APP_VERSION = "3.18.0";
+        private const string APP_VERSION = "3.18.1";
 
         private string iniPath;
         private Dictionary<string, SettingItem> settingsMap;
@@ -297,10 +297,34 @@ namespace WowOptimizeLauncher {
         private static readonly Color SubtextColor = Color.FromArgb(150, 150, 180);
         private static readonly Color SubHeaderColor = Color.FromArgb(150, 150, 180);
 
+        // Must agree with Config::ResolveIniPath in src/core/config.cpp. The two
+        // used to be written separately and only matched because the install
+        // instructions put this launcher in the game folder; with WTF in the
+        // search order, two independent implementations would drift for certain,
+        // and the symptom would be the launcher editing a file the DLL never
+        // reads. Keep them in step.
+        private static string ResolveIniPath() {
+            string env = Environment.GetEnvironmentVariable("WOW_OPT_CONFIG");
+            if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
+
+            string root = AppDomain.CurrentDomain.BaseDirectory;
+            string wtfDir   = Path.Combine(root, "WTF");
+            string wtfPath  = Path.Combine(wtfDir, "wow_opt.ini");
+            string rootPath = Path.Combine(root, "wow_opt.ini");
+
+            if (File.Exists(wtfPath)) return wtfPath;
+
+            // The DLL migrates on the next launch. The launcher only reads
+            // whichever file is live today, so a player who opens it before
+            // launching once still sees their real settings.
+            if (File.Exists(rootPath)) return rootPath;
+
+            return Directory.Exists(wtfDir) ? wtfPath : rootPath;
+        }
+
         public MainForm() {
             // Setup Paths
-            string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-            iniPath = Path.Combine(exeDir, "wow_opt.ini");
+            iniPath = ResolveIniPath();
 
             // Tooltip component
             toolTip = new ToolTip();
@@ -317,9 +341,11 @@ namespace WowOptimizeLauncher {
                 { "Precise Sleep Frame Pacing", new SettingItem("General", "SleepPrecision", true, null, "Enforces millisecond-accurate frame-rate sleep pacing to reduce input lag and stabilize frame delivery.") },
                 { "Keep a Log File per Session", new SettingItem("General", "SessionLogs", true, null, "Writes a separate timestamped log for every session, so two runs can be compared. Older ones are deleted automatically (SessionLogsToKeep in wow_opt.ini, default 10). Turn off to keep only the single overwritten wow_optimize.log.") },
                 { "Lua Allocation Census", new SettingItem("UI_Lua", "LuaAllocCensus", false, null, "Counts every object the Lua VM allocates and reports the size distribution at the end of your log. A measurement, not a speed-up: it decides whether giving Lua its own memory arena would be worth building. Turn it on for one session, send the log, turn it back off.", true) },
+                { "SSE2 Terrain Horizon (experimental)", new SettingItem("Graphics_Sound", "HorizonOcclusionSse2", false, null, "Vectorises the terrain horizon builder, measured at 2.46% of main-thread time in a tester profile. It rasterises up to 384 screen columns one at a time; this does four per instruction. Off by default because it replaces a culling routine, and a wrong answer is terrain that fails to draw. It checks itself: the first 512 calls run both this and the client's version and compare all 384 output values exactly, and any single difference hands every later call back to the client and names the column in your log. Look for \"[Horizon] Matched the client's output exactly\" before trusting it.", true) },
+                { "Animation Census", new SettingItem("Graphics_Sound", "AnimCensus", false, null, "Counts what the model animation update does per frame: how many models, how many bones between them, and microseconds per model. A measurement, not a speed-up. The animation family is about a fifth of main-thread time and is the largest remaining target, but forty models at thirty bones and four hundred at three want completely different fixes and a profile cannot tell them apart. Turn it on for one session, send the log, turn it off.", true) },
                 { "Draw Call Census", new SettingItem("Graphics_Sound", "DrawCensus", false, null, "Counts how many draw calls the client issues per frame and reports the distribution at the end of your log. This is a measurement, not a speed-up - it wraps the busiest call in the renderer, so turn it on for one session, send the log, and turn it back off. Nobody has ever counted this, and whether batching would help depends entirely on the answer.", true) },
-                { "SSE2 Matrix Multiply", new SettingItem("Graphics_Sound", "MatrixMultiplySse2", false, null, "Replaces the client's 4x4 matrix multiply, measured at 1.27% of main-thread execution. Compared against the original over 200000 matrices: both land the same distance from an exact double-precision result, so neither is more accurate. Never run in a game, so it is off by default. On startup it runs the client's own version and this one on the same matrices and compares; if they disagree it refuses to install and says so in the log.", true) },
-                { "Compatibility Mode (fixes VM/connection issues)", new SettingItem("General", "CompatMode", false, null, "Turn ON only if the game will not connect with the DLL loaded, especially inside a VM or with HyperV/virtual switches enabled. Skips the CPU-priority, affinity and working-set tweaks that can starve the network in virtualized environments. It costs performance by design, so it is a repair rather than an improvement - which is why Enable All leaves it alone.", true) },
+                { "SSE2 Matrix Multiply", new SettingItem("Graphics_Sound", "MatrixMultiplySse2", true, null, "Replaces the client's 4x4 matrix multiply, which is 199 x87 instructions and runs once per bone per frame on every animated model. Measured at 24.81 ns against 10.43 ns for this one, and the results are bit-identical - worst difference 0.000e+00 over 4096 random matrix pairs, because it accumulates at the same 53-bit width the client does. A single-precision version was 6.5x faster and drifted by 1e-04, which is the order that caused camera snapping once before, so it was not used. On startup the client's own version and this one are run on the same matrices and compared; any disagreement and it refuses to install and says so in the log.") },
+                { "Compatibility Mode (only if you need it - turns optimizations OFF)", new SettingItem("General", "CompatMode", false, null, "Leave this OFF unless the game will not connect with the DLL loaded, which usually means a VM or HyperV/virtual switches. It works by SWITCHING OFF optimizations - the CPU-priority, affinity and working-set tweaks that can starve the network in virtualized environments - so it makes the game slower on purpose. It is a repair for a broken connection, not an improvement, which is why Enable All leaves it alone.", true) },
                 { "SSE2 Quaternion Normalize", new SettingItem("Graphics_Sound", "QuatNormalizeSse2", false, null, "Replaces the client's quaternion normalize, measured at 3.13% of main-thread execution in a CPU-bound profile. Checked against the original over 400000 quaternions: one float ULP of difference at worst. It has never been run in an actual game, which is why it is here and off by default. On startup it runs the client's own version and this one on the same inputs and compares; if they disagree it refuses to install and says so in the log.", true) },
                 { "Adaptive Quality Governor", new SettingItem("Graphics_Sound", "QualityGovernor", false, null, "Gives up particle density, then shadow quality, then draw distance while the frame-time tail shows the machine cannot keep up, and restores your own settings when it recovers. Learns your values by watching the game write them, and never goes above what you chose. Replaces the three separate scalers. Off by default and skipped by Enable All.", true) },
                 { "Lua Stack API Fast Paths", new SettingItem("UI_Lua", "LuaStackFast", false, null, "Replaces 16 core Lua stack functions, including lua_remove, lua_insert and lua_replace. Off by default and skipped by Enable All: it is under investigation for addon errors where an argument arrives missing or wrong.", true) },
@@ -331,7 +357,6 @@ namespace WowOptimizeLauncher {
                 { "Timing CVar Pin", new SettingItem("General", "TimingCvarPin", true, null, "Pins timingMethod to 2 and timingTestError to 0 whatever the client asks for. This has been on for everyone for a long time with no switch, buried inside the CVar safeguard; it now has its own. Leave it on unless you want the client's own timer choice back.") },
                 { "Null Pointer CVar Safeguard", new SettingItem("General", "CvarNullGuard", true, null, "Declines CVar writes through an object that looks uninitialised, which prevents a class of client crash. The timing CVar pin that used to ride along inside this feature has moved to its own switch above.") },
                 { "Frame Rate Limiter Override", new SettingItem("General", "FrameLimiter", false, null, "Overrides WoW's built-in frame limiter with a high-precision spin-wait sleep loop.") },
-                { "Memory-Mapped DBC RAM Cache", new SettingItem("General", "DbcPreload", false, null, "Pre-loads and decompresses all major client database files (.dbc) into RAM at startup for near-instant loading screens.") },
                 { "32-bit OOM VRAM Governor", new SettingItem("General", "OomGovernor", false, null, "Dynamically downscales texture mipmaps when the 32-bit client's virtual address space usage approaches critical OOM levels.") },
                 { "Hardware Cursor Fix", new SettingItem("General", "HardwareCursor", false, null, "Resets cursor visibility and releases any cursor clip region on startup (no engine byte patches, no hooks). Helps if the cursor is hidden or trapped after alt-tab.") },
                 { "Mouse Clip Release on Alt-Tab", new SettingItem("General", "MouseClipRelease", false, null, "Frees the mouse cursor whenever WoW loses window focus, so it is never trapped inside the game window after alt-tab. Polls focus each frame and only ever RELEASES the clip (never applies one), so it cannot cause cursor/camera issues.") },
@@ -356,7 +381,9 @@ namespace WowOptimizeLauncher {
                 { "CRT Alloc Fast Path", new SettingItem("General", "CrtAllocMsize", true, null, "WoW's allocation wrapper calls _msize after every successful allocation and throws the result away, exactly as the free wrapper did - a heap lookup, sometimes a lock, for a number nobody reads. Same fix, applied to the other half. Separate switch from the free one so either can be turned off alone.") },
                 { "CRT Free Fast Path", new SettingItem("General", "CrtFreeMsize", true, null, "WoW's free wrapper calls _msize on every deallocation and throws the result away - a heap lookup, sometimes a lock, for a number nobody reads. Two tester profiles measured that call at 8-10% of main-thread execution time. This removes it and changes nothing else.") },
                 { "Object Manager Lookup Cache", new SettingItem("General", "ObjVisCache", true, null, "Caches the object-manager hash lookup for one frame at a time, keyed by GUID, and re-reads the object's own GUID before handing a cached pointer back. On unless you turn it off - this switch is new; until now it ran on every install with no way to disable it.") },
+                { "Object GUID Lookup Cache", new SettingItem("Combat_Net", "GuidLookupCache", true, null, "Lock-free cache for GUID to object lookups. On by default because it has always run - until this release it had no switch at all.") },
                 { "WoW API Result Cache", new SettingItem("Combat_Net", "ApiCache", true, null, "Caches GetItemInfo and GetSpellInfo results. This is the cache behind the WeakAuras icon that stays wrong after a talent switch: it used to be cleared only by a /reload. Entries now expire after a second. Until this release it had no switch at all and ran on every install - turn it off if you still see stale spell data.") },
+                { "Disconnect Diagnostics", new SettingItem("Combat_Net", "NetDiag", true, null, "Watches the receive path and writes a report if your connection ends: how it ended (a clean close, a reset, a timeout), how long since the last byte actually arrived, and whether the game was mid-loading or the main thread had stalled. It changes nothing about how the game talks to the server - it only records. Disconnects are the oldest complaint about this DLL and the only one never explained, because nothing was watching. On by default; if you get dropped, your log will now say something about it.") },
                 { "Combat Log Leak Fix (retention 1800s)", new SettingItem("Combat_Net", "CombatLogLeakFix", true, null, "Fixes the 16-year-old WoW combat log memory leak by extending event retention from 300s to 1800s (writes the retention CVar). Proven and stable - on by default.") },
                 { "Combat Log Aggregator", new SettingItem("Combat_Net", "CombatLogParser", false, null, "C++ combat log aggregator + buffer governor that intercepts and summarizes events instead of the slow Lua path. More aggressive than the leak fix above; opt-in.") },
                 { "Incremental Combat Log parsing", new SettingItem("Combat_Net", "CombatLogIncremental", false, null, "Splits large combat updates into small steps, preventing massive spikes in large-scale combat.") },
@@ -369,7 +396,7 @@ namespace WowOptimizeLauncher {
                 { "Parallel Sound Wave Decoding", new SettingItem("Graphics_Sound", "AudioDecodeMt", false, null, "Decodes sound assets in background threads to eliminate latency when playing fresh audio clips.") },
                 { "DBC Data Lookup Cache", new SettingItem("Graphics_Sound", "DbcLookupCache", false, null, "Speeds up data reading from internal database files (.dbc) for models, items, and spells.") },
                 { "Asynchronous Texture Loader", new SettingItem("Graphics_Sound", "AsyncTexLoader", false, null, "Asynchronously loads and decompresses BLP textures in background worker threads, hot-swapping them on frame boundaries to prevent stutters.") },
-                { "Texture Smart Unload Delay", new SettingItem("Graphics_Sound", "TextureUnloadDelay", false, null, "Delays texture unloading during camera turnarounds to prevent immediate load micro-stutters.") },
+                { "Texture Smart Unload Delay", new SettingItem("Graphics_Sound", "TextureUnloadDelay", false, null, "Holds a texture the engine has finished with for five seconds, in case it is wanted again before then. Measured on a long session: 100,664 textures held, 380 wanted again - 0.4%. The other 98,850 expired and were released anyway. It also has to hand back whatever it is holding when a loading screen ends, and a tester saw the loading bar finish and the screen stay up for several seconds while that happened. That burst is now spread over later frames, but the reuse figure is the thing to weigh: your own log prints it, and if it looks like that one, this is paying for a hook on the engine's texture release path and returning almost nothing.") },
                 { "Mipmap Bias Governor", new SettingItem("Graphics_Sound", "MipBiasGovernor", false, null, "Adjusts mipmap texture bias dynamically based on virtual memory pressure to prevent allocation spikes.") },
                 { "SIMD Matrix Vector Transforms", new SettingItem("Graphics_Sound", "SimdMatrixTransform", false, null, "Vectorizes 3D coordinate and matrix-vector calculations using SSE2 SIMD instructions to accelerate particle updates.") },
                 { "Advanced Sound Channels Coalescer", new SettingItem("Graphics_Sound", "SoundCoalescer", false, null, "Coalesces rapid duplicated sound plays to prevent channel exhaustion under AOE spam.") },
@@ -1076,6 +1103,7 @@ namespace WowOptimizeLauncher {
         }
 
         private void LoadSettings() {
+            iniPath = ResolveIniPath();   // re-resolve: the DLL may have migrated it into WTF since startup
             LoadSettingsFromPath(iniPath);
         }
 
@@ -1117,6 +1145,7 @@ namespace WowOptimizeLauncher {
         }
 
         private void SaveSettings() {
+            iniPath = ResolveIniPath();
             SaveSettingsToPath(iniPath);
         }
 

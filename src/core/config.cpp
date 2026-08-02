@@ -16,6 +16,10 @@ namespace Config {
     // the DLL had read from or what it concluded.
     static std::string g_loadedFrom;
 
+    // Set when the config was relocated during this run. Reported by DumpToLog,
+    // because Load() happens before the log file is open.
+    static const char* g_migrationNote = nullptr;
+
 // Generated from the reads in Load(): every boolean setting, the ini section and
 // key it comes from, and the field it lands in.
 struct BoolSetting {
@@ -38,7 +42,6 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "TimingCvarPin", &Settings::OptTimingCvarPin },
     { "General", "FrameLimiter", &Settings::OptFrameLimiter },
     { "General", "ObjVisCache", &Settings::OptObjVisCache },
-    { "General", "DbcPreload", &Settings::OptDbcPreload },
     { "General", "OomGovernor", &Settings::OptOomGovernor },
     { "General", "HardwareCursor", &Settings::OptHardwareCursor },
     { "General", "SamplingProfiler", &Settings::OptSamplingProfiler },
@@ -54,7 +57,6 @@ static const BoolSetting kBoolSettings[] = {
     { "UI_Lua", "LuaNumConvFast", &Settings::OptLuaNumConvFast },
     { "UI_Lua", "LuaOpcache", &Settings::OptLuaOpcache },
     { "UI_Lua", "LuaGcCoalesce", &Settings::OptLuaGcCoalesce },
-    { "UI_Lua", "LuaJIT", &Settings::OptLuaJIT },
     { "UI_Lua", "LuaGetTimeFast", &Settings::OptLuaGetTimeFast },
     { "UI_Lua", "AsyncTexLoader", &Settings::OptAsyncTexLoader },
     { "UI_Lua", "AsyncTerrainLoader", &Settings::OptAsyncTerrainLoader },
@@ -64,12 +66,12 @@ static const BoolSetting kBoolSettings[] = {
     { "Combat_Net", "CombatLogParser", &Settings::OptCombatLogParser },
     { "Combat_Net", "CombatLogIncremental", &Settings::OptCombatLogIncremental },
     { "Combat_Net", "EventCoalescer", &Settings::OptEventCoalescer },
-    { "Combat_Net", "SavedVarsSerializer", &Settings::OptSavedVarsSerializer },
     { "Combat_Net", "SavedVarsAsync", &Settings::OptSavedVarsAsync },
     { "Combat_Net", "SavedVarsPretoken", &Settings::OptSavedVarsPretoken },
     { "Combat_Net", "UnitAuraFast", &Settings::OptUnitAuraFast },
     { "Combat_Net", "NetworkGuidSse2", &Settings::OptNetworkGuidSse2 },
     { "Combat_Net", "ApiCache", &Settings::OptApiCache },
+    { "Combat_Net", "GuidLookupCache", &Settings::OptGuidLookupCache },
     { "Combat_Net", "PacketOffload", &Settings::OptPacketOffload },
     { "Combat_Net", "NameplateMT", &Settings::OptNameplateMT },
     { "Graphics_Sound", "FastMemsetOpt", &Settings::OptFastMemsetOpt },
@@ -94,6 +96,9 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "MatrixMultiplySse2", &Settings::OptMatrixMultiplySse2 },
     { "Graphics_Sound", "DrawCensus", &Settings::OptDrawCensus },
     { "UI_Lua", "LuaAllocCensus", &Settings::OptLuaAllocCensus },
+    { "Graphics_Sound", "AnimCensus", &Settings::OptAnimCensus },
+    { "Graphics_Sound", "HorizonOcclusionSse2", &Settings::OptHorizonOcclusionSse2 },
+    { "Combat_Net", "NetDiag", &Settings::OptNetDiag },
     { "General", "CrtFreeMsize", &Settings::OptCrtFreeMsize },
     { "General", "CrtAllocMsize", &Settings::OptCrtAllocMsize },
     { "General", "CrtMimalloc", &Settings::OptCrtMimalloc },
@@ -107,6 +112,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
 
     void DumpToLog() {
         Log("[Config] Read from: %s", g_loadedFrom.empty() ? "(none)" : g_loadedFrom.c_str());
+        if (g_migrationNote) Log("[Config]   (%s)", g_migrationNote);
 
         // This used to print the ini file and call it "Effective contents". It was
         // neither effective nor complete: a setting the launcher never wrote is
@@ -153,29 +159,88 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         Log("[Config] %d set in the file, %d left at defaults.", fromFile, defaulted);
     }
 
-    void Load() {
-        std::string iniPath;
+    static bool FileExists(const std::string& p) {
+        return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
 
-        // Explicit config path wins (set by wow_loader --config, or anyone who
-        // wants to point us at a specific profile). Only honored if it exists,
-        // so a bad path falls back to the normal wow_opt.ini instead of writing
-        // a fresh default somewhere unexpected.
+    static bool DirExists(const std::string& p) {
+        DWORD a = GetFileAttributesA(p.c_str());
+        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    }
+
+    // The folder Wow.exe lives in, with a trailing separator.
+    static std::string GameRoot() {
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) return std::string();
+        std::string s(path);
+        size_t lastSlash = s.find_last_of("\\/");
+        return (lastSlash == std::string::npos) ? std::string()
+                                                : s.substr(0, lastSlash + 1);
+    }
+
+    // Where wow_opt.ini lives, in the order the file is looked for:
+    //
+    //   1. WOW_OPT_CONFIG, so wow_loader can point each client of a multi-client
+    //      setup at its own profile. Only honoured if the file is really there.
+    //   2. WTF\wow_opt.ini, next to Config.wtf and the account folders.
+    //   3. wow_opt.ini beside Wow.exe, which is where it has always lived.
+    //
+    // WTF is the folder people carry across when they replace a client, so a
+    // config that lives there survives a reinstall and one in the root does not.
+    // That is the reason for the move; tidiness on its own would not be worth it.
+    //
+    // Nothing is ever silently abandoned. An existing root config is copied into
+    // WTF the first time this runs and the old file renamed to wow_opt.ini.moved,
+    // because the alternative - looking in the new place, finding nothing and
+    // writing a fresh default - would reset everyone's settings at once and read,
+    // from the outside, exactly like features switching themselves off.
+    static std::string ResolveIniPath() {
         char envPath[MAX_PATH];
         DWORD envLen = GetEnvironmentVariableA("WOW_OPT_CONFIG", envPath, MAX_PATH);
-        if (envLen > 0 && envLen < MAX_PATH &&
-            GetFileAttributesA(envPath) != INVALID_FILE_ATTRIBUTES) {
-            iniPath = envPath;
-        } else {
-            char path[MAX_PATH];
-            GetModuleFileNameA(NULL, path, MAX_PATH);
-            iniPath = path;
-            size_t lastSlash = iniPath.find_last_of("\\/");
-            if (lastSlash != std::string::npos) {
-                iniPath = iniPath.substr(0, lastSlash + 1) + "wow_opt.ini";
-            } else {
-                iniPath = "wow_opt.ini";
-            }
+        if (envLen > 0 && envLen < MAX_PATH && FileExists(envPath)) {
+            return std::string(envPath);
         }
+
+        std::string root = GameRoot();
+        if (root.empty()) return "wow_opt.ini";
+
+        std::string wtfDir  = root + "WTF";
+        std::string wtfPath = wtfDir + "\\wow_opt.ini";
+        std::string rootPath = root + "wow_opt.ini";
+
+        if (FileExists(wtfPath)) return wtfPath;
+
+        if (FileExists(rootPath)) {
+            // Migrate, but only when there is a WTF folder to migrate into and
+            // the copy actually succeeds. If either fails, keep using the file
+            // where it already is rather than losing the player's settings.
+            if (DirExists(wtfDir) && CopyFileA(rootPath.c_str(), wtfPath.c_str(), TRUE)) {
+                std::string moved = rootPath + ".moved";
+                DeleteFileA(moved.c_str());
+                if (!MoveFileA(rootPath.c_str(), moved.c_str())) {
+                    // Could not rename the original. Two files that both look
+                    // live is worse than not moving at all, so undo the copy.
+                    DeleteFileA(wtfPath.c_str());
+                    return rootPath;
+                }
+                // Not Log() - Load() runs before LogOpen(), so anything printed
+                // from here goes nowhere. DumpToLog reports it once logging is up,
+                // which is the same reason g_loadedFrom exists.
+                g_migrationNote = "moved here from the game folder on this run; "
+                                  "the old copy is now wow_opt.ini.moved";
+                return wtfPath;
+            }
+            return rootPath;
+        }
+
+        // Nothing anywhere: create it in WTF when that folder exists, otherwise
+        // fall back to the root so a client without a WTF folder still works.
+        return DirExists(wtfDir) ? wtfPath : rootPath;
+    }
+
+    void Load() {
+        std::string iniPath = ResolveIniPath();
 
         // Check if the file exists, if not, write the default template
         DWORD attribs = GetFileAttributesA(iniPath.c_str());
@@ -274,7 +339,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptTimingCvarPin       = GetPrivateProfileIntA("General", "TimingCvarPin", 1, iniPath.c_str()) != 0;
         g_settings.OptFrameLimiter        = GetPrivateProfileIntA("General", "FrameLimiter", 0, iniPath.c_str()) != 0;
         g_settings.OptObjVisCache         = GetPrivateProfileIntA("General", "ObjVisCache", 1, iniPath.c_str()) != 0;
-        g_settings.OptDbcPreload          = GetPrivateProfileIntA("General", "DbcPreload", 0, iniPath.c_str()) != 0;
         g_settings.OptOomGovernor         = GetPrivateProfileIntA("General", "OomGovernor", 0, iniPath.c_str()) != 0;
         g_settings.OptHardwareCursor      = GetPrivateProfileIntA("General", "HardwareCursor", 0, iniPath.c_str()) != 0;
         g_settings.OptSamplingProfiler    = GetPrivateProfileIntA("General", "SamplingProfiler", 0, iniPath.c_str()) != 0;
@@ -301,7 +365,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptLuaNumConvFast      = GetPrivateProfileIntA("UI_Lua", "LuaNumConvFast", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaOpcache          = GetPrivateProfileIntA("UI_Lua", "LuaOpcache", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaGcCoalesce       = GetPrivateProfileIntA("UI_Lua", "LuaGcCoalesce", 0, iniPath.c_str()) != 0;
-        g_settings.OptLuaJIT              = GetPrivateProfileIntA("UI_Lua", "LuaJIT", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaGetTimeFast      = GetPrivateProfileIntA("UI_Lua", "LuaGetTimeFast", 0, iniPath.c_str()) != 0;
         g_settings.OptAsyncTexLoader      = GetPrivateProfileIntA("UI_Lua", "AsyncTexLoader", 0, iniPath.c_str()) != 0;
         g_settings.OptAsyncTerrainLoader  = GetPrivateProfileIntA("UI_Lua", "AsyncTerrainLoader", 0, iniPath.c_str()) != 0;
@@ -313,12 +376,12 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptCombatLogParser     = GetPrivateProfileIntA("Combat_Net", "CombatLogParser", 0, iniPath.c_str()) != 0;
         g_settings.OptCombatLogIncremental = GetPrivateProfileIntA("Combat_Net", "CombatLogIncremental", 0, iniPath.c_str()) != 0;
         g_settings.OptEventCoalescer      = GetPrivateProfileIntA("Combat_Net", "EventCoalescer", 0, iniPath.c_str()) != 0;
-        g_settings.OptSavedVarsSerializer = GetPrivateProfileIntA("Combat_Net", "SavedVarsSerializer", 0, iniPath.c_str()) != 0;
         g_settings.OptSavedVarsAsync      = GetPrivateProfileIntA("Combat_Net", "SavedVarsAsync", 0, iniPath.c_str()) != 0;
         g_settings.OptSavedVarsPretoken   = GetPrivateProfileIntA("Combat_Net", "SavedVarsPretoken", 0, iniPath.c_str()) != 0;
         g_settings.OptUnitAuraFast        = GetPrivateProfileIntA("Combat_Net", "UnitAuraFast", 0, iniPath.c_str()) != 0;
         g_settings.OptNetworkGuidSse2     = GetPrivateProfileIntA("Combat_Net", "NetworkGuidSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptApiCache   = GetPrivateProfileIntA("Combat_Net", "ApiCache", 1, iniPath.c_str()) != 0;
+        g_settings.OptGuidLookupCache   = GetPrivateProfileIntA("Combat_Net", "GuidLookupCache", 1, iniPath.c_str()) != 0;
         g_settings.OptPacketOffload       = GetPrivateProfileIntA("Combat_Net", "PacketOffload", 0, iniPath.c_str()) != 0;
         g_settings.OptNameplateMT         = GetPrivateProfileIntA("Combat_Net", "NameplateMT", 0, iniPath.c_str()) != 0;
 
@@ -355,9 +418,12 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptSimdMatrixTransform = GetPrivateProfileIntA("Graphics_Sound", "SimdMatrixTransform", 0, iniPath.c_str()) != 0;
         g_settings.OptSpellEffectCulling = GetPrivateProfileIntA("Graphics_Sound", "SpellEffectCulling", 0, iniPath.c_str()) != 0;
         g_settings.OptQuatNormalizeSse2 = GetPrivateProfileIntA("Graphics_Sound", "QuatNormalizeSse2", 0, iniPath.c_str()) != 0;
-        g_settings.OptMatrixMultiplySse2 = GetPrivateProfileIntA("Graphics_Sound", "MatrixMultiplySse2", 0, iniPath.c_str()) != 0;
+        g_settings.OptMatrixMultiplySse2 = GetPrivateProfileIntA("Graphics_Sound", "MatrixMultiplySse2", 1, iniPath.c_str()) != 0;
         g_settings.OptDrawCensus = GetPrivateProfileIntA("Graphics_Sound", "DrawCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaAllocCensus = GetPrivateProfileIntA("UI_Lua", "LuaAllocCensus", 0, iniPath.c_str()) != 0;
+        g_settings.OptAnimCensus = GetPrivateProfileIntA("Graphics_Sound", "AnimCensus", 0, iniPath.c_str()) != 0;
+        g_settings.OptHorizonOcclusionSse2 = GetPrivateProfileIntA("Graphics_Sound", "HorizonOcclusionSse2", 0, iniPath.c_str()) != 0;
+        g_settings.OptNetDiag = GetPrivateProfileIntA("Combat_Net", "NetDiag", 1, iniPath.c_str()) != 0;
         g_settings.OptCrtFreeMsize = GetPrivateProfileIntA("General", "CrtFreeMsize", 1, iniPath.c_str()) != 0;
         g_settings.OptCrtAllocMsize = GetPrivateProfileIntA("General", "CrtAllocMsize", 1, iniPath.c_str()) != 0;
         g_settings.OptCrtMimalloc = GetPrivateProfileIntA("General", "CrtMimalloc", 0, iniPath.c_str()) != 0;

@@ -84,6 +84,10 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_fastpath.h
     src/runtime_vm/lua_internals.cpp
     src/runtime_vm/lua_internals.h
+    src/diagnostics/net_diag.cpp
+    src/diagnostics/net_diag.h
+    src/diagnostics/anim_census.cpp
+    src/diagnostics/anim_census.h
     src/diagnostics/crash_dumper.cpp
     src/hooks_subsystems/render_null_guard.cpp
     src/diagnostics/cvar_watchdog.cpp
@@ -323,6 +327,8 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/tls_object_cache.h
     src/hooks_subsystems/hooks_render.cpp
     src/hooks_subsystems/hooks_render.h
+    src/simd_math/horizon_occlusion_sse2.cpp
+    src/simd_math/horizon_occlusion_sse2.h
     src/simd_math/hooks_simd.cpp
     src/simd_math/hooks_simd.h
     src/hooks_subsystems/hooks_logic.cpp
@@ -485,6 +491,27 @@ target_compile_definitions(wow_optimize PRIVATE
 set_source_files_properties(src/hooks_subsystems/crt_mem_fastpath.cpp PROPERTIES
     COMPILE_FLAGS "/GS-"
 )
+
+# --- Floating point and instruction set, pinned rather than inherited ---
+#
+# Both of these were already what we get, and neither was written down.
+#
+# /fp:precise is the MSVC default, and this project now depends on it. The
+# matrix multiply at 0x004C1F00 accumulates in packed double specifically to
+# match what the client's x87 does at 53-bit, and a startup self-test compares
+# the two over 4096 random pairs and refuses to install on any disagreement.
+# /fp:fast lets the compiler reorder those additions. That would either break
+# the self-test outright or, worse, pass on the machine that built it and
+# differ on someone else's - which is the failure mode that has cost this
+# project the most time.
+#
+# /arch:SSE2 has been the MSVC x86 default since Visual Studio 2012, so this
+# changes nothing today. It is here so that a toolchain whose default moves
+# cannot silently turn the ordinary float maths in ninety files back into x87
+# while the intrinsics keep working and nothing looks wrong.
+if(MSVC)
+    target_compile_options(wow_optimize PRIVATE /fp:precise /arch:SSE2)
+endif()
 
 # --- LTO / PGO (opt-in; see header block) ---
 if(WO_ENABLE_LTO AND MSVC)

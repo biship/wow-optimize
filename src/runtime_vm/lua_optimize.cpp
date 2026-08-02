@@ -918,6 +918,35 @@ static void WriteLuaGlobal_Bool(lua_State* L, const char* name, bool value) {
     Api.lua_setfield(L, LUA_GLOBALSINDEX, name);
 }
 
+// Is our marker still standing in this state's globals?
+//
+// Swap detection compares the lua_State pointer, which only works where the
+// client allocates a new one. Two players on Warmane reported the DLL going
+// "not detected" after switching character and staying that way until a full
+// restart - the pointer had been handed back at the same address, so
+// currentL == Api.L, the swap branch never ran, and the globals the companion
+// addon looks for were never put back into the rebuilt state.
+//
+// The pointer is a proxy for the question. This asks the question: if the
+// marker is gone, the state was rebuilt, whatever the address says.
+static bool MarkerStillPresent(lua_State* L) {
+    if (!L || !Api.lua_getfield || !Api.lua_toboolean ||
+        !Api.lua_gettop || !Api.lua_settop) {
+        return true;   // cannot tell - never report a false rebuild
+    }
+
+    bool present = false;
+    int top = Api.lua_gettop(L);
+    __try {
+        Api.lua_getfield(L, LUA_GLOBALSINDEX, "LUABOOST_DLL_LOADED");
+        present = Api.lua_toboolean(L, -1) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        present = true;   // a fault here is not evidence of a rebuild
+    }
+    Api.lua_settop(L, top);
+    return present;
+}
+
 static void WriteLuaGlobal_Number(lua_State* L, const char* name, double value) {
     if (!Api.lua_pushnumber || !Api.lua_setfield) return;
     Api.lua_pushnumber(L, value);
@@ -1727,6 +1756,58 @@ void OnMainThreadSleep(DWORD mainThreadId, double frameMs) {
     // where the pointer is reused, currentL==Api.L and this path is skipped.
     lua_State* currentL = ReadLuaState();
     if (!currentL) return;
+
+    // A rebuilt state at the same address looks identical to no change at all,
+    // so ask the state itself rather than the pointer. Checked on a timer, not
+    // every frame: it costs a getfield and this runs on the main thread.
+    if (currentL == Api.L) {
+        static DWORD s_nextMarkerCheck = 0;
+        DWORD nowTick = GetTickCount();
+        if ((LONG)(nowTick - s_nextMarkerCheck) >= 0) {
+            s_nextMarkerCheck = nowTick + 2000;
+            // Require the marker to be missing twice in a row on the same state
+            // before believing it.
+            //
+            // A single look is not enough, and a log from Warmane shows why: the
+            // message fired on L=0x381817D8, and a moment later that state was
+            // replaced by 0x40BD8E90. A real reload tears the globals down before
+            // it swaps the pointer, so for a brief window the marker is gone from
+            // a state whose address has not changed yet - which is exactly what
+            // "rebuilt in place" was meant to detect, and is not it. The swapping
+            // and reloading flags do not help here because they are raised when
+            // the pointer changes, which is after this window.
+            //
+            // Two sightings two seconds apart cannot both land inside that
+            // window: a reload swaps the pointer in milliseconds, so the second
+            // look sees a different state and the count resets. Only a state that
+            // is genuinely staying put without our marker survives to act on.
+            static lua_State* s_missingOn   = nullptr;
+            static int        s_missingSeen = 0;
+
+            bool markerGone = !g_isSwapping.load(std::memory_order_acquire) &&
+                              !g_isReloading.load(std::memory_order_acquire) &&
+                              !MarkerStillPresent(currentL);
+
+            if (!markerGone || currentL != s_missingOn) {
+                s_missingOn   = markerGone ? currentL : nullptr;
+                s_missingSeen = markerGone ? 1 : 0;
+            } else {
+                ++s_missingSeen;
+            }
+
+            if (markerGone && s_missingSeen >= 2) {
+                s_missingOn   = nullptr;
+                s_missingSeen = 0;
+                Log("[LuaOpt] LUABOOST_DLL_LOADED is gone from an unchanged lua_State "
+                    "(0x%08X) - the state was rebuilt in place, reinjecting markers",
+                    (unsigned)(uintptr_t)currentL);
+                CrashDumper::Trace("LUA state rebuilt in place - reinjecting markers");
+                g_pendingInjectState = currentL;
+                InterlockedExchange(&g_frameScriptInjected, 0);
+                g_lastLuaSwapTick = nowTick;
+            }
+        }
+    }
 
     if (currentL != Api.L) {
         DWORD nowTick = GetTickCount();

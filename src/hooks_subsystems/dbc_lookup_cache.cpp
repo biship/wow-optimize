@@ -30,7 +30,12 @@ struct DbcRowEntry {
     bool      valid;
 };
 
-static DbcRowEntry g_cache[CACHE_SIZE];
+// Committed by InstallDbcLookupCache rather than living in BSS. The feature is
+// off by default, so 2.7 MB of a 32-bit address space was being reserved at DLL
+// load for every player who never enabled it - and ClearDbcLookupCache walked
+// all 4096 slots with an atomic compare-exchange each, on the main thread, at
+// every lua_State change, clearing a cache that was never filled.
+static DbcRowEntry* g_cache = nullptr;
 static uint64_t   g_hits = 0;
 static int g_featureToken = -1;
 static uint64_t   g_misses = 0;
@@ -126,6 +131,15 @@ static bool __fastcall Hooked_DbcGetRow(void* store, void* /* edx */, int record
 
 bool InstallDbcLookupCache()
 {
+    if (!g_cache) {
+        g_cache = (DbcRowEntry*)VirtualAlloc(nullptr, sizeof(DbcRowEntry) * CACHE_SIZE,
+                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!g_cache) {
+            Log("[DbcLookupCache] Could not commit %zu KB for the row cache - disabled",
+                (sizeof(DbcRowEntry) * CACHE_SIZE) / 1024);
+            return false;
+        }
+    }
     for (int i = 0; i < CACHE_SIZE; i++) {
         g_cache[i].storePtr = 0;
         g_cache[i].recordId = 0;
@@ -182,6 +196,7 @@ void UninstallDbcLookupCache()
 
 extern "C" void ClearDbcLookupCache()
 {
+    if (!g_cache) return;   // never installed - nothing to walk
     for (int i = 0; i < CACHE_SIZE; i++) {
         DbcRowEntry* e = &g_cache[i];
         // Bounded retry: a slot's seq should always return to even quickly (the

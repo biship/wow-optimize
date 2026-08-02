@@ -19,6 +19,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
+* [What's New in v3.18.1](#whats-new-in-v3181)
 * [What's New in v3.18.0](#whats-new-in-v3180)
 * [Send me your log](#send-me-your-log)
 * [Reviews & Acknowledgments](#reviews)
@@ -33,16 +34,103 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
+## What's New in v3.18.1
+
+A fix release. Thanks to **prince**, [txtsd](https://github.com/txtsd),
+**Signalborn Soulweaver** and **Morbent** for the logs.
+
+**Fixed**
+
+- False freeze reports, and per-frame work that stopped running with them — caches were not dropped on a reload or character swap. Introduced in 3.18.0.
+- Random UI reloads. Also introduced in 3.18.0.
+- WeakAuras icons staying wrong after a talent switch. `GetSpellInfo` is no longer cached; it cannot be cached correctly.
+- Loading screens finishing and then sitting for several seconds with Texture Smart Unload Delay on.
+- Five launcher switches that controlled nothing, one of which was meant to stop worker threads from starting. Three more removed — their features were gone in 3.18.0.
+- Hooks are no longer installed over a function something else has already detoured.
+
+**Faster**
+
+- 4x4 matrix multiply, once per bone per frame on every animated model: 2.38x, and now bit-identical to the client's own result.
+- SSE2 terrain horizon rasterisation, 2.46% of main-thread time. New, off by default, on the Experimental tab.
+
+Both verify themselves against the client at startup and refuse to install if the results differ.
+
+**Memory**
+
+148 MB of address space returned on a 32-bit client — 136 MB from the API cache, sized to the function it caches instead of a round number, and 16.6 MB from disabled features that were reserving buffers anyway. The DLL's data section drops from 30.6 MB to 14.0 MB.
+
+**Changed**
+
+- `wow_opt.ini` now lives in the `WTF` folder. An existing file is moved there on first run; nothing is reset.
+- Texture Smart Unload Delay reports how often a held texture is actually reused. One long session measured 0.4%. Check your own log before leaving it on.
+
+---
+
 ## What's New in v3.18.0
 
-Features that were quietly overwriting graphics settings you had chosen are gone,
-and one new feature replaces the lot of them. The rest of this release is the
-diagnostics catching themselves out — four cases of a log reporting something it
-had not actually measured.
+Forty-six modules were removed because they never ran, three optimizations went
+in because the logs said where the time actually goes, and the settings that were
+quietly overwriting your graphics options are gone. The rest of this release is
+the diagnostics catching themselves out — four cases of a log reporting something
+it had not actually measured.
 
-Thanks again to [txtsd](https://github.com/txtsd), whose testing rounds confirmed
-the 3.17.0 text-rendering fix and whose logs are where most of the problems below
-were found.
+Thanks to [txtsd](https://github.com/txtsd), **Signalborn Soulweaver**, **Morbent**,
+and **prince**, who between them put this build through raids and a good deal of
+open world, and reported what broke. Every measured item below came out of a log
+somebody sent in.
+
+**Forty-six modules that did nothing at all**
+
+They appeared in the log at startup and had settings behind them. None installed
+a hook, patched anything, or was called from anywhere. `Init()` was
+`return true;` and the rest of the module was never entered.
+
+Most had no launcher switch at all and read a default of off, so nobody was
+running them — dead weight rather than active mistakes. Two separate minimap
+throttles existed, neither wired to anything. A JIT compiler sat behind a LuaJIT
+setting on a client that has no JIT. Two files shared a name and a namespace
+differing by one letter's case, and only one of them was ever wired up.
+
+Three of them had callers and still did nothing: a throttle whose enable flag was
+initialised to false and never set, a particle skip that asked a frustum nobody
+filled, and a "font alpha fast path" that turned alpha blending off whenever it
+should have left it alone — which would have painted text as solid rectangles had
+anything reached it.
+
+Two looked alive on inspection and were not. `ItemDataPrefetch::PrefetchItem` was
+an empty body under a comment saying the work was unsafe, called twice per item
+lookup into nothing. `CDataStoreBuffering` read a buffer pointer from an offset
+that actually holds a length, so the first call would have dereferenced a number
+as a pointer — which is presumably why nothing ever called it.
+
+`MpqMmapVfs` and `MpqPrefetch` went too. Both look up StormLib through
+`Storm.dll`, and 3.3.5a links Storm into the executable — there is no such file.
+Every tester log says so outright.
+
+What is left is a much shorter list of things that actually run: eleven settings
+are on unless you turn them off, and every one of them now has a switch.
+
+**Three optimizations that came from measurements, not guesses**
+
+- **The client asks the heap how big every block is, then throws the answer
+  away.** Both the `free` wrapper and the allocation wrapper call `_msize` and
+  discard the result — a walk into the heap on every single allocation and every
+  deallocation, from over a hundred call sites. Two
+  independent profiles measured that call at 8.09% and 10.59% of the time the
+  main thread spent executing. Both are gone; nothing else about either call
+  changes. A three-minute session with the fix in place reports 67,776
+  allocations and 28,393 deallocations served without it.
+
+- **`tostring` on numbers is about 50x cheaper.** It was the single largest
+  target in this project's own domain — 10.74% of execution in a CPU-bound
+  session. There was already a "fast path" hooked onto it, and for numbers it
+  called `sprintf("%.14g")`, which is exactly what Lua does, so it took the call
+  and paid full price. Integral values now convert directly: 841 ns to 16 ns for
+  the formatting step, verified byte-identical against `%.14g` across 200,139
+  values before it was allowed anywhere near a build.
+
+  The formatting is one part of a `tostring` call, so the end-to-end gain is
+  smaller than 50x. Your log now says how many conversions took the fast route.
 
 **Your graphics settings are yours again**
 
@@ -119,98 +207,6 @@ persisted in your config after the feature stopped running.
 To try the replacement, turn on **Adaptive Quality Governor** on the Experimental
 tab.
 
-<details>
-<summary><b>Previously — v3.17.0</b></summary>
-
-A bug fix release, driven mostly by issue #46.
-
-Most of what is fixed below started as an issue filed by [txtsd](https://github.com/txtsd),
-who then ran the testing rounds that confirmed each fix and caught the ones that
-were not fixed yet. This release exists because of that. Thank you.
-
-**Fixed**
-
-- Loading screen no longer stays up after the world has finished loading
-- Fatal `ERROR #134 Invalid function pointer` at login on clients that don't load a third-party Lua extension library
-- Multi-second freezes during addon loading and `/reload`
-- Async frustum culling no longer makes objects pop in and out at the wrong distance, or models flicker at the draw distance, above ~125 fps
-- Loading-screen detection no longer requires the `!LuaBoost` addon — it now works on any install, and the initial login load is covered too
-- Screen flicker and darkening with an overlay running (RTSS, Afterburner, Steam) above ~120 fps. The D3D9 render-state cache was cleared on a timer capped near 125 times a second instead of once per frame, so past that frame rate it stopped keeping up and the device held whatever state the overlay left behind
-- Addon list rendering with overlapping text after a `/reload`, and those entries refusing to toggle
-- The end of the session log is no longer lost when the game exits
-
-**Faster**
-
-- The SSE2 `memset` replacement now actually delivers its win. Its own two diagnostic counters were costing more than the work they measured; the function is about 2.3x faster than the client's `rep stosd` instead of 3%.
-
-**Removed**
-
-Three features shipped on the same assumption — that skipping an engine call per frame only skips work — and all three were wrong about what that call does. Each was reported as visual corruption by testers before it was understood:
-
-- **Animation LOD.** The bone-update call it skipped also applies each model's *placement*, so throttled models held stale positions and juddered whenever the camera moved.
-- **Async Frustum Culling.** It precomputed visibility on worker threads against a frustum the frame had not established yet, so objects popped in and out at the wrong distance and models flickered at the draw distance — above about 125 fps, where several frames shared one cache generation.
-- **Nameplate Throttle.** The call it skipped drives shared UI and render state rather than one nameplate's cosmetics, which is how it managed to break Skada as well as make nameplates blink.
-
-And a set of features that never did anything at all. Some had a switch the DLL never read; some hooked an address that was not the start of the function they meant; one printed "Subsystem Active" in every log while never installing its hook:
-
-- Camera Collision Raycast Throttle, Floating Combat Text Coalescer, Addon Message Coalescing, plus internal modules for aura coalescing, mesh skinning (three separate ones) and the SavedVariables serializer.
-
-Every hook address in the DLL has since been verified against the binary, every launcher switch is now read by the code behind it, and a build-time check keeps it that way.
-
-**Restored**
-
-- **Lua C-API inline cache suite** and **adaptive Lua GC governor**, both removed by mistake in an earlier audit (both still opt-in).
-
-**Diagnostics**
-
-This release adds the thing the project never had: a way to tell whether a change helped.
-
-- **Frame-time benchmark.** Every presented frame is measured at `IDirect3DDevice9::Present` and reported as a distribution, not an average — an average hides exactly the stutters players report:
-
-  ```
-  73581 frames over 183.5s, source: D3D9 Present, config CDFBB03D, build 3.17.0
-  avg 2.49 ms (401.0 fps)   p50 2.40   p95 3.50   p99 4.20   p99.9 17.40   max 1975.45
-  janky frames: >33ms 38 (0.05%)  >50ms 25 (0.03%)  >100ms 15 (0.02%)
-  ```
-
-  The report carries a fingerprint of your settings, so two runs can be compared and each proven to have used the configuration it claims.
-
-- **Slow frames explain themselves.** A frame that runs far past the session's own median pulls the recent event trace, so a hitch comes with what happened during it — a device reset, a UI reload, a cache invalidation.
-
-- Crash reports, Lua error dumps and stutter dumps all open with that same event trace, instead of ~70 lines of unused counters.
-- The sampling profiler resolves hot code to individual functions rather than 4 KB pages, for both the client and this DLL.
-- The startup banner reports the exact build a log came from.
-
-**Upgrading**
-
-Settings carry over. Nothing needs to be reset — keys for removed features are simply ignored from now on.
-
-One rename is worth knowing about: `LuaFileCache` gated a module-handle cache rather than anything to do with Lua files, and is now `ModuleHandleCache`. If you had it on, turn the new one on.
-
-If you had **Animation LOD**, **Async Frustum Culling** (previously "Spatial Culling & Parallel Frustum Culler") or **Nameplate Throttle** enabled, those are gone; the artifacts they caused go with them and there is nothing to re-enable.
-
-**Still open:** a crash reported a while after `alt+F4`. If you hit it, please attach `Crashes\wow_crash_*.dmp` and the timestamped `Logs\wow_optimize_<date>_<time>.log`.
-
-</details>
-
-<details>
-<summary><b>Previously — v3.16.3</b></summary>
-
-A reliability pass driven mostly by your bug reports (issues #34–#42):
-
-- **Connection fixes (#39)** — resolved "unable to connect" on Warmane; the old allocator redirect and a background-thread heap compactor were interfering with Winsock.
-- **Buffs & cooldowns show up again (#42)** — the event coalescer was dropping same-frame aura and cooldown updates.
-- **No more crash while loading (#35)** — a database cache could wedge and hang the next loading screen.
-- **No more `table contains non-strings` errors (#37 / #38)** — a bad type check in the `table.concat` fast path (broke LibGroupTalents and others).
-- **Cleaner loading & character-select screens (#36)** — UIFrameBatch no longer interferes outside gameplay.
-- **DXVK rendering** — device-reset caches now invalidate together, a startup vtable race is fixed, DXVK is properly detected, and window resizing is handled.
-- **Better crash reports** — dumps now include a stack walk, so `EIP=0` null-call crashes are traceable.
-- **New opt-in toggles** (launcher → General, default off): Large-Allocation mimalloc *(experimental — confirm you can still connect)*, Object Manager Lookup Cache, Hardware Cursor Fix, Sampling Profiler.
-
-**Known issue (resolved in 3.17.0):** on some DXVK setups, UI text could garble or overlap. The cause was font metrics being looked up with the wrong memory layout for this client's Lua build; confirmed fixed by a tester over a 5.5-hour session with 13 UI reloads.
-
-</details>
-
 Older releases: see the [Releases page](https://github.com/suprepupre/wow-optimize/releases) for the full version history.
 
 ![wow_optimize Launcher Dashboard](images/launcher_screenshot.jpg)
@@ -281,6 +277,20 @@ This project wouldn't exist without the community. Every crash report, every bis
 
 Special thanks to:
 Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude, Houmbro
+
+### Code contributions
+
+- **[athei](https://github.com/athei)** (Alexander Theissen) — the macOS cross-compile
+  toolchain (`clang-cl` + `lld-link` + `xwin`, [#20](https://github.com/suprepupre/wow-optimize/pull/20)),
+  reliable `!LuaBoost` detection across `lua_State` swaps and fast logins
+  ([#19](https://github.com/suprepupre/wow-optimize/pull/19)), and the filter that stops
+  `ClientExtensions.dll`'s anti-tamper probe from being reported as a crash
+  ([#21](https://github.com/suprepupre/wow-optimize/pull/21)).
+- **[anzz1](https://github.com/anzz1)** — VS2019 build fix
+  ([#2](https://github.com/suprepupre/wow-optimize/pull/2)) and closing dangling thread
+  handles ([#7](https://github.com/suprepupre/wow-optimize/pull/7)).
+- **[POKOch](https://github.com/POKOch)** — selective rendering, spell visual blocking
+  and API caching ([#12](https://github.com/suprepupre/wow-optimize/pull/12)).
 
 </details>
 
@@ -726,7 +736,7 @@ Recent events:
     -110351ms  TID=900   D3D9 device Reset (dev=0x0EB1AA90)
 ```
 
-The startup banner reports the exact build the log came from (`v3.18.0 (build abc1234)`), so please don't trim the first lines.
+The startup banner reports the exact build the log came from (`v3.18.1 (build abc1234)`), so please don't trim the first lines.
 
 If the complaint is stuttering rather than a crash, look for `slow frame` lines — each one names how far past your session's own median that frame ran, and what was happening during it:
 

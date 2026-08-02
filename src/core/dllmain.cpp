@@ -28,6 +28,9 @@
 #include "crash_dumper.h"
 #include "memory_pressure_governor.h"
 #include "sampling_profiler.h"
+#include "anim_census.h"
+#include "net_diag.h"
+#include "../simd_math/horizon_occlusion_sse2.h"
 #include "lua_getstr_inline.h"
 #include "lua_rawgeti_inline.h"
 #include "lua_rawget_inline.h"
@@ -88,6 +91,36 @@ DWORD          g_mainThreadId = 0;
 // Forward-declared here because the watchdog (below) is defined before
 // lua_optimize.h is included; definitions match that header.
 namespace LuaOpt { bool IsLoadingMode(); bool IsReloading(); bool IsSwapping(); DWORD GetLastSwapTick(); bool IsInitialized(); }
+
+// A target we declined because its first byte was a jump - somebody had already
+// detoured it. Reported once per address and then counted, because a client that
+// hooks a dozen functions would otherwise fill the log with the same finding.
+static volatile long g_foreignDetours = 0;
+
+extern "C" void WowOpt_LogForeignDetour(void* target, unsigned char firstByte) {
+    long n = InterlockedIncrement(&g_foreignDetours);
+    if (n <= 16) {
+        Log("[Hooks] 0x%08X already carries a %s (0x%02X) - another party hooked "
+            "it first, so this one is left alone",
+            (unsigned)(uintptr_t)target,
+            firstByte == 0xE9 ? "jmp rel32" : "short jmp", firstByte);
+    } else if (n == 17) {
+        Log("[Hooks] Further already-detoured targets will be counted, not listed");
+    }
+}
+
+extern "C" void WowOpt_ReportForeignDetours() {
+    long n = g_foreignDetours;
+    if (n > 0) {
+        Log("[Hooks] %ld hook target%s skipped because something else had already "
+            "detoured them. On a client that instruments itself this is expected; "
+            "installing over it is what breaks the chain.", n, n == 1 ? "" : "s");
+    }
+}
+
+// For the disconnect observer, which wants to say whether the main thread was
+// still ticking when the connection ended.
+extern "C" DWORD WowOpt_LastMainThreadTick() { return g_lastMainThreadTick; }
 
 static void UpdateMainThreadActivity() {
     g_lastMainThreadTick = GetTickCount();
@@ -1465,6 +1498,10 @@ static void RunPeriodicMaintenanceOnMainThread() {
         g_nextStatsDumpTick = nowTick + 300000;
     }
 
+    // Cheap and idempotent: returns immediately once the module is known, and
+    // catches the case where it loads after we did.
+    CrashDumper::RefreshBenignModuleRanges();
+
     if (Config::g_settings.OptMemoryPressure) {
         TexCacheTuning_Tick();
     }
@@ -1504,102 +1541,132 @@ static void RunPeriodicMaintenanceOnMainThread() {
 static LARGE_INTEGER g_lastSleepTime = {};
 static double g_lastFrameMs = 0.0;
 
-static void WINAPI hooked_Sleep(DWORD ms) {
-    if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId) {
-        UpdateMainThreadActivity();
+// Everything this DLL does once per frame on the main thread: the liveness
+// stamp the freeze watchdog reads, the periodic maintenance, cache
+// invalidation when the lua_State changes, and every subsystem's OnFrame.
+//
+// This used to live inside hooked_Sleep, and so it ran only when the client
+// called Sleep. That held until the frame limiter stopped calling Sleep: its
+// wait moved to a waitable timer, and with it the whole heartbeat stopped.
+// The symptoms were a freeze report every ten seconds for a game that was
+// still rendering, caches never dropped across a reload or a character swap,
+// and the swap detection never running - one root cause behind several
+// reports that looked unrelated.
+//
+// It is called from hooked_Sleep and from the frame limiter now, so it does
+// not matter which of them the client's pacing happens to go through. The
+// eight-millisecond gate inside is what keeps two callers from doing the work
+// twice.
+static void MainThreadPump() {
+    UpdateMainThreadActivity();
 
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        double elapsedMs = 0.0;
-        if (g_lastSleepTime.QuadPart > 0 && g_sleepFreq > 0) {
-            elapsedMs = (double)(now.QuadPart - g_lastSleepTime.QuadPart) / g_sleepFreq;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsedMs = 0.0;
+    if (g_lastSleepTime.QuadPart > 0 && g_sleepFreq > 0) {
+        elapsedMs = (double)(now.QuadPart - g_lastSleepTime.QuadPart) / g_sleepFreq;
+    }
+    g_lastSleepTime = now;
+
+    // Gate frame ticks so they run at most once every 8ms
+    static LARGE_INTEGER lastFrameTickTime = {};
+    double msSinceLastTick = 0.0;
+    if (lastFrameTickTime.QuadPart > 0 && g_sleepFreq > 0) {
+        msSinceLastTick = (double)(now.QuadPart - lastFrameTickTime.QuadPart) / g_sleepFreq;
+    }
+
+    double targetPrecision = (double)(Config::g_settings.SleepPrecisionValue > 0 ? Config::g_settings.SleepPrecisionValue : 8);
+    if (lastFrameTickTime.QuadPart == 0 || msSinceLastTick >= targetPrecision) {
+        lastFrameTickTime = now;
+
+        RunPeriodicMaintenanceOnMainThread();
+
+        // Detect lua_State destruction (logout/exit) - clear caches
+        static uintptr_t g_lastLState = 0;
+        uintptr_t currentL = *(uintptr_t*)0x00D3F78C;  // lua_State* global
+        if (currentL != g_lastLState) {
+            ClearAssetPathCache();
+            ApiCache::ClearCache();
+            ClearCombatLogCache();
+            ClearTableCache();
+            ClearLuaPushStringCache();
+            ClearDbcLookupCache();
+            g_lastLState = currentL;
         }
-        g_lastSleepTime = now;
 
-        // Gate frame ticks so they run at most once every 8ms
-        static LARGE_INTEGER lastFrameTickTime = {};
-        double msSinceLastTick = 0.0;
-        if (lastFrameTickTime.QuadPart > 0 && g_sleepFreq > 0) {
-            msSinceLastTick = (double)(now.QuadPart - lastFrameTickTime.QuadPart) / g_sleepFreq;
-        }
-
-        double targetPrecision = (double)(Config::g_settings.SleepPrecisionValue > 0 ? Config::g_settings.SleepPrecisionValue : 8);
-        if (lastFrameTickTime.QuadPart == 0 || msSinceLastTick >= targetPrecision) {
-            lastFrameTickTime = now;
-
-            RunPeriodicMaintenanceOnMainThread();
-
-            // Detect lua_State destruction (logout/exit) - clear caches
-            static uintptr_t g_lastLState = 0;
-            uintptr_t currentL = *(uintptr_t*)0x00D3F78C;  // lua_State* global
-            if (currentL != g_lastLState) {
-                ClearAssetPathCache();
-                ApiCache::ClearCache();
-                ClearCombatLogCache();
-                ClearTableCache();
-                ClearLuaPushStringCache();
-                ClearDbcLookupCache();
-                g_lastLState = currentL;
-            }
-
-            LuaOpt::OnMainThreadSleep(g_mainThreadId, elapsedMs);
+        LuaOpt::OnMainThreadSleep(g_mainThreadId, elapsedMs);
 #if !TEST_DISABLE_LUA_GETTIME_FAST
-            if (Config::g_settings.OptLuaGetTimeFast) {
-                LuaGetTimeFast_NewFrame();
-            }
+        if (Config::g_settings.OptLuaGetTimeFast) {
+            LuaGetTimeFast_NewFrame();
+        }
 #endif
-            if (Config::g_settings.OptDefragLf) {
-                LoadingDefrag::OnFrame();
-            }
+        if (Config::g_settings.OptDefragLf) {
+            LoadingDefrag::OnFrame();
+        }
 #if !TEST_DISABLE_PREDICTIVE_PREFETCH
-            PredictivePrefetch::OnFrame();
+        PredictivePrefetch::OnFrame();
 #endif
-            FlushFieldUpdates();
-            CombatLogOpt::ProcessUnifiedFrameTicks((int)currentL, g_mainThreadId);
-            WorldStateCoalesce::OnFrame();
+        FlushFieldUpdates();
+        CombatLogOpt::ProcessUnifiedFrameTicks((int)currentL, g_mainThreadId);
+        WorldStateCoalesce::OnFrame();
 #if !TEST_DISABLE_HARDWARE_CURSOR
-            if (Config::g_settings.OptHardwareCursor) {
-                InitHardwareCursor();
-            }
+        if (Config::g_settings.OptHardwareCursor) {
+            InitHardwareCursor();
+        }
 #endif
 #if !TEST_DISABLE_ADDON_DISPATCHER
-            if (Config::g_settings.OptAddonDispatcher) {
-                AddonDispatcher::OnFrame(g_mainThreadId);
-            }
+        if (Config::g_settings.OptAddonDispatcher) {
+            AddonDispatcher::OnFrame(g_mainThreadId);
+        }
 #endif
-            RcuObjMgr::OnFrame();
+        RcuObjMgr::OnFrame();
 #if !TEST_DISABLE_TEXTURE_DECODE_MT
-            AsyncTexLoader::OnFrame();
+        AsyncTexLoader::OnFrame();
 #endif
-            TextureUnloadDelay::OnFrame();
-            SpellEffectCulling::OnFrame();
+        TextureUnloadDelay::OnFrame();
+        AnimCensus::OnFrame();
+        SpellEffectCulling::OnFrame();
 #if !TEST_DISABLE_NAMEPLATE_MT
-            NameplateMT::OnFrame(g_mainThreadId);
+        NameplateMT::OnFrame(g_mainThreadId);
 #endif
 #if !TEST_DISABLE_EVENT_COALESCER
-            EventCoalescer_Flush();
+        EventCoalescer_Flush();
 #endif
 
-            // Enable D3D9 State Manager frame update
-            OnFrameD3D9StateManager(g_mainThreadId);
-            OnFrameRenderHooks(g_mainThreadId);
-            OnFrameLogicHooks(g_mainThreadId);
-            OnFrameAsyncHooks(g_mainThreadId);
+        // Enable D3D9 State Manager frame update
+        OnFrameD3D9StateManager(g_mainThreadId);
+        OnFrameRenderHooks(g_mainThreadId);
+        OnFrameLogicHooks(g_mainThreadId);
+        OnFrameAsyncHooks(g_mainThreadId);
 #if !TEST_DISABLE_LUA_GC_GOVERNOR
-            LuaGCGovernor::OnFrame(elapsedMs);
+        LuaGCGovernor::OnFrame(elapsedMs);
 #endif
 #if !TEST_DISABLE_ADAPTIVE_FARCLIP
-        #endif
+    #endif
 #if !TEST_DISABLE_NET_ADDON_COALESCER
 #endif
 #if !TEST_DISABLE_MIP_BIAS_GOVERNOR
-            MipBiasGovernor::UpdateMipBias(elapsedMs);
+        MipBiasGovernor::UpdateMipBias(elapsedMs);
 #endif
-            if (Config::g_settings.OptMouseClipRelease) MouseClipRelease::OnFrame();
+        if (Config::g_settings.OptMouseClipRelease) MouseClipRelease::OnFrame();
 #if !TEST_DISABLE_PERF_DIAGNOSTICS
-            PerfDiagnostics::OnFrame(elapsedMs);
+        PerfDiagnostics::OnFrame(elapsedMs);
 #endif
-        }
+    }
+}
+
+// For the frame limiter, which waits without calling Sleep. Checks the thread
+// itself so a stray call from anywhere else cannot run main-thread-only work.
+extern "C" void WowOpt_MainThreadPump() {
+    if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId) {
+        MainThreadPump();
+    }
+}
+
+
+static void WINAPI hooked_Sleep(DWORD ms) {
+    if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId) {
+        MainThreadPump();
 
         if (ms == 0) {
             orig_Sleep(0);
@@ -4581,7 +4648,12 @@ static void DumpPeriodicStats() {
     LuaFastPath::LogStats();
     ObjVisCache::LogStats();
     FontGlyphCache::LogStats();
+    WowOpt_ReportForeignDetours();
     ApiCache::LogStats();
+    TextureUnloadDelay::LogStats();
+    NetDiag::LogStats();
+    AnimCensus::LogStats();
+    HorizonOcclusion::LogStats();
     D3D9StateCache::LogStats();
     D3D9StateCache::ReportDrawCensus();
     AsyncSoundLoader::LogStats();
@@ -6892,7 +6964,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     // FrameScript hash dispatch - 18 handlers, O(1) vs O(n)
 #if !TEST_DISABLE_FRAME_SCRIPT_DISPATCH
-    bool fsDispatchOk = InstallFrameScriptDispatch();
+    bool fsDispatchOk = Config::g_settings.OptFrameScriptDispatch && InstallFrameScriptDispatch();
 #else
     bool fsDispatchOk = false;
     Log("[FrameScriptDispatch] DISABLED via feature flag");
@@ -7682,7 +7754,11 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("[NameplateMT] DISABLED (test toggle)");
     bool nameplateMTOk = false;
 #else
-    bool nameplateMTOk = NameplateMT::Init();
+    // NameplateMT spawns worker threads, and its launcher switch was read into
+    // the settings struct and then consulted by nothing at all - so it ran on
+    // every install and could not be turned off from the launcher that offered
+    // to turn it off.
+    bool nameplateMTOk = Config::g_settings.OptNameplateMT && NameplateMT::Init();
 #endif
 
     Log("");
@@ -7727,7 +7803,8 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     // Lua bytecode cache (skips script parsing on reload & addon load)
 #if !TEST_DISABLE_LUA_BYTECODE_CACHE
-    bool bytecodeOk = LuaBytecodeCache::Init();
+    // LuaOpcache gates about fifty other installs but had never gated this one.
+    bool bytecodeOk = Config::g_settings.OptLuaOpcache && LuaBytecodeCache::Init();
 #else
     bool bytecodeOk = false;
 #endif
@@ -7746,7 +7823,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("--- SavedVariables Async Writer ---");
 #if !TEST_DISABLE_SAVED_VARS_ASYNC
-    bool savedVarsAsyncOk = InstallSavedVarsAsync();
+    bool savedVarsAsyncOk = Config::g_settings.OptSavedVarsAsync && InstallSavedVarsAsync();
 #else
     bool savedVarsAsyncOk = false;
     Log("[SavedVarsAsync] DISABLED via feature flag");
@@ -7910,7 +7987,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Lock-Free Object GUID Lookup Cache ---");
-    bool guidCacheOk = GuidLookupCache::Init();
+    bool guidCacheOk = Config::g_settings.OptGuidLookupCache && GuidLookupCache::Init();
 
     Log("");
     Log("--- SSE2 Math Fast Paths ---");
@@ -7971,6 +8048,9 @@ static DWORD WINAPI MainThread(LPVOID param) {
     if (Config::g_settings.OptTerrainHeightCache) TerrainHeightCache::Init();
 
     if (Config::g_settings.OptTextureUnloadDelay) TextureUnloadDelay::Init();
+    NetDiag::Init();
+    AnimCensus::Init();
+    HorizonOcclusion::Init();
     QualityGovernor::Init();
     if (Config::g_settings.OptSpellEffectCulling) SpellEffectCulling::Init();
 

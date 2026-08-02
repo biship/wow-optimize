@@ -3686,6 +3686,19 @@ bool InitPhase2(lua_State* L) {
             } else {
                 // MinHook inline hook path (native Windows, or Wine/Rosetta with cache disabled)
                 MH_STATUS s = MH_CreateHook((void*)e.address, e.hookFn, (void**)e.origFn);
+                if (s == MH_ERROR_ALREADY_CREATED) {
+                    // Phase 2 re-runs whenever the lua_State changes, and the
+                    // addresses it rediscovers are the ones it already hooked
+                    // last time. MinHook saying so is the expected answer, not a
+                    // failure, and it was being logged as one: a seventy-five
+                    // second session produced 108 lines reading
+                    // "MH_CreateHook failed", which is enough to convince a
+                    // reader - it convinced me for a few minutes - that a third
+                    // of the DLL's hooks never install. They install once and
+                    // stay installed. Count it as still hooked and move on.
+                    e.hooked = true;
+                    continue;
+                }
                 if (s != MH_OK) {
                     Log("[FastPath]   %-8s.%-8s  MH_CreateHook failed (%d)",
                         e.table ? e.table : "_G", e.name ? e.name : "ipairsaux", (int)s);

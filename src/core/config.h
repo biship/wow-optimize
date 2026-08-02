@@ -48,7 +48,6 @@ namespace Config {
         bool OptTimingCvarPin = true;
         bool OptFrameLimiter = false;
         bool OptObjVisCache = true;
-        bool OptDbcPreload = false;
         bool OptOomGovernor = false;
         bool OptHardwareCursor = false;
         bool OptSamplingProfiler = false;
@@ -66,7 +65,6 @@ namespace Config {
         bool OptLuaNumConvFast = false;
         bool OptLuaOpcache = false;
         bool OptLuaGcCoalesce = false;
-        bool OptLuaJIT = false;
         bool OptLuaGetTimeFast = false;
         bool OptSimdMatrixTransform = false;
         bool OptAsyncTexLoader = false;
@@ -79,7 +77,6 @@ namespace Config {
         bool OptCombatLogParser = false;
         bool OptCombatLogIncremental = false;
         bool OptEventCoalescer = false;
-        bool OptSavedVarsSerializer = false;
         bool OptSavedVarsAsync = false;
         bool OptSavedVarsPretoken = false;
         bool OptUnitAuraFast = false;
@@ -92,6 +89,10 @@ namespace Config {
         // still had the hook installed. This is the cache behind the WeakAuras
         // icon that stays wrong after a talent switch.
         bool OptApiCache = true;
+        // Lock-free GUID -> object lookup cache. On by default because it has
+        // always been installed unconditionally - it had no setting at all - and
+        // this only gives that behaviour a switch.
+        bool OptGuidLookupCache = true;
         bool OptPacketOffload = false;
         bool OptNameplateMT = false;
 
@@ -134,7 +135,11 @@ namespace Config {
         bool OptQuatNormalizeSse2 = false;
         // SSE2 4x4 matrix multiply. Off by default for the same reason: verified
         // against the client's version numerically, never run in a game.
-        bool OptMatrixMultiplySse2 = false;
+        // On by default since the accumulation moved to packed double: the
+        // results are bit-identical to the client's own routine, and a startup
+        // self-test compares the two over 4096 random pairs and refuses to
+        // install on any disagreement.
+        bool OptMatrixMultiplySse2 = true;
         // Counts draw calls per frame. A diagnostic, not an optimisation: it
         // wraps the hottest call in the renderer, so it is meant to answer the
         // question in one session and be switched off again.
@@ -143,6 +148,21 @@ namespace Config {
         // like the draw census - it decides whether a dedicated Lua arena is
         // worth building.
         bool OptLuaAllocCensus = false;
+        // Counts what the M2 animation update does per frame. A measurement in
+        // the same spirit as the draw and allocation censuses: it decides
+        // whether animation level-of-detail is worth building, and is meant to
+        // answer that in one session and be switched off again.
+        bool OptAnimCensus = false;
+        // SSE2 rasterisation for the terrain horizon builder at 0x0078F6A0,
+        // 2.46% of main-thread execution in a tester's profile. Off by default
+        // until a log shows the startup verification passing: it replaces a
+        // culling routine, and a wrong answer is terrain that fails to draw.
+        bool OptHorizonOcclusionSse2 = false;
+        // Passive watcher on the receive path. On by default: disconnects are
+        // the oldest unexplained complaint here, they happen once a session at
+        // most, and a diagnostic that is off when the thing it watches for
+        // happens is worth nothing. Costs four counters per receive.
+        bool OptNetDiag = true;
         bool OptCrtFreeMsize = true;
         bool OptCrtAllocMsize = true;
         bool OptCrtMimalloc = false;

@@ -24,23 +24,45 @@ extern "C" void Log(const char* fmt, ...);
 // ================================================================
 // SIMD Utility: 4x4 Matrix Multiply (SSE2)
 // ================================================================
+// The client's sub_4C1F00 is 199 x87 instructions doing 64 multiplies and 48
+// adds one at a time, and the Windows CRT sets the x87 control word to 53-bit,
+// so it accumulates in double and stores float.
+//
+// This was packed single until the self-test below was widened from one tidy
+// matrix pair to a few thousand random ones. Single precision is far quicker -
+// 3.81 ns against the client's 24.81, nearly seven times - but on mixed
+// magnitudes it drifts from the client by 1.118e-04 relative, eleven times the
+// tolerance the hook itself declares. Bone matrices carry rotations near unity
+// beside translations in the hundreds, which is exactly the spread that pulls
+// single-precision accumulation apart, and a divergence of that order in a
+// transform is what produced the first-person camera snapping once already.
+//
+// Packed double keeps the client's own accumulation width and still does two
+// lanes per instruction: 10.43 ns, 2.38x, and bit-identical - worst relative
+// deviation 0.000e+00 across the whole set. A smaller number than single
+// precision offers, and the only one that can be enabled without asking players
+// to watch for artifacts.
 void SSE2_MatrixMultiply(const float* __restrict a,
                          const float* __restrict b,
                          float* __restrict result) {
-    __m128 b0 = _mm_loadu_ps(b);       // b[0..3]
-    __m128 b1 = _mm_loadu_ps(b + 4);   // b[4..7]
-    __m128 b2 = _mm_loadu_ps(b + 8);   // b[8..11]
-    __m128 b3 = _mm_loadu_ps(b + 12);  // b[12..15]
+    // Each row of b, widened to two double lanes: columns 0-1 and columns 2-3.
+    __m128d brow[4][2];
+    for (int k = 0; k < 4; k++) {
+        __m128 row = _mm_loadu_ps(b + k * 4);
+        brow[k][0] = _mm_cvtps_pd(row);
+        brow[k][1] = _mm_cvtps_pd(_mm_movehl_ps(row, row));
+    }
 
     for (int row = 0; row < 4; row++) {
-        __m128 a_row = _mm_loadu_ps(a + row * 4); // a[row*4 .. row*4+3]
-
-        __m128 r = _mm_mul_ps(_mm_shuffle_ps(a_row, a_row, _MM_SHUFFLE(0,0,0,0)), b0);
-        r = _mm_add_ps(r, _mm_mul_ps(_mm_shuffle_ps(a_row, a_row, _MM_SHUFFLE(1,1,1,1)), b1));
-        r = _mm_add_ps(r, _mm_mul_ps(_mm_shuffle_ps(a_row, a_row, _MM_SHUFFLE(2,2,2,2)), b2));
-        r = _mm_add_ps(r, _mm_mul_ps(_mm_shuffle_ps(a_row, a_row, _MM_SHUFFLE(3,3,3,3)), b3));
-
-        _mm_storeu_ps(result + row * 4, r);
+        __m128d acc0 = _mm_setzero_pd();
+        __m128d acc1 = _mm_setzero_pd();
+        for (int k = 0; k < 4; k++) {
+            __m128d av = _mm_set1_pd((double)a[row * 4 + k]);
+            acc0 = _mm_add_pd(acc0, _mm_mul_pd(av, brow[k][0]));
+            acc1 = _mm_add_pd(acc1, _mm_mul_pd(av, brow[k][1]));
+        }
+        _mm_storeu_ps(result + row * 4,
+                      _mm_movelh_ps(_mm_cvtpd_ps(acc0), _mm_cvtpd_ps(acc1)));
     }
 }
 
@@ -681,14 +703,60 @@ static inline char SSE2_RayTriangleIntersection(const float* ray, const float* v
     }
 }
 
+// How many real calls a replacement must match the client's on before it is
+// trusted to run alone. Declared here because the ray-triangle checks below use
+// it and they sit above the frustum ones.
+static constexpr long FRUSTUM_VERIFY_CALLS = 4096;
+
 #if !TEST_DISABLE_RAY_TRIANGLE_SSE2
 typedef char (__cdecl *RayTriangle32_t)(const float* ray, const float* vertices, const uint32_t* indices, float* outT, float* outUV, float margin);
 static RayTriangle32_t orig_RayTriangle32 = nullptr;
 
 
+// Shared state for the ray-triangle shadow check. Both width variants feed one
+// verdict: they are the same algorithm over different index types, so a fault in
+// the maths shows in either and there is no reason to prove it twice.
+//
+// The pointer guards inside the template are not this. They catch an unmapped
+// page and hand the call back; they say nothing about whether the answer is the
+// one the client would have given. A wrong answer here is a mouse click that
+// does not land on the model under the cursor - silent, intermittent, and
+// impossible to attribute from a bug report.
+static volatile long g_rayChecked   = 0;
+static bool          g_rayTrusted   = false;
+static bool          g_rayAbandoned = false;
+
 static char __cdecl Hooked_RayTriangle32(const float* ray, const float* vertices, const uint32_t* indices, float* outT, float* outUV, float margin) {
     InterlockedIncrement(&g_rayTriangleCalls);
+
+    if (g_rayAbandoned && orig_RayTriangle32) {
+        return orig_RayTriangle32(ray, vertices, indices, outT, outUV, margin);
+    }
+
     char res = SSE2_RayTriangleIntersection<uint32_t>(ray, vertices, indices, outT, outUV, margin, orig_RayTriangle32);
+
+    if (!g_rayTrusted && orig_RayTriangle32) {
+        // The original writes through outT and outUV, so it gets its own copies
+        // and the caller keeps ours unless the two disagree.
+        float t = 0.0f, uv[2] = { 0.0f, 0.0f };
+        char theirs = orig_RayTriangle32(ray, vertices, indices, &t, uv, margin);
+        long n = InterlockedIncrement(&g_rayChecked);
+        if (theirs != res) {
+            g_rayAbandoned = true;
+            Log("[SimdHooks] Ray-triangle disagreed with the client on call %ld "
+                "(client %d, ours %d) - handing every call back to the original",
+                n, (int)theirs, (int)res);
+            if (outT) *outT = t;
+            if (outUV) { outUV[0] = uv[0]; outUV[1] = uv[1]; }
+            return theirs;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_rayTrusted = true;
+            Log("[SimdHooks] Ray-triangle agreed with the client on %ld consecutive "
+                "real calls - running ours alone from here", n);
+        }
+    }
+
     if (res) {
         InterlockedIncrement(&g_rayTriangleIntersects);
     }
@@ -701,7 +769,33 @@ static RayTriangle16_t orig_RayTriangle16 = nullptr;
 
 static char __cdecl Hooked_RayTriangle16(const float* ray, const float* vertices, const uint16_t* indices, float* outT, float* outUV, float margin) {
     InterlockedIncrement(&g_rayTriangleCalls);
+
+    if (g_rayAbandoned && orig_RayTriangle16) {
+        return orig_RayTriangle16(ray, vertices, indices, outT, outUV, margin);
+    }
+
     char res = SSE2_RayTriangleIntersection<uint16_t>(ray, vertices, indices, outT, outUV, margin, orig_RayTriangle16);
+
+    if (!g_rayTrusted && orig_RayTriangle16) {
+        float t = 0.0f, uv[2] = { 0.0f, 0.0f };
+        char theirs = orig_RayTriangle16(ray, vertices, indices, &t, uv, margin);
+        long n = InterlockedIncrement(&g_rayChecked);
+        if (theirs != res) {
+            g_rayAbandoned = true;
+            Log("[SimdHooks] Ray-triangle (16-bit indices) disagreed with the client "
+                "on call %ld (client %d, ours %d) - handing every call back to the "
+                "original", n, (int)theirs, (int)res);
+            if (outT) *outT = t;
+            if (outUV) { outUV[0] = uv[0]; outUV[1] = uv[1]; }
+            return theirs;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_rayTrusted = true;
+            Log("[SimdHooks] Ray-triangle agreed with the client on %ld consecutive "
+                "real calls - running ours alone from here", n);
+        }
+    }
+
     if (res) {
         InterlockedIncrement(&g_rayTriangleIntersects);
     }
@@ -749,9 +843,55 @@ typedef int (__fastcall *IsAABBVisible_t)(void* ecx, void* edx, const float* bou
 static IsAABBVisible_t orig_IsAABBVisible = nullptr;
 
 
+// Verified against the client's own routine on the client's own data, for the
+// first few thousand calls, and abandoned the moment the two disagree.
+//
+// This hook replaces the frustum test outright - it never calls the original -
+// and until now nothing checked that the replacement answers the same. That is
+// the arrangement that let the matrix multiply run for months a hundred times
+// outside its own declared tolerance. Here a wrong answer is not a rounding
+// difference: sub_9839E0 decides whether an object is drawn, so disagreeing
+// means scenery popping in and out, and the caller at sub_7BCC00 - about 3.45%
+// of main-thread execution, two calls per object per frame - is the world
+// traversal, so it would be everywhere at once.
+//
+// Synthetic input was the wrong way to test it. The plane set arrives as a
+// this-pointer whose layout is inferred, and building a wrong one produces a
+// failure that says nothing about the code. Real frustums and real bounding
+// boxes arrive by the thousand a frame at no cost but running both for a while.
+static volatile long g_frustumChecked   = 0;
+static volatile long g_frustumMismatch  = 0;
+static bool          g_frustumTrusted   = false;   // stop double-running once proven
+static bool          g_frustumAbandoned = false;   // disagreed: original from here on
+
+
 static int __fastcall Hooked_IsAABBVisible(void* ecx, void* edx, const float* bounds) {
     InterlockedIncrement(&g_frustumCalls);
+
+    if (g_frustumAbandoned) {
+        return orig_IsAABBVisible(ecx, edx, bounds);
+    }
+
     int res = SSE2_IsAABBVisible((const float*)ecx, bounds);
+
+    if (!g_frustumTrusted) {
+        int theirs = orig_IsAABBVisible(ecx, edx, bounds);
+        long n = InterlockedIncrement(&g_frustumChecked);
+        if (theirs != res) {
+            InterlockedIncrement(&g_frustumMismatch);
+            g_frustumAbandoned = true;
+            Log("[SimdHooks] Frustum cull disagreed with the client on call %ld "
+                "(client %d, ours %d) - handing every call back to the original",
+                n, theirs, res);
+            return theirs;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_frustumTrusted = true;
+            Log("[SimdHooks] Frustum cull agreed with the client on %ld consecutive "
+                "real calls - running ours alone from here", n);
+        }
+    }
+
     if (res == 0) {
         InterlockedIncrement(&g_frustumCulled);
     }
@@ -762,9 +902,38 @@ typedef int (__fastcall *IsAABBVisibleType2_t)(void* ecx, void* edx, const float
 static IsAABBVisibleType2_t orig_IsAABBVisibleType2 = nullptr;
 
 
+// Same arrangement and same treatment as IsAABBVisible above: a full
+// replacement that never called the original and was never checked against it.
+static volatile long g_frustum2Checked   = 0;
+static bool          g_frustum2Trusted   = false;
+static bool          g_frustum2Abandoned = false;
+
 static int __fastcall Hooked_IsAABBVisibleType2(void* ecx, void* edx, const float* bounds) {
     InterlockedIncrement(&g_frustumCalls);
+
+    if (g_frustum2Abandoned) {
+        return orig_IsAABBVisibleType2(ecx, edx, bounds);
+    }
+
     int res = SSE2_IsAABBVisible_Type2((const float*)ecx, bounds);
+
+    if (!g_frustum2Trusted) {
+        int theirs = orig_IsAABBVisibleType2(ecx, edx, bounds);
+        long n = InterlockedIncrement(&g_frustum2Checked);
+        if (theirs != res) {
+            g_frustum2Abandoned = true;
+            Log("[SimdHooks] Frustum cull (type 2) disagreed with the client on call "
+                "%ld (client %d, ours %d) - handing every call back to the original",
+                n, theirs, res);
+            return theirs;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_frustum2Trusted = true;
+            Log("[SimdHooks] Frustum cull (type 2) agreed with the client on %ld "
+                "consecutive real calls - running ours alone from here", n);
+        }
+    }
+
     if (res == 0) {
         InterlockedIncrement(&g_frustumCulled);
     }
@@ -775,9 +944,42 @@ typedef void (__fastcall *IsPointVisible_t)(void* ecx, void* edx, const float* p
 static IsPointVisible_t orig_IsPointVisible = nullptr;
 
 
+// This one writes its verdict through an out-parameter rather than returning it,
+// so the check compares what each wrote into the caller's byte.
+static volatile long g_pointChecked   = 0;
+static bool          g_pointTrusted   = false;
+static bool          g_pointAbandoned = false;
+
 static void __fastcall Hooked_IsPointVisible(void* ecx, void* edx, const float* point, uint8_t* outMask) {
     InterlockedIncrement(&g_frustumCalls);
+
+    if (g_pointAbandoned) {
+        orig_IsPointVisible(ecx, edx, point, outMask);
+        return;
+    }
+
     SSE2_IsPointVisible((const float*)ecx, point, outMask);
+
+    if (!g_pointTrusted && outMask) {
+        uint8_t ours = *outMask;
+        uint8_t theirs = 0;
+        orig_IsPointVisible(ecx, edx, point, &theirs);
+        long n = InterlockedIncrement(&g_pointChecked);
+        if (theirs != ours) {
+            g_pointAbandoned = true;
+            Log("[SimdHooks] Point visibility disagreed with the client on call %ld "
+                "(client 0x%02X, ours 0x%02X) - handing every call back to the "
+                "original", n, theirs, ours);
+            *outMask = theirs;
+            return;
+        }
+        if (n >= FRUSTUM_VERIFY_CALLS) {
+            g_pointTrusted = true;
+            Log("[SimdHooks] Point visibility agreed with the client on %ld "
+                "consecutive real calls - running ours alone from here", n);
+        }
+    }
+
     if (outMask && *outMask != 0) {
         InterlockedIncrement(&g_frustumCulled);
     }
@@ -936,9 +1138,33 @@ static bool SelfTestQuatNormalize() {
         { 0.0f, 0.0f, 0.0f, 0.0f },
     };
 
-    for (int i = 0; i < 5; i++) {
+    // The five above are kept as the awkward-shape cases; the rest are random,
+    // for the same reason the matrix self-test needed widening. Five tidy inputs
+    // catch a broken implementation and nothing finer, and on the matrix
+    // multiply exactly that gap hid a 1.118e-04 divergence from the client
+    // behind a comment claiming sub-ULP. This one is packed single against a
+    // client that works in x87 at 53-bit, which is the same configuration.
+    const int RANDOM_CASES = 4096;
+    unsigned seed = 0x9E3779B9u;
+    double worst = 0.0;
+    int worstCase = -1, worstComp = -1;
+    float worstClient = 0.0f, worstOurs = 0.0f;
+
+    for (int i = 0; i < 5 + RANDOM_CASES; i++) {
         float a[4], b[4];
-        for (int k = 0; k < 4; k++) { a[k] = cases[i][k]; b[k] = cases[i][k]; }
+        if (i < 5) {
+            for (int k = 0; k < 4; k++) { a[k] = cases[i][k]; b[k] = cases[i][k]; }
+        } else {
+            // Rotations sit near unit length; scaled ones and near-zero ones are
+            // where a normalise is most likely to disagree.
+            float scale = (i & 3) == 0 ? 1.0f : ((i & 3) == 1 ? 100.0f
+                                              : ((i & 3) == 2 ? 0.001f : 10.0f));
+            for (int k = 0; k < 4; k++) {
+                seed = seed * 1103515245u + 12345u;
+                a[k] = (((float)(int)(seed >> 16) / 32768.0f) - 1.0f) * scale;
+                b[k] = a[k];
+            }
+        }
 
         __try {
             original(a, nullptr);
@@ -952,45 +1178,94 @@ static bool SelfTestQuatNormalize() {
             float d = a[k] - b[k];
             if (d < 0.0f) d = -d;
             // One ULP at unit scale, with room for the x87-versus-SSE difference.
-            if (d > 1e-5f) {
-                Log("[SimdHooks] Quaternion self-test FAILED on case %d component %d "
-                    "(client %.9g, ours %.9g) - not hooking", i, k, a[k], b[k]);
-                return false;
+            float mag = (a[k] < 0.0f ? -a[k] : a[k]);
+            double rel = (mag > 1.0f) ? ((double)d / (double)mag) : (double)d;
+            if (rel > worst) {
+                worst = rel; worstCase = i; worstComp = k;
+                worstClient = a[k]; worstOurs = b[k];
             }
         }
     }
+
+    if (worst > 1e-5) {
+        Log("[SimdHooks] Quaternion self-test FAILED: worst deviation %.3e at case %d "
+            "component %d (client %.9g, ours %.9g) over %d inputs - not hooking",
+            worst, worstCase, worstComp, worstClient, worstOurs, 5 + RANDOM_CASES);
+        return false;
+    }
+
+    Log("[SimdHooks] Quaternion self-test passed %d inputs against the client's own "
+        "routine, worst deviation %.3e", 5 + RANDOM_CASES, worst);
     return true;
 }
 
+// Run our matrix multiply against the client's own, on the client's own code,
+// before deciding whether to replace it.
+//
+// This used to test exactly one pair of matrices built from a small integer
+// pattern - sixteen values apiece, all of them tidy multiples of a quarter.
+// That is enough to catch a transposed implementation and nothing subtler. The
+// reason this feature ships disabled is that it had been "verified numerically,
+// never run in a game", and a single tidy sample is a thin basis for the first
+// half of that claim, never mind the second.
+//
+// It now runs a few thousand pseudo-random pairs across a wide range of
+// magnitudes, and reports the worst deviation it saw rather than only whether a
+// threshold was crossed. A number in the log is worth more than a pass: it says
+// how much room is left before the tolerance matters.
 static bool SelfTestMatrixMultiply() {
     typedef float* (__cdecl *mat_fn)(float*, float*, float*);
     mat_fn original = (mat_fn)ADDR_WOW_MATRIX_MULTIPLY;
 
+    const int CASES = 4096;
+    unsigned seed = 0x9E3779B9u;
+    double worstRel = 0.0;
+    int    worstCase = -1, worstElem = -1;
+    float  worstClient = 0.0f, worstOurs = 0.0f;
+
     float lhs[16], rhs[16], a[16], b[16];
-    for (int i = 0; i < 16; i++) {
-        lhs[i] = (float)((i * 7 % 13) - 6) * 0.5f;
-        rhs[i] = (float)((i * 5 % 11) - 5) * 0.25f;
-    }
 
-    __try {
-        original(a, lhs, rhs);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[SimdHooks] Matrix self-test: the original faulted - not hooking");
-        return false;
-    }
-    SSE2_MatrixMultiply(lhs, rhs, b);
+    for (int c = 0; c < CASES; c++) {
+        // Mixed magnitudes: bone matrices carry rotations near unity alongside
+        // translations that run to hundreds of yards, and the error behaviour of
+        // a dot product depends on that spread.
+        float scale = (c & 3) == 0 ? 1.0f : ((c & 3) == 1 ? 100.0f : ((c & 3) == 2 ? 0.01f : 1000.0f));
+        for (int i = 0; i < 16; i++) {
+            seed = seed * 1103515245u + 12345u;
+            lhs[i] = (((float)(int)(seed >> 16) / 32768.0f) - 1.0f) * scale;
+            seed = seed * 1103515245u + 12345u;
+            rhs[i] = (((float)(int)(seed >> 16) / 32768.0f) - 1.0f) * scale;
+        }
 
-    for (int i = 0; i < 16; i++) {
-        float d = a[i] - b[i];
-        if (d < 0.0f) d = -d;
-        float scale = (a[i] < 0.0f ? -a[i] : a[i]);
-        if (scale < 1.0f) scale = 1.0f;
-        if (d > scale * 1e-5f) {
-            Log("[SimdHooks] Matrix self-test FAILED at element %d "
-                "(client %.9g, ours %.9g) - not hooking", i, a[i], b[i]);
+        __try {
+            original(a, lhs, rhs);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[SimdHooks] Matrix self-test: the original faulted - not hooking");
             return false;
         }
+        SSE2_MatrixMultiply(lhs, rhs, b);
+
+        for (int i = 0; i < 16; i++) {
+            float d = a[i] - b[i];
+            if (d < 0.0f) d = -d;
+            float mag = (a[i] < 0.0f ? -a[i] : a[i]);
+            double rel = (mag > 1.0f) ? ((double)d / (double)mag) : (double)d;
+            if (rel > worstRel) {
+                worstRel = rel; worstCase = c; worstElem = i;
+                worstClient = a[i]; worstOurs = b[i];
+            }
+        }
     }
+
+    if (worstRel > 1e-5) {
+        Log("[SimdHooks] Matrix self-test FAILED: worst deviation %.3e at case %d "
+            "element %d (client %.9g, ours %.9g) over %d pairs - not hooking",
+            worstRel, worstCase, worstElem, worstClient, worstOurs, CASES);
+        return false;
+    }
+
+    Log("[SimdHooks] Matrix self-test passed %d random pairs against the client's "
+        "own routine, worst deviation %.3e", CASES, worstRel);
     return true;
 }
 
@@ -998,17 +1273,22 @@ bool InstallSimdHooks(void) {
     Log("[SimdHooks] SSE2 matrix multiply, quaternion normalize, "
         "frustum cull, BGRA/ARGB, premultiplied alpha ready");
 
+    // 0x004C1F00 belongs to matrix_copy_sse2, which installs earlier and wins.
+    // This module used to try for it as well and log "hook FAILED" when MinHook
+    // answered ALREADY_CREATED - a line that reads like a defect, appeared in
+    // every tester log, and cost real time to chase down before it turned out
+    // to mean "someone else got here first".
+    //
+    // Two modules implementing the same optimisation at the same address is the
+    // actual problem, and the half that never ran is the half that was being
+    // maintained: the packed-double rewrite went in here first, where it could
+    // not reach anybody. The implementation now lives with the hook that
+    // installs, and the self-test below verifies that one.
     if (!Config::g_settings.OptMatrixMultiplySse2) {
         Log("[SimdHooks] Matrix multiply DISABLED via configuration");
-    } else if (!SelfTestMatrixMultiply()) {
-        // The message came from the self-test; nothing to add.
-    } else if (WineSafe_CreateHook((void*)ADDR_WOW_MATRIX_MULTIPLY,
-                                   (void*)Hooked_MatrixMultiply,
-                                   (void**)&orig_MatrixMultiply) == MH_OK) {
-        WO_EnableHook((void*)ADDR_WOW_MATRIX_MULTIPLY);
-        Log("[SimdHooks] Matrix multiply hook ACTIVE at 0x%08X", ADDR_WOW_MATRIX_MULTIPLY);
-    } else {
-        Log("[SimdHooks] Matrix multiply hook FAILED at 0x%08X", ADDR_WOW_MATRIX_MULTIPLY);
+    } else if (SelfTestMatrixMultiply()) {
+        Log("[SimdHooks] Matrix multiply is owned by MatrixSSE2 at 0x%08X - "
+            "verified here, hooked there", ADDR_WOW_MATRIX_MULTIPLY);
     }
 
     if (ADDR_WOW_QUAT_NORMALIZE) {
@@ -1158,6 +1438,18 @@ bool InstallSimdHooks(void) {
             WO_EnableHook((void*)0x005FED20);
             Log("[SimdHooks] sub_5FED20 (Vector-Matrix Rotate) hook ACTIVE");
         }
+    }
+#else
+    // Every other compiled-out section in this file says so. This one did not,
+    // and it is the only one of them with a launcher switch: a player could turn
+    // SimdMatrixTransform on, see it echoed in the settings block at the top of
+    // their log, and get no further mention of it anywhere - because the code it
+    // controls is removed by the preprocessor and there was nothing left to run
+    // or to report. Silent is the worst of the three states a feature can be in.
+    if (Config::g_settings.OptSimdMatrixTransform) {
+        Log("[SimdHooks] SimdMatrixTransform is ON in your settings but the code is "
+            "excluded from this build (TEST_DISABLE_MATRIX_TRANSFORM_SSE2) - the "
+            "switch does nothing here");
     }
 #endif
 
