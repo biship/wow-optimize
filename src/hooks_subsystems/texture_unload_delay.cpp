@@ -180,15 +180,34 @@ namespace TextureUnloadDelay {
 
         g_lastTransitionEndTick = GetTickCount();
 
+    // Release a bounded number here, not the whole queue.
+    //
+    // Flush runs at both ends of a loading transition, on the main thread, and
+    // it used to hand every held texture to the engine in one go. A tester
+    // reported the loading bar completing and then the screen sitting there for
+    // several seconds before the new scene appeared, and their log has a
+    // thousand textures held at the moment the transition ended. That burst is
+    // the stall.
+    //
+    // It only started happening because this feature began working: until the
+    // self-disabling bug was fixed the queue was always empty here and the flush
+    // cost nothing. Whatever is left stays queued and goes out through the
+    // ordinary five-second sweep in OnFrame, a few per frame, which is where
+    // this work belongs.
+    static constexpr size_t FLUSH_BUDGET = 128;
+
         std::vector<void*> toRelease;
         {
             WinLockGuard lock(g_textureLock);
-            toRelease.reserve(g_delayedQueue.size());
-            for (const auto& item : g_delayedQueue) {
-                toRelease.push_back(item.ptr);
+            size_t take = g_delayedQueue.size() < FLUSH_BUDGET
+                        ? g_delayedQueue.size() : FLUSH_BUDGET;
+            toRelease.reserve(take);
+            for (size_t i = 0; i < take; ++i) {
+                toRelease.push_back(g_delayedQueue[i].ptr);
+                g_queued.erase(g_delayedQueue[i].ptr);
             }
-            g_delayedQueue.clear();
-            g_queued.clear();
+            g_delayedQueue.erase(g_delayedQueue.begin(),
+                                 g_delayedQueue.begin() + (ptrdiff_t)take);
         }
 
         for (void* ptr : toRelease) {
