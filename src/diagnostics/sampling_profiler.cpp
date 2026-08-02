@@ -155,6 +155,24 @@ static void BuildKnownFuncTable() {
         { 0x0085CAB0, "luaH_newkey" },
 
         // --- Rendering / culling ---
+        //
+        // Identified from a tester's profile, where each showed as raw hex and had
+        // to be looked up in the disassembler one at a time. Naming them here means
+        // the next profile reads as a list of functions rather than addresses - the
+        // percentages were never the hard part, working out what they belonged to
+        // was.
+        { 0x0082F0F0, "M2_AnimateModel" },        // bone tracks + matrix per bone
+        { 0x00828680, "M2_AnimTrackVec3" },
+        { 0x0082B0A0, "M2_AnimTrackInterp" },
+        { 0x0082AF40, "M2_AnimTrackScalar" },
+        { 0x0082B340, "M2_AnimTrackColor" },
+        { 0x007BCC00, "World_VisibilityTraverse" },  // 64x64 tiles, 16x16 cells
+        { 0x0078F6A0, "Terrain_HorizonOcclusionBuild" },
+        { 0x00861D90, "luaK_patchlistaux" },      // Lua code generator jump patching
+        { 0x00685F50, "Unit_SetDisplaySlot" },    // equipment slots 21..36
+        { 0x00516C60, "Script_GetItemInfo" },
+        { 0x00540A30, "Script_GetSpellInfo" },
+        { 0x0081AC90, "FrameScript_SignalEvent" },
         { 0x00821A20, "M2_DrawBatchBuilder" },
         { 0x00960D20, "Lua_Model_SetLight" },
         { 0x00979110, "CQuaternion::Normalize" },
