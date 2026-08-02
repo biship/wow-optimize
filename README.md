@@ -19,6 +19,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
+* [What's New in v3.18.1](#whats-new-in-v3181)
 * [What's New in v3.18.0](#whats-new-in-v3180)
 * [Send me your log](#send-me-your-log)
 * [Reviews & Acknowledgments](#reviews)
@@ -30,6 +31,137 @@ The current public build is focused on real frametime stability, long-session sm
 * [Building](#building)
 * [Core Architecture](#core-architecture)
 * [Troubleshooting & Diagnostics](#troubleshooting)
+
+---
+
+## What's New in v3.18.1
+
+A fix release, and the largest item in it is a mistake 3.18.0 introduced.
+
+Thanks to **prince**, [txtsd](https://github.com/txtsd), **Signalborn Soulweaver**
+and **Morbent**, whose logs are where every item below was found. Four of these
+were reported as unrelated problems and turned out to be one bug.
+
+**The DLL's heartbeat stopped when the frame limiter stopped calling Sleep**
+
+Everything this DLL does once per frame lived inside its `Sleep` hook: the
+liveness stamp its freeze watchdog reads, the periodic maintenance, dropping the
+API, asset, combat-log and DBC caches when the Lua state changes, the reload and
+character-swap handling, and about twenty subsystems' per-frame work.
+
+3.18.0 moved the frame limiter's wait onto a waitable timer to stop it burning a
+third of a CPU core. On that path `Sleep` is never called, and the heartbeat
+stopped with it.
+
+The logs said so without room for argument: in every freeze report, the time the
+main thread was "silent" equalled the Sleep-hook figure to the millisecond,
+because the watchdog measures exactly one thing and that thing is whether Sleep
+ran. The reported address was different every time, and a thread that is truly
+wedged reports the same one. The client was running throughout.
+
+So those freeze reports were false — but the rest was not. Caches were never
+dropped across a reload or a character swap, and the swap detection never ran.
+One cause under several reports that looked unrelated. Three testers' logs on the
+fixed build show none of it; one on the old build has sixteen.
+
+**Random UI reloads**
+
+Also ours, and also from 3.18.0. A check meant to notice a Lua state rebuilt at
+the same address fired during ordinary reloads instead: the client tears the
+globals down before it swaps the state pointer, and in that window the check saw
+its marker missing from an address that had not changed yet. It then pointed
+marker injection at the state being destroyed, which triggered another reload,
+which reopened the window. It now requires two sightings two seconds apart, which
+a real reload cannot produce.
+
+**The WeakAuras icon that stayed wrong after a talent switch**
+
+`GetSpellInfo` was being cached. Reading the client settles that it cannot be:
+with anything but a single numeric argument it resolves through the player's own
+spellbook, which a talent switch rewrites, and even the numeric form computes
+power cost and cast time against live unit state. The cache is gone rather than
+given a shorter life.
+
+The setting that appeared to control it did not — it gated a different module
+whose entire body logged "DISABLED" and returned false. That module is gone too,
+and the cache that did exist has a switch of its own now.
+
+**Loading screens that finish and then sit there**
+
+The texture unload delay hands back everything it is holding when a loading
+screen ends, on the main thread, in one go — around a thousand textures. That is
+the pause. It is spread over later frames now.
+
+It only started happening because the feature began working: it had been
+disabling itself after the first loading screen since long before 3.18.0, and
+paying for its hook for the rest of every session while doing nothing.
+
+Its counters now report what it achieves. On a long session: 100,664 textures
+held, 380 wanted again — 0.4%. Read your own log before leaving it on.
+
+**148 MB of address space returned**
+
+This is a 32-bit client that has to fit the game, DXVK and every addon into two
+gigabytes.
+
+The API cache reserved two 8192-slot arrays with sixteen 512-byte string buffers
+per entry — 136 MB, committed when the DLL loads, whether or not anything ever
+asked for an item. Sized to the function it caches instead: 3.5 MB.
+
+Five features that ship disabled were each carrying a static buffer anyway, for
+16.6 MB between them. They allocate on use now. Measured on the linker map, the
+DLL's data section falls from 30.6 MB to 14.0 MB.
+
+**Five launcher switches that decided nothing**
+
+Read into the settings, written to the ini, shown in the launcher, and consulted
+by no code at all. The worst spawns worker threads, so the multithreaded
+nameplate path ran on every install and a player who turned it off in the
+launcher got the same threads either way. Also now gated: the Lua bytecode cache,
+frame-script dispatch, and background SavedVariables writes.
+
+Three more are gone entirely — their modules were removed in 3.18.0 and the
+switches stayed behind, offering to enable things that no longer existed.
+
+**Faster, and checked against the client this time**
+
+The 4x4 matrix multiply runs once per bone per frame for every animated model.
+Ours was single precision under a comment calling the difference sub-ULP; the
+client accumulates in double, and over 4096 random matrix pairs the real
+divergence was 1.118e-04 — the same order as a camera artifact this project has
+been through before. It accumulates in double now: 2.38x faster than the client
+and bit-identical, worst deviation 0.000e+00.
+
+New in this release, off by default: SSE2 rasterisation for the terrain horizon
+builder, 2.46% of main-thread time. Four screen columns per instruction instead
+of one.
+
+Both check themselves against the client's own routine at startup, on real data,
+and refuse to install on any disagreement. That is not decoration: the horizon
+version disagreed three times while being written — twice on precision, once
+because the client rounds to nearest where the decompiler prints a C cast that
+truncates — and each time it handed the work back to the client and named the
+column in the log rather than putting wrong terrain on anyone's screen.
+
+**Where your config lives**
+
+`wow_opt.ini` moves to the `WTF` folder, next to `Config.wtf`, because that is
+what people carry across when they replace a client. An existing file is copied
+there on first run and the old one renamed to `wow_opt.ini.moved`; nothing is
+reset and nothing is deleted.
+
+**Also**
+
+- A hook is no longer installed on a function something else has already
+  detoured. Some clients instrument their own code, and installing over that
+  breaks a chain we do not own.
+- 108 log lines reading "MH_CreateHook failed" in a 75-second session were a
+  normal condition being reported as an error.
+- One setting sat in front of code excluded from the build and said nothing
+  either way. On, off, and "switched on but not built" are three different
+  states and the log now keeps them apart.
+- Twelve addresses this release had to identify by hand are named in the
+  profiler, so the next profile reads as functions rather than hex.
 
 ---
 
@@ -795,7 +927,7 @@ Recent events:
     -110351ms  TID=900   D3D9 device Reset (dev=0x0EB1AA90)
 ```
 
-The startup banner reports the exact build the log came from (`v3.18.0 (build abc1234)`), so please don't trim the first lines.
+The startup banner reports the exact build the log came from (`v3.18.1 (build abc1234)`), so please don't trim the first lines.
 
 If the complaint is stuttering rather than a crash, look for `slow frame` lines — each one names how far past your session's own median that frame ran, and what was happening during it:
 
