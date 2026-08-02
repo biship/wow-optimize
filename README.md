@@ -36,132 +36,33 @@ The current public build is focused on real frametime stability, long-session sm
 
 ## What's New in v3.18.1
 
-A fix release, and the largest item in it is a mistake 3.18.0 introduced.
+A fix release. Thanks to **prince**, [txtsd](https://github.com/txtsd),
+**Signalborn Soulweaver** and **Morbent** for the logs.
 
-Thanks to **prince**, [txtsd](https://github.com/txtsd), **Signalborn Soulweaver**
-and **Morbent**, whose logs are where every item below was found. Four of these
-were reported as unrelated problems and turned out to be one bug.
+**Fixed**
 
-**The DLL's heartbeat stopped when the frame limiter stopped calling Sleep**
+- False freeze reports, and per-frame work that stopped running with them — caches were not dropped on a reload or character swap. Introduced in 3.18.0.
+- Random UI reloads. Also introduced in 3.18.0.
+- WeakAuras icons staying wrong after a talent switch. `GetSpellInfo` is no longer cached; it cannot be cached correctly.
+- Loading screens finishing and then sitting for several seconds with Texture Smart Unload Delay on.
+- Five launcher switches that controlled nothing, one of which was meant to stop worker threads from starting. Three more removed — their features were gone in 3.18.0.
+- Hooks are no longer installed over a function something else has already detoured.
 
-Everything this DLL does once per frame lived inside its `Sleep` hook: the
-liveness stamp its freeze watchdog reads, the periodic maintenance, dropping the
-API, asset, combat-log and DBC caches when the Lua state changes, the reload and
-character-swap handling, and about twenty subsystems' per-frame work.
+**Faster**
 
-3.18.0 moved the frame limiter's wait onto a waitable timer to stop it burning a
-third of a CPU core. On that path `Sleep` is never called, and the heartbeat
-stopped with it.
+- 4x4 matrix multiply, once per bone per frame on every animated model: 2.38x, and now bit-identical to the client's own result.
+- SSE2 terrain horizon rasterisation, 2.46% of main-thread time. New, off by default, on the Experimental tab.
 
-The logs said so without room for argument: in every freeze report, the time the
-main thread was "silent" equalled the Sleep-hook figure to the millisecond,
-because the watchdog measures exactly one thing and that thing is whether Sleep
-ran. The reported address was different every time, and a thread that is truly
-wedged reports the same one. The client was running throughout.
+Both verify themselves against the client at startup and refuse to install if the results differ.
 
-So those freeze reports were false — but the rest was not. Caches were never
-dropped across a reload or a character swap, and the swap detection never ran.
-One cause under several reports that looked unrelated. Three testers' logs on the
-fixed build show none of it; one on the old build has sixteen.
+**Memory**
 
-**Random UI reloads**
+148 MB of address space returned on a 32-bit client — 136 MB from the API cache, sized to the function it caches instead of a round number, and 16.6 MB from disabled features that were reserving buffers anyway. The DLL's data section drops from 30.6 MB to 14.0 MB.
 
-Also ours, and also from 3.18.0. A check meant to notice a Lua state rebuilt at
-the same address fired during ordinary reloads instead: the client tears the
-globals down before it swaps the state pointer, and in that window the check saw
-its marker missing from an address that had not changed yet. It then pointed
-marker injection at the state being destroyed, which triggered another reload,
-which reopened the window. It now requires two sightings two seconds apart, which
-a real reload cannot produce.
+**Changed**
 
-**The WeakAuras icon that stayed wrong after a talent switch**
-
-`GetSpellInfo` was being cached. Reading the client settles that it cannot be:
-with anything but a single numeric argument it resolves through the player's own
-spellbook, which a talent switch rewrites, and even the numeric form computes
-power cost and cast time against live unit state. The cache is gone rather than
-given a shorter life.
-
-The setting that appeared to control it did not — it gated a different module
-whose entire body logged "DISABLED" and returned false. That module is gone too,
-and the cache that did exist has a switch of its own now.
-
-**Loading screens that finish and then sit there**
-
-The texture unload delay hands back everything it is holding when a loading
-screen ends, on the main thread, in one go — around a thousand textures. That is
-the pause. It is spread over later frames now.
-
-It only started happening because the feature began working: it had been
-disabling itself after the first loading screen since long before 3.18.0, and
-paying for its hook for the rest of every session while doing nothing.
-
-Its counters now report what it achieves. On a long session: 100,664 textures
-held, 380 wanted again — 0.4%. Read your own log before leaving it on.
-
-**148 MB of address space returned**
-
-This is a 32-bit client that has to fit the game, DXVK and every addon into two
-gigabytes.
-
-The API cache reserved two 8192-slot arrays with sixteen 512-byte string buffers
-per entry — 136 MB, committed when the DLL loads, whether or not anything ever
-asked for an item. Sized to the function it caches instead: 3.5 MB.
-
-Five features that ship disabled were each carrying a static buffer anyway, for
-16.6 MB between them. They allocate on use now. Measured on the linker map, the
-DLL's data section falls from 30.6 MB to 14.0 MB.
-
-**Five launcher switches that decided nothing**
-
-Read into the settings, written to the ini, shown in the launcher, and consulted
-by no code at all. The worst spawns worker threads, so the multithreaded
-nameplate path ran on every install and a player who turned it off in the
-launcher got the same threads either way. Also now gated: the Lua bytecode cache,
-frame-script dispatch, and background SavedVariables writes.
-
-Three more are gone entirely — their modules were removed in 3.18.0 and the
-switches stayed behind, offering to enable things that no longer existed.
-
-**Faster, and checked against the client this time**
-
-The 4x4 matrix multiply runs once per bone per frame for every animated model.
-Ours was single precision under a comment calling the difference sub-ULP; the
-client accumulates in double, and over 4096 random matrix pairs the real
-divergence was 1.118e-04 — the same order as a camera artifact this project has
-been through before. It accumulates in double now: 2.38x faster than the client
-and bit-identical, worst deviation 0.000e+00.
-
-New in this release, off by default: SSE2 rasterisation for the terrain horizon
-builder, 2.46% of main-thread time. Four screen columns per instruction instead
-of one.
-
-Both check themselves against the client's own routine at startup, on real data,
-and refuse to install on any disagreement. That is not decoration: the horizon
-version disagreed three times while being written — twice on precision, once
-because the client rounds to nearest where the decompiler prints a C cast that
-truncates — and each time it handed the work back to the client and named the
-column in the log rather than putting wrong terrain on anyone's screen.
-
-**Where your config lives**
-
-`wow_opt.ini` moves to the `WTF` folder, next to `Config.wtf`, because that is
-what people carry across when they replace a client. An existing file is copied
-there on first run and the old one renamed to `wow_opt.ini.moved`; nothing is
-reset and nothing is deleted.
-
-**Also**
-
-- A hook is no longer installed on a function something else has already
-  detoured. Some clients instrument their own code, and installing over that
-  breaks a chain we do not own.
-- 108 log lines reading "MH_CreateHook failed" in a 75-second session were a
-  normal condition being reported as an error.
-- One setting sat in front of code excluded from the build and said nothing
-  either way. On, off, and "switched on but not built" are three different
-  states and the log now keeps them apart.
-- Twelve addresses this release had to identify by hand are named in the
-  profiler, so the next profile reads as functions rather than hex.
+- `wow_opt.ini` now lives in the `WTF` folder. An existing file is moved there on first run; nothing is reset.
+- Texture Smart Unload Delay reports how often a held texture is actually reused. One long session measured 0.4%. Check your own log before leaving it on.
 
 ---
 
@@ -305,98 +206,6 @@ persisted in your config after the feature stopped running.
 
 To try the replacement, turn on **Adaptive Quality Governor** on the Experimental
 tab.
-
-<details>
-<summary><b>Previously — v3.17.0</b></summary>
-
-A bug fix release, driven mostly by issue #46.
-
-Most of what is fixed below started as an issue filed by [txtsd](https://github.com/txtsd),
-who then ran the testing rounds that confirmed each fix and caught the ones that
-were not fixed yet. This release exists because of that. Thank you.
-
-**Fixed**
-
-- Loading screen no longer stays up after the world has finished loading
-- Fatal `ERROR #134 Invalid function pointer` at login on clients that don't load a third-party Lua extension library
-- Multi-second freezes during addon loading and `/reload`
-- Async frustum culling no longer makes objects pop in and out at the wrong distance, or models flicker at the draw distance, above ~125 fps
-- Loading-screen detection no longer requires the `!LuaBoost` addon — it now works on any install, and the initial login load is covered too
-- Screen flicker and darkening with an overlay running (RTSS, Afterburner, Steam) above ~120 fps. The D3D9 render-state cache was cleared on a timer capped near 125 times a second instead of once per frame, so past that frame rate it stopped keeping up and the device held whatever state the overlay left behind
-- Addon list rendering with overlapping text after a `/reload`, and those entries refusing to toggle
-- The end of the session log is no longer lost when the game exits
-
-**Faster**
-
-- The SSE2 `memset` replacement now actually delivers its win. Its own two diagnostic counters were costing more than the work they measured; the function is about 2.3x faster than the client's `rep stosd` instead of 3%.
-
-**Removed**
-
-Three features shipped on the same assumption — that skipping an engine call per frame only skips work — and all three were wrong about what that call does. Each was reported as visual corruption by testers before it was understood:
-
-- **Animation LOD.** The bone-update call it skipped also applies each model's *placement*, so throttled models held stale positions and juddered whenever the camera moved.
-- **Async Frustum Culling.** It precomputed visibility on worker threads against a frustum the frame had not established yet, so objects popped in and out at the wrong distance and models flickered at the draw distance — above about 125 fps, where several frames shared one cache generation.
-- **Nameplate Throttle.** The call it skipped drives shared UI and render state rather than one nameplate's cosmetics, which is how it managed to break Skada as well as make nameplates blink.
-
-And a set of features that never did anything at all. Some had a switch the DLL never read; some hooked an address that was not the start of the function they meant; one printed "Subsystem Active" in every log while never installing its hook:
-
-- Camera Collision Raycast Throttle, Floating Combat Text Coalescer, Addon Message Coalescing, plus internal modules for aura coalescing, mesh skinning (three separate ones) and the SavedVariables serializer.
-
-Every hook address in the DLL has since been verified against the binary, every launcher switch is now read by the code behind it, and a build-time check keeps it that way.
-
-**Restored**
-
-- **Lua C-API inline cache suite** and **adaptive Lua GC governor**, both removed by mistake in an earlier audit (both still opt-in).
-
-**Diagnostics**
-
-This release adds the thing the project never had: a way to tell whether a change helped.
-
-- **Frame-time benchmark.** Every presented frame is measured at `IDirect3DDevice9::Present` and reported as a distribution, not an average — an average hides exactly the stutters players report:
-
-  ```
-  73581 frames over 183.5s, source: D3D9 Present, config CDFBB03D, build 3.17.0
-  avg 2.49 ms (401.0 fps)   p50 2.40   p95 3.50   p99 4.20   p99.9 17.40   max 1975.45
-  janky frames: >33ms 38 (0.05%)  >50ms 25 (0.03%)  >100ms 15 (0.02%)
-  ```
-
-  The report carries a fingerprint of your settings, so two runs can be compared and each proven to have used the configuration it claims.
-
-- **Slow frames explain themselves.** A frame that runs far past the session's own median pulls the recent event trace, so a hitch comes with what happened during it — a device reset, a UI reload, a cache invalidation.
-
-- Crash reports, Lua error dumps and stutter dumps all open with that same event trace, instead of ~70 lines of unused counters.
-- The sampling profiler resolves hot code to individual functions rather than 4 KB pages, for both the client and this DLL.
-- The startup banner reports the exact build a log came from.
-
-**Upgrading**
-
-Settings carry over. Nothing needs to be reset — keys for removed features are simply ignored from now on.
-
-One rename is worth knowing about: `LuaFileCache` gated a module-handle cache rather than anything to do with Lua files, and is now `ModuleHandleCache`. If you had it on, turn the new one on.
-
-If you had **Animation LOD**, **Async Frustum Culling** (previously "Spatial Culling & Parallel Frustum Culler") or **Nameplate Throttle** enabled, those are gone; the artifacts they caused go with them and there is nothing to re-enable.
-
-**Still open:** a crash reported a while after `alt+F4`. If you hit it, please attach `Crashes\wow_crash_*.dmp` and the timestamped `Logs\wow_optimize_<date>_<time>.log`.
-
-</details>
-
-<details>
-<summary><b>Previously — v3.16.3</b></summary>
-
-A reliability pass driven mostly by your bug reports (issues #34–#42):
-
-- **Connection fixes (#39)** — resolved "unable to connect" on Warmane; the old allocator redirect and a background-thread heap compactor were interfering with Winsock.
-- **Buffs & cooldowns show up again (#42)** — the event coalescer was dropping same-frame aura and cooldown updates.
-- **No more crash while loading (#35)** — a database cache could wedge and hang the next loading screen.
-- **No more `table contains non-strings` errors (#37 / #38)** — a bad type check in the `table.concat` fast path (broke LibGroupTalents and others).
-- **Cleaner loading & character-select screens (#36)** — UIFrameBatch no longer interferes outside gameplay.
-- **DXVK rendering** — device-reset caches now invalidate together, a startup vtable race is fixed, DXVK is properly detected, and window resizing is handled.
-- **Better crash reports** — dumps now include a stack walk, so `EIP=0` null-call crashes are traceable.
-- **New opt-in toggles** (launcher → General, default off): Large-Allocation mimalloc *(experimental — confirm you can still connect)*, Object Manager Lookup Cache, Hardware Cursor Fix, Sampling Profiler.
-
-**Known issue (resolved in 3.17.0):** on some DXVK setups, UI text could garble or overlap. The cause was font metrics being looked up with the wrong memory layout for this client's Lua build; confirmed fixed by a tester over a 5.5-hour session with 13 UI reloads.
-
-</details>
 
 Older releases: see the [Releases page](https://github.com/suprepupre/wow-optimize/releases) for the full version history.
 
