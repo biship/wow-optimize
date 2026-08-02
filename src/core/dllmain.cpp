@@ -29,6 +29,7 @@
 #include "memory_pressure_governor.h"
 #include "sampling_profiler.h"
 #include "anim_census.h"
+#include "../simd_math/horizon_occlusion_sse2.h"
 #include "lua_getstr_inline.h"
 #include "lua_rawgeti_inline.h"
 #include "lua_rawget_inline.h"
@@ -4646,6 +4647,7 @@ static void DumpPeriodicStats() {
     ApiCache::LogStats();
     TextureUnloadDelay::LogStats();
     AnimCensus::LogStats();
+    HorizonOcclusion::LogStats();
     D3D9StateCache::LogStats();
     D3D9StateCache::ReportDrawCensus();
     AsyncSoundLoader::LogStats();
@@ -8041,6 +8043,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     if (Config::g_settings.OptTextureUnloadDelay) TextureUnloadDelay::Init();
     AnimCensus::Init();
+    HorizonOcclusion::Init();
     QualityGovernor::Init();
     if (Config::g_settings.OptSpellEffectCulling) SpellEffectCulling::Init();
 

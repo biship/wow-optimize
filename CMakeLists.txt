@@ -325,6 +325,8 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/tls_object_cache.h
     src/hooks_subsystems/hooks_render.cpp
     src/hooks_subsystems/hooks_render.h
+    src/simd_math/horizon_occlusion_sse2.cpp
+    src/simd_math/horizon_occlusion_sse2.h
     src/simd_math/hooks_simd.cpp
     src/simd_math/hooks_simd.h
     src/hooks_subsystems/hooks_logic.cpp
