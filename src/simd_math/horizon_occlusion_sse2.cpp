@@ -59,7 +59,10 @@ static constexpr uintptr_t ADDR_ColumnFlags  = 0x00CD87B8;   // 384 bytes
 
 static constexpr int   COLUMNS       = 384;
 static constexpr int   COLUMN_ORIGIN = 192;
-static constexpr float SENTINEL      = -1000001.0f;
+// The value written into cleared columns is a global the client loads, not a
+// literal: "fld ds:flt_A3F858". Read it from there rather than copying the
+// number the decompiler printed.
+static constexpr uintptr_t ADDR_Sentinel = 0x00A3F858;
 static constexpr float MIN_DEPTH     = 0.027777778f;   // 1/36, the client's own constant
 
 typedef void (__cdecl *HorizonBuild_fn)(int a1, int a2, uint32_t* indices, int count,
@@ -124,8 +127,18 @@ static inline void ColumnRange(float x0, float x1, int& lo, int& hi) {
     // column lands on.
     float t0 = (float)((double)x0 * 64.0);
     float t1 = (float)((double)x1 * 64.0);
-    int a = (int)(t0 - bias) + COLUMN_ORIGIN;
-    int b = (int)(t1 - bias) + COLUMN_ORIGIN;
+
+    // fistp, not fisttp. The client converts with the x87 rounding mode, which
+    // is round-to-nearest-even by default, and the decompiler renders that as a
+    // C cast - which truncates. Believing the cast is what put a span boundary
+    // one column out: with the half-pixel bias, -148.54 rounds to -149 and
+    // truncates to -148, so the client started a span at column 43 where this
+    // started at 44 and left 43 holding whatever was there before.
+    //
+    // _mm_cvtss_si32 uses the MXCSR rounding mode, round-to-nearest-even by
+    // default, which is the same rule fistp follows.
+    int a = _mm_cvtss_si32(_mm_set_ss(t0 - bias)) + COLUMN_ORIGIN;
+    int b = _mm_cvtss_si32(_mm_set_ss(t1 - bias)) + COLUMN_ORIGIN;
     if (b < a) { hi = a; lo = b; } else { lo = a; hi = b; }
     if (lo < 0) lo = 0;
     if (hi >= COLUMNS) hi = COLUMNS - 1;
@@ -170,7 +183,7 @@ static void BuildHorizon(int xyBase, int zBase, uint32_t* indices, int count,
             int lo, hi;
             ColumnRange(scratch[s * 3], scratch[(s + 1) * 3], lo, hi);
             for (int i = lo; i <= hi; ++i) {
-                if ((flags[i] & 1) == 0) horizon[i] = SENTINEL;
+                if ((flags[i] & 1) == 0) horizon[i] = *(const float*)ADDR_Sentinel;
             }
         }
         return;
