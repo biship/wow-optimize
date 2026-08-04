@@ -712,7 +712,7 @@ namespace WowOptimizeLauncher {
             btnExit.Text = "EXIT LAUNCHER";
             btnExit.Size = new Size(btnWidth, 30);
             btnExit.Location = new Point(15, y);
-            btnExit.Click += delegate { Close(); };
+            btnExit.Click += delegate { SaveSettings(); Close(); };
             leftPanel.Controls.Add(btnExit);
             y += 36;
 
