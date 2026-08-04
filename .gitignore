@@ -31,3 +31,5 @@ src/disabled_features/
 scratch/
 wow_opt.ini
 *.ini
+build.ps1
+wow-optimize.code-workspace
