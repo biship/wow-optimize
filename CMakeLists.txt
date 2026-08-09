@@ -4,6 +4,21 @@ project(wow_optimize LANGUAGES C CXX)
 # Force static CRT globally for all targets and dependencies (mimalloc, minhook, etc.)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Keep optimized builds debuggable.  Release remains /O2, but every native
+# target also emits CodeView information and a full linker PDB so Visual Studio
+# can resolve source lines when debugging the deployed binaries.
+if(MSVC)
+    if(POLICY CMP0141)
+        cmake_policy(SET CMP0141 NEW)
+        set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "ProgramDatabase")
+    else()
+        # CMake < 3.25 has no CMAKE_MSVC_DEBUG_INFORMATION_FORMAT variable.
+        add_compile_options(/Zi)
+    endif()
+
+    add_link_options(/DEBUG:FULL)
+endif()
+
 
 # ============================================================================
 # Whole-program / link-time optimization (LTO) for the DLL.

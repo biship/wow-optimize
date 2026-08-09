@@ -57,7 +57,7 @@ cd ..
 
 echo.
 echo [4/4] Compiling Launcher...
-C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /noconfig /nowarn:1701,1702 /nostdlib+ /errorreport:prompt /warn:4 /define:TRACE /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\mscorlib.dll /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.Core.dll /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.dll /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.Drawing.dll /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.Windows.Forms.dll /resource:src\launcher\wotlk_background.jpg,wotlk_background.jpg /target:winexe /out:build\Release\wow_optimize_launcher.exe src\launcher\Launcher.cs
+C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /noconfig /nowarn:1701,1702 /nostdlib+ /errorreport:prompt /warn:4 /define:TRACE /debug:full /pdb:build\Release\wow_optimize_launcher.pdb /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\mscorlib.dll /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.Core.dll /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.dll /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.Drawing.dll /reference:C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.Windows.Forms.dll /resource:src\launcher\wotlk_background.jpg,wotlk_background.jpg /target:winexe /out:build\Release\wow_optimize_launcher.exe src\launcher\Launcher.cs
 if errorlevel 1 (
     echo ERROR: Launcher compilation failed.
     exit /b 1
@@ -69,6 +69,9 @@ echo.
 echo Output files:
 echo   build\Release\wow_optimize.dll  - optimization DLL
 echo   build\Release\version.dll       - auto-loader proxy
+echo   build\Release\wow_optimize.pdb - native symbols for wow_optimize.dll
+echo   build\Release\version.pdb       - native symbols for version.dll
+echo   build\Release\wow_optimize_launcher.pdb - launcher symbols
 echo   build\Release\wow_optimize_launcher.exe - modular launcher dashboard
 echo   build\Release\wotlk_background.jpg - launcher background asset
 echo.

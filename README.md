@@ -638,6 +638,12 @@ Output:
 - `build\Release\version.dll`
 - `build\Release\wow_loader.exe`
 - `build\Release\wow_optimize_launcher.exe`
+- `build\Release\wow_optimize.pdb`, `version.pdb`, and `wow_loader.pdb`
+- `build\Release\wow_optimize_launcher.pdb`
+
+The optimized native Release build retains full source-level debug information.
+In Visual Studio, attach to `Wow.exe` and add `build\Release` to the symbols
+search path; keep each PDB beside the exact matching binary it was built with.
 
 ### macOS (cross-compile to Win32)
 
