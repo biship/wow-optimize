@@ -924,6 +924,14 @@ static inline MH_STATUS WineSafe_CreateHook(void* target, void* detour, void** o
 // end of init. Outside that window (and for crash guards that call MH_EnableHook
 // directly) enables apply immediately. Defined in dllmain.cpp.
 extern volatile long g_hookBatchMode;
+
+// Set to 1 immediately after the background init thread's single
+// MH_ApplyQueued(), and never cleared. MinHook's enable-queue is process-wide:
+// MH_ApplyQueued() commits everything queued by anyone. Later batch users on
+// other threads (Phase 2 runs on the main game thread) must not start building
+// a queue while init is still filling one, so they gate on this flag and fall
+// back to immediate enables until it is set.
+extern volatile long g_hookBatchDone;
 static inline MH_STATUS WO_EnableHook(void* target) {
 #if defined(TEST_DISABLE_HOOK_BATCHING) && TEST_DISABLE_HOOK_BATCHING
     return MH_EnableHook(target);

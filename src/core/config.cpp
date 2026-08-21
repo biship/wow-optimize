@@ -48,6 +48,7 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "MimallocLarge", &Settings::OptMimallocLarge },
     { "General", "VaArena", &Settings::OptVaArena },
     { "General", "CompatMode", &Settings::OptCompatMode },
+    { "General", "FullDump", &Settings::FullDump },
     { "UI_Lua", "UIFrameBatch", &Settings::OptUIFrameBatch },
     { "UI_Lua", "AddonDispatcher", &Settings::OptAddonDispatcher },
     { "UI_Lua", "UIFrameAccessorFast", &Settings::OptUIFrameAccessorFast },
@@ -268,6 +269,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
             WritePrivateProfileStringA("General", "MimallocLarge", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "VaArena", "0", iniPath.c_str());  // EXPERIMENTAL, opt-in
             WritePrivateProfileStringA("General", "CompatMode", "0", iniPath.c_str());  // set 1 on VMs/HyperV if the game can't connect
+            WritePrivateProfileStringA("General", "FullDump", "0", iniPath.c_str());  // 1 = full-memory crash dump (~1-2 GB), 0 = minidump
 
 
             // UI & Lua
@@ -345,6 +347,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptMimallocLarge       = GetPrivateProfileIntA("General", "MimallocLarge", 0, iniPath.c_str()) != 0;
         g_settings.OptVaArena             = GetPrivateProfileIntA("General", "VaArena", 0, iniPath.c_str()) != 0;
         g_settings.OptCompatMode          = GetPrivateProfileIntA("General", "CompatMode", 0, iniPath.c_str()) != 0;
+        g_settings.FullDump               = GetPrivateProfileIntA("General", "FullDump", 0, iniPath.c_str()) != 0;
         // HARD-DISABLED regardless of ini: in tester logs the arena was active
         // on machines with zero fragmentation (2GB+ largest free block), so it
         // used ~0.2MB of its 64MB and delivered no benefit - while still routing

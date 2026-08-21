@@ -54,6 +54,11 @@ namespace Config {
         bool OptMimallocLarge = false;
         bool OptVaArena = false;   // EXPERIMENTAL opt-in: segregated VirtualAlloc arena (anti-fragmentation)
         bool OptCompatMode = false; // Compatibility: skip aggressive CPU-priority/affinity/working-set tweaks (for VMs/HyperV where they break the connection)
+        // Crash dump size. Off by default: a full-memory dump is the whole
+        // committed address space, 1-2 GB per crash, and the game is frozen
+        // while it writes. Worth turning on when a crash needs the heap chased,
+        // not worth it as a standing cost. No launcher switch - edit the ini.
+        bool FullDump = false;
 
         // UI & Lua
         bool OptUIFrameBatch = false;

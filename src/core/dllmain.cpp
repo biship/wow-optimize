@@ -587,6 +587,7 @@ void ClearCombatLogCache();
 // While this is 1 (set across MainThread's install sequence), module enables
 // routed through WO_EnableHook are queued and applied in one MH_ApplyQueued.
 volatile long g_hookBatchMode = 0;
+volatile long g_hookBatchDone = 0;
 
 // Forward declaration for CRT fast paths (defined in crt_mem_fastpath.cpp)
 extern bool InstallCrtMemFastPaths();
@@ -8189,6 +8190,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
         }
     }
 #endif
+    // The init thread is finished with MinHook's process-wide enable queue
+    // (either applied or failed — in both cases nothing of ours is still
+    // pending). Other threads may now batch their own enables. Set
+    // unconditionally, including under TEST_DISABLE_HOOK_BATCHING, where this
+    // thread never queued anything at all.
+    g_hookBatchDone = 1;
 
     Log("");
     Log("========================================");

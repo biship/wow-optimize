@@ -1149,6 +1149,60 @@ namespace WowOptimizeLauncher {
             SaveSettingsToPath(iniPath);
         }
 
+        // Every "key=value" line in an existing ini whose key has no checkbox,
+        // grouped by the section it was found under. Comments and blank lines are
+        // dropped; a key repeated in the file keeps its last value, which is what
+        // GetPrivateProfileInt would have read anyway.
+        private Dictionary<string, List<string>> ReadUnknownKeys(string path) {
+            Dictionary<string, List<string>> kept = new Dictionary<string, List<string>>();
+            if (!File.Exists(path)) return kept;
+
+            Dictionary<string, bool> known = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (SettingItem item in settingsMap.Values) {
+                known[item.Key] = true;
+            }
+
+            try {
+                string section = "General";   // keys before any header
+                Dictionary<string, string> seen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (string line in File.ReadAllLines(path)) {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length == 0 || trimmed.StartsWith(";") || trimmed.StartsWith("#"))
+                        continue;
+
+                    if (trimmed.StartsWith("[") && trimmed.EndsWith("]")) {
+                        section = trimmed.Substring(1, trimmed.Length - 2).Trim();
+                        continue;
+                    }
+
+                    int eq = trimmed.IndexOf('=');
+                    if (eq <= 0) continue;
+
+                    string key = trimmed.Substring(0, eq).Trim();
+                    if (key.Length == 0 || known.ContainsKey(key)) continue;
+
+                    // A duplicate key would otherwise be written out twice.
+                    string dupeId = section + " " + key;
+                    if (seen.ContainsKey(dupeId)) {
+                        List<string> existing = kept[section];
+                        existing.Remove(seen[dupeId]);
+                    }
+
+                    string entry = key + "=" + trimmed.Substring(eq + 1).Trim();
+                    if (!kept.ContainsKey(section)) kept[section] = new List<string>();
+                    kept[section].Add(entry);
+                    seen[dupeId] = entry;
+                }
+            } catch {
+                // An unreadable existing file is not a reason to refuse the save;
+                // the checkbox settings are still worth writing.
+                return new Dictionary<string, List<string>>();
+            }
+
+            return kept;
+        }
+
         private void SaveSettingsToPath(string path) {
             try {
                 string dir = Path.GetDirectoryName(path);
@@ -1166,6 +1220,20 @@ namespace WowOptimizeLauncher {
                 foreach (SettingItem item in settingsMap.Values) {
                     string val = (item.Ctrl != null && item.Ctrl.Checked) ? "1" : "0";
                     sections[item.Section].Add(item.Key + "=" + val);
+                }
+
+                // Carry over anything the UI does not know about. This file is
+                // truncated and rewritten from the checkbox map, so without this a
+                // save silently deletes every key that has no switch - the
+                // DLL-only ones (FullDump, SleepPrecisionValue, SessionLogsToKeep)
+                // and anything a user added by hand. They come back as their
+                // compiled defaults on the next launch, which looks like a setting
+                // undoing itself for no reason.
+                foreach (KeyValuePair<string, List<string>> kept in ReadUnknownKeys(path)) {
+                    if (!sections.ContainsKey(kept.Key)) {
+                        sections[kept.Key] = new List<string>();
+                    }
+                    sections[kept.Key].AddRange(kept.Value);
                 }
 
                 using (StreamWriter sw = new StreamWriter(path, false, Encoding.UTF8)) {
