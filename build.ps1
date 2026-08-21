@@ -54,14 +54,14 @@ Usage:
   .\build.ps1 [--config <configuration>] [-SkipGitUpdate]
   .\build.ps1 --help
 
-Every build removes generated state and configures a clean Win32 C++20 tree.
-The native build profile is MakeFile_C20.cmake and its output is build_C20.
+Builds reuse the dedicated Win32 C++20 tree in build_C20.
+The native build profile is MakeFile_C20.cmake.
 
 Options:
   --config <configuration>  Build one of the Visual Studio configurations below.
                             Default: Release.
   --help                    Show this help text and exit without changing anything.
-  -SkipGitUpdate            Skip the upstream fetch/merge/push step.
+  -SkipGitUpdate            Skip the upstream pull and origin push step.
   --skip-git-update         Double-dash spelling of -SkipGitUpdate.
 
 Configurations:
@@ -93,8 +93,9 @@ $Config = [string]$normalizedConfig
 Set-Location $PSScriptRoot
 
 $wowClient = 'C:\ProgramData\WOW\WOWClient'
-$build     = Join-Path $PSScriptRoot 'build_C20'
-$output    = Join-Path $build $Config
+Set-Variable -Name BuildDirectory -Value (Join-Path $PSScriptRoot 'build_C20') -Option Constant
+Set-Variable -Name LegacyBuildDirectory -Value (Join-Path $PSScriptRoot 'build') -Option Constant
+$output    = Join-Path $BuildDirectory $Config
 $launcherPdb = Join-Path $output 'wow_optimize_launcher.pdb'
 $vswhere   = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $cmakeProfile = Join-Path $PSScriptRoot 'MakeFile_C20.cmake'
@@ -109,58 +110,17 @@ function Invoke-Checked {
 }
 
 if (!$SkipGitUpdate) {
-    $protectedFiles = @('build.ps1', 'wow-optimize.code-workspace')
-    $protectedFileStashed = $false
+    Invoke-Checked git @('pull', '--no-rebase', '--autostash', '--no-edit', 'upstream', 'main')
 
-    $trackedChanges = @(& git status --porcelain=v1 --untracked-files=no -- . `
-        ':(exclude)build.ps1' ':(exclude)wow-optimize.code-workspace')
+    $unmergedFiles = @(& git diff --name-only --diff-filter=U)
     if ($LASTEXITCODE) {
-        throw "git status failed with exit code $LASTEXITCODE."
+        throw "git diff failed with exit code $LASTEXITCODE."
+    }
+    if ($unmergedFiles.Count -gt 0) {
+        throw "Autostash reapplied with conflicts. Resolve them before pushing: $($unmergedFiles -join ', ')"
     }
 
-    $trackedChanges = @($trackedChanges | Where-Object { $_ })
-    if ($trackedChanges.Count -gt 0) {
-        Write-Host 'Upstream update stopped: tracked files have local changes.' -ForegroundColor Yellow
-        $trackedChanges | ForEach-Object { Write-Host "  $_" }
-        Write-Host 'Commit, stash, or restore those files, then run the build again.'
-        Write-Host 'To build the current checkout without Git updates, use --skip-git-update.'
-        exit 1
-    }
-
-    Invoke-Checked git @('fetch', 'upstream')
-
-    # Keep local customizations to these files out of the merge so they are not overwritten.
-    & git diff --quiet -- @protectedFiles
-    if ($LASTEXITCODE -ne 0) {
-        $stashMessage = "auto-stash protected files $(Get-Date -Format o)"
-        Invoke-Checked git (@('stash', 'push', '--message', $stashMessage, '--') + $protectedFiles)
-        $protectedFileStashed = $true
-    }
-
-    try {
-        & git merge --no-edit --message 'Upstream Merge' upstream/main
-        if ($LASTEXITCODE) {
-            $mergeExitCode = $LASTEXITCODE
-            Write-Host "Upstream merge failed (exit code $mergeExitCode); aborting it." -ForegroundColor Yellow
-
-            & git rev-parse --verify --quiet MERGE_HEAD *> $null
-            if ($LASTEXITCODE -eq 0) {
-                Invoke-Checked git @('merge', '--abort')
-            }
-
-            throw "git merge failed with exit code $mergeExitCode."
-        }
-
-        Invoke-Checked git @('push', 'origin', 'main')
-    }
-    finally {
-        if ($protectedFileStashed) {
-            & git stash pop
-            if ($LASTEXITCODE) {
-                throw 'Failed to restore local protected files from stash. Resolve conflicts, then run git stash list to verify stash state.'
-            }
-        }
-    }
+    Invoke-Checked git @('push', 'origin', 'main')
 }
 
 Get-Command cmake.exe -ErrorAction Stop | Out-Null
@@ -178,19 +138,56 @@ if (!(Test-Path $csc))                  { throw "Roslyn compiler not found: $csc
 if (!(Test-Path "$refs\mscorlib.dll")) { throw '.NET Framework 4.8 targeting pack not found.' }
 if (!(Test-Path $cmakeProfile))         { throw "C++20 CMake profile not found: $cmakeProfile" }
 
-# CMake's --fresh resets only the top-level cache. Remove all generated state so
-# FetchContent dependencies cannot retain another configuration or C++ standard.
-if (Test-Path -LiteralPath $build) {
-    Write-Host "Removing generated CMake build state for a clean C++20 $Config build..."
-    Remove-Item -LiteralPath $build -Recurse -Force
+# FetchContent keeps nested caches with absolute paths. Reuse the dedicated
+# C++20 tree unless a cache proves that the checkout moved.
+$staleCache = Get-ChildItem -LiteralPath $BuildDirectory -Filter CMakeCache.txt -Recurse -ErrorAction SilentlyContinue |
+    Where-Object {
+        $cacheDirectory = Select-String -LiteralPath $_.FullName `
+            -Pattern '^CMAKE_CACHEFILE_DIR:INTERNAL=(.+)$' |
+            Select-Object -First 1 -ExpandProperty Matches |
+            ForEach-Object { $_.Groups[1].Value }
+
+        $expectedDirectory = Split-Path $_.FullName -Parent
+        $cacheDirectory -and
+            ($cacheDirectory.Replace('/', '\') -ine $expectedDirectory.Replace('/', '\'))
+    } |
+    Select-Object -First 1
+
+if ($staleCache) {
+    Write-Host 'Checkout moved; removing stale generated C++20 build state.' -ForegroundColor Yellow
+    if (Test-Path -LiteralPath $LegacyBuildDirectory) {
+        $legacyBuildItem = Get-Item -LiteralPath $LegacyBuildDirectory -Force
+        if ($legacyBuildItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            Remove-Item -LiteralPath $LegacyBuildDirectory -Force
+        }
+    }
+    Remove-Item -LiteralPath $BuildDirectory -Recurse -Force
+}
+
+New-Item -ItemType Directory -Path $BuildDirectory -Force | Out-Null
+
+# One upstream source file includes MinHook through ../../build/_deps. Keep that
+# generated compatibility path without moving C++20 output out of build_C20.
+if (Test-Path -LiteralPath $LegacyBuildDirectory) {
+    $legacyBuildItem = Get-Item -LiteralPath $LegacyBuildDirectory -Force
+    $legacyTarget = @($legacyBuildItem.Target) | Select-Object -First 1
+    $expectedTarget = [System.IO.Path]::GetFullPath($BuildDirectory)
+    $actualTarget = if ($legacyTarget) { [System.IO.Path]::GetFullPath($legacyTarget) } else { '' }
+
+    if (!($legacyBuildItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+        $actualTarget -ine $expectedTarget) {
+        throw "The compatibility path '$LegacyBuildDirectory' exists and does not target '$BuildDirectory'."
+    }
+}
+else {
+    New-Item -ItemType Junction -Path $LegacyBuildDirectory -Target $BuildDirectory | Out-Null
 }
 
 Write-Host "[1/4] Configuring x86 $Config build..."
 Invoke-Checked cmake.exe @(
-    '--fresh'
     '-C', $cmakeProfile
     '-S', $PSScriptRoot
-    '-B', $build
+    '-B', $BuildDirectory
     '-G', 'Visual Studio 18 2026'
     '-A', 'Win32'
     "-DCMAKE_GENERATOR_INSTANCE=$vs"
@@ -200,7 +197,7 @@ Invoke-Checked cmake.exe @(
 
 Write-Host "[2/4] Building $Config..."
 Invoke-Checked cmake.exe @(
-    '--build', $build
+    '--build', $BuildDirectory
     '--config', $Config
     '--'
     '/p:LanguageStandard=stdcpp20'
