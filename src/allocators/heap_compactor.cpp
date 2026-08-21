@@ -40,36 +40,83 @@ static volatile bool g_shutdown = false;
 // surface as "unable to connect" (GitHub issue #39).
 static std::atomic<int> g_pendingWork{0}; // 0=none, 1=proactive mi_collect, 2=full ForceHeapCompaction
 
+// Brake and self-assessment for the low-half trigger. A compaction that does
+// not give address space back is pure stall, and doing it every ten seconds for
+// eight hours would be worse than the problem.
+static DWORD g_lastCompactTick     = 0;
+static DWORD g_compactIntervalMs   = 60000;   // grows when a pass achieves little
+static bool  g_compactionGaveUp    = false;
+static int   g_uselessInARow       = 0;
+static unsigned long long g_reclaimedTotalKb = 0;
+
 // Forward declarations
 extern "C" void Log(const char* fmt, ...);
 extern "C" void mi_collect(bool force);
 #include <mimalloc.h>
 #include "crash_dumper.h"
 
-// Get largest free virtual memory block
-static SIZE_T GetLargestFreeBlock() {
+// Largest free virtual address range, measured twice.
+//
+// This scanned to wherever VirtualQuery stops, which on a large-address-aware
+// client means the whole 3 or 4 GB. The region above 2 GB is barely touched, so
+// the answer is dominated by it and stays in the gigabytes while the low half -
+// where the client's own allocations live, and where anything that cannot hold
+// a pointer with the top bit set must go - is down to a megabyte.
+//
+// A tester session shows both numbers side by side for three and a half hours:
+// this function reporting 2046 MB falling to 1361 MB and never approaching its
+// 16 MB trigger, while the periodic statistics line, which scans only the low
+// half, reported a 1 MB largest block and "fragmented" from the first report
+// onwards. Neither line said which range it had measured, so they read as a
+// contradiction rather than as two different questions.
+//
+// `lowHalfOut` receives the figure for the low 2 GB when it is wanted.
+static SIZE_T GetLargestFreeBlock(SIZE_T* lowHalfOut = nullptr) {
+    static const uintptr_t LOW_HALF_END = 0x80000000u;
+
     MEMORY_BASIC_INFORMATION mbi;
     SIZE_T largestFree = 0;
     SIZE_T currentFree = 0;
+    SIZE_T largestLow  = 0;
+    SIZE_T currentLow  = 0;
     uintptr_t addr = 0;
-    
+
     while (VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) {
+        uintptr_t base = (uintptr_t)mbi.BaseAddress;
+
         if (mbi.State == MEM_FREE) {
             currentFree += mbi.RegionSize;
-        } else {
-            if (currentFree > largestFree) {
-                largestFree = currentFree;
+
+            // Only the part of this region that lies below the boundary counts
+            // towards the low-half figure, and a run that crosses it stops
+            // there rather than carrying the high side back down.
+            if (base < LOW_HALF_END) {
+                SIZE_T lowPart = (base + mbi.RegionSize > LOW_HALF_END)
+                               ? (SIZE_T)(LOW_HALF_END - base)
+                               : mbi.RegionSize;
+                currentLow += lowPart;
+                if (lowPart != mbi.RegionSize) {
+                    if (currentLow > largestLow) largestLow = currentLow;
+                    currentLow = 0;
+                }
             }
+        } else {
+            if (currentFree > largestFree) largestFree = currentFree;
             currentFree = 0;
+            if (base < LOW_HALF_END) {
+                if (currentLow > largestLow) largestLow = currentLow;
+                currentLow = 0;
+            }
         }
-        addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-        if (addr < (uintptr_t)mbi.BaseAddress) break; // Overflow
+
+        addr = base + mbi.RegionSize;
+        if (addr < base) break; // Overflow
     }
-    
-    if (currentFree > largestFree) {
-        largestFree = currentFree;
-    }
-    
+
+    if (currentFree > largestFree) largestFree = currentFree;
+    if (currentLow  > largestLow)  largestLow  = currentLow;
+
+    if (lowHalfOut) *lowHalfOut = largestLow;
     return largestFree;
 }
 
@@ -106,8 +153,47 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         DWORD interval = LuaOpt::IsLoadingMode() ? LOADING_INTERVAL_MS : MONITOR_INTERVAL_MS;
         Sleep(interval);
         
-        SIZE_T largestFree = GetLargestFreeBlock();
+        SIZE_T largestLow = 0;
+        SIZE_T largestFree = GetLargestFreeBlock(&largestLow);
         g_checksPerformed++;
+
+        // The low half is what actually runs out, and it is what the trigger
+        // reads now.
+        //
+        // This used to trigger on the full-range figure and log the discrepancy
+        // instead of acting on it, because the cost of acting was unknown. An
+        // eight-hour session settled it: that line fired 66 times with the low
+        // half at 10-14 MB - under the 16 MB threshold the whole time - while
+        // the full range sat at 1857 MB and no compaction ever ran. The client
+        // spent the session with the resource it actually allocates from
+        // exhausted, and this module watched.
+        //
+        // Acting on it needs a brake, which is the reason it was left alone
+        // before: a client parked below the threshold would otherwise compact on
+        // every tick, and a full mi_collect plus a HeapCompact of every process
+        // heap is exactly the kind of stall this project keeps chasing. So the
+        // request is rate limited, and the module measures whether its own work
+        // achieves anything - see the recovery check in RunPendingWork.
+        if (largestLow < CRITICAL_THRESHOLD) {
+            DWORD nowTick2 = GetTickCount();
+            bool due = (g_lastCompactTick == 0) ||
+                       (nowTick2 - g_lastCompactTick) >= g_compactIntervalMs;
+            if (due && !g_compactionGaveUp) {
+                g_pendingWork.store(2, std::memory_order_release);
+                g_lastCompactTick = nowTick2;
+            }
+            static DWORD lastSplitTick = 0;
+            if (lastSplitTick == 0 || nowTick2 - lastSplitTick > 60000) {
+                Log("[HeapCompactor] %uMB free below 2GB (largest block), %uMB "
+                    "across all user address space. The low half is what the "
+                    "client allocates from, so that is what this acts on.%s",
+                    (unsigned)(largestLow / (1024*1024)),
+                    (unsigned)(largestFree / (1024*1024)),
+                    g_compactionGaveUp ? " Compaction has stopped: it was not "
+                                         "recovering anything." : "");
+                lastSplitTick = nowTick2;
+            }
+        }
         
         // Update statistics
         g_lastLargestBlock = largestFree;
@@ -160,7 +246,9 @@ extern "C" void HeapCompactor_RunPendingWork() {
     if (work == 0) return;
 
     if (work == 2) {
-        SIZE_T before = GetLargestFreeBlock();
+        SIZE_T beforeLow = 0;
+        SIZE_T before = GetLargestFreeBlock(&beforeLow);
+        (void)before;
 
         // mimalloc runs with purge_decommits off, so a purge resets pages but
         // leaves them committed - physical RAM comes back, address space does not.
@@ -181,9 +269,44 @@ extern "C" void HeapCompactor_RunPendingWork() {
 
         ForceHeapCompaction();
         g_compactionsTriggered++;
-        SIZE_T after = GetLargestFreeBlock();
-        Log("[HeapCompactor] After compaction: LargestFreeBlock=%uMB (%+dMB)",
-            (unsigned)(after / (1024*1024)), (int)((after - before) / (1024*1024)));
+
+        // Judge the pass by the half it was run for. The full-range figure is
+        // what made this module blind in the first place, so measuring recovery
+        // with it would repeat the mistake one level down.
+        SIZE_T afterLow = 0;
+        SIZE_T after = GetLargestFreeBlock(&afterLow);
+        long long gainedKb = ((long long)afterLow - (long long)beforeLow) / 1024;
+        if (gainedKb > 0) g_reclaimedTotalKb += (unsigned long long)gainedKb;
+
+        Log("[HeapCompactor] After compaction: %uMB largest below 2GB (%+lldKB), "
+            "%uMB across all address space",
+            (unsigned)(afterLow / (1024*1024)), gainedKb,
+            (unsigned)(after / (1024*1024)));
+
+        // A pass that returns almost nothing is pure stall. Back off, and stop
+        // entirely if it keeps happening: on a client whose low half is
+        // genuinely full rather than merely fragmented there is nothing to
+        // recover, and grinding every heap in the process to find that out again
+        // costs a frame each time.
+        if (gainedKb < 256) {
+            if (++g_uselessInARow >= 3) {
+                if (g_compactIntervalMs < 600000) {
+                    g_compactIntervalMs *= 2;
+                    Log("[HeapCompactor] Three passes in a row recovered almost "
+                        "nothing; backing off to one attempt per %u seconds.",
+                        g_compactIntervalMs / 1000);
+                } else {
+                    g_compactionGaveUp = true;
+                    Log("[HeapCompactor] Compaction is not recovering address "
+                        "space on this client, so it stops. The low half is full "
+                        "rather than fragmented, and grinding every heap to "
+                        "rediscover that costs a frame each time.");
+                }
+                g_uselessInARow = 0;
+            }
+        } else {
+            g_uselessInARow = 0;
+        }
     } else {
         {
             StallProbe probe("compaction mi_collect", 4.0);
@@ -231,6 +354,20 @@ void HeapCompactor_Shutdown() {
 }
 
 // Query current state (for diagnostics)
+// Printed from the periodic report, not from Shutdown: this DLL exits through
+// TerminateProcess and a teardown-only counter never reaches a log.
+extern "C" void HeapCompactor_LogStats() {
+    SIZE_T low = 0;
+    SIZE_T all = GetLargestFreeBlock(&low);
+    Log("[HeapCompactor] %uMB largest free below 2GB, %uMB across all address "
+        "space; %llu compactions, %lluKB recovered, next attempt no sooner than "
+        "%us%s",
+        (unsigned)(low / (1024*1024)), (unsigned)(all / (1024*1024)),
+        (unsigned long long)g_compactionsTriggered.load(), g_reclaimedTotalKb,
+        g_compactIntervalMs / 1000,
+        g_compactionGaveUp ? " - stopped, it was not recovering anything" : "");
+}
+
 extern "C" SIZE_T HeapCompactor_GetLargestFreeBlock() {
     return GetLargestFreeBlock();
 }

@@ -39,6 +39,9 @@ static DbcRowEntry* g_cache = nullptr;
 static uint64_t   g_hits = 0;
 static int g_featureToken = -1;
 static uint64_t   g_misses = 0;
+// Calls handed straight back because the client's own path was a plain memcpy
+// that this cache cannot improve on. See the note in the hook.
+static uint64_t   g_bypassedPlainCopy = 0;
 
 typedef bool (__thiscall *orig_dbc_getrow_t)(void* store, int recordId, void* outBuf);
 static orig_dbc_getrow_t g_orig = nullptr;
@@ -52,27 +55,62 @@ static bool __fastcall Hooked_DbcGetRow(void* store, void* /* edx */, int record
         return g_orig(store, recordId, outBuf);
     }
 
+    // Whether this cache can win at all is decided by one byte in the client.
+    //
+    // sub_4CFD20 is three comparisons, an indexed load, and then one of two
+    // things: if byte_C5DEA0 is set it runs sub_4CFBB0, a byte-at-a-time RLE
+    // decode over 680 bytes, and caching that is a real saving. If it is clear
+    // it is a single 680-byte memcpy - and this cache cannot beat a memcpy,
+    // because a hit costs a hash, two atomic loads and *two* 680-byte copies,
+    // one into a temporary for the seqlock and one out to the caller.
+    //
+    // A tester's profile put this function at 3.76% of executing main-thread
+    // time with 17.6 million hits in 28 minutes, which is what being slower than
+    // the thing you are caching looks like. One byte load per call is a cheap
+    // price for not paying that.
+    if (!*(volatile uint8_t*)0x00C5DEA0) {
+        ++g_bypassedPlainCopy;
+        return g_orig(store, recordId, outBuf);
+    }
+
     uintptr_t storeKey = (uintptr_t)store;
     uint32_t idx = ((uint32_t)(storeKey >> 2) ^ recordId) & CACHE_MASK;
     DbcRowEntry* e = &g_cache[idx];
 
-    // Optimistic lock-free read using Sequence Lock
+    // Optimistic lock-free read using Sequence Lock.
+    //
+    // The payload goes straight to the caller rather than through a temporary.
+    // The seqlock was reading into tempBuf, verifying, then copying tempBuf out,
+    // which is 1360 bytes moved per hit for 680 bytes of result - and a tester
+    // session took 9869554 hits, so that spare copy was about 6.7 GB of memcpy
+    // on the main thread.
+    //
+    // Writing the caller's buffer before the sequence is verified is safe here
+    // because of what happens next: if the sequence moved, control falls through
+    // to g_orig, which fills that same buffer completely. The caller cannot
+    // observe the discarded bytes. It only works in that order, so the fall-
+    // through below must stay unconditional.
+    //
+    // The key comparison also moves ahead of the copy. It is not the
+    // authoritative check - the one after the sequence still is - but a slot
+    // holding a different record is the common collision case and there is no
+    // reason to copy 680 bytes before noticing.
     uint32_t s1 = e->seq.load(std::memory_order_acquire);
-    if ((s1 & 1) == 0 && e->valid) { // even sequence means no write in progress
-        uintptr_t sk = e->storePtr;
-        uint32_t rid = e->recordId;
-        uint8_t tempBuf[0x2A8];
-        memcpy(tempBuf, e->rowData, 0x2A8); // read payload safely into temp buffer
+    if ((s1 & 1) == 0 && e->valid &&
+        e->storePtr == storeKey && e->recordId == (uint32_t)recordId) {
+        if (outBuf) memcpy(outBuf, e->rowData, 0x2A8);
         uint32_t s2 = e->seq.load(std::memory_order_acquire);
 
         // If sequence didn't change, the data we read is consistent and valid
-        if (s1 == s2 && sk == storeKey && rid == (uint32_t)recordId) {
+        if (s1 == s2 && e->storePtr == storeKey && e->recordId == (uint32_t)recordId) {
             g_hits++;
-            CrashDumper::FeatureHit(g_featureToken);
-            if (outBuf) {
-                memcpy(outBuf, tempBuf, 0x2A8);
-            }
-            return true;
+            // Sampled, not per hit. This runs seventeen million times a session,
+            // and a cross-module counter call on a path this hot costs a real
+            // fraction of the work it is counting - the same mistake this project
+            // found once already in the SSE2 matrix-vector hook. One in 1024 is
+            // still far more than enough to answer "is it reached".
+            if ((g_hits & 1023u) == 0u) CrashDumper::FeatureHit(g_featureToken);
+            return true;   // already in the caller's buffer
         }
     }
 
@@ -181,17 +219,33 @@ bool InstallDbcLookupCache()
     return true;
 }
 
+// Printed from the periodic report.
+//
+// The hit rate used to be reported only from UninstallDbcLookupCache, which is
+// on the teardown path this DLL never reaches - the process exits through
+// TerminateProcess. So a cache that ran seventeen million times in one session
+// had never once reported whether it was hitting.
+void DbcLookupCache_LogStats()
+{
+    uint64_t total = g_hits + g_misses;
+    if (total == 0 && g_bypassedPlainCopy == 0) return;
+
+    if (total > 0) {
+        Log("[DbcLookupCache] %llu calls, %llu hits, %llu misses (%.1f%% hit rate)",
+            total, g_hits, g_misses, 100.0 * g_hits / total);
+    }
+    if (g_bypassedPlainCopy > 0) {
+        Log("[DbcLookupCache] %llu calls handed straight back - the client's own path "
+            "was a plain copy this cache cannot beat", g_bypassedPlainCopy);
+    }
+}
+
 void UninstallDbcLookupCache()
 {
     void* target = reinterpret_cast<void*>(0x004CFD20);
     MH_DisableHook(target);
     MH_RemoveHook(target);
-
-    uint64_t total = g_hits + g_misses;
-    if (total > 0) {
-        Log("[DbcLookupCache] Stats: %llu calls, %llu hits, %llu misses (%.1f%% hit rate)",
-            total, g_hits, g_misses, 100.0 * g_hits / total);
-    }
+    DbcLookupCache_LogStats();
 }
 
 extern "C" void ClearDbcLookupCache()

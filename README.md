@@ -19,8 +19,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
-* [What's New in v3.18.1](#whats-new-in-v3181)
-* [What's New in v3.18.0](#whats-new-in-v3180)
+* [What's New in v3.19.0](#whats-new-in-v3190)
 * [Send me your log](#send-me-your-log)
 * [Reviews & Acknowledgments](#reviews)
 * [Current Feature Set](#current-feature-set)
@@ -34,198 +33,106 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
-## What's New in v3.18.1
+## What's New in v3.19.0
 
-A fix release. Thanks to **prince**, [txtsd](https://github.com/txtsd),
-**Signalborn Soulweaver** and **Morbent** for the logs.
+Thanks to [txtsd](https://github.com/txtsd) for four long sessions, including the
+first one anyone has sent in with the frame rate uncapped. Every number below
+comes from those logs.
 
-**Fixed**
+### Four new features, all off by default
 
-- False freeze reports, and per-frame work that stopped running with them — caches were not dropped on a reload or character swap. Introduced in 3.18.0.
-- Random UI reloads. Also introduced in 3.18.0.
-- WeakAuras icons staying wrong after a talent switch. `GetSpellInfo` is no longer cached; it cannot be cached correctly.
-- Loading screens finishing and then sitting for several seconds with Texture Smart Unload Delay on.
-- Five launcher switches that controlled nothing, one of which was meant to stop worker threads from starting. Three more removed — their features were gone in 3.18.0.
-- Hooks are no longer installed over a function something else has already detoured.
+They sit in the **Experimental** tab and **Enable All skips them**. Tick them
+yourself.
 
-**Faster**
+**Reuse Compiled Scripts** — `UI_Lua/LuaProtoCache`
 
-- 4x4 matrix multiply, once per bone per frame on every animated model: 2.38x, and now bit-identical to the client's own result.
-- SSE2 terrain horizon rasterisation, 2.46% of main-thread time. New, off by default, on the Experimental tab.
+Interface scripts written inside XML templates are recompiled every time a frame
+is built from that template. Measured: 68% of every chunk the client compiled in
+a session was source it had already compiled. This keeps the compiled form and
+hands it back, so the parse does not run. The client still builds the function
+object, its environment and its addon ownership, so nothing about permissions is
+shared between two uses.
 
-Both verify themselves against the client at startup and refuse to install if the results differ.
+Field: 806 and 704 reuses across two sessions, each compared against a fresh
+compile, none differing.
 
-**Memory**
+**UI Method Object Lookup** — `UI_Lua/LuaThisFast`
 
-148 MB of address space returned on a 32-bit client — 136 MB from the API cache, sized to the function it caches instead of a round number, and 16.6 MB from disabled features that were reserving buffers anyway. The DLL's data section drops from 30.6 MB to 14.0 MB.
+Every call an addon makes into a frame (`SetText`, `GetWidth`, and 672 others)
+starts by fetching the frame object out of a table slot through four script-engine
+calls. This reads it directly. The addon-ownership propagation those calls perform
+is reproduced, not skipped — it decides what may touch protected actions.
 
-**Changed**
+Field: 86.6M, 63.4M and 31.4M lookups across three sessions. None handed back,
+none disagreeing.
 
-- `wow_opt.ini` now lives in the `WTF` folder. An existing file is moved there on first run; nothing is reset.
-- Texture Smart Unload Delay reports how often a held texture is actually reused. One long session measured 0.4%. Check your own log before leaving it on.
+**Spread Model Animation** — `Graphics_Sound/AnimLod`
 
----
+Posing model skeletons is the largest single block of frame time: 3.68 ms of a
+24.5 ms frame in a VoA raid, 114 models averaging 31 bones. No one function
+inside it is worth rewriting, so the only way to reach it is to do less.
 
-## What's New in v3.18.0
+Below 96 models on screen nothing changes. Above that each model's pose refreshes
+every 2nd–4th frame, never slower than a quarter of your frame rate, and never
+before its first pose. It cannot make animations run slow: the client derives
+animation time from a clock, not by counting frames. In a packed city you may
+notice steppier movement on some characters.
 
-Forty-six modules were removed because they never ran, three optimizations went
-in because the logs said where the time actually goes, and the settings that were
-quietly overwriting your graphics options are gone. The rest of this release is
-the diagnostics catching themselves out — four cases of a log reporting something
-it had not actually measured.
+**Collision Box Test (SSE2)** — `Graphics_Sound/CollisionOutcode`
 
-Thanks to [txtsd](https://github.com/txtsd), **Signalborn Soulweaver**, **Morbent**,
-and **prince**, who between them put this build through raids and a good deal of
-open world, and reported what broke. Every measured item below came out of a log
-somebody sent in.
+Line-of-sight checks, world clicks and projectile paths sort a collision model's
+corners against a box — six comparisons per corner on the x87 stack, 3.8% of
+main-thread time. This does four corners per instruction.
 
-**Forty-six modules that did nothing at all**
+Unlike the other maths replacements here it is **exact, not approximate**: the
+bounds are plain floats with no arithmetic applied, so the vector comparison
+answers identically for every input including NaN. Before taking over it predicts
+which corners are outside and which triangles the game will queue, lets the game
+run, and compares — 3000 matches required.
 
-They appeared in the log at startup and had settings behind them. None installed
-a hook, patched anything, or was called from anywhere. `Init()` was
-`return true;` and the rest of the module was never entered.
+### The measurement tools were wrong
 
-Most had no launcher switch at all and read a default of off, so nobody was
-running them — dead weight rather than active mistakes. Two separate minimap
-throttles existed, neither wired to anything. A JIT compiler sat behind a LuaJIT
-setting on a client that has no JIT. Two files shared a name and a namespace
-differing by one letter's case, and only one of them was ever wired up.
+**Every percentage the profiler printed was 5.6× too small** on a three-hour
+session: counts came from the last million ring entries, the divisor was the whole
+session. The top fifty summed to 12% of a profile, which no program can do. It
+produced a profile with no hot spot in it, and that reading was steering the work.
+Corrected: `AwesomeWotlkLib.dll` 9.7%, model animation 7.0%, `d3d9.dll` 6.3%, this
+DLL's own modules ~6%, particle vertex fill 2.5%, UI batch draw 2.3%. The
+executing/blocked split had the same defect and pinned every long session near
+99% executing whatever it was doing.
 
-Three of them had callers and still did nothing: a throttle whose enable flag was
-initialised to false and never set, a particle skip that asked a frustum nobody
-filled, and a "font alpha fast path" that turned alpha blending off whenever it
-should have left it alone — which would have painted text as solid rectangles had
-anything reached it.
+**The animation counter claimed 72 ms of animation inside a 53 ms frame.** It
+closed its frame on the hooked `Sleep` tick, which a CPU-bound client stops
+running, so many frames were charged to one.
 
-Two looked alive on inspection and were not. `ItemDataPrefetch::PrefetchItem` was
-an empty body under a comment saying the work was unsafe, called twice per item
-lookup into nothing. `CDataStoreBuffering` read a buffer pointer from an offset
-that actually holds a length, so the first call would have dereferenced a number
-as a pointer — which is presumably why nothing ever called it.
+**The feature summary listed two working default-on features as never having
+run**, forty lines below those features reporting their own work.
 
-`MpqMmapVfs` and `MpqPrefetch` went too. Both look up StormLib through
-`Storm.dll`, and 3.3.5a links Storm into the executable — there is no such file.
-Every tester log says so outright.
+**The vsync detector called an uncapped session capped** and told a tester to
+redo it. It tested the median frame time alone; a limiter has no tail, so the
+spread is what separates the two cases.
 
-What is left is a much shorter list of things that actually run: eleven settings
-are on unless you turn them off, and every one of them now has a switch.
+### Removed and cheapened
 
-**Three optimizations that came from measurements, not guesses**
+Six things that were never running: two event-name caches that logged themselves
+at startup and were never read, a CDataStore batch whose Install was called from
+nowhere, a frame-script throttle whose entry point nothing called, a sound guard
+that re-registered another module's hook, and a combat-text batch flushed every
+frame whose producer index nothing incremented. About 550 lines, and six log
+lines that claimed something was running.
 
-- **The client asks the heap how big every block is, then throws the answer
-  away.** Both the `free` wrapper and the allocation wrapper call `_msize` and
-  discard the result — a walk into the heap on every single allocation and every
-  deallocation, from over a hundred call sites. Two
-  independent profiles measured that call at 8.09% and 10.59% of the time the
-  main thread spent executing. Both are gone; nothing else about either call
-  changes. A three-minute session with the fix in place reports 67,776
-  allocations and 28,393 deallocations served without it.
+Nine counters on hot paths were atomic. On 32-bit x86 that is a locked
+instruction — and in the D3D9 state cache they sat on the skip branch, the fast
+one the whole feature exists to reach. The 64-bit ones in the script handler cache
+compiled to a locked retry loop. All are plain counters now; the numbers they
+report are a lower bound.
 
-- **`tostring` on numbers is about 50x cheaper.** It was the single largest
-  target in this project's own domain — 10.74% of execution in a CPU-bound
-  session. There was already a "fast path" hooked onto it, and for numbers it
-  called `sprintf("%.14g")`, which is exactly what Lua does, so it took the call
-  and paid full price. Integral values now convert directly: 841 ns to 16 ns for
-  the formatting step, verified byte-identical against `%.14g` across 200,139
-  values before it was allowed anywhere near a build.
+The DBC row cache moved 1360 bytes per hit to deliver 680 — about 6.7 GB of spare
+`memcpy` in one session. The payload now goes straight to the caller.
 
-  The formatting is one part of a `tostring` call, so the end-to-end gain is
-  smaller than 50x. Your log now says how many conversions took the fast route.
-
-**Your graphics settings are yours again**
-
-Three "adaptive" features scaled quality down when frame rate dropped. Each one
-started from a number written into the code rather than the number you had set, so
-turning them on could raise your settings instead of lowering them. **Dynamic Shadow
-Scaler** went in 3.17.0; the other two go now:
-
-- **Adaptive Farclip** assumed a draw distance of 1250. If yours was 500 — a common
-  choice on older hardware — it dragged you *up* toward 1250, making the game
-  heavier while claiming to make it lighter. It also moved on thresholds three
-  frames apart (below 55 fps, above 58), so anyone playing near 60 had it adjusting
-  constantly.
-- **Particle Density Scaler** assumed 1.0 and restored to 1.0, so a deliberate 0.5
-  was pushed back to full density.
-
-Neither survives. Nothing in the DLL now overwrites a setting it never read.
-
-**Adaptive Quality Governor** *(experimental, off by default)*
-
-What replaces them is one dial instead of three that argued with each other. It
-learns your ceiling by watching what the game writes when you change a setting, and
-treats that as a limit it will never exceed — the worst it can do is give back what
-it took.
-
-It reads the p95 of recent frames rather than an instant frame rate, so a single
-slow frame moves nothing. It degrades after 5 seconds past 33 ms and restores only
-after 30 seconds back under 20 ms; that asymmetry is deliberate, because quality
-flickering up and down is worse than quality being slightly too low. Order is
-particles, then shadows, then draw distance, on the assumption that you would rather
-see the world at full distance with fewer sparks.
-
-It has not been proven on anyone's machine yet. That is why it is opt-in and on the
-Experimental tab — if you run it, the `[FrameBench]` block in your log says whether
-it helped.
-
-**An Experimental tab in the launcher**
-
-Features that are new or unproven now live on their own tab, and **Enable All no
-longer switches them on**. Previously it did, which meant anyone testing "everything
-on" was also testing code that had never run in a game — and made their results
-impossible to interpret.
-
-**Diagnostics that stop reporting things they did not measure**
-
-Four of these, all found by reading logs testers sent in:
-
-- The CVar watchdog ran at injection, before the client had initialized anything it
-  inspects. Every one of its nine "CORRUPT" findings was a game that had not started
-  yet. It now waits until the client is up.
-- A 41.9-second loading screen was being recorded as a *frame*, which made `p99.9`
-  and `max` meaningless. Gaps over 2 seconds are now counted and reported separately
-  from frame times.
-- The profiler ranked `NtDelayExecution` — a thread doing nothing — as the second
-  hottest function, with a share of "executing" time it was by definition not using.
-- The loading report printed `0 ms inside ReadFile` in sessions where the ReadFile
-  hook was switched off and nothing had been measured at all.
-
-**Loading screens are now measurable**
-
-Logs show loading screens running past 30 seconds on some setups — on one tester's
-machine, 7 of 12 loads. The cause is not known yet. This release adds timing that
-separates disk time from everything else, without turning the MPQ cache back on to
-get it. If your loads are slow, your log now contains the evidence.
-
-### Upgrading
-
-Settings carry over. If you had **Adaptive Farclip** or **Particle Density Scaler**
-on, they are gone, and your `farclip` and `particleDensity` will stay wherever you
-set them from now on. Worth checking them once in the game's own video options —
-these features may have left them somewhere you did not choose, and that value
-persisted in your config after the feature stopped running.
-
-To try the replacement, turn on **Adaptive Quality Governor** on the Experimental
-tab.
-
-Older releases: see the [Releases page](https://github.com/suprepupre/wow-optimize/releases) for the full version history.
-
-![wow_optimize Launcher Dashboard](images/launcher_screenshot.jpg)
-
-## Current Status
-
-### Performance
-
-**`memset` replacement** — 2.3x faster than the client's own `rep stosd` at the
-sizes engine code clears: 5.05 ns/call against 11.76, measured over 4.8M calls per
-variant. The client reaches that one function from 1108 call sites.
-
-Everything else is opt-in, and the frame-time benchmark lets you settle it on your own hardware,
-with your own addons, instead of taking anyone's word for it. Play a session, quit
-the game normally, and read the `[FrameBench]` block at the end of
-`Logs\wow_optimize_<date>_<time>.log`. Compare `p95` and `p99` between runs rather
-than the average, which hides the stutters you actually feel — and the `config`
-fingerprint on that line proves two runs differed only where you meant them to.
-A/B testing a single toggle is two logs on the same route.
+The quality governor could change settings the client only applies later, which
+queues a change the player never asked for and leaves the governor unable to
+measure what it did. It now reads each setting's flags and refuses those.
 
 ---
 
@@ -292,6 +199,29 @@ Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_
 - **[POKOch](https://github.com/POKOch)** — selective rendering, spell visual blocking
   and API caching ([#12](https://github.com/suprepupre/wow-optimize/pull/12)).
 
+### Testing
+
+Every measured item in these notes came out of a log somebody sent in.
+
+- **prince** — Chinese client under DXVK; the WeakAuras talent-switch bug, the
+  loading-screen stall, and the crash report that finally pinned an access
+  violation to one instruction.
+- **[txtsd](https://github.com/txtsd)** — raids on ChromieCraft; the memory growth
+  and freeze reports, and the request for per-addon profiling that turned into the
+  addon CPU profiler and the Lua compile census.
+- **Signalborn Soulweaver**, **Morbent**, **Sicsoo** — early 3.18 logs.
+- **Doc.James** — the zone-change stall, with three sessions that made it
+  reproducible.
+- **kojekude** — boss voice lines going missing in raids and dungeons while every
+  other sound kept working, which turned out to be the sound coalescer returning
+  "played fine" for sounds it had dropped.
+- **nobus** — three sessions with warrior stance-swap crashes, carrying a second
+  independent reproduction of a null-callback crash in the client's device
+  callback list.
+- **[biship](https://github.com/suprepupre/wow-optimize/issues/50)** — read the
+  timing switch's code and reported that it gated twelve unrelated things and
+  described none of them.
+
 </details>
 
 ---
@@ -321,7 +251,7 @@ Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_
 - GC step sync with !LuaBoost
 - safe Lua stats export to addon
 - Lua reload detection and clean reinitialization
-- **Lua VM Bytecode JIT Redirection & Cache** — detours standard Lua VM preparation function `sub_856370` to run JIT stubs under normal play conditions, utilizing a lock-free direct-mapped cache (`g_protoCache`) to avoid profiling lock contention.
+- **Reuse Compiled Scripts** *(off by default, experimental)* — keeps the compiled form of a Lua chunk and hands it back when the client compiles the same source under the same name again, so the parse does not run. The client still builds the function object, its environment and its addon ownership. Nothing is kept until a chunk has been compiled twice. `UI_Lua/LuaProtoCache`
 
 ### WoW API result cache
 - `GetItemInfo` - 8192-slot cache, Direct Memory Access *(disabled - breaks Aux / WCollections / ElvUI)*
@@ -369,6 +299,7 @@ Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_
   - `strsplit`
 
 ### Lua VM internals
+- **UI Method Object Lookup** *(off by default, experimental)* — the object fetch that starts every one of 674 Lua calls into a frame (`sub_4A81B0`). Four script-engine calls and a push/pop replaced by direct reads; the addon-ownership propagation `lua_rawgeti` performs is reproduced rather than skipped, and anything unusual is handed back to the client. `UI_Lua/LuaThisFast`
 - `luaV_concat` and `luaS_newlstr` hooks disabled for public stability
 - baseline-safe VM operation with zero overhead
 - string table pre-sizing remains active to prevent rehash freezes
@@ -424,6 +355,7 @@ Features that use worker threads and lock-free queues. Status reflects the curre
 - **Addon dispatcher** - lightweight event-driven addon update dispatch *(enabled)*
 
 ### Other runtime optimizations
+- **Spread Model Animation** *(off by default, experimental)* — posing model skeletons measured at 3.68 ms of a 24.5 ms frame in raid content. Below 96 models on screen nothing changes; above it each model's pose refreshes every 2nd to 4th frame, never slower than a quarter of the frame rate, and never before its first pose. Cannot make animations run slow: the client derives animation time from a clock rather than by counting frames. `Graphics_Sound/AnimLod`
 - combat log optimizer - **fixes the 16-year combat log bug** (log retention increased from 300s to 1800s, events no longer lost during extended sessions)
 - `CompareStringA` fast ASCII path
 - `MultiByteToWideChar` / `WideCharToMultiByte` - SSE2 ASCII fast path (bypasses NLS for pure-ASCII strings on ASCII-compatible codepages)
@@ -448,6 +380,7 @@ Replacements for WoW's own statically-linked CRT routines at verified addresses:
 - SSE2 matrix-vector transforms — 3D point × 4x4 matrix (0x4C21B0), 4D vector × 4x4 matrix (0x4C2270), in-place point × 4x4 (0x4C2300)
 - SSE2 `C3Vector::Normalize` — 0x4C3420 + 0x4C3600 (full-precision `sqrtss`/`divss`, engine guards replicated)
 - SSE2 `CMatrix::Transpose` — 0x4C23D0 (`_MM_TRANSPOSE4_PS`, bit-identical)
+- **SSE2 collision box test** *(off by default, experimental)* — the AABB outcode classification in `sub_7C7230`, 3.8% of main-thread time in a corrected profile. Six x87 comparisons per vertex become six packed comparisons per four vertices. Bit-exact, not approximate: the bounds are plain floats with no arithmetic applied. `Graphics_Sound/CollisionOutcode`
 - SSE2 frustum point culling — `CFrustum::IsPointVisible` (0x983D70)
 - SSE2 Möller-Trumbore ray-triangle intersection — 32-bit indices (0x9836B0), 16-bit indices (0x983490)
 - SSE2 frustum AABB-vs-4-planes cull
@@ -742,7 +675,7 @@ Recent events:
     -110351ms  TID=900   D3D9 device Reset (dev=0x0EB1AA90)
 ```
 
-The startup banner reports the exact build the log came from (`v3.18.1 (build abc1234)`), so please don't trim the first lines.
+The startup banner reports the exact build the log came from (`v3.19.0 (build abc1234)`), so please don't trim the first lines.
 
 If the complaint is stuttering rather than a crash, look for `slow frame` lines — each one names how far past your session's own median that frame ran, and what was happening during it:
 

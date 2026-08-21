@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <emmintrin.h>
 #include <intrin.h>
+#include <cmath>
 #include "version.h"
 #include "matrix_copy_sse2.h"
 
@@ -43,6 +44,16 @@ static MatVec3Mul_t  pOrigMatVec3Mul  = nullptr;
 static MatVec4Mul_t  pOrigMatVec4Mul  = nullptr;
 static volatile long g_matvec3_calls  = 0;
 static volatile long g_matvec4_calls  = 0;
+
+// sub_4C1C40: quaternion -> 3x3 rotation block, both operands on the stack.
+typedef float* (__cdecl* QuatToMatrix_t)(const float* quat, float* dest);
+static QuatToMatrix_t pOrigQuatToMatrix = nullptr;
+static volatile long  g_quat2mat_calls  = 0;
+
+// sub_4C1DE0: __thiscall wrapper, ECX = destination matrix, quaternion on the stack.
+typedef float* (__fastcall* QuatToMatrixFull_t)(float* dest, void* edx, const float* quat);
+static QuatToMatrixFull_t pOrigQuatToMatrixFull = nullptr;
+static volatile long      g_quat2matfull_calls  = 0;
 
 // ================================================================
 // Precomputed identity matrix rows for the SSE2 store path
@@ -225,6 +236,202 @@ static float* __cdecl HookMatrixMultiply(float* result, float* a, float* b) {
     return pOrigMatMul(result, a, b);
 }
 
+#if !TEST_DISABLE_QUAT_MATRIX_SSE2
+// ================================================================
+// sub_4C1C40: quaternion -> 3x3 rotation block  __cdecl(quat, dest)
+// ================================================================
+// The arithmetic core behind all three of the client's quaternion wrappers
+// (0x004C1DE0, 0x004C1E20, 0x004C33C0), so hooking it here covers every caller
+// including sub_82F0F0, which runs it once per animated bone per frame.
+//
+// It writes nine of the sixteen floats - indices 0,1,2,4,5,6,8,9,10 - and
+// deliberately leaves 3, 7, 11 and 12..15 alone; the wrappers set those. This
+// replacement writes the same nine and no others.
+//
+// The original is not plain double arithmetic, and that is the whole difficulty.
+// It is 72 x87 instructions, the CRT runs x87 at 53-bit precision, and the
+// compiler ran out of the eight-deep x87 stack: it spilled three products to
+// 32-bit stack slots and reloaded them.
+//
+//     fstp [ebp+arg_0]   <- x*2z rounded to float
+//     fstp [ebp+var_8]   <- y*2z rounded to float
+//     fst  [ebp+var_4]   <- z*2z rounded to float, but NOT popped
+//
+// So three of the twelve intermediates are float and the rest are 53-bit. The
+// third is the awkward one: `fst` stores without popping, so z*2z survives in a
+// register at full width as well, and the function then uses both. Row 0 gets
+// the unrounded value and row 1 gets the rounded one. Reproducing that asymmetry
+// is what makes this bit-identical rather than merely close - and "merely close"
+// on a bone rotation is the same order of error that produced the first-person
+// camera snapping the last time this project reached for lower precision here.
+//
+// Grouping is preserved exactly; operand order within a single multiply or add
+// is not, because IEEE multiply and add are commutative and exactly rounded.
+static inline void QuatToMatrix3x3_PackedDouble(const float* q, float* dest) {
+    // Two lanes per multiply for the six products that pair up naturally.
+    __m128  qf   = _mm_loadu_ps(q);                          // x  y  z  w
+    __m128d q_lo = _mm_cvtps_pd(qf);                         // (x, y)
+    __m128d q_hi = _mm_cvtps_pd(_mm_movehl_ps(qf, qf));      // (z, w)
+
+    __m128d two  = _mm_set1_pd(2.0);
+    __m128d d_lo = _mm_mul_pd(q_lo, two);                    // (2x, 2y)
+    __m128d d_hi = _mm_mul_pd(q_hi, two);                    // (2z, 2w)
+
+    __m128d z2   = _mm_unpacklo_pd(d_hi, d_hi);              // (2z, 2z)
+    __m128d ww   = _mm_unpackhi_pd(q_hi, q_hi);              // (w,  w)
+
+    __m128d sq   = _mm_mul_pd(q_lo, d_lo);                   // (x*2x, y*2y)
+    __m128d wxy  = _mm_mul_pd(ww,   d_lo);                   // (w*2x, w*2y)
+    __m128d xyz2 = _mm_mul_pd(q_lo, z2);                     // (x*2z, y*2z)
+
+    double xx2 = _mm_cvtsd_f64(sq);
+    double yy2 = _mm_cvtsd_f64(_mm_unpackhi_pd(sq, sq));
+    double wx2 = _mm_cvtsd_f64(wxy);
+    double wy2 = _mm_cvtsd_f64(_mm_unpackhi_pd(wxy, wxy));
+
+    double zz2 = _mm_cvtsd_f64(_mm_mul_sd(z2, q_hi));        // 2z*z, full width
+    double wz2 = _mm_cvtsd_f64(_mm_mul_sd(ww, z2));          // w*2z
+    double xy2 = _mm_cvtsd_f64(_mm_mul_sd(q_lo, _mm_unpackhi_pd(d_lo, d_lo)));
+
+    // The three the original could not keep in registers. Narrowing here is not
+    // a shortcut - it is the client's own rounding, and omitting it is what
+    // makes the two answers differ.
+    __m128 narrowed = _mm_cvtpd_ps(xyz2);
+    float xz2f = _mm_cvtss_f32(narrowed);
+    float yz2f = _mm_cvtss_f32(_mm_shuffle_ps(narrowed, narrowed, _MM_SHUFFLE(1, 1, 1, 1)));
+    float zz2f = (float)zz2;
+
+    dest[0]  = (float)(1.0 - (zz2 + yy2));          // zz2 at full width here
+    dest[1]  = (float)(xy2 + wz2);
+    dest[2]  = (float)((double)xz2f - wy2);
+    dest[4]  = (float)(xy2 - wz2);
+    dest[5]  = (float)(1.0 - ((double)zz2f + xx2)); // and rounded here
+    dest[6]  = (float)((double)yz2f + wx2);
+    dest[8]  = (float)(wy2 + (double)xz2f);
+    dest[9]  = (float)((double)yz2f - wx2);
+    dest[10] = (float)(1.0 - (xx2 + yy2));
+}
+
+// Run the client's own routine beside ours on the real binary before replacing
+// it, and demand exact equality rather than a tolerance. Every intermediate here
+// is reproduced at the width the original used, so anything short of identical
+// means the reading of those three spill slots is wrong, and a tolerance would
+// hide exactly the mistake this is meant to catch.
+static bool SelfTestQuatToMatrix() {
+    typedef float* (__cdecl* quat_fn)(const float*, float*);
+    quat_fn original = (quat_fn)0x004C1C40;
+
+    const int CASES = 4096;
+    unsigned seed = 0x85EBCA6Bu;
+    int mismatches = 0;
+
+    for (int c = 0; c < CASES; ++c) {
+        float q[4];
+        for (int i = 0; i < 4; ++i) {
+            seed = seed * 1103515245u + 12345u;
+            q[i] = ((float)(int)(seed >> 16) / 32768.0f) - 1.0f;
+        }
+
+        // Most of the run is unit quaternions, because that is what bone tracks
+        // actually hold; the rest is left unnormalised to exercise the paths
+        // where the products are far from 1 and the float spills matter most.
+        if ((c & 3) != 0) {
+            double n = sqrt((double)q[0] * q[0] + (double)q[1] * q[1] +
+                            (double)q[2] * q[2] + (double)q[3] * q[3]);
+            if (n > 1e-6) {
+                for (int i = 0; i < 4; ++i) q[i] = (float)(q[i] / n);
+            }
+        }
+
+        // Both sides get a full 16-float buffer so that a stray write outside
+        // the nine cells shows up as a mismatch instead of going unnoticed.
+        float theirs[16], ours[16];
+        for (int i = 0; i < 16; ++i) { theirs[i] = (float)i; ours[i] = (float)i; }
+
+        __try {
+            original(q, theirs);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[MatrixSSE2] Quaternion self-test: the client's routine faulted - not hooking");
+            return false;
+        }
+        QuatToMatrix3x3_PackedDouble(q, ours);
+
+        if (memcmp(theirs, ours, sizeof(theirs)) != 0) ++mismatches;
+    }
+
+    if (mismatches != 0) {
+        Log("[MatrixSSE2] Quaternion self-test FAILED: %d of %d cases differed "
+            "from the client - not hooking", mismatches, CASES);
+        return false;
+    }
+    Log("[MatrixSSE2] Quaternion self-test passed %d cases against the client's "
+        "own routine, bit-identical", CASES);
+    return true;
+}
+
+static float* __cdecl Hooked_QuatToMatrix(const float* quat, float* dest) {
+    ++g_quat2mat_calls;
+
+    uintptr_t pq = (uintptr_t)quat, pd = (uintptr_t)dest;
+    if (pq > 0x10000 && pq < 0xFFE00000 &&
+        pd > 0x10000 && pd < 0xFFE00000) {
+        __try {
+            // Staged, so a fault partway through the arithmetic cannot leave the
+            // caller's matrix half written.
+            float out_val[16];
+            QuatToMatrix3x3_PackedDouble(quat, out_val);
+            _ReadWriteBarrier();
+            dest[0]  = out_val[0];  dest[1] = out_val[1];  dest[2]  = out_val[2];
+            dest[4]  = out_val[4];  dest[5] = out_val[5];  dest[6]  = out_val[6];
+            dest[8]  = out_val[8];  dest[9] = out_val[9];  dest[10] = out_val[10];
+            return dest;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            // Unmapped page mid-op - fall through to the original.
+        }
+    }
+    return pOrigQuatToMatrix(quat, dest);
+}
+
+// sub_4C1DE0: the wrapper sub_82F0F0 actually calls, once per animated bone per
+// frame. It writes seven constants into the fourth row and column and then calls
+// the core above.
+//
+// Hooking it as well as the core is not redundant. Replacing only the core still
+// leaves the client making two calls where one would do, and on a routine this
+// small the call is a real fraction of the cost - the core is under six
+// nanoseconds end to end, so an extra call and return is not noise against it.
+// Fusing them removes that call from the hot path entirely.
+//
+// The other two wrappers (0x004C1E20, 0x004C33C0) are left alone; they are not on
+// the per-bone path and they still get the faster core underneath.
+static float* __fastcall Hooked_QuatToMatrixFull(float* dest, void* /*edx*/, const float* quat) {
+    ++g_quat2matfull_calls;
+
+    uintptr_t pq = (uintptr_t)quat, pd = (uintptr_t)dest;
+    if (pq > 0x10000 && pq < 0xFFE00000 &&
+        pd > 0x10000 && pd < 0xFFE00000) {
+        __try {
+            float out_val[16];
+            QuatToMatrix3x3_PackedDouble(quat, out_val);
+            _ReadWriteBarrier();
+            dest[0]  = out_val[0];  dest[1]  = out_val[1];  dest[2]  = out_val[2];
+            dest[4]  = out_val[4];  dest[5]  = out_val[5];  dest[6]  = out_val[6];
+            dest[8]  = out_val[8];  dest[9]  = out_val[9];  dest[10] = out_val[10];
+            // The seven the wrapper contributes, in the client's own order.
+            dest[3]  = 0.0f; dest[7]  = 0.0f; dest[11] = 0.0f;
+            dest[12] = 0.0f; dest[13] = 0.0f; dest[14] = 0.0f;
+            dest[15] = 1.0f;
+            return dest;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            // Unmapped page mid-op - fall through to the original. That original
+            // calls the core, which is hooked, and the core is bit-identical, so
+            // the fallback answer is the same one either way.
+        }
+    }
+    return pOrigQuatToMatrixFull(dest, nullptr, quat);
+}
+#endif
+
 // ================================================================
 // sub_4C21B0: 3D point * 4x4 matrix (100+ xrefs)
 // Vectorized via column linear combination using SSE2
@@ -330,12 +537,17 @@ static float* __cdecl Hooked_MatVec4Mul(float* result, const float* vec4, const 
 // ================================================================
 // sub_4C3420 / sub_4C3600: C3Vector::Normalize (in-place, __thiscall(this))
 // ================================================================
-// Both do v *= 1.0/sqrt(x*x+y*y+z*z) with x87 fsqrt+fdiv. We replace that with
-// full-precision SSE (sqrtss + divss) -- deliberately NOT _mm_rsqrt_ps, whose
-// approximation + the missing degenerate guard is exactly what NaN-poisoned the
-// quaternion-normalize hook. sqrtss/divss are IEEE round-to-nearest, so the result
-// matches the scalar original to sub-ULP (only the x^2+y^2+z^2 accumulation order
-// differs, x87's 80-bit vs SSE 32-bit -- invisible for a unit vector).
+// Both do v *= 1.0/sqrt(x*x+y*y+z*z) with x87 fsqrt+fdiv, at the 53-bit
+// precision the CRT leaves x87 in. We replace that with sqrtsd + divsd at the
+// same width -- deliberately NOT _mm_rsqrt_ps, whose approximation plus the
+// missing degenerate guard is exactly what NaN-poisoned the quaternion-normalize
+// hook. sqrtsd and divsd are correctly rounded, so they match fsqrt and fdivr
+// exactly and the result is bit-identical rather than close.
+//
+// The paragraph that stood here said the difference was accumulation order,
+// "x87's 80-bit vs SSE 32-bit -- invisible for a unit vector". It was 53-bit
+// against 32-bit, it was visible, and it differed on close to every vector the
+// epsilon did not skip. The measurements are in the shadow-check note below.
 //
 //   sub_4C3420: no guard. On a zero vector the original yields 1.0/0 = +Inf then
 //               v*Inf = NaN; SSE divss-by-zero (exceptions masked, as WoW runs)
@@ -348,31 +560,42 @@ static Vec3Norm_t pOrigVec3Norm     = nullptr;  // sub_4C3420 (unguarded)
 static Vec3Norm_t pOrigVec3NormSafe = nullptr;  // sub_4C3600 (mag^2 > 2^-22 guard)
 static volatile long g_vec3norm_calls = 0;
 
-// 2^-22 == 0x34000000f, the engine's near-zero magnitude cutoff in sub_4C3600.
-static const float kVec3NormEps = 0.00000023841858f;
+// 2^-22, the engine's near-zero magnitude cutoff in sub_4C3600 (flt_9EA27C, the
+// same constant the quaternion normalise uses). It is loaded with `fld dword`
+// and compared against a 53-bit sum, so the comparison happens in double.
+static const double kVec3NormEpsD = 2.384185791015625e-07;
 
 static inline void SSE2_Vec3NormalizeInPlace(float* v, bool guard) {
-    float vx_val = v[0];
-    float vy_val = v[1];
-    float vz_val = v[2];
-
     // Read exactly 3 floats (never v[3], which may sit on an unmapped next page).
-    __m128 xyz = _mm_setr_ps(vx_val, vy_val, vz_val, 0.0f);
-    __m128 sq  = _mm_mul_ps(xyz, xyz);                                  // x^2,y^2,z^2,0
-    __m128 mag2 = _mm_add_ss(_mm_add_ss(sq,
-                      _mm_shuffle_ps(sq, sq, _MM_SHUFFLE(1, 1, 1, 1))), // +y^2
-                      _mm_shuffle_ps(sq, sq, _MM_SHUFFLE(2, 2, 2, 2))); // +z^2
-    if (guard) {
-        float m = mag2.m128_f32[0];
-        if (!(m > kVec3NormEps)) return;  // leave unchanged, exactly like the engine
-    }
-    __m128 inv  = _mm_div_ss(_mm_set_ss(1.0f), _mm_sqrt_ss(mag2));      // 1.0/sqrt(mag2)
-    __m128 invb = _mm_shuffle_ps(inv, inv, _MM_SHUFFLE(0, 0, 0, 0));    // broadcast
-    __m128 res  = _mm_mul_ps(xyz, invb);
+    double x = v[0];
+    double y = v[1];
+    double z = v[2];
 
-    float out_x = res.m128_f32[0];
-    float out_y = res.m128_f32[1];
-    float out_z = res.m128_f32[2];
+    // Both originals square and accumulate in double and narrow only on the
+    // three final stores, and both group the sum the same way: (x*x + y*y)
+    // first, then + z*z. This was packed single with the same grouping, which
+    // left it a ULP or so out and is why the hooks that use it are still being
+    // shadow-checked against the client on every call at a 1e-5 tolerance rather
+    // than trusted. Keeping the client's width makes the answers identical, and
+    // an identical answer needs no tolerance.
+    double s = x * x + y * y;
+    s = s + z * z;
+
+    if (guard) {
+        // Written this way round so a NaN takes the same branch the client's
+        // unordered compare takes: leave the vector alone.
+        if (!(s > kVec3NormEpsD)) return;
+    }
+
+    // sub_4C3420 has no guard at all, so a zero vector divides by zero there and
+    // the components come back NaN. That is reproduced rather than fixed: this
+    // has to match the client, not improve on it.
+    __m128d root = _mm_sqrt_sd(_mm_setzero_pd(), _mm_set_sd(s));
+    double  inv  = _mm_cvtsd_f64(_mm_div_sd(_mm_set_sd(1.0), root));
+
+    float out_x = (float)(x * inv);
+    float out_y = (float)(y * inv);
+    float out_z = (float)(z * inv);
 
     v[0] = out_x;
     v[1] = out_y;
@@ -393,6 +616,13 @@ static inline void SSE2_Vec3NormalizeInPlace(float* v, bool guard) {
 // A normalise feeds directions - camera, bone axes, lighting - so a wrong one
 // is a subtle visual defect rather than a crash, which is the kind that reaches
 // a bug report as "something looks off" and never gets attributed.
+//
+// The check is now for identical bits rather than a tolerance, because the
+// arithmetic became bit-identical. Measured offline against both originals
+// transcribed verbatim as inline asm: 4,000,000 vectors each, zero differing.
+// The packed single version this replaced differed on 1,882,782 of them
+// unguarded and 1,416,357 guarded - not an occasional ULP, close to every vector
+// that was not left alone by the epsilon.
 static volatile long g_normChecked   = 0;
 static bool          g_normTrusted   = false;
 static bool          g_normAbandoned = false;
@@ -400,6 +630,17 @@ static bool          g_normAbandoned = false;
 static constexpr long NORM_VERIFY_CALLS = 4096;
 
 // The client writes in place, so comparing means giving it its own copy.
+//
+// This compared with a 1e-5 relative tolerance, which was as much as the packed
+// single implementation could promise. Now that the arithmetic keeps the client's
+// double width the answers are the same bits, so the comparison is on bits.
+//
+// Bits also settle two cases a tolerance handles badly. sub_4C3420 has no guard,
+// so a zero vector makes it divide by zero and return NaN in every component -
+// and NaN minus NaN is NaN, which is not greater than 1e-5, so the old check
+// silently passed anything at all whenever the client produced one. And a vector
+// under the epsilon must come back byte-for-byte untouched, which a distance
+// cannot distinguish from being rewritten with the same value.
 static bool NormalizeAgreesWithClient(const float* before, const float* ours,
                                       void (__fastcall* orig)(float*, void*), void* edx) {
     float theirs[3] = { before[0], before[1], before[2] };
@@ -408,14 +649,7 @@ static bool NormalizeAgreesWithClient(const float* before, const float* ours,
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return true;   // cannot compare; never report a false disagreement
     }
-    for (int i = 0; i < 3; ++i) {
-        float d = theirs[i] - ours[i];
-        if (d < 0.0f) d = -d;
-        float mag = (theirs[i] < 0.0f ? -theirs[i] : theirs[i]);
-        double rel = (mag > 1.0f) ? ((double)d / (double)mag) : (double)d;
-        if (rel > 1e-5) return false;
-    }
-    return true;
+    return memcmp(theirs, ours, 3 * sizeof(float)) == 0;
 }
 
 static void __fastcall Hooked_Vec3Norm(float* self, void* edx) {
@@ -651,44 +885,117 @@ static float* __cdecl Hooked_PointXformInPlace(float* a1, float* a2, float* a3) 
 // _MM_TRANSPOSE4_PS with a zeroed 4th row yields the transposed rotation rows
 // with lane3 already 0; the same transposed rows are exactly the column vectors
 // needed for the three translation dot products, so trans = r0*(-tx)+r1*(-ty)+
-// r2*(-tz) lands (out12,out13,out14,0). Products and (a+b)+c summation order
-// match the FPU original; only x87 80-bit vs SSE 32-bit intermediates differ
-// (sub-ULP, invisible for a rigid transform). All reads stay inside the 64-byte
-// input matrix; the full 16-float output is written exactly as the original.
+// r2*(-tz) lands (out12,out13,out14,0). All reads stay inside the 64-byte input
+// matrix; the full 16-float output is written exactly as the original.
+//
+// This used to carry the line "only x87 80-bit vs SSE 32-bit intermediates
+// differ (sub-ULP, invisible for a rigid transform)". Both halves of that are
+// wrong. The CRT runs x87 at 53-bit, not 80, so the original accumulates in
+// double; and the gap between a double accumulation and a single one over three
+// products is not sub-ULP - it is the same divergence found in the matrix
+// multiply, the quaternion normalise and both vector normalises in this same
+// tree, each of which had a comment saying much the same thing. This one builds
+// the inverse of a view transform, which is to say it feeds the camera, and a
+// wrong camera matrix is precisely the artifact this project has already shipped
+// once.
+//
+// The three dot products now accumulate in double, which removes the width
+// difference. What is not proven here is the order of the three terms: the
+// original juggles them across an eight-deep x87 stack through two spilled
+// scratch slots, and the tail does not read unambiguously, so the grouping is
+// taken from the existing implementation rather than from the disassembly.
+//
+// That is why this hook now has a shadow check, which it never had at all.
+// Rather than assert the order is right, it runs the client beside itself on the
+// first few thousand real calls and compares all sixteen floats as bits. If the
+// order is wrong the log says so and every call goes back to the original -
+// which is a better outcome than a comment claiming sub-ULP.
+//
+// The check has since answered it: 4096 consecutive real calls in a live session
+// matched the client exactly, so the inherited order is correct. The check stays
+// anyway - it costs nothing after those first few thousand calls, and it is what
+// would catch a differently-patched client rather than a player noticing the
+// camera looks slightly off.
 #if !TEST_DISABLE_MATRIX_INVERT_SSE2
 typedef float* (__fastcall* MatInvRigid_t)(float* self, void* edx, float* out);
 static MatInvRigid_t pOrigMatInvRigid = nullptr;
 static volatile long g_matinvrigid_calls = 0;
 
+// The arithmetic alone, so the shadow check exercises the same code the hook
+// runs rather than a second copy of it that could drift.
+static inline void InvertRigid_Build(const float* self, float* out) {
+    __m128 r0 = _mm_loadu_ps(self);        // M0..M3   (row 0)
+    __m128 r1 = _mm_loadu_ps(self + 4);    // M4..M7   (row 1)
+    __m128 r2 = _mm_loadu_ps(self + 8);    // M8..M11  (row 2)
+    __m128 r3 = _mm_setzero_ps();          // forces transposed lane3 -> 0
+    _MM_TRANSPOSE4_PS(r0, r1, r2, r3);     // pure movement, exact either way
+
+    _mm_storeu_ps(out,     r0);
+    _mm_storeu_ps(out + 4, r1);
+    _mm_storeu_ps(out + 8, r2);
+
+    // The rotation is data movement and cannot round; only these three dot
+    // products can, and they accumulate at the client's width.
+    double ntx = -(double)self[12];
+    double nty = -(double)self[13];
+    double ntz = -(double)self[14];
+
+    // Transposed rows are the columns the dot products need. Read back from the
+    // stored output so the operands are the same values the rotation block got.
+    for (int i = 0; i < 3; ++i) {
+        double a = (double)out[i]      * ntx;
+        double b = (double)out[4 + i]  * nty;
+        double c = (double)out[8 + i]  * ntz;
+        out[12 + i] = (float)((a + b) + c);
+    }
+    out[15] = 1.0f;
+}
+
+// Shadow check against the client, bit for bit, for the first few thousand real
+// calls. See the note above: the summation order here is inherited rather than
+// proven, and this is what decides whether that inheritance was correct.
+static volatile long g_invChecked   = 0;
+static bool          g_invTrusted   = false;
+static bool          g_invAbandoned = false;
+
+static constexpr long INV_VERIFY_CALLS = 4096;
+
 static float* __fastcall Hooked_MatInvertRigid(float* self, void* edx, float* out) {
     ++g_matinvrigid_calls;
+    if (g_invAbandoned) return pOrigMatInvRigid(self, nullptr, out);
+
     uintptr_t s = (uintptr_t)self, o = (uintptr_t)out;
     if (s > 0x10000 && s < 0xFFE00000 && o > 0x10000 && o < 0xFFE00000) {
         __try {
-            __m128 orig0 = _mm_loadu_ps(self);       // M0..M3   (row 0)
-            __m128 orig1 = _mm_loadu_ps(self + 4);   // M4..M7   (row 1)
-            __m128 orig2 = _mm_loadu_ps(self + 8);   // M8..M11  (row 2)
-            float tx = self[12], ty = self[13], tz = self[14];   // translation row
+            // Staged, so a fault partway through cannot leave a half-built
+            // matrix in the caller's buffer.
+            float built[16];
+            InvertRigid_Build(self, built);
 
-            // Now transpose rotation matrix first
-            __m128 r0 = orig0;
-            __m128 r1 = orig1;
-            __m128 r2 = orig2;
-            __m128 r3 = _mm_setzero_ps();         // forces transposed lane3 -> 0
-            _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
+            if (!g_invTrusted) {
+                long n = InterlockedIncrement(&g_invChecked);
+                float theirs[16];
+                bool comparable = true;
+                __try {
+                    pOrigMatInvRigid(self, nullptr, theirs);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    comparable = false;   // never report a false disagreement
+                }
+                if (comparable && memcmp(theirs, built, sizeof(built)) != 0) {
+                    g_invAbandoned = true;
+                    Log("[MatrixSSE2] CMatrix::InvertRigid disagreed with the client on "
+                        "call %ld - handing every call back to the original", n);
+                    return pOrigMatInvRigid(self, nullptr, out);
+                }
+                if (n >= INV_VERIFY_CALLS) {
+                    g_invTrusted = true;
+                    Log("[MatrixSSE2] CMatrix::InvertRigid matched the client exactly on "
+                        "%ld consecutive real calls - running ours alone", n);
+                }
+            }
 
-            // Compute translation vector using transposed rows:
-            // trans = r0*(-tx) + r1*(-ty) + r2*(-tz)
-            __m128 trans = _mm_add_ps(
-                _mm_add_ps(_mm_mul_ps(r0, _mm_set1_ps(-tx)),
-                           _mm_mul_ps(r1, _mm_set1_ps(-ty))),
-                _mm_mul_ps(r2, _mm_set1_ps(-tz)));          // (out12,out13,out14,0)
-            trans = _mm_add_ps(trans, _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f)); // out15=1
-
-            _mm_storeu_ps(out,      r0);
-            _mm_storeu_ps(out + 4,  r1);
-            _mm_storeu_ps(out + 8,  r2);
-            _mm_storeu_ps(out + 12, trans);
+            _ReadWriteBarrier();
+            memcpy(out, built, sizeof(built));
             return out;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
@@ -869,6 +1176,35 @@ bool InstallMatrixCopySSE2() {
     Log("[MatrixSSE2] MatrixMultiply DISABLED via feature flag");
 #endif
 
+#if !TEST_DISABLE_QUAT_MATRIX_SSE2
+    if (!SelfTestQuatToMatrix()) {
+        // The self-test said why. Installing anyway would throw away the only
+        // thing standing between a misread spill slot and a subtly wrong bone
+        // rotation on every animated model in the game.
+    } else if (WineSafe_CreateHook((void*)0x004C1C40, (void*)Hooked_QuatToMatrix,
+                                   (void**)&pOrigQuatToMatrix) == MH_OK &&
+               WO_EnableHook((void*)0x004C1C40) == MH_OK) {
+        Log("[MatrixSSE2] Hooked QuatToMatrix at 0x004C1C40 "
+            "(SSE2 packed double, bit-identical, covers all 3 quaternion wrappers)");
+
+        // Only worth attempting once the core has proved itself and installed;
+        // this shares its arithmetic, so if that did not pass there is nothing
+        // here worth installing either.
+        if (WineSafe_CreateHook((void*)0x004C1DE0, (void*)Hooked_QuatToMatrixFull,
+                                (void**)&pOrigQuatToMatrixFull) == MH_OK &&
+            WO_EnableHook((void*)0x004C1DE0) == MH_OK) {
+            Log("[MatrixSSE2] Hooked QuatToMatrix(full) at 0x004C1DE0 "
+                "(fused with the core, one call instead of two on the per-bone path)");
+        } else {
+            Log("[MatrixSSE2] QuatToMatrix(full) hook FAILED - the core is still active");
+        }
+    } else {
+        Log("[MatrixSSE2] QuatToMatrix hook FAILED");
+    }
+#else
+    Log("[MatrixSSE2] QuatToMatrix DISABLED via feature flag");
+#endif
+
 #if !TEST_DISABLE_MATRIX_VECTOR_SSE2
     if (WineSafe_CreateHook((void*)0x004C21B0, (void*)Hooked_MatVec3Mul,
                             (void**)&pOrigMatVec3Mul) == MH_OK &&
@@ -893,7 +1229,8 @@ bool InstallMatrixCopySSE2() {
     if (WineSafe_CreateHook((void*)0x004C3420, (void*)Hooked_Vec3Norm,
                             (void**)&pOrigVec3Norm) == MH_OK &&
         WO_EnableHook((void*)0x004C3420) == MH_OK) {
-        Log("[MatrixSSE2] Hooked C3Vector::Normalize at 0x004C3420 (SSE2 sqrtss, 12 callers)");
+        Log("[MatrixSSE2] Hooked C3Vector::Normalize at 0x004C3420 "
+            "(SSE2 packed double, bit-identical, 12 callers)");
     } else {
         Log("[MatrixSSE2] C3Vector::Normalize hook FAILED");
     }
@@ -901,7 +1238,8 @@ bool InstallMatrixCopySSE2() {
     if (WineSafe_CreateHook((void*)0x004C3600, (void*)Hooked_Vec3NormSafe,
                             (void**)&pOrigVec3NormSafe) == MH_OK &&
         WO_EnableHook((void*)0x004C3600) == MH_OK) {
-        Log("[MatrixSSE2] Hooked C3Vector::Normalize(guarded) at 0x004C3600 (SSE2 sqrtss, 2^-22 guard, 22 callers)");
+        Log("[MatrixSSE2] Hooked C3Vector::Normalize(guarded) at 0x004C3600 "
+            "(SSE2 packed double, bit-identical, 2^-22 guard, 22 callers)");
     } else {
         Log("[MatrixSSE2] C3Vector::Normalize(guarded) hook FAILED");
     }
@@ -1006,6 +1344,12 @@ void ShutdownMatrixCopySSE2() {
     MH_DisableHook((void*)0x00407F40);
 #if !TEST_DISABLE_MATRIX_MULTIPLY
     MH_DisableHook((void*)0x004C1F00);
+#endif
+#if !TEST_DISABLE_QUAT_MATRIX_SSE2
+    MH_DisableHook((void*)0x004C1C40);
+    MH_DisableHook((void*)0x004C1DE0);
+    Log("[MatrixSSE2] Stats: QuatToMatrix core=%ld  fused wrapper=%ld",
+        g_quat2mat_calls, g_quat2matfull_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_VECTOR_SSE2
     MH_DisableHook((void*)0x004C21B0);

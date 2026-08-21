@@ -71,6 +71,7 @@ add_library(wow_optimize SHARED
     # unnoticed through several releases.
     src/core/version.rc
     src/hooks_subsystems/crt_mem_fastpath.cpp
+    src/runtime_vm/lua_mempool_fast.cpp
     src/runtime_vm/lua_optimize.cpp
     src/runtime_vm/lua_optimize.h
     src/hooks_subsystems/combatlog_optimize.cpp
@@ -101,10 +102,26 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_internals.h
     src/diagnostics/net_diag.cpp
     src/diagnostics/net_diag.h
+    src/diagnostics/addon_profiler.cpp
+    src/diagnostics/addon_profiler.h
+    src/diagnostics/lua_compile_census.cpp
+    src/diagnostics/lua_compile_census.h
+    src/diagnostics/shadow_state_probe.cpp
+    src/diagnostics/shadow_state_probe.h
+    src/hooks_subsystems/strncmp_sse2.cpp
+    src/hooks_subsystems/strncmp_sse2.h
     src/diagnostics/anim_census.cpp
     src/diagnostics/anim_census.h
     src/diagnostics/crash_dumper.cpp
+    src/hooks_subsystems/vertex_fmt_inline.cpp
+    src/hooks_subsystems/objmgr_find_fast.cpp
+    src/hooks_subsystems/anim_lod.cpp
+    src/simd_math/collision_outcode_sse2.cpp
+    src/runtime_vm/lua_proto_cache.cpp
+    src/simd_math/quat_lerp_sse2.cpp
     src/hooks_subsystems/render_null_guard.cpp
+    src/hooks_subsystems/device_callback_guard.cpp
+    src/hooks_subsystems/layout_relink_fast.cpp
     src/diagnostics/cvar_watchdog.cpp
     src/diagnostics/cvar_watchdog.h
     src/runtime_vm/lua_precall_cache.cpp
@@ -131,8 +148,6 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_getlocal_fast.h
     src/runtime_vm/lua_setlocal_fast.cpp
     src/runtime_vm/lua_setlocal_fast.h
-    src/runtime_vm/lua_setupvalue_fast.cpp
-    src/runtime_vm/lua_setupvalue_fast.h
     src/runtime_vm/lua_getinfo_fast.cpp
     src/runtime_vm/lua_getinfo_fast.h
     src/runtime_vm/lua_error_fast.cpp
@@ -155,8 +170,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/font_glyph_cache.h
     src/hooks_subsystems/async_sound_loader.cpp
     src/hooks_subsystems/async_sound_loader.h
-    src/runtime_vm/saved_vars_pretoken.cpp
-    src/runtime_vm/saved_vars_pretoken.h
     src/hooks_subsystems/mip_bias_governor.cpp
     src/hooks_subsystems/mip_bias_governor.h
     src/diagnostics/perf_diagnostics.cpp
@@ -175,8 +188,6 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_pushfstring_fast.h
     src/runtime_vm/lua_gettable_fast.cpp
     src/runtime_vm/lua_gettable_fast.h
-    src/runtime_vm/lua_concat_fast.cpp
-    src/runtime_vm/lua_concat_fast.h
     src/runtime_vm/lua_rawseti_fast.cpp
     src/runtime_vm/lua_rawseti_fast.h
     src/runtime_vm/lua_setfield_fast.cpp
@@ -202,16 +213,12 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/dxvk_bridge.h
     src/hooks_subsystems/strncmp_null_guard.cpp
     src/hooks_subsystems/strncmp_null_guard.h
-    src/hooks_subsystems/frame_throttle.cpp
-    src/hooks_subsystems/frame_throttle.h
     src/runtime_vm/lua_vm_cache.cpp
     src/runtime_vm/lua_vm_cache.h
     src/runtime_vm/lua_settable_cache.cpp
     src/runtime_vm/lua_settable_cache.h
     src/runtime_vm/regex_cache.cpp
     src/runtime_vm/regex_cache.h
-    src/simd_math/trig_lut.cpp
-    src/simd_math/trig_lut.h
     src/runtime_vm/lua_bytecode_cache.cpp
     src/runtime_vm/lua_bytecode_cache.h
     src/hooks_subsystems/addon_preload.cpp
@@ -224,8 +231,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/crt_char_fast.h
     src/hooks_subsystems/crt_wchar_fast.cpp
     src/hooks_subsystems/crt_wchar_fast.h
-    src/hooks_subsystems/stream_cache.cpp
-    src/hooks_subsystems/stream_cache.h
     src/runtime_vm/lua_this_cache.cpp
     src/runtime_vm/lua_this_cache.h
     src/hooks_subsystems/io_cache.cpp
@@ -242,6 +247,7 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/fast_strncmp.h
     src/allocators/crt_free_hook.cpp
     src/threading/lock_tuning.cpp
+    src/threading/cpu_topology.cpp
     src/allocators/texcache_tuning.cpp
     src/allocators/crt_free_hook.h
     src/allocators/aligned_alloc_cache.cpp
@@ -256,8 +262,6 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_checknumber_cache.h
     src/runtime_vm/lua_pushstring_cache.cpp
     src/runtime_vm/lua_pushstring_cache.h
-    src/hooks_subsystems/object_accessor_cache.cpp
-    src/hooks_subsystems/object_accessor_cache.h
     src/hooks_subsystems/format_validator_cache.cpp
     src/hooks_subsystems/format_validator_cache.h
     src/allocators/heap_compactor.cpp
@@ -289,8 +293,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/gettime_fast.cpp
     src/runtime_vm/lua_pushvalue_fast.cpp
     src/hooks_subsystems/render_state_dedup.cpp
-    src/hooks_subsystems/event_name_hash.cpp
-    src/hooks_subsystems/cdatastore_batch.cpp
     src/runtime_vm/lua_tonumber_fast.h
     src/hooks_subsystems/strcat_fast.cpp
     src/hooks_subsystems/strcat_fast.h
@@ -300,8 +302,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/dbc_lookup_cache.h
     src/hooks_subsystems/event_dispatch_cache.cpp
     src/hooks_subsystems/event_dispatch_cache.h
-    src/hooks_subsystems/event_name_cache.cpp
-    src/hooks_subsystems/event_name_cache.h
     src/runtime_vm/lua_getstr_inline.cpp
     src/runtime_vm/lua_rawgeti_inline.cpp
     src/runtime_vm/lua_rawget_inline.cpp
@@ -336,10 +336,6 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/wow_subsystem_hooks.h
     src/hooks_subsystems/wow_memory_opt.cpp
     src/hooks_subsystems/wow_memory_opt.h
-    src/hooks_subsystems/wow_source_opt.cpp
-    src/hooks_subsystems/wow_source_opt.h
-    src/hooks_subsystems/tls_object_cache.cpp
-    src/hooks_subsystems/tls_object_cache.h
     src/hooks_subsystems/hooks_render.cpp
     src/hooks_subsystems/hooks_render.h
     src/simd_math/horizon_occlusion_sse2.cpp
@@ -412,16 +408,15 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/font_metrics_fast.cpp
     src/hooks_subsystems/font_metrics_fast.h
     src/diagnostics/sampling_profiler.cpp
+    src/diagnostics/lua_addon_sampler.cpp
     src/hooks_subsystems/sound_driver_guard.cpp
     src/hooks_subsystems/sound_emitter_guard.cpp
     src/hooks_subsystems/sound_buffer_guard.cpp
-    src/hooks_subsystems/sound_update_guard.cpp
 
     src/diagnostics/sampling_profiler.h
     src/hooks_subsystems/sound_driver_guard.h
     src/hooks_subsystems/sound_emitter_guard.h
     src/hooks_subsystems/sound_buffer_guard.h
-    src/hooks_subsystems/sound_update_guard.h
 
     src/hooks_subsystems/sound_coalescer.cpp
     src/hooks_subsystems/sound_coalescer.h

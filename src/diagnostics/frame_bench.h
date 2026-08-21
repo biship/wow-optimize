@@ -58,4 +58,16 @@ double RecentP95Ms();
 // per-Sleep path.
 double SmoothedFrameMs();
 
+// The running median frame time, refreshed from the histogram every few hundred
+// frames. Read by the sampling profiler to notice a frame-rate cap: a median
+// sitting on a display interval means its verdict is describing a wait.
+double MedianMs();
+
+// The session's 95th percentile, computed in the same walk as the median so the
+// two can be compared. A frame-rate cap holds every frame at the interval, so a
+// capped session has these two almost equal; a client that is merely slow at the
+// same median has a long tail. Reading the median alone is what made the profiler
+// call an uncapped session capped.
+double SessionP95Ms();
+
 } // namespace FrameBench
