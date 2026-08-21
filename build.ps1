@@ -108,6 +108,21 @@ if (!$SkipGitUpdate) {
     $protectedFiles = @('build.ps1', 'wow-optimize.code-workspace')
     $protectedFileStashed = $false
 
+    $trackedChanges = @(& git status --porcelain=v1 --untracked-files=no -- . `
+        ':(exclude)build.ps1' ':(exclude)wow-optimize.code-workspace')
+    if ($LASTEXITCODE) {
+        throw "git status failed with exit code $LASTEXITCODE."
+    }
+
+    $trackedChanges = @($trackedChanges | Where-Object { $_ })
+    if ($trackedChanges.Count -gt 0) {
+        Write-Host 'Upstream update stopped: tracked files have local changes.' -ForegroundColor Yellow
+        $trackedChanges | ForEach-Object { Write-Host "  $_" }
+        Write-Host 'Commit, stash, or restore those files, then run the build again.'
+        Write-Host 'To build the current checkout without Git updates, use --skip-git-update.'
+        exit 1
+    }
+
     Invoke-Checked git @('fetch', 'upstream')
 
     # Keep local customizations to these files out of the merge so they are not overwritten.
