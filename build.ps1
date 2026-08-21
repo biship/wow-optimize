@@ -54,6 +54,9 @@ Usage:
   .\build.ps1 [--config <configuration>] [-SkipGitUpdate]
   .\build.ps1 --help
 
+Every build removes generated state and configures a clean Win32 C++20 tree.
+The native build profile is MakeFile_C20.cmake and its output is build_C20.
+
 Options:
   --config <configuration>  Build one of the Visual Studio configurations below.
                             Default: Release.
@@ -90,10 +93,11 @@ $Config = [string]$normalizedConfig
 Set-Location $PSScriptRoot
 
 $wowClient = 'C:\ProgramData\WOW\WOWClient'
-$build     = Join-Path $PSScriptRoot 'build'
+$build     = Join-Path $PSScriptRoot 'build_C20'
 $output    = Join-Path $build $Config
 $launcherPdb = Join-Path $output 'wow_optimize_launcher.pdb'
 $vswhere   = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$cmakeProfile = Join-Path $PSScriptRoot 'MakeFile_C20.cmake'
 
 function Invoke-Checked {
     param([string]$Command, [string[]]$Arguments)
@@ -172,31 +176,19 @@ $refs = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETF
 
 if (!(Test-Path $csc))                  { throw "Roslyn compiler not found: $csc" }
 if (!(Test-Path "$refs\mscorlib.dll")) { throw '.NET Framework 4.8 targeting pack not found.' }
+if (!(Test-Path $cmakeProfile))         { throw "C++20 CMake profile not found: $cmakeProfile" }
 
-# CMake's --fresh option resets only the top-level cache. FetchContent keeps
-# nested caches under build\_deps, and those contain absolute paths that become
-# invalid when this checkout is moved.
-$staleCache = Get-ChildItem -LiteralPath $build -Filter CMakeCache.txt -Recurse -ErrorAction SilentlyContinue |
-    Where-Object {
-        $cacheDirectory = Select-String -LiteralPath $_.FullName `
-            -Pattern '^CMAKE_CACHEFILE_DIR:INTERNAL=(.+)$' |
-            Select-Object -First 1 -ExpandProperty Matches |
-            ForEach-Object { $_.Groups[1].Value }
-
-        $expectedDirectory = Split-Path $_.FullName -Parent
-        $cacheDirectory -and
-            ($cacheDirectory.Replace('/', '\') -ine $expectedDirectory.Replace('/', '\'))
-    } |
-    Select-Object -First 1
-
-if ($staleCache) {
-    Write-Host "Checkout moved; removing stale generated CMake build state." -ForegroundColor Yellow
+# CMake's --fresh resets only the top-level cache. Remove all generated state so
+# FetchContent dependencies cannot retain another configuration or C++ standard.
+if (Test-Path -LiteralPath $build) {
+    Write-Host "Removing generated CMake build state for a clean C++20 $Config build..."
     Remove-Item -LiteralPath $build -Recurse -Force
 }
 
 Write-Host "[1/4] Configuring x86 $Config build..."
 Invoke-Checked cmake.exe @(
     '--fresh'
+    '-C', $cmakeProfile
     '-S', $PSScriptRoot
     '-B', $build
     '-G', 'Visual Studio 18 2026'
@@ -211,6 +203,7 @@ Invoke-Checked cmake.exe @(
     '--build', $build
     '--config', $Config
     '--'
+    '/p:LanguageStandard=stdcpp20'
     '/p:UseMultiToolTask=true'
 )
 
