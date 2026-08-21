@@ -1,6 +1,7 @@
 #include "config.h"
 #include <windows.h>
 #include <string>
+#include <vector>
 #include <cstdio>
 #include <cstring>
 
@@ -39,6 +40,19 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "VulkanDXVK", &Settings::OptVulkanDXVK },
     { "General", "TimingFix", &Settings::OptTimingFix },
     { "General", "CvarNullGuard", &Settings::OptCvarNullGuard },
+    { "General", "DeviceCbGuard", &Settings::OptDeviceCbGuard },
+    { "General", "WowOptHooks", &Settings::OptWowOptHooks },
+    { "General", "WowPerfHooks", &Settings::OptWowPerfHooks },
+    { "General", "WowExtendedHooks", &Settings::OptWowExtendedHooks },
+    { "General", "WowSubsystemHooks", &Settings::OptWowSubsystemHooks },
+    { "General", "LockTuning", &Settings::OptLockTuning },
+    { "General", "AsyncMpqIo", &Settings::OptAsyncMpqIo },
+    { "General", "ThreadIdCache", &Settings::OptThreadIdCache },
+    { "General", "PriorityGuard", &Settings::OptPriorityGuard },
+    { "UI_Lua", "LuaVmOpt", &Settings::OptLuaVmOpt },
+    { "UI_Lua", "LuaGcManual", &Settings::OptLuaGcManual },
+    { "Graphics_Sound", "D3d9StateManager", &Settings::OptD3d9StateManager },
+    { "UI_Lua", "LayoutRelinkFast", &Settings::OptLayoutRelinkFast },
     { "General", "TimingCvarPin", &Settings::OptTimingCvarPin },
     { "General", "FrameLimiter", &Settings::OptFrameLimiter },
     { "General", "ObjVisCache", &Settings::OptObjVisCache },
@@ -48,7 +62,6 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "MimallocLarge", &Settings::OptMimallocLarge },
     { "General", "VaArena", &Settings::OptVaArena },
     { "General", "CompatMode", &Settings::OptCompatMode },
-    { "General", "FullDump", &Settings::FullDump },
     { "UI_Lua", "UIFrameBatch", &Settings::OptUIFrameBatch },
     { "UI_Lua", "AddonDispatcher", &Settings::OptAddonDispatcher },
     { "UI_Lua", "UIFrameAccessorFast", &Settings::OptUIFrameAccessorFast },
@@ -57,12 +70,21 @@ static const BoolSetting kBoolSettings[] = {
     { "UI_Lua", "FrameScriptDispatch", &Settings::OptFrameScriptDispatch },
     { "UI_Lua", "LuaNumConvFast", &Settings::OptLuaNumConvFast },
     { "UI_Lua", "LuaOpcache", &Settings::OptLuaOpcache },
+    { "UI_Lua", "LuaOpcacheTables", &Settings::OptLuaOpcacheTables },
+    { "UI_Lua", "LuaOpcacheStrings", &Settings::OptLuaOpcacheStrings },
+    { "UI_Lua", "LuaOpcacheWrites", &Settings::OptLuaOpcacheWrites },
+    { "UI_Lua", "LuaOpcacheReads", &Settings::OptLuaOpcacheReads },
     { "UI_Lua", "LuaGcCoalesce", &Settings::OptLuaGcCoalesce },
     { "UI_Lua", "LuaGetTimeFast", &Settings::OptLuaGetTimeFast },
-    { "UI_Lua", "AsyncTexLoader", &Settings::OptAsyncTexLoader },
+    // AsyncTexLoader and MipBiasGovernor are read from Graphics_Sound because
+    // that is the section the launcher writes them to. They used to be read from
+    // UI_Lua, which the launcher never writes for these two keys, so the switch
+    // was inert: whatever you set, the DLL read the absent-key default of off and
+    // neither feature could be turned on by anyone.
+    { "Graphics_Sound", "AsyncTexLoader", &Settings::OptAsyncTexLoader },
     { "UI_Lua", "AsyncTerrainLoader", &Settings::OptAsyncTerrainLoader },
     { "UI_Lua", "RcuObjMgr", &Settings::OptRcuObjMgr },
-    { "UI_Lua", "MipBiasGovernor", &Settings::OptMipBiasGovernor },
+    { "Graphics_Sound", "MipBiasGovernor", &Settings::OptMipBiasGovernor },
     { "Combat_Net", "CombatLogLeakFix", &Settings::OptCombatLogLeakFix },
     { "Combat_Net", "CombatLogParser", &Settings::OptCombatLogParser },
     { "Combat_Net", "CombatLogIncremental", &Settings::OptCombatLogIncremental },
@@ -83,6 +105,22 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "SoundMixerOpt", &Settings::OptSoundMixerOpt },
     { "Graphics_Sound", "AudioDecodeMt", &Settings::OptAudioDecodeMt },
     { "Graphics_Sound", "DbcLookupCache", &Settings::OptDbcLookupCache },
+    { "General", "FileIoHooks", &Settings::OptFileIoHooks },
+    { "UI_Lua", "LuaTypeFast", &Settings::OptLuaTypeFast },
+    { "General", "Win32ApiCaches", &Settings::OptWin32ApiCaches },
+    { "General", "DebugApiHooks", &Settings::OptDebugApiHooks },
+    { "General", "LockSpinHooks", &Settings::OptLockSpinHooks },
+    { "UI_Lua", "LuaAddonProfile", &Settings::OptLuaAddonProfile },
+    { "General", "CpuTopology", &Settings::OptCpuTopology },
+    { "General", "PinMainThread", &Settings::OptPinMainThread },
+    { "UI_Lua", "LuaMemPoolFast", &Settings::OptLuaMemPoolFast },
+    { "Graphics_Sound", "VertexFmtInline", &Settings::OptVertexFmtInline },
+    { "General", "ObjMgrFindFast", &Settings::OptObjMgrFindFast },
+    { "Graphics_Sound", "QuatLerpSse2", &Settings::OptQuatLerpSse2 },
+    { "UI_Lua", "LuaProtoCache", &Settings::OptLuaProtoCache },
+    { "UI_Lua", "LuaThisFast", &Settings::OptLuaThisFast },
+    { "Graphics_Sound", "AnimLod", &Settings::OptAnimLod },
+    { "Graphics_Sound", "CollisionOutcode", &Settings::OptCollisionOutcode },
     { "Graphics_Sound", "WorldStateCoalesce", &Settings::OptWorldStateCoalesce },
     { "Graphics_Sound", "D3d9RenderThread", &Settings::OptD3d9RenderThread },
     { "Combat_Net", "CombatLogFilter", &Settings::OptCombatLogFilter },
@@ -93,6 +131,11 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "MpqAsyncDecompress", &Settings::OptMpqAsyncDecompress },
     { "Graphics_Sound", "SimdMatrixTransform", &Settings::OptSimdMatrixTransform },
     { "Graphics_Sound", "SpellEffectCulling", &Settings::OptSpellEffectCulling },
+    { "Graphics_Sound", "RenderNullGuard", &Settings::OptRenderNullGuard },
+    { "Graphics_Sound", "StrncmpSse2", &Settings::OptStrncmpSse2 },
+    { "UI_Lua", "AddonProfiler", &Settings::OptAddonProfiler },
+    { "UI_Lua", "LuaCompileCensus", &Settings::OptLuaCompileCensus },
+    { "Graphics_Sound", "ShadowStateProbe", &Settings::OptShadowStateProbe },
     { "Graphics_Sound", "QuatNormalizeSse2", &Settings::OptQuatNormalizeSse2 },
     { "Graphics_Sound", "MatrixMultiplySse2", &Settings::OptMatrixMultiplySse2 },
     { "Graphics_Sound", "DrawCensus", &Settings::OptDrawCensus },
@@ -110,6 +153,8 @@ static const BoolSetting kBoolSettings[] = {
 };
 
 static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolSettings[0]));
+
+    static void ReportDuplicateKeys(const char* path);
 
     void DumpToLog() {
         Log("[Config] Read from: %s", g_loadedFrom.empty() ? "(none)" : g_loadedFrom.c_str());
@@ -158,6 +203,69 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         Log("[Config]   [General] SleepPrecisionValue=%d", g_settings.SleepPrecisionValue);
         Log("[Config]   [General] SessionLogsToKeep=%d", g_settings.SessionLogsToKeep);
         Log("[Config] %d set in the file, %d left at defaults.", fromFile, defaulted);
+
+        if (haveFile) ReportDuplicateKeys(path);
+    }
+
+    // A key written twice in one section is not a hypothetical. A tester's ini
+    // carried LuaGcManual=1 near the top of [UI_Lua] and LuaGcManual=0 at the
+    // bottom, and spent a session believing the collector was on manual when
+    // GetPrivateProfileInt had answered from the first one. Everything above
+    // reports the resolved value correctly and still cannot show that, because
+    // the losing line never reaches this code.
+    //
+    // Reads the file directly rather than through the profile API, which is what
+    // hides the duplicate in the first place.
+    static void ReportDuplicateKeys(const char* path) {
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "rb") != 0 || !f) return;
+
+        struct Seen { std::string section; std::string key; int line; };
+        std::vector<Seen> seen;
+        std::string section;
+        char buf[512];
+        int lineNo = 0, reported = 0;
+
+        while (fgets(buf, sizeof(buf), f)) {
+            lineNo++;
+            char* s = buf;
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == ';' || *s == '#' || *s == '\r' || *s == '\n' || *s == 0) continue;
+
+            if (*s == '[') {
+                char* end = strchr(s, ']');
+                if (end) section.assign(s + 1, end - s - 1);
+                continue;
+            }
+
+            char* eq = strchr(s, '=');
+            if (!eq) continue;
+            std::string key(s, eq - s);
+            while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+            if (key.empty()) continue;
+
+            bool dup = false;
+            for (size_t i = 0; i < seen.size(); i++) {
+                if (seen[i].section == section && _stricmp(seen[i].key.c_str(), key.c_str()) == 0) {
+                    if (reported == 0) {
+                        Log("[Config] This file sets the same key more than once. Windows "
+                            "answers with the first one it finds, so the later line does "
+                            "nothing and a setting you believe you changed has not "
+                            "changed:");
+                    }
+                    Log("[Config]   [%s] %s - line %d wins, line %d is ignored",
+                        section.c_str(), key.c_str(), seen[i].line, lineNo);
+                    reported++;
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                Seen e; e.section = section; e.key = key; e.line = lineNo;
+                seen.push_back(e);
+            }
+        }
+        fclose(f);
     }
 
     static bool FileExists(const std::string& p) {
@@ -260,6 +368,19 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
             WritePrivateProfileStringA("General", "VulkanDXVK", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "TimingFix", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "CvarNullGuard", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "DeviceCbGuard", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "WowOptHooks", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "WowPerfHooks", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "WowExtendedHooks", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "WowSubsystemHooks", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "LockTuning", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "AsyncMpqIo", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "ThreadIdCache", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "PriorityGuard", "1", iniPath.c_str());
+            WritePrivateProfileStringA("UI_Lua", "LuaVmOpt", "1", iniPath.c_str());
+            WritePrivateProfileStringA("UI_Lua", "LuaGcManual", "1", iniPath.c_str());
+            WritePrivateProfileStringA("Graphics_Sound", "D3d9StateManager", "1", iniPath.c_str());
+            WritePrivateProfileStringA("UI_Lua", "LayoutRelinkFast", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "FrameLimiter", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "ObjVisCache", "1", iniPath.c_str());
             WritePrivateProfileStringA("General", "DbcPreload", "0", iniPath.c_str());
@@ -269,7 +390,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
             WritePrivateProfileStringA("General", "MimallocLarge", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "VaArena", "0", iniPath.c_str());  // EXPERIMENTAL, opt-in
             WritePrivateProfileStringA("General", "CompatMode", "0", iniPath.c_str());  // set 1 on VMs/HyperV if the game can't connect
-            WritePrivateProfileStringA("General", "FullDump", "0", iniPath.c_str());  // 1 = full-memory crash dump (~1-2 GB), 0 = minidump
 
 
             // UI & Lua
@@ -281,13 +401,17 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
             WritePrivateProfileStringA("UI_Lua", "FrameScriptDispatch", "0", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "LuaNumConvFast", "0", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "LuaOpcache", "0", iniPath.c_str());  // #37: slow loads + Lua errors — off by default
+            WritePrivateProfileStringA("UI_Lua", "LuaOpcacheTables", "1", iniPath.c_str());
+            WritePrivateProfileStringA("UI_Lua", "LuaOpcacheStrings", "1", iniPath.c_str());
+            WritePrivateProfileStringA("UI_Lua", "LuaOpcacheWrites", "1", iniPath.c_str());
+            WritePrivateProfileStringA("UI_Lua", "LuaOpcacheReads", "1", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "LuaGcCoalesce", "0", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "LuaJIT", "0", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "LuaGetTimeFast", "0", iniPath.c_str());
-            WritePrivateProfileStringA("UI_Lua", "AsyncTexLoader", "0", iniPath.c_str());
+            WritePrivateProfileStringA("Graphics_Sound", "AsyncTexLoader", "0", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "AsyncTerrainLoader", "0", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "RcuObjMgr", "0", iniPath.c_str());
-            WritePrivateProfileStringA("UI_Lua", "MipBiasGovernor", "0", iniPath.c_str());
+            WritePrivateProfileStringA("Graphics_Sound", "MipBiasGovernor", "0", iniPath.c_str());
 
             // Combat & Network
             WritePrivateProfileStringA("Combat_Net", "CombatLogLeakFix", "1", iniPath.c_str());
@@ -338,6 +462,19 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptVulkanDXVK          = GetPrivateProfileIntA("General", "VulkanDXVK", 0, iniPath.c_str()) != 0;
         g_settings.OptTimingFix           = GetPrivateProfileIntA("General", "TimingFix", 0, iniPath.c_str()) != 0;
         g_settings.OptCvarNullGuard       = GetPrivateProfileIntA("General", "CvarNullGuard", 1, iniPath.c_str()) != 0;
+        g_settings.OptDeviceCbGuard       = GetPrivateProfileIntA("General", "DeviceCbGuard", 1, iniPath.c_str()) != 0;
+        g_settings.OptWowOptHooks        = GetPrivateProfileIntA("General", "WowOptHooks", 1, iniPath.c_str()) != 0;
+        g_settings.OptWowPerfHooks       = GetPrivateProfileIntA("General", "WowPerfHooks", 1, iniPath.c_str()) != 0;
+        g_settings.OptWowExtendedHooks   = GetPrivateProfileIntA("General", "WowExtendedHooks", 1, iniPath.c_str()) != 0;
+        g_settings.OptWowSubsystemHooks  = GetPrivateProfileIntA("General", "WowSubsystemHooks", 1, iniPath.c_str()) != 0;
+        g_settings.OptLockTuning         = GetPrivateProfileIntA("General", "LockTuning", 1, iniPath.c_str()) != 0;
+        g_settings.OptAsyncMpqIo         = GetPrivateProfileIntA("General", "AsyncMpqIo", 1, iniPath.c_str()) != 0;
+        g_settings.OptThreadIdCache      = GetPrivateProfileIntA("General", "ThreadIdCache", 1, iniPath.c_str()) != 0;
+        g_settings.OptPriorityGuard      = GetPrivateProfileIntA("General", "PriorityGuard", 1, iniPath.c_str()) != 0;
+        g_settings.OptLuaVmOpt           = GetPrivateProfileIntA("UI_Lua", "LuaVmOpt", 1, iniPath.c_str()) != 0;
+        g_settings.OptLuaGcManual        = GetPrivateProfileIntA("UI_Lua", "LuaGcManual", 1, iniPath.c_str()) != 0;
+        g_settings.OptD3d9StateManager    = GetPrivateProfileIntA("Graphics_Sound", "D3d9StateManager", 1, iniPath.c_str()) != 0;
+        g_settings.OptLayoutRelinkFast    = GetPrivateProfileIntA("UI_Lua", "LayoutRelinkFast", 0, iniPath.c_str()) != 0;
         g_settings.OptTimingCvarPin       = GetPrivateProfileIntA("General", "TimingCvarPin", 1, iniPath.c_str()) != 0;
         g_settings.OptFrameLimiter        = GetPrivateProfileIntA("General", "FrameLimiter", 0, iniPath.c_str()) != 0;
         g_settings.OptObjVisCache         = GetPrivateProfileIntA("General", "ObjVisCache", 1, iniPath.c_str()) != 0;
@@ -347,7 +484,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptMimallocLarge       = GetPrivateProfileIntA("General", "MimallocLarge", 0, iniPath.c_str()) != 0;
         g_settings.OptVaArena             = GetPrivateProfileIntA("General", "VaArena", 0, iniPath.c_str()) != 0;
         g_settings.OptCompatMode          = GetPrivateProfileIntA("General", "CompatMode", 0, iniPath.c_str()) != 0;
-        g_settings.FullDump               = GetPrivateProfileIntA("General", "FullDump", 0, iniPath.c_str()) != 0;
         // HARD-DISABLED regardless of ini: in tester logs the arena was active
         // on machines with zero fragmentation (2GB+ largest free block), so it
         // used ~0.2MB of its 64MB and delivered no benefit - while still routing
@@ -367,18 +503,24 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptFrameScriptDispatch = GetPrivateProfileIntA("UI_Lua", "FrameScriptDispatch", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaNumConvFast      = GetPrivateProfileIntA("UI_Lua", "LuaNumConvFast", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaOpcache          = GetPrivateProfileIntA("UI_Lua", "LuaOpcache", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaOpcacheTables   = GetPrivateProfileIntA("UI_Lua", "LuaOpcacheTables", 1, iniPath.c_str()) != 0;
+        g_settings.OptLuaOpcacheStrings  = GetPrivateProfileIntA("UI_Lua", "LuaOpcacheStrings", 1, iniPath.c_str()) != 0;
+        g_settings.OptLuaOpcacheWrites   = GetPrivateProfileIntA("UI_Lua", "LuaOpcacheWrites", 1, iniPath.c_str()) != 0;
+        g_settings.OptLuaOpcacheReads    = GetPrivateProfileIntA("UI_Lua", "LuaOpcacheReads", 1, iniPath.c_str()) != 0;
         g_settings.OptLuaGcCoalesce       = GetPrivateProfileIntA("UI_Lua", "LuaGcCoalesce", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaGetTimeFast      = GetPrivateProfileIntA("UI_Lua", "LuaGetTimeFast", 0, iniPath.c_str()) != 0;
-        g_settings.OptAsyncTexLoader      = GetPrivateProfileIntA("UI_Lua", "AsyncTexLoader", 0, iniPath.c_str()) != 0;
+        g_settings.OptAsyncTexLoader      = GetPrivateProfileIntA("Graphics_Sound", "AsyncTexLoader", 0, iniPath.c_str()) != 0;
         g_settings.OptAsyncTerrainLoader  = GetPrivateProfileIntA("UI_Lua", "AsyncTerrainLoader", 0, iniPath.c_str()) != 0;
         g_settings.OptRcuObjMgr           = GetPrivateProfileIntA("UI_Lua", "RcuObjMgr", 0, iniPath.c_str()) != 0;
-        g_settings.OptMipBiasGovernor     = GetPrivateProfileIntA("UI_Lua", "MipBiasGovernor", 0, iniPath.c_str()) != 0;
+        g_settings.OptMipBiasGovernor     = GetPrivateProfileIntA("Graphics_Sound", "MipBiasGovernor", 0, iniPath.c_str()) != 0;
 
         // Combat & Network
         g_settings.OptCombatLogLeakFix    = GetPrivateProfileIntA("Combat_Net", "CombatLogLeakFix", 1, iniPath.c_str()) != 0;
         g_settings.OptCombatLogParser     = GetPrivateProfileIntA("Combat_Net", "CombatLogParser", 0, iniPath.c_str()) != 0;
         g_settings.OptCombatLogIncremental = GetPrivateProfileIntA("Combat_Net", "CombatLogIncremental", 0, iniPath.c_str()) != 0;
         g_settings.OptEventCoalescer      = GetPrivateProfileIntA("Combat_Net", "EventCoalescer", 0, iniPath.c_str()) != 0;
+        // Back to 0. Both modules are inert - see the notes in config.h - so a 1
+        // here only makes the config dump read as though something is running.
         g_settings.OptSavedVarsAsync      = GetPrivateProfileIntA("Combat_Net", "SavedVarsAsync", 0, iniPath.c_str()) != 0;
         g_settings.OptSavedVarsPretoken   = GetPrivateProfileIntA("Combat_Net", "SavedVarsPretoken", 0, iniPath.c_str()) != 0;
         g_settings.OptUnitAuraFast        = GetPrivateProfileIntA("Combat_Net", "UnitAuraFast", 0, iniPath.c_str()) != 0;
@@ -397,6 +539,29 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptSoundMixerOpt       = GetPrivateProfileIntA("Graphics_Sound", "SoundMixerOpt", 0, iniPath.c_str()) != 0;
         g_settings.OptAudioDecodeMt       = GetPrivateProfileIntA("Graphics_Sound", "AudioDecodeMt", 0, iniPath.c_str()) != 0;
         g_settings.OptDbcLookupCache      = GetPrivateProfileIntA("Graphics_Sound", "DbcLookupCache", 0, iniPath.c_str()) != 0;
+        // Inherits DbcLookupCache when absent, which is exactly what these
+        // hooks were gated on before they had a switch of their own. An
+        // existing wow_opt.ini therefore keeps the behaviour it had.
+        g_settings.OptFileIoHooks         = GetPrivateProfileIntA("General", "FileIoHooks", g_settings.OptDbcLookupCache ? 1 : 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaTypeFast         = GetPrivateProfileIntA("UI_Lua", "LuaTypeFast", g_settings.OptDbcLookupCache ? 1 : 0, iniPath.c_str()) != 0;
+        // Same inheritance rule as FileIoHooks: each takes the switch it used to
+        // hang off as its default, so an existing wow_opt.ini keeps behaving the
+        // way it did until its owner writes the new key.
+        g_settings.OptWin32ApiCaches      = GetPrivateProfileIntA("General", "Win32ApiCaches", g_settings.OptTimingFix ? 1 : 0, iniPath.c_str()) != 0;
+        g_settings.OptDebugApiHooks       = GetPrivateProfileIntA("General", "DebugApiHooks", g_settings.OptCvarNullGuard ? 1 : 0, iniPath.c_str()) != 0;
+        g_settings.OptLockSpinHooks       = GetPrivateProfileIntA("General", "LockSpinHooks", g_settings.OptDefragLf ? 1 : 0, iniPath.c_str()) != 0;
+        // There is nothing to charge samples to without the sampler running.
+        g_settings.OptLuaAddonProfile     = GetPrivateProfileIntA("UI_Lua", "LuaAddonProfile", g_settings.OptSamplingProfiler ? 1 : 0, iniPath.c_str()) != 0;
+        g_settings.OptCpuTopology         = GetPrivateProfileIntA("General", "CpuTopology", 1, iniPath.c_str()) != 0;
+        g_settings.OptPinMainThread       = GetPrivateProfileIntA("General", "PinMainThread", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaMemPoolFast      = GetPrivateProfileIntA("UI_Lua", "LuaMemPoolFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptVertexFmtInline     = GetPrivateProfileIntA("Graphics_Sound", "VertexFmtInline", 0, iniPath.c_str()) != 0;
+        g_settings.OptObjMgrFindFast      = GetPrivateProfileIntA("General", "ObjMgrFindFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptQuatLerpSse2        = GetPrivateProfileIntA("Graphics_Sound", "QuatLerpSse2", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaProtoCache       = GetPrivateProfileIntA("UI_Lua", "LuaProtoCache", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaThisFast         = GetPrivateProfileIntA("UI_Lua", "LuaThisFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptAnimLod             = GetPrivateProfileIntA("Graphics_Sound", "AnimLod", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionOutcode    = GetPrivateProfileIntA("Graphics_Sound", "CollisionOutcode", 0, iniPath.c_str()) != 0;
         g_settings.OptWorldStateCoalesce  = GetPrivateProfileIntA("Graphics_Sound", "WorldStateCoalesce", 0, iniPath.c_str()) != 0;
         g_settings.OptD3d9RenderThread    = GetPrivateProfileIntA("Graphics_Sound", "D3d9RenderThread", 0, iniPath.c_str()) != 0;
         // HARD-DISABLED regardless of ini: this offloads D3D9 draw/Present/Reset
@@ -420,7 +585,12 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptMpqAsyncDecompress = GetPrivateProfileIntA("General", "MpqAsyncDecompress", 0, iniPath.c_str()) != 0;
         g_settings.OptSimdMatrixTransform = GetPrivateProfileIntA("Graphics_Sound", "SimdMatrixTransform", 0, iniPath.c_str()) != 0;
         g_settings.OptSpellEffectCulling = GetPrivateProfileIntA("Graphics_Sound", "SpellEffectCulling", 0, iniPath.c_str()) != 0;
-        g_settings.OptQuatNormalizeSse2 = GetPrivateProfileIntA("Graphics_Sound", "QuatNormalizeSse2", 0, iniPath.c_str()) != 0;
+        g_settings.OptRenderNullGuard = GetPrivateProfileIntA("Graphics_Sound", "RenderNullGuard", 1, iniPath.c_str()) != 0;
+        g_settings.OptStrncmpSse2 = GetPrivateProfileIntA("Graphics_Sound", "StrncmpSse2", 1, iniPath.c_str()) != 0;
+        g_settings.OptAddonProfiler = GetPrivateProfileIntA("UI_Lua", "AddonProfiler", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaCompileCensus = GetPrivateProfileIntA("UI_Lua", "LuaCompileCensus", 1, iniPath.c_str()) != 0;
+        g_settings.OptShadowStateProbe = GetPrivateProfileIntA("Graphics_Sound", "ShadowStateProbe", 0, iniPath.c_str()) != 0;
+        g_settings.OptQuatNormalizeSse2 = GetPrivateProfileIntA("Graphics_Sound", "QuatNormalizeSse2", 1, iniPath.c_str()) != 0;
         g_settings.OptMatrixMultiplySse2 = GetPrivateProfileIntA("Graphics_Sound", "MatrixMultiplySse2", 1, iniPath.c_str()) != 0;
         g_settings.OptDrawCensus = GetPrivateProfileIntA("Graphics_Sound", "DrawCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaAllocCensus = GetPrivateProfileIntA("UI_Lua", "LuaAllocCensus", 0, iniPath.c_str()) != 0;
@@ -441,3 +611,8 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptVertexBufferPrealloc = GetPrivateProfileIntA("General", "VertexBufferPrealloc", 0, iniPath.c_str()) != 0;
     }
 }
+
+// lua_optimize.cpp has a file-scope object named Config, so it cannot include
+// config.h. It reads these two settings through here instead.
+extern "C" bool WowOpt_LuaVmOptEnabled()    { return Config::g_settings.OptLuaVmOpt; }
+extern "C" bool WowOpt_LuaGcManualEnabled() { return Config::g_settings.OptLuaGcManual; }

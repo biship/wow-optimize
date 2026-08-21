@@ -3537,26 +3537,15 @@ bool InitPhase2(lua_State* L) {
     int hookedNow = 0;
     int hookedTotal = 0;
 
-    // Batch this loop's MinHook enables into one thread-freeze.
-    //
-    // Every MH_EnableHook does a system-wide CreateToolhelp32Snapshot plus a
-    // suspend/resume of all ~50 client threads: a flat ~128ms each on a busy
-    // 32-CPU box. Fifty-five of them in a row froze the main game thread for
-    // ~7-10 seconds right after the login screen appeared.
-    //
-    // Hazard: MinHook's enable queue is process-global. MH_ApplyQueued() commits
-    // whatever anyone has queued, so two threads building queues concurrently
-    // can commit each other's half-built work. The background init thread
-    // already batches via g_hookBatchMode, and Phase 2 runs later on the main
-    // game thread — today separated by ~3ms of luck. Rather than serialise both
-    // behind a lock (this loop body is inside __try, where MSVC forbids anything
-    // with a destructor, so no lock guard is available and a raw acquire/release
-    // around SEH is easy to get wrong), we gate on the explicit g_hookBatchDone
-    // signal set right after init's own MH_ApplyQueued(). Before that point
-    // Phase 2 simply keeps the old immediate path.
-    const bool batchEnables = (g_hookBatchDone != 0) && (g_hookBatchMode == 0);
-    int queuedIdx[NUM_FUNC_HOOKS > 0 ? NUM_FUNC_HOOKS : 1];
-    int queuedCount = 0;
+    // Phase 2 runs on the main thread, after init has closed its batch window,
+    // every time the lua_State changes. Enabling each inline hook on its own
+    // costs a process-wide thread freeze, and this loop installs dozens of them
+    // in a row - that is the multi-second unresponsive window reported just
+    // after the login screen. Queue them and pay one freeze at the end instead.
+    // Only when init has settled: the MinHook queue is shared, and committing it
+    // mid-init would enable a partially built set.
+    const bool lateBatch = WO_LateBatchAllowed();
+    int queuedEnables = 0;
 
     for (int i = 0; i < NUM_FUNC_HOOKS; i++) {
         FuncHookEntry& e = g_funcHooks[i];
@@ -3725,27 +3714,15 @@ bool InitPhase2(lua_State* L) {
                         e.table ? e.table : "_G", e.name ? e.name : "ipairsaux", (int)s);
                     continue;
                 }
-                if (batchEnables) {
-                    // Queue only. MH_QueueEnableHook returning MH_OK means
-                    // "accepted", not "installed", so e.hooked, the profiler
-                    // symbol, the counters and the [ OK ] line all wait until
-                    // MH_ApplyQueued() below has actually committed them.
-                    s = MH_QueueEnableHook((void*)e.address);
-                    if (s != MH_OK && s != MH_ERROR_ENABLED) {
-                        Log("[FastPath]   %-8s.%-8s  MH_QueueEnableHook failed (%d)",
-                            e.table ? e.table : "_G", e.name ? e.name : "ipairsaux", (int)s);
-                        continue;
-                    }
-                    queuedIdx[queuedCount++] = i;
-                    continue;
-                }
-
-                s = WO_EnableHook((void*)e.address);
+                s = lateBatch ? MH_QueueEnableHook((void*)e.address)
+                              : WO_EnableHook((void*)e.address);
                 if (s != MH_OK && s != MH_ERROR_ENABLED) {
-                    Log("[FastPath]   %-8s.%-8s  WO_EnableHook failed (%d)",
-                        e.table ? e.table : "_G", e.name ? e.name : "ipairsaux", (int)s);
+                    Log("[FastPath]   %-8s.%-8s  %s failed (%d)",
+                        e.table ? e.table : "_G", e.name ? e.name : "ipairsaux",
+                        lateBatch ? "MH_QueueEnableHook" : "WO_EnableHook", (int)s);
                     continue;
                 }
+                if (lateBatch && s == MH_OK) queuedEnables++;
 
                 e.hooked = true;
                 // Name it in the profile. Without this our own hot code shows
@@ -3766,34 +3743,16 @@ bool InitPhase2(lua_State* L) {
         }
     }
 
-    // Commit every queued enable in a single freeze. Skipped entirely when the
-    // run queued nothing — a re-run after a lua_State change rediscovers the
-    // same addresses, gets MH_ERROR_ALREADY_CREATED and never reaches the queue.
-    if (queuedCount > 0) {
-        MH_STATUS aq = MH_UNKNOWN;
-        __try {
-            aq = MH_ApplyQueued();
-        }
-        __except(EXCEPTION_EXECUTE_HANDLER) {
-            aq = MH_UNKNOWN;
-            Log("[FastPath]   EXCEPTION during MH_ApplyQueued");
-        }
-
+    if (queuedEnables > 0) {
+        MH_STATUS aq = MH_ApplyQueued();
         if (aq != MH_OK) {
-            Log("[FastPath]   MH_ApplyQueued FAILED (%d) — %d hooks left inactive",
-                (int)aq, queuedCount);
+            // The entries were marked hooked on the assumption this would
+            // commit. It did not, so say so rather than let the counts below
+            // report hooks that are not redirecting anything.
+            Log("[FastPath] Phase 2: MH_ApplyQueued FAILED (%d) - the enables queued "
+                "in this pass are not active", (int)aq);
         } else {
-            for (int q = 0; q < queuedCount; q++) {
-                FuncHookEntry& e = g_funcHooks[queuedIdx[q]];
-                e.hooked = true;
-                if (e.name) SamplingProfiler::RegisterSelfSymbol(e.name, e.hookFn);
-                hookedNow++;
-                hookedTotal++;
-                Log("[FastPath]   %-8s.%-8s  0x%08X  [ OK ]%s",
-                    e.table ? e.table : "_G", e.name ? e.name : "ipairsaux", (unsigned)e.address,
-                    g_rosettaCacheDisabled ? " (JIT cache disabled)" : "");
-            }
-            Log("[FastPath]   Applied %d queued hook enables in one freeze", queuedCount);
+            Log("[FastPath] Phase 2: applied queued hook enables in one freeze");
         }
     }
 

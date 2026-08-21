@@ -12,7 +12,6 @@
 #include <cstring>
 #include "MinHook.h"
 #include "version.h"
-#include "config.h"
 #include "crash_dumper.h"
 #include <intrin.h>
 
@@ -396,44 +395,12 @@ static void WriteMinidump(EXCEPTION_POINTERS* ep) {
             // while doing it. The fault being reported is often address-space
             // exhaustion, which is exactly when that walk fails, so the dump is
             // guarded and downgraded rather than allowed to take the handler down.
-            // [General] FullDump=1 asks for the whole committed address space, so
-            // the heap objects a bad pointer came from are actually in the dump.
-            // Costs 1-2 GB and a second or two of frozen process. FullDump=0 is
-            // the long-standing behaviour and stays the default.
-            const MINIDUMP_TYPE kFull = (MINIDUMP_TYPE)(
-                MiniDumpWithFullMemory |
-                MiniDumpWithFullMemoryInfo |
-                MiniDumpWithHandleData |
-                MiniDumpWithThreadInfo |
-                MiniDumpWithUnloadedModules);
-
-            const bool wantFull = Config::g_settings.FullDump;
-
-            // A failed attempt leaves the file pointer wherever it stopped, so each
-            // fallback has to rewind and truncate or it writes after the debris.
             __try {
-                bool done = false;
-
-                if (wantFull) {
-                    done = writeDump(GetCurrentProcess(), GetCurrentProcessId(),
-                                     hFile, kFull, &mdei, NULL, NULL) != FALSE;
-                    if (!done) {
-                        Log("[CrashDumper] full-memory dump failed (err=%lu) - retrying smaller",
-                            GetLastError());
-                        SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
-                        SetEndOfFile(hFile);
-                    }
-                }
-
-                if (!done) {
-                    if (!writeDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
-                                   MiniDumpWithIndirectlyReferencedMemory,
-                                   &mdei, NULL, NULL)) {
-                        SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
-                        SetEndOfFile(hFile);
-                        writeDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
-                                  MiniDumpNormal, &mdei, NULL, NULL);
-                    }
+                if (!writeDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
+                               MiniDumpWithIndirectlyReferencedMemory,
+                               &mdei, NULL, NULL)) {
+                    writeDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
+                              MiniDumpNormal, &mdei, NULL, NULL);
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 Log("[CrashDumper] minidump writer faulted - text report stands");
@@ -1124,10 +1091,7 @@ bool Init() {
     }
 
     Log("[CrashDumper] Enhanced crash reporter active%s",
-        IsWine() ? " (Wine: text reports -> .\\Crashes)"
-                 : (Config::g_settings.FullDump
-                        ? " (Windows: FULL memory dump -> .\\Crashes)"
-                        : " (Windows: minidump -> .\\Crashes)"));
+        IsWine() ? " (Wine: text reports)" : " (Windows: minidump)");
     Log("[CrashDumper] Feature tracking: %d slots, Hook trace: %d entries",
         MAX_TRACKED_FEATURES, HOOK_TRACE_SIZE);
     return true;

@@ -42,6 +42,56 @@ namespace Config {
         bool OptVulkanDXVK = false;
         bool OptTimingFix = false;
         bool OptCvarNullGuard = true; // Safe default: enabled
+        // Null-callback crash in the client's device callback list. On by
+        // default: on a healthy client it is one read-only pointer walk per
+        // device teardown and changes nothing.
+        bool OptDeviceCbGuard = true;
+
+        // LuaOpcache gated fifty-five separate installs on its own, so a report
+        // that it corrupts an addon could not be narrowed by anyone. These four
+        // subdivide it and all default on, so LuaOpcache=1 behaves exactly as
+        // before; turning one off removes only its group.
+        bool OptLuaOpcacheTables  = true;   // table, index and global caches
+        bool OptLuaOpcacheStrings = true;   // string, buffer and pattern paths
+        bool OptLuaOpcacheWrites  = true;   // setters and object creation
+        bool OptLuaOpcacheReads   = true;   // accessors, arg checks, debug
+
+        // Four batches of hooks into WoW.exe that were installed unconditionally,
+        // ignoring every switch in the launcher. With all switches off a log
+        // still showed "[SUBSYSTEM] 98/100" and "[EXTENDED] 34/40", so "Disable
+        // All (vanilla)" left about 150 detours in the client. They default ON
+        // because they have always been running for everyone; turning them off
+        // is now what makes the vanilla button honest.
+        bool OptWowOptHooks       = true;   // 20 hooks
+        bool OptWowPerfHooks      = true;   // 20 hooks
+        bool OptWowExtendedHooks  = true;   // 40 features
+        bool OptWowSubsystemHooks = true;   // 100 features
+
+        // Four more that took no setting at all. Same rule: they have always
+        // run, so they default on, and turning them off is what the vanilla
+        // button needs in order to mean anything.
+        bool OptLockTuning        = true;   // retrofits spin counts onto 15 client locks
+        bool OptAsyncMpqIo        = true;   // spawns a background I/O worker thread
+        bool OptThreadIdCache     = true;   // hooks GetCurrentThreadId
+        bool OptPriorityGuard     = true;   // hooks SetPriorityClass to block downgrades
+
+        // The Lua VM optimizer: it replaces the VM's allocator with mimalloc,
+        // pre-sizes the string table and retunes the collector, and it did all
+        // of that with every switch off. Split in two because stopping the
+        // automatic collector is the part worth isolating on its own.
+        bool OptLuaVmOpt          = true;
+        bool OptLuaGcManual       = true;
+
+        // Sixteen hooks into the D3D9 device vtable, deduplicating redundant
+        // render-state calls. Also took no setting: it patched the vtable on
+        // every install regardless of the launcher.
+        bool OptD3d9StateManager  = true;
+
+        // The UI layout dependency relink, sub_489710: 9.06% of main-thread
+        // executing time, the largest single entry in the profile. New, and it
+        // rewrites pointer surgery in the client's layout list, so it is
+        // opt-in until testers have run it.
+        bool OptLayoutRelinkFast  = false;
         // Pins timingMethod to 2 and timingTestError to 0 whatever the client
         // asks. On by default because it has shipped that way for a long time;
         // it used to have no switch at all and lived inside CvarNullGuard.
@@ -54,11 +104,6 @@ namespace Config {
         bool OptMimallocLarge = false;
         bool OptVaArena = false;   // EXPERIMENTAL opt-in: segregated VirtualAlloc arena (anti-fragmentation)
         bool OptCompatMode = false; // Compatibility: skip aggressive CPU-priority/affinity/working-set tweaks (for VMs/HyperV where they break the connection)
-        // Crash dump size. Off by default: a full-memory dump is the whole
-        // committed address space, 1-2 GB per crash, and the game is frozen
-        // while it writes. Worth turning on when a crash needs the heap chased,
-        // not worth it as a standing cost. No launcher switch - edit the ini.
-        bool FullDump = false;
 
         // UI & Lua
         bool OptUIFrameBatch = false;
@@ -82,6 +127,17 @@ namespace Config {
         bool OptCombatLogParser = false;
         bool OptCombatLogIncremental = false;
         bool OptEventCoalescer = false;
+        // Off, and equally inert: InstallSavedVarsAsync is a three-line stub that
+        // logs "Bypassed for stability" and returns true, and its Shutdown is a
+        // no-op. Nothing writes SavedVariables off the main thread here.
+        //
+        // Both of these were turned on in a fix for what looked like the
+        // 3.18.0 -> 3.18.1 regression: 3.18.1 gave real gates to switches that
+        // had gated nothing, and left them defaulting off, which does silently
+        // remove a feature from everyone who never wrote the key. That reasoning
+        // is right and the rule still stands - it just does not apply to these
+        // two, because neither has run in either version. A tester's log said so
+        // plainly and I had not checked.
         bool OptSavedVarsAsync = false;
         bool OptSavedVarsPretoken = false;
         bool OptUnitAuraFast = false;
@@ -99,6 +155,12 @@ namespace Config {
         // this only gives that behaviour a switch.
         bool OptGuidLookupCache = true;
         bool OptPacketOffload = false;
+        // Off, and it does not matter which way it is set: the module is compiled
+        // out by TEST_DISABLE_NAMEPLATE_MT, in this build and in 3.18.0, and its
+        // Init logs "DISABLED (test toggle)" and returns. I briefly defaulted
+        // this to on believing the gate added in 3.18.1 had taken a working
+        // feature away from everyone. It had not - there was nothing there to
+        // take. See the note on OptSavedVarsAsync.
         bool OptNameplateMT = false;
 
         // Graphics & Sound
@@ -117,6 +179,103 @@ namespace Config {
         bool OptSoundMixerOpt = false;
         bool OptAudioDecodeMt = false;
         bool OptDbcLookupCache = false;
+        // The Win32 file hooks: CreateFile sequential-scan hinting, the adaptive
+        // MPQ ReadFile cache, CloseHandle cleanup, the FlushFileBuffers skip,
+        // and the GetFileAttributes / SetFilePointer / GetFileSize caches.
+        //
+        // These used to hang off OptDbcLookupCache, which is described to the
+        // player as speeding up .dbc reads and says nothing about file I/O.
+        // Anyone who cleared that switch to test the DBC cache silently removed
+        // the whole file layer; anyone who set it got seven hooks they never
+        // asked for. Defaults to whatever DbcLookupCache resolved to, so no
+        // install changes behaviour until its owner sets it deliberately.
+        bool OptFileIoHooks = false;
+        // The lua_type fast path in hot_patch.cpp, which resolves a positive
+        // stack index inline instead of calling the engine's index2adr. It was
+        // gated on OptDbcLookupCache as well and has nothing to do with .dbc
+        // reads. Same inheritance rule, same reason.
+        bool OptLuaTypeFast = false;
+        // Caches over Win32 calls that answer the same thing every time:
+        // GetSystemInfo, GetSystemMetrics, GetVersionEx, RegQueryValueEx,
+        // GetProcAddress, GetModuleFileName, GetEnvironmentVariable and
+        // GetPrivateProfile. They hung off OptTimingFix, which is described as
+        // a timing fix and should own the clock hooks, not eight lookups that
+        // have nothing to do with time.
+        bool OptWin32ApiCaches = false;
+        // The debug-family Win32 hooks: IsBadReadPtr / IsBadWritePtr answered
+        // from VirtualQuery, OutputDebugString turned into a no-op, and
+        // IsDebuggerPresent forced to false. They hung off OptCvarNullGuard,
+        // which declines CVar writes through uninitialised objects and is
+        // unrelated to any of them.
+        // Defaults on, matching CvarNullGuard, which is what it used to run under.
+        bool OptDebugApiHooks = true;
+        // Spin counts retrofitted onto CriticalSection and WaitForSingleObject.
+        // They hung off OptDefragLf, the lock-free heap defragmenter, which is
+        // a different subsystem; OptLockTuning is the neighbouring switch and
+        // does the same kind of work, but it defaults on while DefragLf defaults
+        // off, so folding them in would silently start them everywhere.
+        bool OptLockSpinHooks = false;
+        // Charges the sampling profiler's main-thread samples to the addon whose
+        // Lua is on the call stack. Rides on the sampler, which already stops
+        // the thread, so it adds nothing to the paths it measures - unlike the
+        // client's own script profiler, which a reporter measured at 1-4 fps in
+        // a dungeon. Inherits SamplingProfiler: no sampler, nothing to charge.
+        bool OptLuaAddonProfile = false;
+        // Reads the CPU's core classes and samples which one the frame loop is
+        // running on. Measurement only, and cheap: one GetCurrentProcessorNumber
+        // per frame. On by default because the answer is worth having in every
+        // log and nothing acts on it.
+        bool OptCpuTopology = true;
+        // Keeps the main thread off the efficiency cores of a hybrid CPU. Off by
+        // default: it overrides the scheduler, and the residency figure from
+        // OptCpuTopology should say it is needed before anyone turns it on.
+        bool OptPinMainThread = false;
+        // The Lua pool block allocator (lmemPool.cpp, sub_855820) restarts its
+        // free-chunk search at chunk zero on every allocation. Second in a
+        // CPU-bound profile at 4.29% of executing time, with 2.3 million
+        // allocations in six minutes. Opt-in until a log shows the search is
+        // really where that time goes - the counters it adds answer that.
+        bool OptLuaMemPoolFast = false;
+        // Removes a per-vertex call from the UI batcher and the particle vertex
+        // filler. The call resolved to a fixed offset from a global whose value
+        // cannot change between two vertices of a batch; together those two
+        // functions were 5.06% of executing time. Patches machine code in place
+        // after verifying it byte for byte, so it is opt-in.
+        bool OptVertexFmtInline = false;
+        // The object manager's find-by-GUID re-derived the bucket link offset
+        // from the table header on every node of the chain. 2.22% of executing
+        // time in a CPU-bound profile. Verifies against the client and retires
+        // on one disagreement, so it is opt-in until a log shows it agreeing.
+        bool OptObjMgrFindFast = false;
+        // The per-bone quaternion interpolation (sub_982630), four components at
+        // once instead of one at a time on the x87 stack. Not bit-exact: the
+        // worst divergence measured over 12 million components is 2.98e-07,
+        // under three float epsilon, and the result is renormalised right after.
+        // Opt-in, and it verifies against the client before trusting itself.
+        bool OptQuatLerpSse2 = false;
+        // 88% of the chunks this client compiles are source it already compiled
+        // this session - 332 MB of repeated parsing, measured. A repeat reuses
+        // the compiled Proto; the client still builds the closure, environment
+        // and taint, so nothing about ownership is shared. Opt-in, and it checks
+        // reuses against a fresh compile before trusting itself.
+        bool OptLuaProtoCache = false;
+        // The object lookup every Lua call into a UI method starts with
+        // (sub_4A81B0, 674 call sites). Four Lua API calls replaced by direct
+        // reads, including the taint move lua_rawgeti performs. Opt-in, and it
+        // checks itself against the client before trusting itself.
+        bool OptLuaThisFast = false;
+        // Animating models is 3.68 ms of a 24.5 ms frame in raid content, and no
+        // single function in it exceeds 0.4% of self time, so only doing less of
+        // it can help. Above a model budget each model updates every Nth frame
+        // instead of every frame. Opt-in; skipping cannot slow an animation down
+        // because the client derives its time from an absolute clock.
+        bool OptAnimLod = false;
+        // The collision reject pass (sub_7C7230), 3.8% of executing in a
+        // corrected profile. Six x87 compares per vertex become six packed
+        // compares per four. The bounds are plain floats with no arithmetic
+        // applied, so this is bit-exact rather than close. Opt-in, and it
+        // predicts the client's whole output and compares before trusting itself.
+        bool OptCollisionOutcode = false;
         bool OptWorldStateCoalesce = false;
         bool OptD3d9RenderThread = false;
 
@@ -132,12 +291,39 @@ namespace Config {
         bool OptM2MatrixSimd = false;
         bool OptMpqAsyncDecompress = false;
         bool OptSpellEffectCulling = false;
+        // Read-only watch on the client's own shadow state, for the flicker seen
+        // below extShadowQuality 5. Not our bug - a tester reproduced it with
+        // every feature off and no DXVK - but nothing has ever looked at what the
+        // engine does when it happens. Off by default.
+        bool OptShadowStateProbe = false;
+        // Counts what the client compiles at runtime, by chunk name. On by
+        // default and silent unless the totals say something is recompiling in a
+        // loop - the case that costs about 5% of a real session's CPU and that
+        // nothing has ever been able to name.
+        bool OptLuaCompileCensus = true;
+        // Turns on the client's own script profiler and reports per-addon CPU to
+        // the log every minute, ranked. Off by default: the client's profiler is
+        // not free, and only someone chasing a stutter should pay for it.
+        bool OptAddonProfiler = false;
+        // SSE2 strncmp for the CRT copy at 0x004180A6, 1.55% of executing time.
+        // 3.88x on a 63-byte compare and 1.33x on a short one, so it does not
+        // regress the short case the way a naive block version does - though a
+        // very short compare is close to break-even once the detour is counted.
+        bool OptStrncmpSse2 = true;
+        // Null guard on sub_873060, the per-draw parameter setter in the M2 path.
+        // On by default - it prevents a real null dereference - but it can only
+        // do that by skipping the call, and a skipped call draws that model with
+        // the previous one's parameters. Exposed so a flicker report can be
+        // tested against it in one session instead of guessed at.
+        bool OptRenderNullGuard = true;
         // Drops a dead _msize from WoW's free wrapper. Measured at 8-10% of
         // main-thread execution in two tester profiles.
-        // SSE2 quaternion normalize. Off by default: the client's version is
-        // 3.13% of execution in a CPU-bound profile and the replacement matches
-        // it to one ULP, but it has never been run in a game.
-        bool OptQuatNormalizeSse2 = false;
+        // SSE2 quaternion normalize, 3.13% of execution in a CPU-bound profile.
+        // On by default now that it is bit-identical to the client rather than
+        // within one ULP - it reproduces the client's double-precision width and
+        // its left-to-right summation order, and a self-test refuses to install
+        // it on a single differing bit.
+        bool OptQuatNormalizeSse2 = true;
         // SSE2 4x4 matrix multiply. Off by default for the same reason: verified
         // against the client's version numerically, never run in a game.
         // On by default since the accumulation moved to packed double: the
