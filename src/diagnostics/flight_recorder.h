@@ -22,6 +22,10 @@ void OnFrame();
 
 // Write the ring out. `why` names what triggered it and appears in the banner.
 void Mark(const char* why);
+// True when a Mark would produce frames. A caller that marks on its own
+// judgement - a slow frame, say - should ask first, or a switched-off recorder
+// answers every one of them with a line saying it is switched off.
+bool IsRecording();
 
 // Edge-detects the marker key. Called from the frame boundary.
 void PollHotkey();

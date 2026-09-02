@@ -224,6 +224,8 @@ void Mark(const char* why) {
     Log("=== END MARK %u ===", g_marks);
 }
 
+bool IsRecording() { return g_active; }
+
 void PollHotkey() {
     if (!g_active || !g_markKey) return;
     bool down = (GetAsyncKeyState(g_markKey) & 0x8000) != 0;

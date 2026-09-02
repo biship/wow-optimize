@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include "frame_bench.h"
+#include "flight_recorder.h"
 #include "core/config.h"
 #include "crash_dumper.h"
 #include "version.h"
@@ -103,6 +104,11 @@ static bool          g_ready  = false;
 static constexpr double SLOW_FRAME_FACTOR   = 5.0;    // times the running median
 static constexpr double SLOW_FRAME_FLOOR_MS = 8.0;    // never report below this
 static constexpr DWORD  SLOW_FRAME_QUIET_MS = 2000;   // spacing between reports
+// A spike this long gets the flight recorder dumped around it. Chosen above
+// anything a zone boundary produces and well above the 8 ms floor, so a log
+// carries these for the hitches a player would actually complain about rather
+// than for every frame that ran long.
+static constexpr double AUTO_MARK_MS        = 100.0;
 
 static double g_medianMs      = 0.0;   // refreshed periodically from the histogram
 static double g_p95Ms         = 0.0;   // same walk, so the two are always comparable
@@ -252,6 +258,25 @@ static void Accumulate(double ms) {
     Log("[FrameBench] slow frame: %.1f ms (%.1fx the %.2f ms median) - events within it:",
         ms, ms / (g_medianMs > 0.0 ? g_medianMs : 1.0), g_medianMs);
     CrashDumper::DumpTrace(8, window);
+
+    // A 43x spike with "(nothing traced in this window)" under it is the shape
+    // most of these reports take, and it is not the tracer being empty - it is
+    // the tracer only knowing about events something chose to trace. The flight
+    // recorder holds the last 512 frames with a counter column per subsystem,
+    // so the frames around the spike are already sitting in memory; they just
+    // needed someone to ask.
+    //
+    // Only for a spike large enough that nobody would argue about it. A slow
+    // frame at three times the median happens while a zone loads and dumping
+    // 240 frames for each of those would bury the log. The recorder rate limits
+    // nothing itself, so the gate is here.
+    if (ms >= AUTO_MARK_MS && FlightRecorder::IsRecording()) {
+        char why[96];
+        _snprintf(why, sizeof(why) - 1, "frame of %.0f ms, %.0fx the median",
+                  ms, ms / (g_medianMs > 0.0 ? g_medianMs : 1.0));
+        why[sizeof(why) - 1] = 0;
+        FlightRecorder::Mark(why);
+    }
 }
 
 void OnPresent(Source src) {
