@@ -378,6 +378,11 @@ namespace Config {
         // set was under a gigabyte, and one of them wrote a SavedVariables file
         // under a garbage name. Opt-in, and it refuses to run if the block it
         // gets back is below 2GB.
+        // Gathers the client's nine-byte file writes into 64KB pieces. A
+        // tester's loading screen spent 2470 ms of 16828 inside 593557 of
+        // them. Opt-in, needs the CloseHandle hook, and checks every closed
+        // file's size against what the client handed over.
+        bool OptClientWriteBatch = false;
         bool OptMimallocHighArena = false;
         int  MimallocHighArenaMB = 512;
         // The box-overlap predicate (sub_78F370) that seventeen culling and

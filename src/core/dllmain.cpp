@@ -44,6 +44,7 @@
 #include "collision_outcode_sse2.h"
 #include "bone_matrix_upload_sse2.h"
 #include "mimalloc_high_arena.h"
+#include "client_write_batch.h"
 #include "aabb_overlap_sse2.h"
 #include "anim_quat_unpack_sse2.h"
 #include "anim_vec3_track_sse2.h"
@@ -2709,6 +2710,10 @@ static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
 static BOOL WINAPI hooked_ReadFile_Inner(HANDLE hFile, LPVOID lpBuffer,
     DWORD nBytesToRead, LPDWORD lpBytesRead, LPOVERLAPPED lpOverlapped)
 {
+    // Reading a file whose tail we are still holding would read stale
+    // bytes. It goes out first. The seek the read implies also ends the
+    // size check for this file.
+    ClientWriteBatch::FlushHandle(hFile, true);
     // Skip: overlapped I/O, non-MPQ, or not initialized
     if (lpOverlapped)
         return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
@@ -3597,6 +3602,11 @@ static long g_sfpRedirected = 0;
 static DWORD WINAPI hooked_SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
     PLONG lpDistanceToMoveHigh, DWORD dwMoveMethod)
 {
+    // A seek past buffered bytes would write them at the new position, and
+    // after one the file size no longer has to equal what was handed over -
+    // so the batcher stops checking this file rather than reporting a
+    // mismatch that is not a loss.
+    ClientWriteBatch::FlushHandle(hFile, true);
     LARGE_INTEGER liDist;
     if (lpDistanceToMoveHigh) {
         liDist.LowPart  = (DWORD)lDistanceToMove;
@@ -4192,6 +4202,11 @@ static BOOL WINAPI hooked_CloseHandle(HANDLE hObject) {
     if (!hObject || hObject == INVALID_HANDLE_VALUE ||
         hObject == GetCurrentProcess() || hObject == GetCurrentThread())
         return orig_CloseHandle(hObject);
+    // First, and before anything below can fail or take a lock: if this
+    // handle is the one the write batcher is holding, its bytes go out now
+    // while the handle is still open, and the file size is checked against
+    // what the client handed over.
+    ClientWriteBatch::OnClosing(hObject);
 #if !CRASH_TEST_DISABLE_MPQ_MMAP
     AcquireSRWLockExclusive(&g_mpqMapLock);
     DestroyMpqMapping(hObject);
@@ -4367,6 +4382,10 @@ static FlushFileBuffers_fn orig_FlushFileBuffers = nullptr;
 static long g_flushSkipped = 0;
 
 static BOOL WINAPI hooked_FlushFileBuffers(HANDLE hFile) {
+    // Asking the OS to flush a file whose tail is still in our buffer would
+    // flush the wrong thing. Ours goes out first, and the size check stays
+    // valid because nothing seeked.
+    ClientWriteBatch::FlushHandle(hFile, false);
     if (IsMpqHandle(hFile)) {
         InterlockedIncrement(&g_flushSkipped);
         return TRUE;
@@ -5230,6 +5249,7 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     CollisionOutcode::LogStats();
     BoneMatrixUpload::LogStats();
     MimallocHighArena::LogStats();
+    ClientWriteBatch::LogStats();
     AabbOverlap::LogStats();
     AnimQuatUnpack::LogStats();
     AnimVec3Track::LogStats();
@@ -7625,6 +7645,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
     // in, the report must say so rather than print a confident zero.
     LoadingState::SetReadHookInstalled(readOk);
     bool closeOk = Config::g_settings.OptFileIoHooks && InstallCloseHandleHook();
+
+    // After the close hook, because that is the flush the batcher cannot do
+    // without, and it is told rather than left to guess.
+    ClientWriteBatch::Init(LoadingState::GetClientWriter(), closeOk);
     bool flushOk = Config::g_settings.OptFileIoHooks && InstallFlushFileBuffersHook();
     Log("--- Async MPQ I/O ---");
     // Worker started after init completes to avoid race with hook setup
@@ -10841,6 +10865,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             // Puts ten bytes of wow.exe back. It matters only on a real
             // DLL_PROCESS_DETACH, and this DLL usually leaves through
             // TerminateProcess, where nothing here runs and nothing needs to.
+            // Anything still buffered goes out before the client can be
+            // torn down under it. TerminateProcess usually gets there
+            // first, which is why every other flush point exists.
+            ClientWriteBatch::FlushAll("process detach");
             BoneMatrixUpload::Shutdown();
             SamplingProfiler::Shutdown();
 #endif

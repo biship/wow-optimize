@@ -636,6 +636,7 @@
 // inline-batch-dangerous groups (confirmed at luaD_precall 0x5565E9).
 #define TEST_DISABLE_BONE_MATRIX_UPLOAD  0  // enabled: the bone matrix transpose
 #define TEST_DISABLE_MIMALLOC_HIGH_ARENA 0  // enabled: the high-address mimalloc arena
+#define TEST_DISABLE_CLIENT_WRITE_BATCH  0  // enabled: batching the client's tiny file writes
 #define TEST_DISABLE_LUA_SAFE_G1         0  
 #define TEST_DISABLE_LUA_SAFE_G2         0  // enabled: Safe Group 2 hooks
 // G2A groups the three debug/execution-control hooks below it. dllmain.cpp

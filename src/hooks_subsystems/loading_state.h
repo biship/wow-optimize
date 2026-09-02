@@ -6,7 +6,11 @@
 
 #pragma once
 
+namespace ClientWriteBatch { typedef char (__cdecl* WriteFn)(void*, const void*, void*, unsigned long*); }
+
 namespace LoadingState {
+// The client's file-write wrapper once it is hooked, or null.
+ClientWriteBatch::WriteFn GetClientWriter();
     // Installs the FrameScript_SignalEvent detour. Always installed - the loading
     // state it publishes gates safety bypasses across many other subsystems.
     bool Init();

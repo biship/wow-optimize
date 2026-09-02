@@ -25,6 +25,7 @@
 #include "version.h"
 
 #include "loading_state.h"
+#include "client_write_batch.h"
 #include "session_verdict.h"
 #include "event_coalescer.h"
 #include "combat_log_filter.h"
@@ -206,6 +207,17 @@ static char __cdecl Hooked_ClientWrite(void* fileObj, const void* buf,
     unsigned long want = 0;
     __try { if (pBytes) want = *pBytes; } __except (EXCEPTION_EXECUTE_HANDLER) { want = 0; }
 
+    // The batcher, when it is on, takes small writes and issues them in
+    // 64KB pieces. It reports success the way the client's own wrapper does
+    // for a write it accepted: return 1 and leave the requested count in
+    // place, which is what the original does when WriteFile succeeds in
+    // full. The time is still recorded, as close to zero, so the loading
+    // screen report shows the difference rather than losing the calls.
+    if (ClientWriteBatch::TryAbsorb(fileObj, buf, want, overlapped)) {
+        LoadingState::NoteWrite(0.0, want, nullptr);
+        return 1;
+    }
+
     LARGE_INTEGER a, b;
     QueryPerformanceCounter(&a);
     char r = orig_ClientWrite(fileObj, buf, overlapped, pBytes);
@@ -271,6 +283,18 @@ void ApplyEventKind(EventKind kind) {
 }
 
 } // namespace
+
+// The client's own write wrapper, for the batcher to flush through. Null when
+// the hook did not install, which is the batcher's cue not to run.
+//
+// Defined here rather than beside the detour it returns: the detour lives in the
+// anonymous namespace above, and a LoadingState block opened inside that one
+// gets internal linkage, so the definition compiles and the link still fails.
+namespace LoadingState {
+ClientWriteBatch::WriteFn GetClientWriter() {
+    return (ClientWriteBatch::WriteFn)orig_ClientWrite;
+}
+}  // namespace LoadingState
 
 // Returns true if the event must be swallowed (the coalescer queued it for replay
 // at end of frame). State tracking always runs first, so it is never affected by
