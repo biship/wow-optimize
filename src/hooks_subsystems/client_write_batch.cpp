@@ -149,6 +149,16 @@ bool CopyIn(const void* src, unsigned long bytes) {
     }
 }
 
+// The client clears the byte at fileObj+8 on the way into every write, before it
+// calls WriteFile. A write this module absorbs has to leave the object in the
+// same state as one the client performed, or something that reads that byte sees
+// a value the original would have cleared.
+void ClearWriteFlag(void* fileObj) {
+    __try {
+        *((unsigned char*)fileObj + 8) = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 void DropOwner() {
     g_owner = nullptr;
     g_handle = nullptr;
@@ -216,6 +226,7 @@ bool TryAbsorb(void* fileObj, const void* buf, unsigned long bytes,
     // Split out because MSVC will not put __try and an object with a destructor
     // in one function, and this one holds a lock guard.
     if (!CopyIn(buf, bytes)) return false;  // unreadable source: let the client try
+    ClearWriteFlag(fileObj);
     g_len += bytes;
     g_ownerBytes += bytes;
     ++g_absorbed;
