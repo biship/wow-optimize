@@ -236,6 +236,15 @@ bool TryAbsorb(void* fileObj, const void* buf, unsigned long bytes,
 
 void FlushHandle(HANDLE h, bool stopVerifying) {
     if (!g_installed || !h) return;
+    // Read before locking. This is called from the ReadFile and SetFilePointer
+    // hooks, which every part of the process goes through - one loading screen
+    // makes fifteen thousand reads - and taking a lock on each of them to
+    // discover there is nothing buffered is a cost paid by everything to serve
+    // one file. An empty buffer has nothing to lose, and a buffer that fills
+    // between this read and the lock belongs to a thread writing the same handle
+    // that this one is reading, which is the client's own race and not one this
+    // introduces.
+    if (g_len == 0) return;
     WinLockGuard g(g_lock);
     if (g_handle != h) return;
     if (!FlushLocked()) g_dead = true;
