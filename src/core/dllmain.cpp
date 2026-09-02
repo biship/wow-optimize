@@ -4734,7 +4734,10 @@ static void ConfigureMimalloc() {
         "space, which is deliberate - MEM_DECOMMIT unmapped buffers a GL driver "
         "was still reading on its own thread - but it means freed memory does "
         "not raise the largest free block below 2GB. Only a collect does.",
-        mi_version() / 100, (mi_version() % 100) / 10, mi_version() % 10,
+        // MI_MALLOC_VERSION is major, then two digits of minor, then two of
+        // patch: 30302 is 3.3.2. Dividing by 100 printed it as "v303.0.2" in
+        // every log this project has ever produced.
+        mi_version() / 10000, (mi_version() / 100) % 100, mi_version() % 100,
         (int)mi_option_get(mi_option_purge_delay),
         TEST_ENABLE_LARGE_PAGES ? "allowed" : "off");
 }
