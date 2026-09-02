@@ -46,6 +46,10 @@ bool IsActive();
 
 // Get total number of samples collected (for diagnostics).
 uint64_t GetSampleCount();
+// Share of main-thread samples executing rather than blocked, from the last
+// report. False when none has run. A frame-time comparison in a session with a
+// low share cannot show a CPU saving.
+bool GetExecutingShare(double* pct, unsigned long long* samples);
 
 // Dump the current top-50 hot functions to the log without stopping sampling.
 // Called from the periodic stats dump so the profile is captured even when the

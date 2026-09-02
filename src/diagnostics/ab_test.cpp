@@ -74,6 +74,7 @@
 #include "ab_test.h"
 #include "config.h"
 #include "session_verdict.h"
+#include "sampling_profiler.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -695,6 +696,44 @@ void LogStats() {
     // Printing "NO MODULE ANSWERED TO 'AnimQuatUnpack'" when the ini said
     // "AnimQatUnpack" would name the wrong thing entirely, so a named run reports
     // under the configured name whatever slot the frames are in.
+    // Whether a frame-time comparison could have shown anything at all.
+    //
+    // A session where the client waits on the GPU or a frame limiter spends
+    // its frame not executing, and a CPU saving inside that frame changes no
+    // frame time. One log carried both this harness reporting differences per
+    // frame and the profiler, forty lines away, saying the client was not
+    // CPU-bound. Neither mentioned the other.
+    //
+    // The threshold is the profiler's own: under 15% executing is where it
+    // says so about itself, and using a second number here would be two
+    // instruments disagreeing about one fact.
+    {
+        double workPct = 0.0;
+        unsigned long long samples = 0;
+        if (!SamplingProfiler::GetExecutingShare(&workPct, &samples)) {
+            Log("[AbTest] the profiler has not reported yet, so nothing here "
+                "says whether this session was CPU-bound. Frame times below "
+                "are what they are; whether a CPU saving could have shown in "
+                "them is not established.");
+        } else if (workPct < 15.0) {
+            Log("[AbTest] THE FRAME TIMES BELOW CANNOT SHOW A CPU SAVING. The "
+                "client was executing for %.1f%% of %llu sampled moments and "
+                "waiting for the rest - on the GPU, vsync or a frame limiter. "
+                "Work removed from inside a frame that then waits longer "
+                "produces the same frame time. Read the per-call tick figures "
+                "instead, and run again uncapped in a place that loads the "
+                "processor.", workPct, samples);
+            Verdict::Add(Verdict::Warn,
+                         "the A/B run happened in a session that was %.0f%% "
+                         "blocked, so its frame-time figures cannot show a "
+                         "CPU saving", 100.0 - workPct);
+        } else {
+            Log("[AbTest] the client was executing for %.1f%% of %llu sampled "
+                "moments, so a CPU saving has room to show in the frame times "
+                "below.", workPct, samples);
+        }
+    }
+
     int reported = 0;
     for (int i = 0; i < g_offeredCount; ++i) {
         if (!g_on[i].frames && !g_off[i].frames) continue;

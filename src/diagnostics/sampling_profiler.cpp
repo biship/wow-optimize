@@ -34,6 +34,11 @@ namespace SamplingProfiler {
 // actually costs frame time in the world. Counted separately for transparency.
 static DWORD    g_samplerStartTick = 0;
 static uint64_t g_skippedSamples = 0;
+// The share of main-thread samples that were executing rather than blocked in
+// a kernel wait, from the most recent report. Negative until one has run, so a
+// caller can tell "not measured" from "measured and low".
+static double   g_lastWorkPct     = -1.0;
+static uint64_t g_lastWorkSamples = 0;
 static const DWORD PROFILER_WARMUP_MS = 15000;
 
 // ---- configuration ------------------------------------------------
@@ -1267,6 +1272,13 @@ static void DumpResults() {
     uint64_t workSamples = (n > waitSamples) ? (n - waitSamples) : 0;
     double   workPct     = n ? (100.0 * (double)workSamples / (double)n) : 0.0;
 
+    // Published for the A/B harness. A frame-time comparison in a session the
+    // client spends waiting on the GPU cannot show a CPU saving, and it used to
+    // print one anyway while this line, in the same log, said the client was
+    // not CPU-bound.
+    g_lastWorkPct = workPct;
+    g_lastWorkSamples = n;
+
     Log("[SamplingProfiler] === MAIN THREAD: %.1f%% executing, %.1f%% blocked "
         "(%llu of the %llu most recent samples were a kernel wait; %llu taken in "
         "all, and everything below describes the recent ones) ===",
@@ -1460,6 +1472,16 @@ static void DumpResults() {
 }
 
 // ---- public API ---------------------------------------------------
+// The share of main-thread samples that were executing rather than blocked, as
+// of the last report. False when no report has run, so a caller can tell "not
+// measured" from "measured and low".
+bool GetExecutingShare(double* pct, unsigned long long* samples) {
+    if (g_lastWorkPct < 0.0) return false;
+    if (pct)     *pct = g_lastWorkPct;
+    if (samples) *samples = g_lastWorkSamples;
+    return true;
+}
+
 bool Init(HANDLE mainThread) {
     if (!g_ring) {
         // VirtualAlloc returns zeroed pages, which is what the ring wants anyway.
