@@ -56,6 +56,10 @@ The current public build is focused on real frametime stability, long-session sm
   in one session, on too few samples to call it settled. Off by default.
 * **Object Tick Prefetch** prefetches the two fields the object tick reads.
   1.39% of main-thread time in a measured session. Off by default.
+* **Keep the Allocator Above 2GB** reserves address space above 2GB and gives
+  it to the allocator, so it stops growing into the half a 32-bit client has
+  to allocate from. Needs a large-address-aware client on 64-bit Windows.
+  Off by default.
 * **No Client Patches** stops the DLL writing anything into WoW.exe. See the
   warning at the top of this file. Off by default.
 * **Table Emptiness Census** and **Leave Lua Garbage Collection Alone** are
