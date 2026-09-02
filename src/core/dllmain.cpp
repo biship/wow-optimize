@@ -1798,6 +1798,11 @@ static void PreciseSleep(double milliseconds) {
     }
 }
 
+// The flight recorder column for our own periodic tick, so a spike dump can
+// say "this frame was us" instead of leaving the reader to infer it. That
+// has been the answer before.
+static int g_frSlotMaint = -1;
+
 static void RunPeriodicMaintenanceOnMainThread() {
     if (g_mainThreadId == 0 || GetCurrentThreadId() != g_mainThreadId)
         return;
@@ -1806,6 +1811,7 @@ static void RunPeriodicMaintenanceOnMainThread() {
     // lands inside a frame. When a hitch is reported, the first question is
     // whether we caused it, and this is the probe that answers it. The inner
     // probes attribute further once this one fires.
+    FlightRecorder::Bump(g_frSlotMaint);
     StallProbe maintenanceProbe("periodic maintenance", 4.0);
 
     DWORD nowTick = GetTickCount();
@@ -8050,6 +8056,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
     // calls have somewhere to land.
     FlightRecorder::Init();
     g_frSlotSavedVars = FlightRecorder::RegisterSlot("svopen");
+    // Our own periodic tick, so a dump can say "this frame was us" instead of
+    // leaving the reader to infer it. That has been the answer before.
+    g_frSlotMaint = FlightRecorder::RegisterSlot("wowopt");
+    LoadingState::ClaimRecorderColumns();
     AbTest::Init();
 
     Log("--- Event Name Hash Cache ---");

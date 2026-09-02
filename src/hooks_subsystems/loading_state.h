@@ -9,6 +9,9 @@
 namespace ClientWriteBatch { typedef char (__cdecl* WriteFn)(void*, const void*, void*, unsigned long*); }
 
 namespace LoadingState {
+// Claims the flight recorder columns for file reads and writes. Call once,
+// after the recorder is up.
+void ClaimRecorderColumns();
 // The client's file-write wrapper once it is hooked, or null.
 ClientWriteBatch::WriteFn GetClientWriter();
     // Installs the FrameScript_SignalEvent detour. Always installed - the loading

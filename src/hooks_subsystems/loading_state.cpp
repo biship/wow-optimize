@@ -26,6 +26,7 @@
 
 #include "loading_state.h"
 #include "client_write_batch.h"
+#include "flight_recorder.h"
 #include "session_verdict.h"
 #include "event_coalescer.h"
 #include "combat_log_filter.h"
@@ -291,6 +292,17 @@ void ApplyEventKind(EventKind kind) {
 // anonymous namespace above, and a LoadingState block opened inside that one
 // gets internal linkage, so the definition compiles and the link still fails.
 namespace LoadingState {
+
+// Flight recorder columns. A spike dump that shows a frame doing four thousand
+// file reads has explained itself; one that shows none has ruled I/O out, which
+// is worth as much. Declared here because NoteWrite is below and uses them.
+static int g_frRead  = -1;
+static int g_frWrite = -1;
+
+void ClaimRecorderColumns() {
+    g_frRead  = FlightRecorder::RegisterSlot("filerd");
+    g_frWrite = FlightRecorder::RegisterSlot("filewr");
+}
 ClientWriteBatch::WriteFn GetClientWriter() {
     return (ClientWriteBatch::WriteFn)orig_ClientWrite;
 }
@@ -354,6 +366,7 @@ void SetReadHookInstalled(bool installed) {
 }
 
 void NoteWrite(double ms, unsigned int bytes, const char* name) {
+    FlightRecorder::Bump(g_frWrite);
     g_wrMsThisLoad += ms;
     g_wrBytesThisLoad += bytes;
     g_wrCountThisLoad++;
@@ -374,6 +387,7 @@ void NoteWrite(double ms, unsigned int bytes, const char* name) {
 }
 
 void NoteRead(double ms, unsigned int bytes) {
+    FlightRecorder::Bump(g_frRead);
     g_ioMsThisLoad += ms;
     g_ioBytesThisLoad += bytes;
     g_ioReadsThisLoad++;
