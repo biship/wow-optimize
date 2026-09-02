@@ -531,10 +531,23 @@ static void ReportSubject(int i, const char* name) {
                 if (!Percentile(g_on[i], tails[t].frac, &a)) continue;
                 if (!Percentile(g_off[i], tails[t].frac, &b)) continue;
                 double diff = b - a;   // positive means ON was faster
-                Log("[AbTest]   %s: %.2f ms with it on against %.2f without, so ON is "
-                    "%.2f ms %s there",
-                    tails[t].name, a, b, diff < 0 ? -diff : diff,
-                    diff > 0 ? "faster" : "slower");
+                // A difference smaller than the bucket it came out of is not a
+                // difference. The buckets are 1/64 of their own value, so the
+                // resolution at this frame time is about a percent and a half,
+                // and printing "0.05 ms faster" from two adjacent buckets is
+                // the same mistake the linear histogram made in whole
+                // half-milliseconds.
+                const double resolution = ((a > b) ? a : b) / (double)kPerOctave;
+                if ((diff < 0 ? -diff : diff) < resolution) {
+                    Log("[AbTest]   %s: %.2f ms with it on against %.2f without - "
+                        "the same, to the %.3f ms this histogram can resolve here",
+                        tails[t].name, a, b, resolution);
+                } else {
+                    Log("[AbTest]   %s: %.2f ms with it on against %.2f without, so "
+                        "ON is %.2f ms %s there",
+                        tails[t].name, a, b, diff < 0 ? -diff : diff,
+                        diff > 0 ? "faster" : "slower");
+                }
             }
 
             // The function's own cost, which is the number that resolves a feature
