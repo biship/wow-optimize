@@ -372,6 +372,14 @@ namespace Config {
         // the same. No arithmetic anywhere in it, so bit-exact by construction.
         // Opt-in, and it does the first bones both ways and compares.
         bool OptBoneMatrixUpload = false;
+        // Hands mimalloc a block of address space above 2GB so it grows there
+        // instead of into the half a 32-bit client allocates from. Two tester
+        // sessions ended with the low half down to a megabyte while the working
+        // set was under a gigabyte, and one of them wrote a SavedVariables file
+        // under a garbage name. Opt-in, and it refuses to run if the block it
+        // gets back is below 2GB.
+        bool OptMimallocHighArena = false;
+        int  MimallocHighArenaMB = 512;
         // The box-overlap predicate (sub_78F370) that seventeen culling and
         // pick functions call once per scene node per pass. Six x87 compares,
         // each leaving the FPU through fnstsw and a data-dependent branch,

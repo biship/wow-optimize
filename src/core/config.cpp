@@ -134,6 +134,7 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "AnimLod", &Settings::OptAnimLod },
     { "Graphics_Sound", "CollisionOutcode", &Settings::OptCollisionOutcode },
     { "Graphics_Sound", "BoneMatrixUpload", &Settings::OptBoneMatrixUpload },
+    { "General", "MimallocHighArena", &Settings::OptMimallocHighArena },
     { "Graphics_Sound", "AabbOverlap", &Settings::OptAabbOverlap },
     { "Graphics_Sound", "AnimQuatUnpack", &Settings::OptAnimQuatUnpack },
     { "UI_Lua", "LuaPoolFast", &Settings::OptLuaPoolFast },
@@ -646,6 +647,10 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptAnimLod             = GetPrivateProfileIntA("Graphics_Sound", "AnimLod", 0, iniPath.c_str()) != 0;
         g_settings.OptCollisionOutcode    = GetPrivateProfileIntA("Graphics_Sound", "CollisionOutcode", 0, iniPath.c_str()) != 0;
         g_settings.OptBoneMatrixUpload    = GetPrivateProfileIntA("Graphics_Sound", "BoneMatrixUpload", 0, iniPath.c_str()) != 0;
+        g_settings.OptMimallocHighArena   = GetPrivateProfileIntA("General", "MimallocHighArena", 0, iniPath.c_str()) != 0;
+        g_settings.MimallocHighArenaMB    = GetPrivateProfileIntA("General", "MimallocHighArenaMB", 512, iniPath.c_str());
+        if (g_settings.MimallocHighArenaMB < 8)    g_settings.MimallocHighArenaMB = 8;
+        if (g_settings.MimallocHighArenaMB > 1024) g_settings.MimallocHighArenaMB = 1024;
         g_settings.OptAabbOverlap         = GetPrivateProfileIntA("Graphics_Sound", "AabbOverlap", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimQuatUnpack      = GetPrivateProfileIntA("Graphics_Sound", "AnimQuatUnpack", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaPoolFast     = GetPrivateProfileIntA("UI_Lua", "LuaPoolFast", 0, iniPath.c_str()) != 0;

@@ -43,6 +43,7 @@
 #include "anim_lod.h"
 #include "collision_outcode_sse2.h"
 #include "bone_matrix_upload_sse2.h"
+#include "mimalloc_high_arena.h"
 #include "aabb_overlap_sse2.h"
 #include "anim_quat_unpack_sse2.h"
 #include "anim_vec3_track_sse2.h"
@@ -4700,6 +4701,10 @@ static void ConfigureMimalloc() {
     // RAM back under pressure.
     mi_option_set(mi_option_purge_decommits, 0);
 
+    // The high arena goes in before the pre-warm, so the 32MB below lands in
+    // it rather than carving another hole in the low half.
+    MimallocHighArena::Init();
+
     // Pre-warm allocator with 32MB to reduce VA space pressure
     // 64MB was too aggressive for HD clients with 37+ MPQs (VA fragmentation)
     void* warmup = mi_malloc(32 * 1024 * 1024);
@@ -5221,6 +5226,7 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     AnimLod::LogStats();
     CollisionOutcode::LogStats();
     BoneMatrixUpload::LogStats();
+    MimallocHighArena::LogStats();
     AabbOverlap::LogStats();
     AnimQuatUnpack::LogStats();
     AnimVec3Track::LogStats();
