@@ -373,13 +373,26 @@ uint64_t KeyOf(const char* src, size_t srcLen, const char* name, size_t nameLen)
     return h;
 }
 
+// Everything a Lua state owns goes when the state does. Everything that is
+// only a fact about source text stays.
+//
+// g_cache holds Protos, which belong to the state, so it must go. g_seenOnce
+// holds a hash and a length - twelve bytes, no pointer into anything - and used
+// to be cleared with it. That cost more than the cache ever saved: a session
+// with three reloads resets the state eight times, so a chunk first seen in one
+// state and compiled again in the next started over as unseen instead of being
+// promoted, and 4427 repeats in that session produced 532 reuses. Only 337
+// chunks were ever stored out of 8096 offered, because first sightings kept
+// being forgotten.
+//
+// Keeping it is what g_knownRepeaters already does one step further along, and
+// for the same reason.
 void FlushAll() {
     for (std::unordered_map<uint64_t, Entry>::iterator it = g_cache.begin();
          it != g_cache.end(); ++it) {
         free(it->second.blob);
     }
     g_cache.clear();
-    g_seenOnce.clear();
     g_blobBytes = 0;
 }
 
