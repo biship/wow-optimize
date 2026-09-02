@@ -681,6 +681,14 @@ namespace WowOptimizeLauncher {
             leftPanel.Controls.Add(btnMeasure);
             y += 36;
 
+            DarkButton btnDiag = new DarkButton(Color.FromArgb(160, 120, 220), false);
+            btnDiag.Text = "ANSWER THE OPEN QUESTIONS";
+            btnDiag.Size = new Size(btnWidth, 30);
+            btnDiag.Location = new Point(15, y);
+            btnDiag.Click += delegate { SetUpDiagnosticRun(); };
+            leftPanel.Controls.Add(btnDiag);
+            y += 36;
+
             DarkButton btnSaveProfile = new DarkButton(CyanAccent, false);
             btnSaveProfile.Text = "SAVE PROFILE...";
             btnSaveProfile.Size = new Size(btnWidth, 30);
@@ -1114,6 +1122,54 @@ namespace WowOptimizeLauncher {
             "AabbOverlap", "SegmentAabb", "SimdGeometry", "FastMemsetOpt",
             "StrncmpSse2", "LuaGcManual", "MatrixVectorSse2", "BoneMatrixUpload"
         };
+
+        // The counting questions, which are not the same session as the A/B run.
+        //
+        // These answer "how much of X is there", not "is X faster". Several of
+        // them cost something to measure - the draw census wraps the busiest call
+        // in the renderer - so running them during an A/B test would move the very
+        // frame times that test is comparing. Two buttons, two sessions.
+        private static readonly string[] DiagnosticKeys = new string[] {
+            "DrawCensus",            // how many draw calls, how small, how many could merge
+            "LuaProtoCache",         // how much of the compiling is repeat work
+            "LuaCompileCensus",      // and what is being compiled
+            "HorizonOcclusionSse2",  // how long the horizon column scans really are
+            "ClientWriteBatch",      // how many file writes get gathered
+            "MimallocHighArena",     // whether the allocator can be moved above 2GB
+            "SamplingProfiler"       // where the main thread actually is
+        };
+
+        private void SetUpDiagnosticRun() {
+            if (settingsMap == null) return;
+
+            DialogResult answer = MessageBox.Show(
+                "Turns on the counters that answer what is actually going on: draw calls and how many could be merged, how much Lua is compiled twice, how big the horizon scans are, how many tiny file writes there are, and where the main thread is.\r\n\r\n"
+                + "Not the same session as a measurement run. These cost something to collect, so they would move the frame times that test compares.\r\n\r\n"
+                + "Play 20 minutes doing whatever you normally do, then send the log and turn these back off.\r\n\r\nSet them up and save?",
+                "Diagnostic run",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (answer != DialogResult.Yes) return;
+
+            SettingItem ab = FindByKey("AbTest");
+            if (ab != null && ab.Ctrl != null) ab.Ctrl.Checked = false;
+
+            int turnedOn = 0, notFound = 0;
+            for (int i = 0; i < DiagnosticKeys.Length; i++) {
+                SettingItem item = FindByKey(DiagnosticKeys[i]);
+                if (item == null || item.Ctrl == null) { notFound++; continue; }
+                if (!item.Ctrl.Checked) { item.Ctrl.Checked = true; turnedOn++; }
+            }
+            SaveSettings();
+
+            string note = turnedOn.ToString()
+                + " counter(s) switched on and the A/B test switched off. Saved. Play 20 minutes, then send the log.";
+            if (notFound > 0) {
+                note = note + "\r\n\r\n" + notFound.ToString()
+                    + " of them has no entry in this launcher. That is a bug here - please mention it with the log.";
+            }
+            MessageBox.Show(note, "Diagnostic run",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
 
         private void SetUpMeasurementRun() {
             if (settingsMap == null) return;

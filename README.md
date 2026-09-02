@@ -169,6 +169,14 @@ empty. To pick them by hand instead, these are the ones it can measure:
 
 Each is alternated on its own, so turning several on does not mix them up.
 
+There is a second button, **ANSWER THE OPEN QUESTIONS**, and it is a different
+session. It turns the A/B test off and the counters on: draw calls and how
+many of them could be merged, how much Lua the game compiles twice, how long
+the horizon scans are, how many tiny file writes there are, and where the main
+thread actually is. Those cost something to collect, which is why they do not
+go in the same session as a test comparing frame times. Twenty minutes of
+whatever you normally do is enough.
+
 Each subject gets four on/off pairs of twenty seconds, so it spends about two
 minutes and forty seconds on one before moving to the next: all sixteen take
 about forty-three minutes. Play for at least that, longer if you can, and send
