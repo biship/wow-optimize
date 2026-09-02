@@ -86,6 +86,9 @@ void LogLowHalfOccupancy(const char* why) {
 
     SIZE_T commitPrivate = 0, commitMapped = 0, commitImage = 0, reservedOnly = 0;
     SIZE_T totalFree = 0, largestFree = 0, currentFree = 0;
+    // Split by owner, which is the whole point of looking at this half.
+    SIZE_T oursBytes = 0, theirsBytes = 0;
+    unsigned oursRegions = 0;
 
     struct TopEntry { uintptr_t base; SIZE_T size; DWORD type; };
     const int kTopN = 10;
@@ -117,6 +120,13 @@ void LogLowHalfOccupancy(const char* why) {
                 else                             commitPrivate += size;
             } else {
                 reservedOnly += size;
+            }
+            if (mbi.Type == MEM_PRIVATE) {
+                bool ours = false;
+                __try { ours = mi_is_in_heap_region((const void*)base); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { ours = false; }
+                if (ours) { oursBytes += size; ++oursRegions; }
+                else      { theirsBytes += size; }
             }
             uintptr_t allocBase = (uintptr_t)mbi.AllocationBase;
             if (allocBase != runBase) {
@@ -156,6 +166,14 @@ void LogLowHalfOccupancy(const char* why) {
             "low half went to this tool's allocator rather than to the client.",
             commit / (1024.0 * 1024.0), peakCommit / (1024.0 * 1024.0));
     }
+
+    // The one line this dump exists to produce.
+    Log("[LowHalf]   of the private memory below 2GB, %.0f MB in %u region(s) "
+        "belongs to this tool's allocator and %.0f MB does not. If the first "
+        "number is the larger one, Keep the Allocator Above 2GB is the fix; if "
+        "the second is, it is not.",
+        oursBytes / (1024.0 * 1024.0), oursRegions,
+        theirsBytes / (1024.0 * 1024.0));
 
     Log("[LowHalf]   largest %d reservations below 2GB:", kTopN);
     for (int i = 0; i < kTopN && top[i].size > 0; ++i) {
