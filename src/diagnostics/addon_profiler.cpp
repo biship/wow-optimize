@@ -40,6 +40,8 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include "session_verdict.h"
 
 #include "addon_profiler.h"
 #include "config.h"
@@ -156,6 +158,56 @@ static const char* kGatherChunk =
 
 // Reads one Lua global string back. Guarded, and it always restores the stack
 // top it moved, including on the paths that do not find a string.
+// One addon carrying most of the cost is the finding, not the list.
+//
+// A session reported "8 addons, 654 ms total (events 595) | ZygorGuidesViewer
+// 342ms 52.3% | DBM-Core 110ms 16.8% | ...". Half of every millisecond the
+// interface spent was one addon, and that sat in the middle of a log nobody
+// reads to the end while the block at the top said nothing about it.
+//
+// The report is this module's own format, built by the Lua above:
+//   "<n> addons, <ms> ms total (events <n>) | <Name> <ms>ms <pct>% | ..."
+// so the first entry after the first bar is the largest, and its share is the
+// number worth carrying to the top.
+static void NoteIfOneAddonDominates(const char* report) {
+    if (!report) return;
+    double totalMs = 0.0;
+    const char* comma = strchr(report, ',');
+    if (!comma) return;
+    totalMs = atof(comma + 1);
+    // Under a tenth of a second in a whole window there is nothing to report,
+    // whatever the shares look like.
+    if (totalMs < 100.0) return;
+
+    const char* bar = strchr(report, '|');
+    if (!bar) return;
+    const char* p = bar + 1;
+    while (*p == ' ') ++p;
+
+    char name[64];
+    size_t n = 0;
+    while (*p && *p != ' ' && n + 1 < sizeof(name)) name[n++] = *p++;
+    name[n] = 0;
+    if (n == 0) return;
+
+    // Past the "342ms" field to the percentage.
+    while (*p == ' ') ++p;
+    while (*p && *p != ' ') ++p;
+    while (*p == ' ') ++p;
+    const double pct = atof(p);
+    if (pct < 40.0) return;
+
+    // Once per session. The same addon will dominate every window and twenty
+    // identical findings is a worse report than one.
+    static bool said = false;
+    if (said) return;
+    said = true;
+    Verdict::Add(Verdict::Note,
+                 "%s is %.0f%% of all addon time (%.0f ms in one window) - "
+                 "more than every other addon put together",
+                 name, pct, totalMs);
+}
+
 static bool ReadGlobalString(const char* name, char* out, size_t outSize) {
     uintptr_t L = 0;
     __try {
@@ -384,6 +436,7 @@ void OnFrame(bool luaBusy) {
     if (ReadGlobalString("WOWOPT_ADDON_CPU", report, sizeof(report))) {
         ++g_reports;
         Log("[AddonProfiler] #%d  %s", g_reports, report);
+        NoteIfOneAddonDominates(report);
 
         // A report that is only an error is worth saying once, not twenty-one
         // times - and each attempt costs an UpdateAddOnCPUUsage walk over every
