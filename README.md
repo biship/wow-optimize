@@ -63,6 +63,13 @@ The current public build is focused on real frametime stability, long-session sm
 * **Batch the Game's File Writes** gathers the game's nine-byte SavedVariables
   writes into 64KB pieces. One tester's loading screen spent 2470 ms of 16828
   inside 593557 of those calls. Off by default.
+* **Reuse Compiled Scripts** now keeps the large files too. The game spent 461
+  ms of a six minute session recompiling Lua it had already compiled, and the
+  cache was refusing 14 of those 40 megabytes for being over a size cap. Off
+  by default.
+* **Draw Call Census** now also counts how many of the game's draw calls could
+  have been issued as one. It makes 355 a frame and a third of them carry
+  eight triangles or fewer. Off by default; a measurement, not a speed-up.
 * **No Client Patches** stops the DLL writing anything into WoW.exe. See the
   warning at the top of this file. Off by default.
 * **Table Emptiness Census** and **Leave Lua Garbage Collection Alone** are
