@@ -42,8 +42,12 @@
 // stall while costing 0.1 ms every frame looks worse on the mean and better on
 // the tail, and the tail is what a player feels. So the report carries the
 // median and the 95th and 99th percentiles per phase, from a fixed histogram
-// rather than a sort - half-millisecond buckets to 120 ms, everything above in
-// one overflow bucket that is named rather than folded into the last one.
+// rather than a sort. The buckets are logarithmic - 64 to the octave, so 1.6% of
+// their own value everywhere - because a linear width cannot serve both a 2.9 ms
+// frame and a 120 ms one, and the linear version it replaced could only report
+// percentile differences of 0.00 or 0.50 ms at three hundred frames a second.
+// Anything above 120 ms goes in one overflow bucket that is named rather than
+// folded into the last one.
 //
 // ---------------------------------------------------------------------------
 // What this cannot tell you
@@ -76,8 +80,28 @@ extern "C" void Log(const char* fmt, ...);
 namespace AbTest {
 namespace {
 
-constexpr int    kBuckets    = 241;    // 0.5 ms each to 120 ms, plus overflow
-constexpr double kBucketMs   = 0.5;
+// Frame times are logarithmic and the histogram has to be too.
+//
+// This was 241 linear buckets of half a millisecond, and a session at 340 frames
+// a second showed what that costs: the median frame was 2.9 ms, so p50 could
+// only ever come out as 2.75 or 3.25, and the report printed "p50: 3.25 with it
+// on against 2.75 without, so ON is 0.50 ms slower" for what is one bucket
+// boundary. Every percentile difference at that frame rate was either 0.00 or
+// 0.50, and neither is a measurement.
+//
+// Half a millisecond is 17% of a 2.9 ms frame and 0.4% of a 120 ms one. No
+// single linear width serves a quantity spanning three decades. Constant
+// *relative* resolution does: 64 buckets per octave from 0.25 ms to 128 ms is
+// 1.1% everywhere, so a 340 fps session and a 30 fps one are measured to the
+// same precision.
+//
+// The index comes out of the float's own bits - the exponent is log2 and the top
+// mantissa bits are the fraction - so there is no log() on the frame boundary.
+constexpr int kOctaveBits  = 6;                    // 64 buckets per octave
+constexpr int kPerOctave   = 1 << kOctaveBits;
+constexpr int kMinExp      = -2;                   // 0.25 ms
+constexpr int kMaxExp      = 6;                    // up to 128 ms
+constexpr int kBuckets     = (kMaxExp - kMinExp + 1) * kPerOctave;   // 576
 constexpr int    kSettleFrames = 12;   // discarded after every flip
 
 struct Phase {
@@ -196,15 +220,38 @@ LARGE_INTEGER g_freq = {};
 LARGE_INTEGER g_last = {};
 bool     g_haveLast = false;
 
+// Bucket index straight out of the IEEE representation: the biased exponent is
+// floor(log2), and the top kOctaveBits of the mantissa are the position within
+// the octave. No division, no log, no table.
+int BucketOf(double ms) {
+    float f = (float)ms;
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    const int expo = (int)((u >> 23) & 0xFF) - 127;
+    if (expo < kMinExp) return 0;                       // faster than 0.25 ms
+    if (expo > kMaxExp) return kBuckets - 1;
+    const int frac = (int)((u >> (23 - kOctaveBits)) & (kPerOctave - 1));
+    const int b = (expo - kMinExp) * kPerOctave + frac;
+    return (b < 0) ? 0 : (b >= kBuckets ? kBuckets - 1 : b);
+}
+
+// The middle of a bucket, for reporting. Its width is the same fraction of its
+// own value everywhere, so the centre is the geometric one.
+double BucketCentre(int b) {
+    const int expo = kMinExp + b / kPerOctave;
+    const int frac = b % kPerOctave;
+    double lo = 1.0;
+    if (expo >= 0) { for (int i = 0; i < expo; ++i) lo *= 2.0; }
+    else           { for (int i = 0; i < -expo; ++i) lo *= 0.5; }
+    return lo * (1.0 + ((double)frac + 0.5) / (double)kPerOctave);
+}
+
 void Add(Phase& p, double ms) {
     ++p.frames;
     p.sumMs += ms;
     if (ms > p.maxMs) p.maxMs = ms;
     if (ms >= 120.0) { ++p.over; return; }
-    int b = (int)(ms / kBucketMs);
-    if (b < 0) b = 0;
-    if (b >= kBuckets) b = kBuckets - 1;
-    ++p.hist[b];
+    ++p.hist[BucketOf(ms)];
 }
 
 // The frame time at a given share of the distribution. Frames above 120 ms are
@@ -218,7 +265,7 @@ bool Percentile(const Phase& p, double frac, double* out) {
     uint64_t seen = 0;
     for (int b = 0; b < kBuckets; ++b) {
         seen += p.hist[b];
-        if (seen > want) { *out = ((double)b + 0.5) * kBucketMs; return true; }
+        if (seen > want) { *out = BucketCentre(b); return true; }
     }
     return false;   // it landed in the overflow
 }
