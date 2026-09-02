@@ -60,6 +60,9 @@ The current public build is focused on real frametime stability, long-session sm
   it to the allocator, so it stops growing into the half a 32-bit client has
   to allocate from. Needs a large-address-aware client on 64-bit Windows.
   Off by default.
+* **Batch the Game's File Writes** gathers the game's nine-byte SavedVariables
+  writes into 64KB pieces. One tester's loading screen spent 2470 ms of 16828
+  inside 593557 of those calls. Off by default.
 * **No Client Patches** stops the DLL writing anything into WoW.exe. See the
   warning at the top of this file. Off by default.
 * **Table Emptiness Census** and **Leave Lua Garbage Collection Alone** are
