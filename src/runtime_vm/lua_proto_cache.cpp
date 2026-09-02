@@ -193,9 +193,53 @@ inline void*    RDP (const void* p, unsigned off) { return *(void* const*)   ((c
 // larger now: 402 chunks were refused for exceeding 32 KB, and with only proven
 // repeats competing for the budget there is room to keep the ones that recur.
 
-constexpr size_t kMaxChunkBytes = 128u * 1024u;
+// The cap that threw away the largest wins.
+//
+// A session reported "turned away: 36 over the 128 KB size cap (14106 KB)"
+// while the whole session compiled 40 MB. Fourteen of those forty megabytes
+// were refused at the door, in thirty-six offers, before a key was even
+// recorded for them - so the repeat detection below never saw them either.
+//
+// What they are is not a mystery: the census in the same log names them.
+// GlobalStrings.lua, 985 KB over two compiles. ChatFrame.lua, 266 over two.
+// UIParent, FriendsFrame, PaperDollFrame. The client compiles each of them once
+// per Lua state, and a session with three reloads compiles them three times.
+//
+// A megabyte admits every one of them, and the budget below is twenty-four, of
+// which that session used thirty-nine kilobytes. The cap was never what was
+// protecting the budget; the policy that only stores proven repeats is.
+constexpr size_t kMaxChunkBytes = 1024u * 1024u;
+
+// Above this, a chunk is kept the first time it is seen rather than the second.
+//
+// The rule below - record a key on first sight, keep the source on the second,
+// reuse on the third - was reasoned about small chunks and is right for them:
+// holding 185 bytes of source for each of 3669 distinct handlers to save 0.02
+// ms apiece is a bad trade. For a 492 KB file that takes ten milliseconds to
+// parse, the same arithmetic runs the other way, and the "one extra compile per
+// chunk" the policy costs is ten milliseconds rather than twenty microseconds.
+//
+// There are few of them - thirty-six offers in six minutes - so this cannot
+// spend the budget, and each one it catches is worth more than every small
+// chunk in the cache put together.
+constexpr size_t kKeepOnFirstSight = 32u * 1024u;
 constexpr size_t kMaxEntries    = 8192;
-constexpr size_t kMaxTotalBytes = 24u * 1024u * 1024u;
+// Eight megabytes, down from twenty-four, and lowered in the same change that
+// raised the per-chunk cap.
+//
+// This cache competes for the resource that is actually scarce here. A 32-bit
+// client allocates from below 2GB, three tester sessions have ended with the
+// largest free run there at one or two megabytes, and one of them wrote a
+// SavedVariables file under a garbage name because of it. Twenty-four megabytes
+// of held source to save a few hundred milliseconds of parsing is the wrong way
+// round when the alternative is a corrupted interface.
+//
+// Eight is still two hundred times what the session that motivated all of this
+// actually used, and past it the cache stops storing rather than evicting -
+// what it already holds is proven repeats and is worth more than whatever
+// arrives next. With the high-address arena switched on this memory lands above
+// 2GB and the conflict goes away, but the default has to be safe without it.
+constexpr size_t kMaxTotalBytes = 8u * 1024u * 1024u;
 constexpr size_t kMaxSeenKeys   = 32768;
 
 // --- Verification -----------------------------------------------------------
@@ -275,6 +319,9 @@ bool g_dead      = false;
 unsigned long g_seen = 0, g_hits = 0, g_stored = 0;
 unsigned long g_tooBig = 0, g_notBuffer = 0, g_capped = 0, g_anchorFailed = 0;
 unsigned long g_verified = 0, g_firstSighting = 0, g_flushes = 0, g_onSight = 0;
+// Chunks large enough to be worth keeping the moment they are first seen. The
+// number that says whether raising the cap was the right call.
+unsigned long g_keptOnFirstSight = 0;
 unsigned long g_stale = 0;
 unsigned long long g_bytesSaved = 0, g_bytesTooBig = 0;
 
@@ -468,7 +515,10 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
     bool second = (seen != g_seenOnce.end() && seen->second == (uint32_t)srcLen);
     bool known  = (g_knownRepeaters.find(key) != g_knownRepeaters.end());
 
-    if (!second && !known) {
+    // Big chunks skip the waiting period; see kKeepOnFirstSight.
+    const bool bigEnoughToKeepNow = (srcLen >= kKeepOnFirstSight);
+
+    if (!second && !known && !bigEnoughToKeepNow) {
         if (g_seenOnce.size() < kMaxSeenKeys) {
             g_seenOnce[key] = (uint32_t)srcLen;
             g_firstSighting++;
@@ -477,6 +527,7 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
         }
         return nullptr;
     }
+    if (bigEnoughToKeepNow && !second && !known) ++g_keptOnFirstSight;
 
     if (g_cache.size() >= kMaxEntries ||
         g_blobBytes + srcLen + nameLen + 2 > kMaxTotalBytes) {
@@ -725,6 +776,10 @@ void LogStats() {
         g_onSight, g_flushes, (unsigned)g_seenOnce.size(),
         (unsigned)g_knownRepeaters.size());
 
+    Log("[ProtoCache]   %lu chunk(s) were large enough to keep on first sight "
+        "rather than waiting for a second compile - those are the ones a raised "
+        "cap admits, and each is worth more than every small chunk here put "
+        "together.", g_keptOnFirstSight);
     Log("[ProtoCache]   %lu reuses verified against a fresh compile; turned away: "
         "%lu over the %u KB size cap (%llu KB), %lu after the cache filled, %lu "
         "not a flat buffer, %lu could not be anchored (%lu of the resets were "
