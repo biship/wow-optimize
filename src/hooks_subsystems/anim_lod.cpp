@@ -316,9 +316,36 @@ inline uint32_t Hash(uint32_t p) {
 } // namespace
 
 // Returns 1 to skip this model's animation for this frame, 0 to let it run.
+// After this many calls with nothing skipped, stop looking.
+//
+// Two sessions now: 3,797,301 calls, 0 skipped, 0.0%, and "0 were far enough
+// that the distance rule would have thrown them away". The feature cannot help
+// on this content - every model the client asks about is close, or has tail work
+// that makes it unskippable - and it keeps paying for a hook, a call and eight
+// pointer dereferences on every one of those four million calls to find that
+// out again.
+//
+// A million is far past the point where the answer could still change: the
+// sessions above reached it inside the first minute. If a later zone would have
+// been different, the log says exactly what was given up, which is more than a
+// feature that quietly does nothing forever offers.
+static const unsigned long long kGiveUpAfter = 1000000;
+static bool g_gaveUp = false;
+
 extern "C" int __cdecl AnimLod_ShouldSkip(uint32_t model) {
-    if (g_dead || !model) return 0;
+    if (g_dead || g_gaveUp || !model) return 0;
     ++g_calls;
+
+    if (g_skipped == 0 && g_calls == kGiveUpAfter) {
+        g_gaveUp = true;
+        Log("[AnimLod] STANDING DOWN after %llu calls with nothing skipped. Every "
+            "model asked about was close enough or had material and attachment "
+            "work that makes it unskippable, so the guard has been declining all "
+            "of them and the checks cost more than the feature saves. Every call "
+            "from here returns immediately. Turn it off in the launcher; it is "
+            "not doing anything on this content.", g_calls);
+        return 0;
+    }
 
     int decision = 0;
     __try {
@@ -630,6 +657,11 @@ void LogStats() {
     if (!Config::g_settings.OptAnimLod) return;
     if (!g_installed)  { Log("[AnimLod] not installed - nothing measured"); return; }
     if (g_calls == 0)  { Log("[AnimLod] installed but never called"); return; }
+    if (g_gaveUp) {
+        Log("[AnimLod] STOOD DOWN after %llu calls without a single skip - every "
+            "call since has returned immediately. The counters below stopped at "
+            "that point and are not a picture of the whole session.", g_calls);
+    }
 
     Log("[AnimLod] %llu calls, %llu skipped (%.1f%%), %llu first sightings never "
         "skipped; peak %u models in a frame, peak stride %u, currently %u%s",
