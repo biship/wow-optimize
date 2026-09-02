@@ -45,6 +45,114 @@ static void DescribeAllocation(uintptr_t base, DWORD type, char* out, size_t out
               (int)outSize);
 }
 
+// Who is holding the low 2GB.
+//
+// The one question nobody has been able to answer. A tester session ends with
+// "VA Space (below 2GB): Free=16MB LargestBlock=1MB" while the working set is
+// 903MB, so a gigabyte of the half the client allocates from is *reserved* and
+// not resident - and nothing said by what. That is the state in which a
+// SavedVariables filename comes out as ")_.lua".
+//
+// The snapshot above already collects exactly this, but over the whole address
+// space, where a 3GB machine's high half swamps the list. Restricted to the low
+// half it names the owner instead: a module by filename, a mapped section, or
+// private memory, which on this client means the allocator.
+//
+// Called from the heap compactor's monitor thread, so the walk is not on the
+// main thread - the whole point of the last release's work. Rate limited by the
+// caller, because it is a full VirtualQuery walk.
+void LogLowHalfOccupancy(const char* why) {
+    static const uintptr_t kLowEnd = 0x80000000u;
+
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    SIZE_T commitPrivate = 0, commitMapped = 0, commitImage = 0, reservedOnly = 0;
+    SIZE_T totalFree = 0, largestFree = 0, currentFree = 0;
+
+    struct TopEntry { uintptr_t base; SIZE_T size; DWORD type; };
+    const int kTopN = 10;
+    TopEntry top[kTopN] = {};
+    uintptr_t runBase = 0; SIZE_T runSize = 0; DWORD runType = 0;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    uintptr_t addr = 0;
+    unsigned regions = 0;
+
+    while (addr < kLowEnd && VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) {
+        uintptr_t base = (uintptr_t)mbi.BaseAddress;
+        if (base >= kLowEnd) break;
+
+        // A region straddling the boundary counts only its low part, or the
+        // totals inflate and the answer is about a range nobody asked about.
+        SIZE_T size = mbi.RegionSize;
+        if (base + size > kLowEnd) size = (SIZE_T)(kLowEnd - base);
+
+        if (mbi.State == MEM_FREE) {
+            totalFree += size;
+            currentFree += size;
+            if (currentFree > largestFree) largestFree = currentFree;
+        } else {
+            currentFree = 0;
+            if (mbi.State == MEM_COMMIT) {
+                if      (mbi.Type == MEM_IMAGE)  commitImage   += size;
+                else if (mbi.Type == MEM_MAPPED) commitMapped  += size;
+                else                             commitPrivate += size;
+            } else {
+                reservedOnly += size;
+            }
+            uintptr_t allocBase = (uintptr_t)mbi.AllocationBase;
+            if (allocBase != runBase) {
+                if (runSize > 0) TrackTopReservation(top, kTopN, runBase, runSize, runType);
+                runBase = allocBase; runSize = 0; runType = mbi.Type;
+            }
+            runSize += size;
+        }
+
+        ++regions;
+        addr = base + mbi.RegionSize;
+        if (mbi.RegionSize == 0) addr += 0x10000;
+        if (addr < base) break;                       // overflow
+    }
+    if (runSize > 0) TrackTopReservation(top, kTopN, runBase, runSize, runType);
+
+    QueryPerformanceCounter(&t1);
+    double walkMs = freq.QuadPart
+                  ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+                  : 0.0;
+
+    Log("[LowHalf] === WHAT IS HOLDING THE LOW 2GB === (%s)", why ? why : "no reason given");
+    Log("[LowHalf]   free %.0f MB in %u region(s), largest run %.0f MB",
+        totalFree / (1024.0 * 1024.0), regions, largestFree / (1024.0 * 1024.0));
+    Log("[LowHalf]   in use: private %.0f MB, mapped %.0f MB, image %.0f MB, "
+        "reserved but never committed %.0f MB",
+        commitPrivate / (1024.0 * 1024.0), commitMapped / (1024.0 * 1024.0),
+        commitImage / (1024.0 * 1024.0), reservedOnly / (1024.0 * 1024.0));
+
+    {
+        size_t elapsed = 0, userMs = 0, sysMs = 0, rss = 0, peakRss = 0,
+               commit = 0, peakCommit = 0, faults = 0;
+        mi_process_info(&elapsed, &userMs, &sysMs, &rss, &peakRss,
+                        &commit, &peakCommit, &faults);
+        Log("[LowHalf]   mimalloc holds %.0f MB committed across the whole address "
+            "space (peak %.0f MB). If the private figure above is close to it, the "
+            "low half went to this tool's allocator rather than to the client.",
+            commit / (1024.0 * 1024.0), peakCommit / (1024.0 * 1024.0));
+    }
+
+    Log("[LowHalf]   largest %d reservations below 2GB:", kTopN);
+    for (int i = 0; i < kTopN && top[i].size > 0; ++i) {
+        char owner[MAX_PATH];
+        DescribeAllocation(top[i].base, top[i].type, owner, sizeof(owner));
+        Log("[LowHalf]     0x%08X  %7.1f MB  %s",
+            (unsigned)top[i].base, top[i].size / (1024.0 * 1024.0), owner);
+    }
+    Log("[LowHalf]   walk took %.1f ms on the heap monitor thread, not on the "
+        "main one.", walkMs);
+    Log("[LowHalf] ====================================");
+}
+
 void LogPerformanceSnapshot(double elapsedMs) {
     DWORD now = GetTickCount();
     if (now - g_lastDiagTick < 5000) return; // Rate-limit to once every 5 seconds

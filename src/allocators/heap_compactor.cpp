@@ -57,6 +57,7 @@ extern "C" void Log(const char* fmt, ...);
 extern "C" void mi_collect(bool force);
 #include <mimalloc.h>
 #include "crash_dumper.h"
+#include "perf_diagnostics.h"
 
 // Largest free virtual address range, measured twice.
 //
@@ -239,6 +240,20 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         // achieves anything - see the recovery check in RunPendingWork.
         if (largestLow < CRITICAL_THRESHOLD) {
             DWORD nowTick2 = GetTickCount();
+
+            // Name what is holding the low half, once when it first runs out
+            // and then rarely. Every log that has ever shown this state has
+            // shown the number and not the owner, so the same question gets
+            // asked of every tester and answered by none of them. This is a
+            // full VirtualQuery walk, which is why it is here on the monitor
+            // thread and rate limited rather than in the periodic report.
+            static DWORD lastOccupancyTick = 0;
+            if (lastOccupancyTick == 0 ||
+                (nowTick2 - lastOccupancyTick) >= 300000) {
+                lastOccupancyTick = nowTick2;
+                PerfDiagnostics::LogLowHalfOccupancy(
+                    "largest free block below 2GB went under 16MB");
+            }
             bool due = (g_lastCompactTick == 0) ||
                        (nowTick2 - g_lastCompactTick) >= g_compactIntervalMs;
             if (due && !g_compactionGaveUp) {
