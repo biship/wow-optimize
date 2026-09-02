@@ -527,6 +527,11 @@ typedef HRESULT (WINAPI *DrawIndexedPrimitive_fn)(IDirect3DDevice9*, D3DPRIMITIV
 static DrawPrimitive_fn        orig_DrawPrimitive        = nullptr;
 static DrawIndexedPrimitive_fn orig_DrawIndexedPrimitive = nullptr;
 
+// Whether the redundancy-filter hooks actually went in. They do not unless
+// DXVK support or the render thread is switched on, and the report used to
+// print its counters either way.
+static bool g_stateHooksInstalled = false;
+
 static uint32_t g_drawsThisFrame = 0;
 
 // ---------------------------------------------------------------------------
@@ -804,8 +809,7 @@ void OnCreateDevice(IDirect3DDevice9* device) {
         return;
     }
 
-    static bool hooksInstalled = false;
-    if (hooksInstalled) return;
+    if (g_stateHooksInstalled) return;
 
     void* target_Reset = (void*)orig_Reset;
     void* target_Present = (void*)orig_Present;
@@ -844,13 +848,26 @@ void OnCreateDevice(IDirect3DDevice9* device) {
     MH_EnableHook(target_SetTextureStageState);
     MH_EnableHook(target_SetVertexShader);
 
-    hooksInstalled = true;
+    g_stateHooksInstalled = true;
     Log("[D3D9StateCache] Active - Redundant render state filtering successfully hooked on main thread");
 }
 
 // Printed from the periodic report. Shutdown does not run - the DLL exits via
 // TerminateProcess - so anything reported only from there is never seen.
 void LogStats() {
+    // Three states, not two. These seven counters read as a feature that ran and
+    // found nothing, and in the session that prompted this they meant the hooks
+    // were never installed at all: they go in only under DXVK or the D3D9 render
+    // thread, and both were off. Seven zeros printed as measurements.
+    if (!g_stateHooksInstalled) {
+        Log("[D3D9StateCache] not installed - its state hooks go in only when "
+            "Vulkan/DXVK support or the D3D9 render thread is on, and neither "
+            "is. The counters below would all be zero because nothing ran, "
+            "which is not the same as nothing to skip. The D3D9 State Manager "
+            "is the one doing this work; its numbers are elsewhere in this "
+            "report.");
+        return;
+    }
     Log("[D3D9StateCache] redundancy skips - textures %ld, render states %ld, "
         "stage states %ld, samplers %ld, transforms %ld, viewports %ld, "
         "vs constants %ld",
