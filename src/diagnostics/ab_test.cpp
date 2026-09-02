@@ -112,6 +112,7 @@ struct Phase {
     double   maxMs     = 0.0;
     uint32_t hist[kBuckets] = {};
     uint32_t over      = 0;            // above 120 ms, kept out of the histogram
+    double   overMs    = 0.0;          // and what they contributed to the mean
     uint32_t stints    = 0;            // how many times this phase was entered
 };
 
@@ -250,7 +251,7 @@ void Add(Phase& p, double ms) {
     ++p.frames;
     p.sumMs += ms;
     if (ms > p.maxMs) p.maxMs = ms;
-    if (ms >= 120.0) { ++p.over; return; }
+    if (ms >= 120.0) { ++p.over; p.overMs += ms; return; }
     ++p.hist[BucketOf(ms)];
 }
 
@@ -509,11 +510,36 @@ static void ReportSubject(int i, const char* name) {
             double meanOn  = g_on[i].sumMs  / (double)g_on[i].frames;
             double meanOff = g_off[i].sumMs / (double)g_off[i].frames;
             double d = meanOff - meanOn;   // positive means ON was faster
+
+            // The mean's exposure to a handful of frames.
+            //
+            // A session reported "ON is 0.064 ms slower on the mean" with a
+            // single 667 ms frame in the OFF half and twenty-four frames over
+            // 120 ms against six. One 667 ms frame in twenty-five thousand moves
+            // a mean by 0.026 ms on its own, which is nearly half the difference
+            // being reported as a result. The percentiles are unaffected by this
+            // and say what they say; the mean has to declare it.
+            double trimOn  = (g_on[i].frames  > g_on[i].over)
+                           ? (g_on[i].sumMs  - g_on[i].overMs)
+                             / (double)(g_on[i].frames  - g_on[i].over) : meanOn;
+            double trimOff = (g_off[i].frames > g_off[i].over)
+                           ? (g_off[i].sumMs - g_off[i].overMs)
+                             / (double)(g_off[i].frames - g_off[i].over) : meanOff;
+            double dTrim = trimOff - trimOn;
             Log("[AbTest]   ON is %.3f ms %s per frame on the mean (%+.1f%%). Both "
                 "halves come from the same session and the same play, so this is the "
                 "closest thing to a controlled figure this project can produce.",
                 d < 0 ? -d : d, d > 0 ? "faster" : "slower",
                 meanOff != 0.0 ? (-100.0 * d / meanOff) : 0.0);
+            if (g_on[i].over || g_off[i].over) {
+                Log("[AbTest]     without the %u and %u frame(s) over 120 ms, that "
+                    "becomes %.3f ms %s. Those frames are %.0f%% of the difference "
+                    "above, and there are few enough of them that one of them "
+                    "landing in one half is not a property of the feature.",
+                    g_on[i].over, g_off[i].over,
+                    dTrim < 0 ? -dTrim : dTrim, dTrim > 0 ? "faster" : "slower",
+                    (d != 0.0) ? (100.0 * (d - dTrim) / d) : 0.0);
+            }
 
             // The tail, differenced rather than left for the reader.
             //
