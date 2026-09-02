@@ -143,7 +143,10 @@ itself.
 
 In the launcher, press **SET UP A MEASUREMENT RUN**. It ticks A/B Test a
 Feature and the sixteen features the harness can measure, changes nothing else
-you have set, and tells you how long a full pass takes. Press SAVE and play.
+you have set, and saves. Then play - somewhere the processor is busy. A raid, a
+battleground, a crowded city. Standing in a field the game waits on the
+graphics card, a saving inside the frame changes no frame time, and the report
+will tell you so instead of giving you numbers.
 
 That button exists because the harness can only measure features that are
 switched on - a feature registers with it at the moment it installs - and on a

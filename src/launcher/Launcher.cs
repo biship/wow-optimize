@@ -1120,7 +1120,7 @@ namespace WowOptimizeLauncher {
 
             DialogResult answer = MessageBox.Show(
                 "Turns on the A/B test and the sixteen features it can measure. Nothing else you have set is changed.\r\n\r\n"
-                + "Play for at least 45 minutes, then send the log.\r\n\r\n"
+                + "Play for at least 45 minutes, somewhere the processor is busy - a raid, a battleground, a crowded city. Standing in a field the game waits on the graphics card and the test cannot measure anything. Then send the log.\r\n\r\n"
                 + "These are experimental features. If the game misbehaves, this is why.\r\n\r\nSet them up and save?",
                 "Measurement run",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question);
