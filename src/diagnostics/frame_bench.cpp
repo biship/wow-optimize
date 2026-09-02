@@ -104,11 +104,19 @@ static bool          g_ready  = false;
 static constexpr double SLOW_FRAME_FACTOR   = 5.0;    // times the running median
 static constexpr double SLOW_FRAME_FLOOR_MS = 8.0;    // never report below this
 static constexpr DWORD  SLOW_FRAME_QUIET_MS = 2000;   // spacing between reports
-// A spike this long gets the flight recorder dumped around it. Chosen above
-// anything a zone boundary produces and well above the 8 ms floor, so a log
-// carries these for the hitches a player would actually complain about rather
-// than for every frame that ran long.
-static constexpr double AUTO_MARK_MS        = 100.0;
+// A spike gets the flight recorder dumped around it when it is both far above
+// the median and long enough to see.
+//
+// A flat 100 ms was the first shape of this and it was wrong at both ends. A
+// session running at 3 ms a frame reported hitches of 42.7 ms - fourteen times
+// the median, a visible stutter - and none of them reached the threshold. A
+// session running at 30 ms a frame would have had every ordinary frame during a
+// zone load qualify.
+//
+// A multiple catches the first and refuses the second. The floor is there
+// because a 25x spike on a 0.5 ms frame is 12 ms, which nobody feels.
+static constexpr double AUTO_MARK_FACTOR    = 10.0;
+static constexpr double AUTO_MARK_FLOOR_MS  = 25.0;
 
 static double g_medianMs      = 0.0;   // refreshed periodically from the histogram
 static double g_p95Ms         = 0.0;   // same walk, so the two are always comparable
@@ -270,7 +278,10 @@ static void Accumulate(double ms) {
     // frame at three times the median happens while a zone loads and dumping
     // 240 frames for each of those would bury the log. The recorder rate limits
     // nothing itself, so the gate is here.
-    if (ms >= AUTO_MARK_MS && FlightRecorder::IsRecording()) {
+    const double autoMarkAt =
+        (g_medianMs > 0.0 && g_medianMs * AUTO_MARK_FACTOR > AUTO_MARK_FLOOR_MS)
+            ? g_medianMs * AUTO_MARK_FACTOR : AUTO_MARK_FLOOR_MS;
+    if (ms >= autoMarkAt && FlightRecorder::IsRecording()) {
         char why[96];
         _snprintf(why, sizeof(why) - 1, "frame of %.0f ms, %.0fx the median",
                   ms, ms / (g_medianMs > 0.0 ? g_medianMs : 1.0));
