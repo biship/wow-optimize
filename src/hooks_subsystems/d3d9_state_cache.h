@@ -16,6 +16,9 @@ void LogStats();
 
 // Draw calls per frame, if the census was switched on.
 void ReportDrawCensus();
+// How many of the session's draw calls could have been issued as one. Printed
+// beside the draw census, because on its own it says nothing.
+void LogMergeCensus();
 
 // Handle device creation (resolve pointers and install hooks)
 void OnCreateDevice(struct IDirect3DDevice9* device);

@@ -529,6 +529,74 @@ static DrawIndexedPrimitive_fn orig_DrawIndexedPrimitive = nullptr;
 
 static uint32_t g_drawsThisFrame = 0;
 
+// ---------------------------------------------------------------------------
+// Could these draws have been merged?
+//
+// A session: 27,357,216 draw calls over 77,047 frames, 355 a frame, carrying
+// 1.54 billion primitives. 35.3% of them carried eight primitives or fewer and
+// 21.2% carried one or two. At that size the cost is the call, not the
+// triangles, and under DXVK a call is command buffer recording and state
+// validation.
+//
+// So the question is how many of them the client could have issued as one, and
+// nothing has ever counted it. Two consecutive DrawIndexedPrimitive calls can
+// become one when nothing changed between them, they draw the same primitive
+// type from the same vertex base, and the second picks up where the first left
+// off in the index buffer.
+//
+// Triangle lists only. A strip or a fan needs degenerate triangles inserted to
+// join, which is a different and larger change, so counting them here would
+// promise something this measurement is not about.
+//
+// "Nothing changed" is g_stateEpoch, which the state manager bumps when a
+// setter actually reaches D3D9 and not when its dedup skips one - a skipped
+// call means the state did not change, which is exactly right here.
+//
+// This counts and does not act. Merging draw calls is a renderer change; the
+// point of this is to find out in one session whether it is worth making.
+extern "C" unsigned long g_stateEpoch;
+
+static uint64_t g_mergeable      = 0;   // draws that could join the one before
+static uint64_t g_mergeablePrims = 0;
+static uint64_t g_chains         = 0;   // runs of two or more
+static uint32_t g_chainLen       = 0;
+static uint32_t g_longestChain   = 0;
+static uint64_t g_indexedDraws   = 0;
+
+static unsigned long g_prevEpoch  = 0xFFFFFFFFu;
+static DWORD    g_prevType       = 0;
+static INT      g_prevBaseVertex = 0;
+static UINT     g_prevStartIndex = 0;
+static UINT     g_prevPrimCount  = 0;
+static bool     g_havePrev       = false;
+
+static inline void NoteMergeChance(DWORD type, INT baseVertex,
+                                   UINT startIndex, UINT primCount) {
+    ++g_indexedDraws;
+    const bool joins =
+        g_havePrev &&
+        g_stateEpoch == g_prevEpoch &&
+        type == g_prevType &&
+        type == 4 /* D3DPT_TRIANGLELIST */ &&
+        baseVertex == g_prevBaseVertex &&
+        startIndex == g_prevStartIndex + g_prevPrimCount * 3;
+    if (joins) {
+        ++g_mergeable;
+        g_mergeablePrims += primCount;
+        if (g_chainLen == 0) g_chainLen = 2; else ++g_chainLen;
+        if (g_chainLen > g_longestChain) g_longestChain = g_chainLen;
+    } else {
+        if (g_chainLen >= 2) ++g_chains;
+        g_chainLen = 0;
+    }
+    g_prevEpoch      = g_stateEpoch;
+    g_prevType       = type;
+    g_prevBaseVertex = baseVertex;
+    g_prevStartIndex = startIndex;
+    g_prevPrimCount  = primCount;
+    g_havePrev       = true;
+}
+
 // Buckets of 100 draws, up to 5000, then an overflow bin.
 static constexpr int DRAW_BUCKETS = 51;
 static uint32_t g_drawHistogram[DRAW_BUCKETS] = {};
@@ -578,8 +646,35 @@ static HRESULT WINAPI Hooked_DrawIndexedPrimitiveCount(IDirect3DDevice9* device,
                                                        UINT primCount) {
     ++g_drawsThisFrame;
     NoteDrawShape(primCount);
+    NoteMergeChance((DWORD)type, baseVertex, startIndex, primCount);
     return orig_DrawIndexedPrimitive(device, type, baseVertex, minIndex,
                                      numVertices, startIndex, primCount);
+}
+
+void LogMergeCensus() {
+    if (g_indexedDraws == 0) {
+        Log("[DrawMerge] no indexed draws were counted, so nothing here says "
+            "whether merging would be worth anything.");
+        return;
+    }
+    const double pct = 100.0 * (double)g_mergeable / (double)g_indexedDraws;
+    Log("[DrawMerge] %llu of %llu indexed draws (%.1f%%) could have been issued "
+        "as part of the one before them: same triangle list, same vertex base, "
+        "the next indices along, and no state change in between.",
+        g_mergeable, g_indexedDraws, pct);
+    Log("[DrawMerge]   they carried %llu primitives, in %llu run(s) of two or "
+        "more, the longest %lu draws long. Collapsing every run leaves %llu "
+        "calls where the client made %llu.",
+        g_mergeablePrims, g_chains, g_longestChain,
+        g_indexedDraws - g_mergeable, g_indexedDraws);
+    Log("[DrawMerge]   this counts and changes nothing. Merging draws is a "
+        "renderer change and the point of counting first is to find out in one "
+        "session whether it is worth making. A share in the tens of percent "
+        "says yes; a few percent says the client already batches what it can "
+        "and the small draws are small because their state differs.");
+    Log("[DrawMerge]   strips and fans are not counted as mergeable at all - "
+        "joining them needs degenerate triangles, which is a different and "
+        "larger change than this measurement is about.");
 }
 
 // Called from the Present hook, which already runs once per presented frame.
@@ -589,6 +684,9 @@ void NoteFrameForDrawCensus() {
     // A frame boundary ends whatever run was open.
     if (g_currentRun >= 2) { ++g_runs; g_runDraws += g_currentRun; }
     g_currentRun = 0;
+    if (g_chainLen >= 2) ++g_chains;
+    g_chainLen = 0;
+    g_havePrev = false;
 
     uint32_t n = g_drawsThisFrame;
     g_drawsThisFrame = 0;

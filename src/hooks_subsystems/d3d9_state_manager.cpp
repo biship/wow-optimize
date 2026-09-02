@@ -316,6 +316,18 @@ typedef HRESULT (__stdcall *PresentFn)(void* dev, const RECT* src, const RECT* d
 // Hooked functions
 // ================================================================
 
+// Bumped whenever a state setter actually reaches D3D9, and never on a call the
+// dedup above skips - a skipped call means the state did not change, which is
+// exactly what a draw-merge census needs to know. Free on the fast path, and
+// beside a real D3D9 call on the slow one.
+//
+// It exists for one question: how many of the 27 million draw calls a session
+// makes could have been merged with the one before them. 35.3% of them carry
+// eight primitives or fewer and 21.2% carry one or two, so the per-call cost
+// dominates - but two draws can only merge if nothing changed between them, and
+// nothing has ever counted that.
+extern "C" unsigned long g_stateEpoch = 0;
+
 static HRESULT __stdcall Hooked_SetRenderState(void* dev, DWORD state, DWORD value) {
     CheckDeviceChange(dev);
     ++g_statCalls[0];
@@ -334,7 +346,7 @@ static HRESULT __stdcall Hooked_SetRenderState(void* dev, DWORD state, DWORD val
         ++g_statSkipped[0];
         return 0;
     }
-    HRESULT hr = g_orig_SetRenderState(dev, state, value);
+    HRESULT hr = (++g_stateEpoch, g_orig_SetRenderState)(dev, state, value);
     if (SUCCEEDED(hr) && state < 256) {
         g_rsCache[state] = value;
         g_rsValid[state] = true;
@@ -351,7 +363,7 @@ static HRESULT __stdcall Hooked_SetTextureStageState(void* dev, DWORD stage, DWO
         ++g_statSkipped[1];
         return 0;
     }
-    HRESULT hr = g_orig_SetTextureStageState(dev, stage, type, value);
+    HRESULT hr = (++g_stateEpoch, g_orig_SetTextureStageState)(dev, stage, type, value);
     if (SUCCEEDED(hr) && idx < 256) {
         g_tssCache[idx] = value;
         g_tssValid[idx] = true;
@@ -368,7 +380,7 @@ static HRESULT __stdcall Hooked_SetSamplerState(void* dev, DWORD sampler, DWORD 
         ++g_statSkipped[2];
         return 0;
     }
-    HRESULT hr = g_orig_SetSamplerState(dev, sampler, type, value);
+    HRESULT hr = (++g_stateEpoch, g_orig_SetSamplerState)(dev, sampler, type, value);
     if (SUCCEEDED(hr) && idx < 256) {
         g_ssCache[idx] = value;
         g_ssValid[idx] = true;
@@ -417,14 +429,14 @@ static HRESULT __stdcall Hooked_SetTexture(void* dev, DWORD stage, void* tex) {
     }
 
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return g_orig_SetTexture(dev, stage, tex);
+    return (++g_stateEpoch, g_orig_SetTexture)(dev, stage, tex);
 }
 
 static HRESULT __stdcall Hooked_SetTransform(void* dev, DWORD state, const void* matrix) {
     CheckDeviceChange(dev);
     ++g_statCalls[4];
     // Always call original transform setter to guarantee 100% world matrix accuracy on weapon sub-meshes
-    return g_orig_SetTransform(dev, state, matrix);
+    return (++g_stateEpoch, g_orig_SetTransform)(dev, state, matrix);
 }
 
 static HRESULT __stdcall Hooked_SetMaterial(void* dev, const void* material) {
@@ -433,7 +445,7 @@ static HRESULT __stdcall Hooked_SetMaterial(void* dev, const void* material) {
 
     if (!material) {
         g_materialValid = false;
-        return g_orig_SetMaterial(dev, material);
+        return (++g_stateEpoch, g_orig_SetMaterial)(dev, material);
     }
 
     uint32_t hash = HashMaterial((const DWORD*)material);
@@ -441,7 +453,7 @@ static HRESULT __stdcall Hooked_SetMaterial(void* dev, const void* material) {
         ++g_statSkipped[5];
         return 0;
     }
-    HRESULT hr = g_orig_SetMaterial(dev, material);
+    HRESULT hr = (++g_stateEpoch, g_orig_SetMaterial)(dev, material);
     if (SUCCEEDED(hr)) {
         g_materialHash = hash;
         g_materialValid = true;
@@ -455,14 +467,14 @@ static HRESULT __stdcall Hooked_SetViewport(void* dev, const DWORD* vp) {
 
     if (!vp) {
         g_viewportValid = false;
-        return g_orig_SetViewport(dev, vp);
+        return (++g_stateEpoch, g_orig_SetViewport)(dev, vp);
     }
 
     if (g_viewportValid && memcmp(g_viewportData, vp, sizeof(g_viewportData)) == 0) {
         ++g_statSkipped[6];
         return 0;
     }
-    HRESULT hr = g_orig_SetViewport(dev, vp);
+    HRESULT hr = (++g_stateEpoch, g_orig_SetViewport)(dev, vp);
     if (SUCCEEDED(hr)) {
         memcpy(g_viewportData, vp, sizeof(g_viewportData));
         g_viewportValid = true;
@@ -476,7 +488,7 @@ static HRESULT __stdcall Hooked_SetScissorRect(void* dev, const RECT* rect) {
 
     if (!rect) {
         g_scissorValid = false;
-        return g_orig_SetScissorRect(dev, rect);
+        return (++g_stateEpoch, g_orig_SetScissorRect)(dev, rect);
     }
 
     if (g_scissorValid
@@ -487,7 +499,7 @@ static HRESULT __stdcall Hooked_SetScissorRect(void* dev, const RECT* rect) {
         ++g_statSkipped[7];
         return 0;
     }
-    HRESULT hr = g_orig_SetScissorRect(dev, rect);
+    HRESULT hr = (++g_stateEpoch, g_orig_SetScissorRect)(dev, rect);
     if (SUCCEEDED(hr)) {
         g_scissorData[0] = rect->left;
         g_scissorData[1] = rect->top;
@@ -502,21 +514,21 @@ static HRESULT __stdcall Hooked_SetStreamSource(void* dev, UINT stream, void* vb
     CheckDeviceChange(dev);
     ++g_statCalls[8];
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return g_orig_SetStreamSource(dev, stream, vb, offset, stride);
+    return (++g_stateEpoch, g_orig_SetStreamSource)(dev, stream, vb, offset, stride);
 }
 
 static HRESULT __stdcall Hooked_SetIndices(void* dev, void* ib) {
     CheckDeviceChange(dev);
     ++g_statCalls[9];
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return g_orig_SetIndices(dev, ib);
+    return (++g_stateEpoch, g_orig_SetIndices)(dev, ib);
 }
 
 static HRESULT __stdcall Hooked_SetVertexDeclaration(void* dev, void* decl) {
     CheckDeviceChange(dev);
     ++g_statCalls[10];
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return g_orig_SetVertexDeclaration(dev, decl);
+    return (++g_stateEpoch, g_orig_SetVertexDeclaration)(dev, decl);
 }
 
 static HRESULT __stdcall Hooked_SetFVF(void* dev, DWORD fvf) {
@@ -527,7 +539,7 @@ static HRESULT __stdcall Hooked_SetFVF(void* dev, DWORD fvf) {
         ++g_statSkipped[11];
         return 0;
     }
-    HRESULT hr = g_orig_SetFVF(dev, fvf);
+    HRESULT hr = (++g_stateEpoch, g_orig_SetFVF)(dev, fvf);
     if (SUCCEEDED(hr)) {
         g_fvf = fvf;
         g_fvfValid = true;
@@ -539,14 +551,14 @@ static HRESULT __stdcall Hooked_SetVertexShader(void* dev, void* vs) {
     CheckDeviceChange(dev);
     ++g_statCalls[12];
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return g_orig_SetVertexShader(dev, vs);
+    return (++g_stateEpoch, g_orig_SetVertexShader)(dev, vs);
 }
 
 static HRESULT __stdcall Hooked_SetPixelShader(void* dev, void* ps) {
     CheckDeviceChange(dev);
     ++g_statCalls[13];
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return g_orig_SetPixelShader(dev, ps);
+    return (++g_stateEpoch, g_orig_SetPixelShader)(dev, ps);
 }
 
 static HRESULT __stdcall Hooked_Reset(void* dev, D3DPRESENT_PARAMETERS* params) {
@@ -1086,6 +1098,7 @@ void D3D9StateManager_LogStats(void) {
             "that share is what a batching pass could remove; a small share means "
             "the draws are already as large as they get.",
             g_drawTiny, 100.0 * (double)g_drawTiny / (double)draws);
+        D3D9StateCache::LogMergeCensus();
     }
 }
 
