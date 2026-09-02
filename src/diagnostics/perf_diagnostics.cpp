@@ -9,6 +9,15 @@
 
 extern "C" void Log(const char* fmt, ...);
 extern void CrashDumper_DumpHookTrace(int count);
+// Whether an address belongs to this project's allocator.
+//
+// The stutter snapshot has been printing "private (heap/allocator)" against the
+// largest reservations for as long as it has existed, and a tester log finally
+// showed why that is not enough: 128 MB, 128 MB, 51 MB, 32 MB, 32 MB, every one
+// of them below 2GB and every one of them described with the same six words. The
+// question the whole low-address-space investigation turns on is whether those
+// are the client's or ours, and mimalloc can answer it directly.
+extern "C" bool mi_is_in_heap_region(const void* p);
 extern "C" void mi_process_info(size_t* elapsed_msecs, size_t* user_msecs, size_t* system_msecs,
                                 size_t* current_rss, size_t* peak_rss,
                                 size_t* current_commit, size_t* peak_commit,
@@ -41,7 +50,14 @@ static void DescribeAllocation(uintptr_t base, DWORD type, char* out, size_t out
         lstrcpynA(out, "image", (int)outSize);
         return;
     }
-    lstrcpynA(out, (type == MEM_MAPPED) ? "mapped file/section" : "private (heap/allocator)",
+    if (type == MEM_MAPPED) { lstrcpynA(out, "mapped file/section", (int)outSize); return; }
+    // "private" covers both heaps in this process, and which one it is decides
+    // whether the fix is ours to make.
+    bool ours = false;
+    __try { ours = mi_is_in_heap_region((const void*)base); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ours = false; }
+    lstrcpynA(out, ours ? "private - THIS TOOL'S ALLOCATOR (mimalloc)"
+                        : "private - the client's own heap, or something else",
               (int)outSize);
 }
 
