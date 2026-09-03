@@ -25,5 +25,10 @@ void D3D9StateManager_LogStats(void);
 void ShutdownD3D9StateManagerAtProcessExit(void);
 void OnFrameD3D9StateManager(DWORD mainThreadId);
 bool IsD3D9DeviceHooked(void);
+// How many merge barriers went in, of how many, and how many state blocks the
+// client created. The draw-merge census needs all three to say whether its own
+// answer can be trusted.
+void D3D9StateManager_GetBarrierState(int* installed, int* total,
+                                      unsigned long* stateBlocks);
 
 extern volatile LONG g_deviceResetCounter;

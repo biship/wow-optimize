@@ -15,6 +15,7 @@
 #include "font_glyph_cache.h"
 #include "vertex_buffer_prealloc.h"
 #include "texture_unload_delay.h"
+#include "d3d9_state_manager.h"
 #include <atomic>
 
 extern "C" void Log(const char* fmt, ...);
@@ -680,6 +681,44 @@ void LogMergeCensus() {
     Log("[DrawMerge]   strips and fans are not counted as mergeable at all - "
         "joining them needs degenerate triangles, which is a different and "
         "larger change than this measurement is about.");
+
+    // Whether the share above can be believed.
+    //
+    // "Nothing changed between them" is only as good as the set of things that
+    // say something changed. The state manager wraps fourteen setters; a draw
+    // also depends on shader constants, Clear, SetRenderTarget, the scene
+    // boundary, lights and clip planes, and those bump the epoch through
+    // barriers patched into the device vtable beside the state hooks. A
+    // barrier that did not install leaves the share too high.
+    int installed = 0, total = 0;
+    unsigned long stateBlocks = 0;
+    D3D9StateManager_GetBarrierState(&installed, &total, &stateBlocks);
+    if (total == 0) {
+        Log("[DrawMerge]   THE SHARE ABOVE IS NOT MEASURED: no merge barriers "
+            "were installed at all, so nothing but the fourteen wrapped setters "
+            "could move the epoch.");
+    } else if (installed < total) {
+        Log("[DrawMerge]   THE SHARE ABOVE IS TOO HIGH: %d of %d merge barriers "
+            "installed. The %d that did not are device methods that change what "
+            "a draw produces without moving the epoch, so pairs that are not "
+            "joinable were counted as joinable.",
+            installed, total, total - installed);
+    } else {
+        Log("[DrawMerge]   all %d merge barriers installed: a pair counted as "
+            "joinable had no shader constant, no Clear, no render target change "
+            "and no scene boundary between it and the draw before it.", total);
+    }
+    if (stateBlocks) {
+        Log("[DrawMerge]   THE SHARE ABOVE IS UNSOUND: the client created %lu "
+            "state block(s). IDirect3DStateBlock9::Apply changes device state "
+            "without touching the device vtable, so it cannot be seen from here "
+            "and a merge across one would be wrong. Build nothing on this "
+            "number until that is handled.", stateBlocks);
+    } else {
+        Log("[DrawMerge]   the client created no state blocks, so the one state "
+            "change this cannot see - a state block applying itself, which "
+            "never touches the device vtable - did not happen.");
+    }
 }
 
 // Called from the Present hook, which already runs once per presented frame.

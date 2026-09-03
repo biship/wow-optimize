@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <d3d9.h>
 #include "d3d9_state_manager.h"
+#include "config.h"
 #include "session_verdict.h"
 #include "sampling_profiler.h"
 #include "font_glyph_cache.h"
@@ -756,6 +757,311 @@ static void SetHookOrigin(int idx, void* orig) {
 #define ADDR_CGXDEVICED3D_PTR  0x00C5DF88  // global CGxDeviceD3d*
 #endif
 
+
+// ---------------------------------------------------------------------------
+// Merge barriers
+//
+// The draw-merge census counts two consecutive DrawIndexedPrimitive calls as
+// joinable when the state epoch has not moved between them. The epoch is bumped
+// by the fourteen setters this module wraps - and by nothing else, which means
+// the census has been counting a pair as joinable when the client changed a
+// vertex shader constant between them, or cleared the render target, or ended
+// the scene. It over-counts, and a census that over-counts the thing it exists
+// to decide is worse than no census.
+//
+// Every device method below can change what a draw produces. None of them needs
+// a wrapper with a signature: a naked thunk that bumps the epoch and jumps to the
+// original leaves the stack exactly as it was, so the original returns straight
+// to the client and the argument count never comes into it. Two instructions.
+// The flags the inc touches are not live across a __stdcall boundary.
+//
+// Gated on the draw census, which is off by default. These exist to make its
+// answer sound and there is nothing else to spend them on, so the default path
+// keeps the fourteen it had.
+//
+// One hole is left and it is named rather than papered over:
+// IDirect3DStateBlock9::Apply changes device state without touching the device
+// vtable at all. It cannot be seen from here. So state block creation is counted
+// separately, and the census says its answer is unsound if the count is not zero.
+
+static unsigned long g_stateBlockCreates = 0;
+
+static void* g_bOrig_UpdateSurface = nullptr;
+static __declspec(naked) void g_bThunk_UpdateSurface() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_UpdateSurface]
+}
+
+static void* g_bOrig_UpdateTexture = nullptr;
+static __declspec(naked) void g_bThunk_UpdateTexture() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_UpdateTexture]
+}
+
+static void* g_bOrig_StretchRect = nullptr;
+static __declspec(naked) void g_bThunk_StretchRect() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_StretchRect]
+}
+
+static void* g_bOrig_ColorFill = nullptr;
+static __declspec(naked) void g_bThunk_ColorFill() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_ColorFill]
+}
+
+static void* g_bOrig_SetRenderTarget = nullptr;
+static __declspec(naked) void g_bThunk_SetRenderTarget() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetRenderTarget]
+}
+
+static void* g_bOrig_SetDepthStencilSurface = nullptr;
+static __declspec(naked) void g_bThunk_SetDepthStencilSurface() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetDepthStencilSurface]
+}
+
+static void* g_bOrig_BeginScene = nullptr;
+static __declspec(naked) void g_bThunk_BeginScene() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_BeginScene]
+}
+
+static void* g_bOrig_EndScene = nullptr;
+static __declspec(naked) void g_bThunk_EndScene() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_EndScene]
+}
+
+static void* g_bOrig_Clear = nullptr;
+static __declspec(naked) void g_bThunk_Clear() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_Clear]
+}
+
+static void* g_bOrig_SetLight = nullptr;
+static __declspec(naked) void g_bThunk_SetLight() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetLight]
+}
+
+static void* g_bOrig_LightEnable = nullptr;
+static __declspec(naked) void g_bThunk_LightEnable() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_LightEnable]
+}
+
+static void* g_bOrig_SetClipPlane = nullptr;
+static __declspec(naked) void g_bThunk_SetClipPlane() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetClipPlane]
+}
+
+static void* g_bOrig_SetClipStatus = nullptr;
+static __declspec(naked) void g_bThunk_SetClipStatus() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetClipStatus]
+}
+
+static void* g_bOrig_SetPaletteEntries = nullptr;
+static __declspec(naked) void g_bThunk_SetPaletteEntries() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetPaletteEntries]
+}
+
+static void* g_bOrig_SetCurrentTexturePalette = nullptr;
+static __declspec(naked) void g_bThunk_SetCurrentTexturePalette() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetCurrentTexturePalette]
+}
+
+static void* g_bOrig_SetSoftwareVertexProcessing = nullptr;
+static __declspec(naked) void g_bThunk_SetSoftwareVertexProcessing() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetSoftwareVertexProcessing]
+}
+
+static void* g_bOrig_SetNPatchMode = nullptr;
+static __declspec(naked) void g_bThunk_SetNPatchMode() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetNPatchMode]
+}
+
+static void* g_bOrig_DrawPrimitiveUP = nullptr;
+static __declspec(naked) void g_bThunk_DrawPrimitiveUP() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_DrawPrimitiveUP]
+}
+
+static void* g_bOrig_DrawIndexedPrimitiveUP = nullptr;
+static __declspec(naked) void g_bThunk_DrawIndexedPrimitiveUP() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_DrawIndexedPrimitiveUP]
+}
+
+static void* g_bOrig_ProcessVertices = nullptr;
+static __declspec(naked) void g_bThunk_ProcessVertices() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_ProcessVertices]
+}
+
+static void* g_bOrig_SetVertexShaderConstantF = nullptr;
+static __declspec(naked) void g_bThunk_SetVertexShaderConstantF() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetVertexShaderConstantF]
+}
+
+static void* g_bOrig_SetVertexShaderConstantI = nullptr;
+static __declspec(naked) void g_bThunk_SetVertexShaderConstantI() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetVertexShaderConstantI]
+}
+
+static void* g_bOrig_SetVertexShaderConstantB = nullptr;
+static __declspec(naked) void g_bThunk_SetVertexShaderConstantB() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetVertexShaderConstantB]
+}
+
+static void* g_bOrig_SetStreamSourceFreq = nullptr;
+static __declspec(naked) void g_bThunk_SetStreamSourceFreq() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetStreamSourceFreq]
+}
+
+static void* g_bOrig_SetPixelShaderConstantF = nullptr;
+static __declspec(naked) void g_bThunk_SetPixelShaderConstantF() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetPixelShaderConstantF]
+}
+
+static void* g_bOrig_SetPixelShaderConstantI = nullptr;
+static __declspec(naked) void g_bThunk_SetPixelShaderConstantI() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetPixelShaderConstantI]
+}
+
+static void* g_bOrig_SetPixelShaderConstantB = nullptr;
+static __declspec(naked) void g_bThunk_SetPixelShaderConstantB() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_SetPixelShaderConstantB]
+}
+
+static void* g_bOrig_MultiplyTransform = nullptr;
+static __declspec(naked) void g_bThunk_MultiplyTransform() {
+    __asm inc dword ptr [g_stateEpoch]
+
+    __asm jmp dword ptr [g_bOrig_MultiplyTransform]
+}
+
+static void* g_bOrig_CreateStateBlock = nullptr;
+static __declspec(naked) void g_bThunk_CreateStateBlock() {
+    __asm inc dword ptr [g_stateEpoch]
+    __asm inc dword ptr [g_stateBlockCreates]
+    __asm jmp dword ptr [g_bOrig_CreateStateBlock]
+}
+
+static void* g_bOrig_EndStateBlock = nullptr;
+static __declspec(naked) void g_bThunk_EndStateBlock() {
+    __asm inc dword ptr [g_stateEpoch]
+    __asm inc dword ptr [g_stateBlockCreates]
+    __asm jmp dword ptr [g_bOrig_EndStateBlock]
+}
+
+struct Barrier { int vt; const char* name; void* thunk; void** origSlot; bool patched; };
+static Barrier g_barriers[] = {
+    {  30, "UpdateSurface", (void*)g_bThunk_UpdateSurface, &g_bOrig_UpdateSurface, false },
+    {  31, "UpdateTexture", (void*)g_bThunk_UpdateTexture, &g_bOrig_UpdateTexture, false },
+    {  34, "StretchRect", (void*)g_bThunk_StretchRect, &g_bOrig_StretchRect, false },
+    {  35, "ColorFill", (void*)g_bThunk_ColorFill, &g_bOrig_ColorFill, false },
+    {  37, "SetRenderTarget", (void*)g_bThunk_SetRenderTarget, &g_bOrig_SetRenderTarget, false },
+    {  39, "SetDepthStencilSurface", (void*)g_bThunk_SetDepthStencilSurface, &g_bOrig_SetDepthStencilSurface, false },
+    {  41, "BeginScene", (void*)g_bThunk_BeginScene, &g_bOrig_BeginScene, false },
+    {  42, "EndScene", (void*)g_bThunk_EndScene, &g_bOrig_EndScene, false },
+    {  43, "Clear", (void*)g_bThunk_Clear, &g_bOrig_Clear, false },
+    {  46, "MultiplyTransform", (void*)g_bThunk_MultiplyTransform, &g_bOrig_MultiplyTransform, false },
+    {  51, "SetLight", (void*)g_bThunk_SetLight, &g_bOrig_SetLight, false },
+    {  53, "LightEnable", (void*)g_bThunk_LightEnable, &g_bOrig_LightEnable, false },
+    {  55, "SetClipPlane", (void*)g_bThunk_SetClipPlane, &g_bOrig_SetClipPlane, false },
+    {  62, "SetClipStatus", (void*)g_bThunk_SetClipStatus, &g_bOrig_SetClipStatus, false },
+    {  71, "SetPaletteEntries", (void*)g_bThunk_SetPaletteEntries, &g_bOrig_SetPaletteEntries, false },
+    {  73, "SetCurrentTexturePalette", (void*)g_bThunk_SetCurrentTexturePalette, &g_bOrig_SetCurrentTexturePalette, false },
+    {  77, "SetSoftwareVertexProcessing", (void*)g_bThunk_SetSoftwareVertexProcessing, &g_bOrig_SetSoftwareVertexProcessing, false },
+    {  79, "SetNPatchMode", (void*)g_bThunk_SetNPatchMode, &g_bOrig_SetNPatchMode, false },
+    {  83, "DrawPrimitiveUP", (void*)g_bThunk_DrawPrimitiveUP, &g_bOrig_DrawPrimitiveUP, false },
+    {  84, "DrawIndexedPrimitiveUP", (void*)g_bThunk_DrawIndexedPrimitiveUP, &g_bOrig_DrawIndexedPrimitiveUP, false },
+    {  85, "ProcessVertices", (void*)g_bThunk_ProcessVertices, &g_bOrig_ProcessVertices, false },
+    {  94, "SetVertexShaderConstantF", (void*)g_bThunk_SetVertexShaderConstantF, &g_bOrig_SetVertexShaderConstantF, false },
+    {  96, "SetVertexShaderConstantI", (void*)g_bThunk_SetVertexShaderConstantI, &g_bOrig_SetVertexShaderConstantI, false },
+    {  98, "SetVertexShaderConstantB", (void*)g_bThunk_SetVertexShaderConstantB, &g_bOrig_SetVertexShaderConstantB, false },
+    { 102, "SetStreamSourceFreq", (void*)g_bThunk_SetStreamSourceFreq, &g_bOrig_SetStreamSourceFreq, false },
+    { 109, "SetPixelShaderConstantF", (void*)g_bThunk_SetPixelShaderConstantF, &g_bOrig_SetPixelShaderConstantF, false },
+    { 111, "SetPixelShaderConstantI", (void*)g_bThunk_SetPixelShaderConstantI, &g_bOrig_SetPixelShaderConstantI, false },
+    { 113, "SetPixelShaderConstantB", (void*)g_bThunk_SetPixelShaderConstantB, &g_bOrig_SetPixelShaderConstantB, false },
+    {  59, "CreateStateBlock", (void*)g_bThunk_CreateStateBlock, &g_bOrig_CreateStateBlock, false },
+    {  61, "EndStateBlock", (void*)g_bThunk_EndStateBlock, &g_bOrig_EndStateBlock, false },
+};
+static const int NUM_BARRIERS = (int)(sizeof(g_barriers) / sizeof(g_barriers[0]));
+static int g_barriersPatched = 0;
+
+// Patch the barrier slots. Same mechanism as the loop below, kept separate
+// because these carry no state of their own and must not be able to fail the
+// eighteen that do: a barrier that will not patch costs the census its
+// soundness, and the report says so, but the state manager still works.
+void D3D9StateManager_GetBarrierState(int* installed, int* total,
+                                      unsigned long* stateBlocks) {
+    if (installed)   *installed   = g_barriersPatched;
+    if (total)       *total       = NUM_BARRIERS;
+    if (stateBlocks) *stateBlocks = g_stateBlockCreates;
+}
+
+static void PatchBarriers(uintptr_t* vtable) {
+    if (!Config::g_settings.OptDrawCensus) return;
+    for (int i = 0; i < NUM_BARRIERS; i++) {
+        Barrier& b = g_barriers[i];
+        if (b.patched) continue;
+        uintptr_t orig = vtable[b.vt];
+        if (!IsReadable(orig)) continue;
+        if (orig == (uintptr_t)b.thunk) { b.patched = true; g_barriersPatched++; continue; }
+        DWORD prot;
+        if (!VirtualProtect(&vtable[b.vt], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot))
+            continue;
+        *b.origSlot = (void*)orig;
+        vtable[b.vt] = (uintptr_t)b.thunk;
+        VirtualProtect(&vtable[b.vt], sizeof(void*), prot, &prot);
+        b.patched = true;
+        g_barriersPatched++;
+    }
+}
+
 static bool PatchDeviceVTable(void* pDevice) {
     WinLockGuard lock(g_vtableMutex);
     if (!pDevice || g_deviceHooked) return false;
@@ -797,14 +1103,27 @@ static bool PatchDeviceVTable(void* pDevice) {
         SetHookOrigin(i, (void*)origFunc);
         vtable[vtIndex] = (uintptr_t)g_hookFuncs[i];
         VirtualProtect(&vtable[vtIndex], sizeof(void*), oldProtect, &oldProtect);
+        // (barriers are patched after this loop, see PatchBarriers)
         g_vtablePatched[i] = true;
         patched++;
     }
+
+    PatchBarriers(vtable);
 
     g_pDevice = pDevice;
     g_pPatchedVTable = vtable;
     g_deviceHooked = true;
     InterlockedIncrement(&g_deviceResetCounter);
+    if (Config::g_settings.OptDrawCensus) {
+        Log("[D3D9State] %d of %d merge barriers installed. These bump the state "
+            "epoch and jump straight to the original, so the draw-merge census "
+            "stops counting a pair as joinable when the client changed a shader "
+            "constant, cleared the target or ended the scene between them.%s",
+            g_barriersPatched, NUM_BARRIERS,
+            g_barriersPatched == NUM_BARRIERS ? ""
+              : " Any that did not install leave the census over-counting, and "
+                "the census says so.");
+    }
     Log("[D3D9State] Device vtable patched: %d/%d state hooks installed (vtable: %p, resetCounter: %ld)", patched, NUM_HOOKS, vtable, g_deviceResetCounter);
 
     // Name these to the profiler. Sixteen detours on the device vtable are among
