@@ -176,6 +176,32 @@ void Grow() {
 bool Init() {
     if (!Config::g_settings.OptMimallocHighArena) return true;
 
+    // The one combination this must never be in.
+    //
+    // hooked_malloc and hooked_calloc in dllmain hand mimalloc blocks to the
+    // client, and both end with the same guard: if the pointer is at or above
+    // 0x80000000 they free it again and fall back to the CRT, because a 32-bit
+    // client that was never built for a large address space can treat a pointer
+    // above 2GB as negative.
+    //
+    // This module exists to put mimalloc's memory above 2GB. Together they turn
+    // every client allocation into an allocate, a free and a fallback - slower
+    // than either feature alone and silent about it, because both would report
+    // themselves as working.
+    //
+    // Our own allocations are fine up there; the client's are not. Separating
+    // them properly needs a second mimalloc heap bound to the arena, which is a
+    // larger change than refusing the combination.
+    if (Config::g_settings.OptCrtMimalloc || Config::g_settings.OptMimallocLarge) {
+        Log("[HighArena] NOT active: %s hands mimalloc blocks to the client, and "
+            "the client is not built for addresses above 2GB - those paths free "
+            "any block they get from up there and fall back to the CRT. With "
+            "this module on, that would be every allocation. Turn one of them "
+            "off; they cannot both be right at once.",
+            Config::g_settings.OptCrtMimalloc ? "CrtMimalloc" : "MimallocLarge");
+        return false;
+    }
+
     SYSTEM_INFO si = {};
     GetSystemInfo(&si);
     const uintptr_t top = (uintptr_t)si.lpMaximumApplicationAddress;
