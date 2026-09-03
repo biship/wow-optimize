@@ -26,6 +26,15 @@ extern "C" void Log(const char* fmt, ...);
 // true while a zone/UI load or transition is in progress.
 namespace LuaOpt { bool IsLoadingMode(); }
 
+// Declared rather than included: loading_state.h pulls in the write batcher.
+//
+// At file scope on purpose. Written inside namespace SamplingProfiler it
+// becomes SamplingProfiler::LoadingState::IsLoading, which compiles and then
+// fails to link against a name nothing defines - the same shape as a
+// namespace opened inside an anonymous one, which cost a link error in
+// loading_state.cpp the same week.
+namespace LoadingState { bool IsLoading(); }
+
 namespace SamplingProfiler {
 
 // Samples taken during loading screens / the first few seconds after start are
@@ -88,6 +97,34 @@ static int          g_knownCount = 0;
 // by the sampler thread and read only at shutdown (after the thread
 // is joined), so no synchronization is needed beyond the atomic
 // write index.
+// Fine-grained buckets over wow.exe, 512 bytes each. Declared here rather than
+// beside the dump because the sampler fills a second copy of them live.
+static constexpr int WOW_FINE_SHIFT = 9;
+static constexpr int WOW_FINE_SLOTS = (int)((WOW_END - WOW_BASE) >> WOW_FINE_SHIFT) + 1;
+
+// That second copy, filled only while a loading screen is up.
+//
+// A tester loading screen took 25 seconds. The loading timer accounts for two
+// percent of it in ReadFile and ten percent in the client's own file writes. The
+// other eighty-eight has never been attributed to anything, and loading screens
+// are the complaint this project hears most.
+//
+// The ring the main report reads is a window of recent samples, so a load that
+// happened twenty minutes ago has rolled out of it. This accumulates instead,
+// live, at one shift and one increment per sample - which is why it is a fine
+// histogram and not a function lookup. Naming happens at dump time, against the
+// same symbol table the rest of the report uses.
+static uint32_t g_loadFineCounts[WOW_FINE_SLOTS];
+static uint64_t g_loadSamples   = 0;   // taken while loading, anywhere
+static uint64_t g_loadInWow     = 0;   // and of those, inside wow.exe
+static uint64_t g_loadInSelf    = 0;   // inside this DLL
+static uint64_t g_loadElsewhere = 0;   // a system DLL, the driver, a wait
+
+// This DLL's own mapped range. Declared here because the sampler classifies a
+// loading-screen sample by it before the dump code that used to own it.
+static uintptr_t g_selfBase = 0;
+static uintptr_t g_selfEnd  = 0;
+
 static constexpr int RING_SIZE = 1 << 20;  // ~1M samples (~17 min at 1ms)
 // Committed on Init rather than living in BSS. The profiler is off by default,
 // but a static array is committed the moment the DLL is mapped, so every player
@@ -613,6 +650,21 @@ static DWORD WINAPI SamplerThreadProc(LPVOID) {
                 g_ring[idx] = eip;
                 g_writeIdx++;
                 g_totalSamples++;
+
+                // A second, accumulating histogram for loading screens only.
+                // One atomic load and one increment; the naming is deferred.
+                if (::LoadingState::IsLoading()) {
+                    ++g_loadSamples;
+                    if (eip >= WOW_BASE && eip <= WOW_END) {
+                        ++g_loadInWow;
+                        uint32_t lf = (uint32_t)((eip - WOW_BASE) >> WOW_FINE_SHIFT);
+                        if (lf < WOW_FINE_SLOTS) g_loadFineCounts[lf]++;
+                    } else if (g_selfBase && eip >= g_selfBase && eip < g_selfEnd) {
+                        ++g_loadInSelf;
+                    } else {
+                        ++g_loadElsewhere;
+                    }
+                }
             }
         }
 
@@ -647,8 +699,6 @@ static int g_modCount = 0;
 // showed up as a top-4 consumer (~8% of main-thread time) and we need to know
 // WHICH of our hooks costs that. Reported as "wowopt+0xNNNN" (offset from our
 // DLL base) so it maps directly to wow_optimize.map.
-static uintptr_t g_selfBase = 0;
-static uintptr_t g_selfEnd  = 0;
 
 // Our own functions, by absolute address, so a hot spot inside this DLL prints a
 // name instead of an offset nobody can resolve without the matching .map.
@@ -790,8 +840,6 @@ static uint32_t g_selfFineCounts[SELF_FINE_SLOTS];
 // so "which client function is worth hooking" could not be answered from a log at
 // all. 512 bytes over the 8MB image costs 64KB of counters and usually lands on
 // one function, which can then be decompiled directly.
-static constexpr int WOW_FINE_SHIFT = 9;       // 512-byte buckets
-static constexpr int WOW_FINE_SLOTS = (int)((WOW_END - WOW_BASE) >> WOW_FINE_SHIFT) + 1;
 static uint32_t g_wowFineCounts[WOW_FINE_SLOTS];
 
 // Prints the top SELF_FINE_TOP buckets of a histogram, largest first. Selection is
@@ -1111,6 +1159,10 @@ static void DumpResults() {
     memset(g_selfPageCounts, 0, sizeof(g_selfPageCounts));
     memset(g_selfFineCounts, 0, sizeof(g_selfFineCounts));
     memset(g_wowFineCounts, 0, sizeof(g_wowFineCounts));
+    // Deliberately NOT cleared here. The main histogram is rebuilt from the
+    // ring on every dump; the loading one accumulates across the session,
+    // because a load that happened twenty minutes ago is exactly the one
+    // somebody wants to know about.
 
     // Snapshot loaded modules so system samples can be attributed to a DLL.
     BuildModuleTable();
@@ -1457,6 +1509,32 @@ static void DumpResults() {
     DumpSelfSymbolTable();
     DumpFineHistogram(g_selfFineCounts, SELF_FINE_SLOTS, SELF_FINE_SHIFT, n,
                       "wow_optimize.dll HOT SPOTS (256-byte resolution)", "wowopt+0x%05X", 0);
+    // Loading screens, separately, because they are the complaint this project
+    // hears most and the loading timer can only account for twelve percent of
+    // one - two in reads and ten in the client's own writes.
+    if (g_loadSamples == 0) {
+        Log("[SamplingProfiler] === LOADING SCREENS === no sample was taken "
+            "while one was up. Either none came up, or none lasted long enough "
+            "to be sampled - not a measurement that they are fast.");
+    } else {
+        Log("[SamplingProfiler] === LOADING SCREENS: %llu sample(s) taken while "
+            "one was up, %.1f%% of the session. Of those, %.0f%% were inside "
+            "wow.exe, %.0f%% inside this tool, and %.0f%% in a system library, a "
+            "driver or a wait ===",
+            (unsigned long long)g_loadSamples,
+            total ? (100.0 * (double)g_loadSamples / (double)total) : 0.0,
+            100.0 * (double)g_loadInWow     / (double)g_loadSamples,
+            100.0 * (double)g_loadInSelf    / (double)g_loadSamples,
+            100.0 * (double)g_loadElsewhere / (double)g_loadSamples);
+        Log("[SamplingProfiler]   these accumulate over the whole session rather "
+            "than living in the ring, so a load twenty minutes ago is still "
+            "here. The shares below are of the wow.exe samples only.");
+        DumpFineHistogram(g_loadFineCounts, WOW_FINE_SLOTS, WOW_FINE_SHIFT,
+                          g_loadInWow,
+                          "WHERE A LOADING SCREEN GOES (512-byte resolution)",
+                          "0x%08X", WOW_BASE);
+    }
+
     DumpFineHistogram(g_wowFineCounts, WOW_FINE_SLOTS, WOW_FINE_SHIFT, n,
                       "wow.exe HOT SPOTS (512-byte resolution)", "0x%08X", WOW_BASE);
 
