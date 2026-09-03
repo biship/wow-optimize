@@ -349,7 +349,7 @@ namespace WowOptimizeLauncher {
                 { "Render Null Guard", new SettingItem("Graphics_Sound", "RenderNullGuard", true, null, "Stops the client crashing when it sets up a model's draw parameters before the render device is ready. It can only do that by skipping the call, and a skipped call draws that model with the previous model's parameters - which looks like a brief flicker. On by default. If you see the screen flicker occasionally, especially after changing a graphics setting, turn this off for one session and say whether it stops; your log now counts how often it fires either way.") },
                 { "Animation Census", new SettingItem("Graphics_Sound", "AnimCensus", false, null, "Counts what the model animation update does per frame: how many models, how many bones between them, and microseconds per model. A measurement, not a speed-up. The animation family is about a fifth of main-thread time and is the largest remaining target, but forty models at thirty bones and four hundred at three want completely different fixes and a profile cannot tell them apart. It also settles whether each model brings its own position to that call, which decides whether distance-based animation LOD is possible at all. Turn it on for one session, send the log, turn it off.", true) },
                 { "Draw Call Census", new SettingItem("Graphics_Sound", "DrawCensus", false, null, "Counts how many draw calls the client issues per frame, how big they are, and how many of them could have been issued as one - same triangle list, same vertex base, next indices along, no state change in between. The last session showed 355 draws a frame with 35% of them carrying eight triangles or fewer, which is where the cost is a call rather than the triangles. Whether merging them is worth building depends on that share and nobody has ever counted it. A measurement, not a speed-up: it wraps the busiest call in the renderer, so run one session, send the log, and turn it back off.", true) },
-                { "Draw Call Merging (experimental)", new SettingItem("Graphics_Sound", "DrawMerge", false, null, "Issues consecutive draw calls as one where they can be: same triangle list, same vertex base, the next indices along, and nothing changed in between. The client sends about 355 draws a frame and a fifth of them carry one or two triangles, where the cost is the call rather than the triangles. This holds a draw so the next one can join it, and lets it go the moment anything changes that the draw depends on. Experimental. Turn it on with the Draw Call Census and send the log - the report says how many calls it actually saved.", true) },
+                { "Draw Call Merging (experimental)", new SettingItem("Graphics_Sound", "DrawMerge", false, null, "Sends consecutive draw calls as one where they can be. The client issues about 355 draws a frame and a fifth of them carry one or two triangles, so the cost is the call. Experimental. The log says how many calls it saved.", true) },
                 { "SSE2 Matrix Multiply", new SettingItem("Graphics_Sound", "MatrixMultiplySse2", true, null, "Replaces the client's 4x4 matrix multiply, which is 199 x87 instructions and runs once per bone per frame on every animated model. Measured at 24.81 ns against 10.43 ns for this one, and the results are bit-identical - worst difference 0.000e+00 over 4096 random matrix pairs, because it accumulates at the same 53-bit width the client does. A single-precision version was 6.5x faster and drifted by 1e-04, which is the order that caused camera snapping once before, so it was not used. On startup the client's own version and this one are run on the same matrices and compared; any disagreement and it refuses to install and says so in the log.") },
                 { "Compatibility Mode (only if you need it - turns optimizations OFF)", new SettingItem("General", "CompatMode", false, null, "Leave this OFF unless the game will not connect with the DLL loaded, which usually means a VM or HyperV/virtual switches. It works by SWITCHING OFF optimizations - the CPU-priority, affinity and working-set tweaks that can starve the network in virtualized environments - so it makes the game slower on purpose. It is a repair for a broken connection, not an improvement, which is why Enable All leaves it alone.", true) },
                 { "SSE2 Quaternion Normalize", new SettingItem("Graphics_Sound", "QuatNormalizeSse2", true, null, "Replaces the client's quaternion normalize, measured at 3.13% of main-thread execution in a CPU-bound profile. Twice as fast, and it now produces exactly the same bits rather than being a ULP away, so it cannot change how anything looks. It was off by default while it was written in single precision; the client works in double, and that version disagreed with it on three quarters of the quaternions it touched. On startup it runs the client's own version and this one on the same inputs and refuses to install on a single differing bit.") },
@@ -382,7 +382,7 @@ namespace WowOptimizeLauncher {
                 { "Sampling Profiler (diagnostic)", new SettingItem("General", "SamplingProfiler", false, null, "Developer tool: a background thread samples the main-thread instruction pointer ~1000x/sec and logs the top 50 hot functions on exit. Read-only, no gameplay effect. Leave off for normal play. Skipped by Enable All: it is a diagnostic and it costs frames. One reporter traced their long loading screens to leaving it on.", true) },
                 { "No Client Patches (diagnostic)", new SettingItem("General", "NoClientPatches", false, null, "Writes nothing into WoW.exe, which turns every optimization off. Fixes the WoWCircle disconnects: two players ran it and the drops stopped. It is a trade, not a fix - you keep your connection and lose the performance work.", true) },
                 { "Flight Recorder (mark a moment)", new SettingItem("General", "FlightRecorder", true, null, "Keeps the last 512 frames and writes 240 of them to the log when you press Scroll Lock. Press it the moment you see something wrong. Nothing is written until you do, and it also marks itself for a disconnect, a freeze and a bad SavedVariables filename. Change the key with FlightRecorderKey in wow_opt.ini.") },
-                { "A/B Test a Feature", new SettingItem("General", "AbTest", false, null, "Turns one feature on and off in stints while you play and compares the two halves, so the same zone and the same addons land in both. Ticking it takes every testable feature in turn. It can only measure features you have switched on. Use SET UP A MEASUREMENT RUN instead of ticking this by hand - it does the whole setup. Play at least 45 minutes.", true) },
+                { "A/B Test a Feature", new SettingItem("General", "AbTest", false, null, "Turns one feature on and off in stints while you play and compares the two halves. It can only measure features you have switched on. Use the MEASUREMENT RUN button instead of ticking this by hand. Play at least 45 minutes.", true) },
 
                 // UI & Lua
                 { "Fast UI Frame Accessors", new SettingItem("UI_Lua", "UIFrameAccessorFast", false, null, "Bypasses standard Lua stack queries to retrieve UI frame parameters (IsShown, GetAlpha) instantly.") },
@@ -675,7 +675,7 @@ namespace WowOptimizeLauncher {
             y += 36;
 
             DarkButton btnMeasure = new DarkButton(Color.FromArgb(0, 200, 120), false);
-            btnMeasure.Text = "SET UP A MEASUREMENT RUN";
+            btnMeasure.Text = "MEASUREMENT RUN (A/B)";
             btnMeasure.Size = new Size(btnWidth, 30);
             btnMeasure.Location = new Point(15, y);
             btnMeasure.Click += delegate { SetUpMeasurementRun(); };
@@ -683,7 +683,7 @@ namespace WowOptimizeLauncher {
             y += 36;
 
             DarkButton btnDiag = new DarkButton(Color.FromArgb(160, 120, 220), false);
-            btnDiag.Text = "ANSWER THE OPEN QUESTIONS";
+            btnDiag.Text = "DIAGNOSTIC RUN";
             btnDiag.Size = new Size(btnWidth, 30);
             btnDiag.Location = new Point(15, y);
             btnDiag.Click += delegate { SetUpDiagnosticRun(); };
@@ -1145,9 +1145,8 @@ namespace WowOptimizeLauncher {
             if (settingsMap == null) return;
 
             DialogResult answer = MessageBox.Show(
-                "Turns on the counters that answer what is actually going on: draw calls and how many could be merged, how much Lua is compiled twice, how big the horizon scans are, how many tiny file writes there are, and where the main thread is.\r\n\r\n"
-                + "Not the same session as a measurement run. These cost something to collect, so they would move the frame times that test compares.\r\n\r\n"
-                + "Play 20 minutes doing whatever you normally do, then send the log and turn these back off.\r\n\r\nSet them up and save?",
+                "Turns on the counters and turns the A/B test off. Run it on its own session, not together with a measurement run.\r\n\r\n"
+                + "Play 20 minutes, send the log, then turn them back off.\r\n\r\nSave?",
                 "Diagnostic run",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (answer != DialogResult.Yes) return;
@@ -1164,7 +1163,7 @@ namespace WowOptimizeLauncher {
             SaveSettings();
 
             string note = turnedOn.ToString()
-                + " counter(s) switched on and the A/B test switched off. Saved. Play 20 minutes, then send the log.";
+                + " counter(s) on, A/B test off. Saved. Play 20 minutes, then send the log.";
             if (notFound > 0) {
                 note = note + "\r\n\r\n" + notFound.ToString()
                     + " of them has no entry in this launcher. That is a bug here - please mention it with the log.";
@@ -1177,9 +1176,9 @@ namespace WowOptimizeLauncher {
             if (settingsMap == null) return;
 
             DialogResult answer = MessageBox.Show(
-                "Turns on the A/B test and the sixteen features it can measure. Nothing else you have set is changed.\r\n\r\n"
-                + "Play for at least 45 minutes, somewhere the processor is busy - a raid, a battleground, a crowded city. Standing in a field the game waits on the graphics card and the test cannot measure anything. Then send the log.\r\n\r\n"
-                + "These are experimental features. If the game misbehaves, this is why.\r\n\r\nSet them up and save?",
+                "Turns on the A/B test and the 16 features it can measure. Nothing else changes.\r\n\r\n"
+                + "Play 45 minutes or more where the processor is busy - a raid, a battleground, a crowded city. Standing in a field measures nothing. Then send the log.\r\n\r\n"
+                + "These are experimental. If the game misbehaves, this is why.\r\n\r\nSave?",
                 "Measurement run",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (answer != DialogResult.Yes) return;
