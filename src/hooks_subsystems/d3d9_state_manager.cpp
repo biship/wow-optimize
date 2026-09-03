@@ -13,6 +13,7 @@
 #include <d3d9.h>
 #include "d3d9_state_manager.h"
 #include "config.h"
+#include "draw_merge.h"
 #include "session_verdict.h"
 #include "sampling_profiler.h"
 #include "font_glyph_cache.h"
@@ -347,7 +348,7 @@ static HRESULT __stdcall Hooked_SetRenderState(void* dev, DWORD state, DWORD val
         ++g_statSkipped[0];
         return 0;
     }
-    HRESULT hr = (++g_stateEpoch, g_orig_SetRenderState)(dev, state, value);
+    HRESULT hr = (D3D9_StateBarrier(), g_orig_SetRenderState)(dev, state, value);
     if (SUCCEEDED(hr) && state < 256) {
         g_rsCache[state] = value;
         g_rsValid[state] = true;
@@ -364,7 +365,7 @@ static HRESULT __stdcall Hooked_SetTextureStageState(void* dev, DWORD stage, DWO
         ++g_statSkipped[1];
         return 0;
     }
-    HRESULT hr = (++g_stateEpoch, g_orig_SetTextureStageState)(dev, stage, type, value);
+    HRESULT hr = (D3D9_StateBarrier(), g_orig_SetTextureStageState)(dev, stage, type, value);
     if (SUCCEEDED(hr) && idx < 256) {
         g_tssCache[idx] = value;
         g_tssValid[idx] = true;
@@ -381,7 +382,7 @@ static HRESULT __stdcall Hooked_SetSamplerState(void* dev, DWORD sampler, DWORD 
         ++g_statSkipped[2];
         return 0;
     }
-    HRESULT hr = (++g_stateEpoch, g_orig_SetSamplerState)(dev, sampler, type, value);
+    HRESULT hr = (D3D9_StateBarrier(), g_orig_SetSamplerState)(dev, sampler, type, value);
     if (SUCCEEDED(hr) && idx < 256) {
         g_ssCache[idx] = value;
         g_ssValid[idx] = true;
@@ -437,14 +438,14 @@ static HRESULT __stdcall Hooked_SetTexture(void* dev, DWORD stage, void* tex) {
     }
 
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return (++g_stateEpoch, g_orig_SetTexture)(dev, stage, tex);
+    return (D3D9_StateBarrier(), g_orig_SetTexture)(dev, stage, tex);
 }
 
 static HRESULT __stdcall Hooked_SetTransform(void* dev, DWORD state, const void* matrix) {
     CheckDeviceChange(dev);
     ++g_statCalls[4];
     // Always call original transform setter to guarantee 100% world matrix accuracy on weapon sub-meshes
-    return (++g_stateEpoch, g_orig_SetTransform)(dev, state, matrix);
+    return (D3D9_StateBarrier(), g_orig_SetTransform)(dev, state, matrix);
 }
 
 static HRESULT __stdcall Hooked_SetMaterial(void* dev, const void* material) {
@@ -453,7 +454,7 @@ static HRESULT __stdcall Hooked_SetMaterial(void* dev, const void* material) {
 
     if (!material) {
         g_materialValid = false;
-        return (++g_stateEpoch, g_orig_SetMaterial)(dev, material);
+        return (D3D9_StateBarrier(), g_orig_SetMaterial)(dev, material);
     }
 
     uint32_t hash = HashMaterial((const DWORD*)material);
@@ -461,7 +462,7 @@ static HRESULT __stdcall Hooked_SetMaterial(void* dev, const void* material) {
         ++g_statSkipped[5];
         return 0;
     }
-    HRESULT hr = (++g_stateEpoch, g_orig_SetMaterial)(dev, material);
+    HRESULT hr = (D3D9_StateBarrier(), g_orig_SetMaterial)(dev, material);
     if (SUCCEEDED(hr)) {
         g_materialHash = hash;
         g_materialValid = true;
@@ -475,14 +476,14 @@ static HRESULT __stdcall Hooked_SetViewport(void* dev, const DWORD* vp) {
 
     if (!vp) {
         g_viewportValid = false;
-        return (++g_stateEpoch, g_orig_SetViewport)(dev, vp);
+        return (D3D9_StateBarrier(), g_orig_SetViewport)(dev, vp);
     }
 
     if (g_viewportValid && memcmp(g_viewportData, vp, sizeof(g_viewportData)) == 0) {
         ++g_statSkipped[6];
         return 0;
     }
-    HRESULT hr = (++g_stateEpoch, g_orig_SetViewport)(dev, vp);
+    HRESULT hr = (D3D9_StateBarrier(), g_orig_SetViewport)(dev, vp);
     if (SUCCEEDED(hr)) {
         memcpy(g_viewportData, vp, sizeof(g_viewportData));
         g_viewportValid = true;
@@ -496,7 +497,7 @@ static HRESULT __stdcall Hooked_SetScissorRect(void* dev, const RECT* rect) {
 
     if (!rect) {
         g_scissorValid = false;
-        return (++g_stateEpoch, g_orig_SetScissorRect)(dev, rect);
+        return (D3D9_StateBarrier(), g_orig_SetScissorRect)(dev, rect);
     }
 
     if (g_scissorValid
@@ -507,7 +508,7 @@ static HRESULT __stdcall Hooked_SetScissorRect(void* dev, const RECT* rect) {
         ++g_statSkipped[7];
         return 0;
     }
-    HRESULT hr = (++g_stateEpoch, g_orig_SetScissorRect)(dev, rect);
+    HRESULT hr = (D3D9_StateBarrier(), g_orig_SetScissorRect)(dev, rect);
     if (SUCCEEDED(hr)) {
         g_scissorData[0] = rect->left;
         g_scissorData[1] = rect->top;
@@ -518,25 +519,84 @@ static HRESULT __stdcall Hooked_SetScissorRect(void* dev, const RECT* rect) {
     return hr;
 }
 
+// A vertex or index buffer being written under a held draw is the one state
+// change that does not go through the device at all. Both buffer types put
+// Lock at vtable slot 11, and every buffer a D3D9 implementation hands out
+// shares one vtable per type, so patching the first one seen covers all of
+// them. The client passes the lock flags at [esp+20] on entry: return address,
+// this, OffsetToLock, SizeToLock, ppbData, Flags.
+static void* g_bOrig_VBLock = nullptr;
+static __declspec(naked) void g_bThunk_VBLock() {
+    __asm {
+        mov  eax, [esp+20]
+        push eax
+        call D3D9DrawMerge_BufferLockBarrier
+        add  esp, 4
+        jmp  dword ptr [g_bOrig_VBLock]
+    }
+}
+
+static void* g_bOrig_IBLock = nullptr;
+static __declspec(naked) void g_bThunk_IBLock() {
+    __asm {
+        mov  eax, [esp+20]
+        push eax
+        call D3D9DrawMerge_BufferLockBarrier
+        add  esp, 4
+        jmp  dword ptr [g_bOrig_IBLock]
+    }
+}
+
+static bool g_vbLockPatched = false;
+static bool g_ibLockPatched = false;
+
+// Patch slot 11 of a buffer's vtable, once, the first time one is seen.
+static void PatchBufferLock(void* buffer, void** origSlot, void* thunk, bool* done,
+                            const char* what) {
+    if (*done || !buffer) return;
+    *done = true;   // one attempt, win or lose - this runs on the draw path
+    if (!IsReadable((uintptr_t)buffer)) return;
+    uintptr_t* vt = *(uintptr_t**)buffer;
+    if (!vt || !IsReadable((uintptr_t)vt)) return;
+    uintptr_t orig = vt[11];
+    if (!IsReadable(orig) || orig == (uintptr_t)thunk) return;
+    DWORD prot;
+    if (!VirtualProtect(&vt[11], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[DrawMerger] could not make the %s vtable writable; a lock on one "
+            "will not release a held draw, so merging stays off.", what);
+        return;
+    }
+    *origSlot = (void*)orig;
+    vt[11] = (uintptr_t)thunk;
+    VirtualProtect(&vt[11], sizeof(void*), prot, &prot);
+    Log("[DrawMerger] %s Lock is a merge barrier now.", what);
+}
+
 static HRESULT __stdcall Hooked_SetStreamSource(void* dev, UINT stream, void* vb, UINT offset, UINT stride) {
     CheckDeviceChange(dev);
     ++g_statCalls[8];
+    if (Config::g_settings.OptDrawMerge && !g_vbLockPatched)
+        PatchBufferLock(vb, &g_bOrig_VBLock, (void*)g_bThunk_VBLock, &g_vbLockPatched,
+                        "vertex buffer");
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return (++g_stateEpoch, g_orig_SetStreamSource)(dev, stream, vb, offset, stride);
+    return (D3D9_StateBarrier(), g_orig_SetStreamSource)(dev, stream, vb, offset, stride);
 }
 
 static HRESULT __stdcall Hooked_SetIndices(void* dev, void* ib) {
     CheckDeviceChange(dev);
     ++g_statCalls[9];
+    if (Config::g_settings.OptDrawMerge && !g_ibLockPatched)
+        PatchBufferLock(ib, &g_bOrig_IBLock, (void*)g_bThunk_IBLock, &g_ibLockPatched,
+                        "index buffer");
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return (++g_stateEpoch, g_orig_SetIndices)(dev, ib);
+    return (D3D9_StateBarrier(), g_orig_SetIndices)(dev, ib);
 }
 
 static HRESULT __stdcall Hooked_SetVertexDeclaration(void* dev, void* decl) {
     CheckDeviceChange(dev);
     ++g_statCalls[10];
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return (++g_stateEpoch, g_orig_SetVertexDeclaration)(dev, decl);
+    return (D3D9_StateBarrier(), g_orig_SetVertexDeclaration)(dev, decl);
 }
 
 static HRESULT __stdcall Hooked_SetFVF(void* dev, DWORD fvf) {
@@ -547,7 +607,7 @@ static HRESULT __stdcall Hooked_SetFVF(void* dev, DWORD fvf) {
         ++g_statSkipped[11];
         return 0;
     }
-    HRESULT hr = (++g_stateEpoch, g_orig_SetFVF)(dev, fvf);
+    HRESULT hr = (D3D9_StateBarrier(), g_orig_SetFVF)(dev, fvf);
     if (SUCCEEDED(hr)) {
         g_fvf = fvf;
         g_fvfValid = true;
@@ -559,19 +619,21 @@ static HRESULT __stdcall Hooked_SetVertexShader(void* dev, void* vs) {
     CheckDeviceChange(dev);
     ++g_statCalls[12];
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return (++g_stateEpoch, g_orig_SetVertexShader)(dev, vs);
+    return (D3D9_StateBarrier(), g_orig_SetVertexShader)(dev, vs);
 }
 
 static HRESULT __stdcall Hooked_SetPixelShader(void* dev, void* ps) {
     CheckDeviceChange(dev);
     ++g_statCalls[13];
     // Caching resource pointers is unsafe due to address recycling. Always call original.
-    return (++g_stateEpoch, g_orig_SetPixelShader)(dev, ps);
+    return (D3D9_StateBarrier(), g_orig_SetPixelShader)(dev, ps);
 }
 
 static HRESULT __stdcall Hooked_Reset(void* dev, D3DPRESENT_PARAMETERS* params) {
     CheckDeviceChange(dev);
     ++g_statCalls[14];
+    // A held draw must not survive the device losing its buffers.
+    if (g_drawMergePending) D3D9DrawMerge_FlushPending();
     CrashDumper::Trace("D3D9 device Reset (dev=%p)", dev);
     Log("[D3D9State] Device Reset detected! Invalidating all caches and flushing delayed textures...");
     InvalidateAllCaches();
@@ -615,6 +677,10 @@ static HRESULT __stdcall Hooked_Present(void* dev, const RECT* src, const RECT* 
                                         HWND hOverride, const RGNDATA* dirty) {
     CheckDeviceChange(dev);
     ++g_statCalls[15];
+    // EndScene is a barrier and comes first in any correct renderer, so this
+    // should never have anything to do. It is here so that nothing can be held
+    // across a presented frame even if EndScene is skipped.
+    if (g_drawMergePending) D3D9DrawMerge_FlushPending();
     FrameBench::OnPresent(FrameBench::Source::D3D9Present);
     WowOpt_OnFrameBoundary();
 
@@ -788,212 +854,418 @@ static unsigned long g_stateBlockCreates = 0;
 
 static void* g_bOrig_UpdateSurface = nullptr;
 static __declspec(naked) void g_bThunk_UpdateSurface() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_UpdateSurface]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_UpdateSurface]
+    }
 }
 
 static void* g_bOrig_UpdateTexture = nullptr;
 static __declspec(naked) void g_bThunk_UpdateTexture() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_UpdateTexture]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_UpdateTexture]
+    }
 }
 
 static void* g_bOrig_StretchRect = nullptr;
 static __declspec(naked) void g_bThunk_StretchRect() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_StretchRect]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_StretchRect]
+    }
 }
 
 static void* g_bOrig_ColorFill = nullptr;
 static __declspec(naked) void g_bThunk_ColorFill() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_ColorFill]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_ColorFill]
+    }
 }
 
 static void* g_bOrig_SetRenderTarget = nullptr;
 static __declspec(naked) void g_bThunk_SetRenderTarget() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetRenderTarget]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetRenderTarget]
+    }
 }
 
 static void* g_bOrig_SetDepthStencilSurface = nullptr;
 static __declspec(naked) void g_bThunk_SetDepthStencilSurface() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetDepthStencilSurface]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetDepthStencilSurface]
+    }
 }
 
 static void* g_bOrig_BeginScene = nullptr;
 static __declspec(naked) void g_bThunk_BeginScene() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_BeginScene]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_BeginScene]
+    }
 }
 
 static void* g_bOrig_EndScene = nullptr;
 static __declspec(naked) void g_bThunk_EndScene() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_EndScene]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_EndScene]
+    }
 }
 
 static void* g_bOrig_Clear = nullptr;
 static __declspec(naked) void g_bThunk_Clear() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_Clear]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_Clear]
+    }
 }
 
 static void* g_bOrig_SetLight = nullptr;
 static __declspec(naked) void g_bThunk_SetLight() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetLight]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetLight]
+    }
 }
 
 static void* g_bOrig_LightEnable = nullptr;
 static __declspec(naked) void g_bThunk_LightEnable() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_LightEnable]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_LightEnable]
+    }
 }
 
 static void* g_bOrig_SetClipPlane = nullptr;
 static __declspec(naked) void g_bThunk_SetClipPlane() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetClipPlane]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetClipPlane]
+    }
 }
 
 static void* g_bOrig_SetClipStatus = nullptr;
 static __declspec(naked) void g_bThunk_SetClipStatus() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetClipStatus]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetClipStatus]
+    }
 }
 
 static void* g_bOrig_SetPaletteEntries = nullptr;
 static __declspec(naked) void g_bThunk_SetPaletteEntries() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetPaletteEntries]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetPaletteEntries]
+    }
 }
 
 static void* g_bOrig_SetCurrentTexturePalette = nullptr;
 static __declspec(naked) void g_bThunk_SetCurrentTexturePalette() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetCurrentTexturePalette]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetCurrentTexturePalette]
+    }
 }
 
 static void* g_bOrig_SetSoftwareVertexProcessing = nullptr;
 static __declspec(naked) void g_bThunk_SetSoftwareVertexProcessing() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetSoftwareVertexProcessing]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetSoftwareVertexProcessing]
+    }
 }
 
 static void* g_bOrig_SetNPatchMode = nullptr;
 static __declspec(naked) void g_bThunk_SetNPatchMode() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetNPatchMode]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetNPatchMode]
+    }
 }
 
 static void* g_bOrig_DrawPrimitiveUP = nullptr;
 static __declspec(naked) void g_bThunk_DrawPrimitiveUP() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_DrawPrimitiveUP]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_DrawPrimitiveUP]
+    }
 }
 
 static void* g_bOrig_DrawIndexedPrimitiveUP = nullptr;
 static __declspec(naked) void g_bThunk_DrawIndexedPrimitiveUP() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_DrawIndexedPrimitiveUP]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_DrawIndexedPrimitiveUP]
+    }
 }
 
 static void* g_bOrig_ProcessVertices = nullptr;
 static __declspec(naked) void g_bThunk_ProcessVertices() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_ProcessVertices]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_ProcessVertices]
+    }
 }
 
 static void* g_bOrig_SetVertexShaderConstantF = nullptr;
 static __declspec(naked) void g_bThunk_SetVertexShaderConstantF() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetVertexShaderConstantF]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetVertexShaderConstantF]
+    }
 }
 
 static void* g_bOrig_SetVertexShaderConstantI = nullptr;
 static __declspec(naked) void g_bThunk_SetVertexShaderConstantI() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetVertexShaderConstantI]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetVertexShaderConstantI]
+    }
 }
 
 static void* g_bOrig_SetVertexShaderConstantB = nullptr;
 static __declspec(naked) void g_bThunk_SetVertexShaderConstantB() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetVertexShaderConstantB]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetVertexShaderConstantB]
+    }
 }
 
 static void* g_bOrig_SetStreamSourceFreq = nullptr;
 static __declspec(naked) void g_bThunk_SetStreamSourceFreq() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetStreamSourceFreq]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetStreamSourceFreq]
+    }
 }
 
 static void* g_bOrig_SetPixelShaderConstantF = nullptr;
 static __declspec(naked) void g_bThunk_SetPixelShaderConstantF() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetPixelShaderConstantF]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetPixelShaderConstantF]
+    }
 }
 
 static void* g_bOrig_SetPixelShaderConstantI = nullptr;
 static __declspec(naked) void g_bThunk_SetPixelShaderConstantI() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetPixelShaderConstantI]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetPixelShaderConstantI]
+    }
 }
 
 static void* g_bOrig_SetPixelShaderConstantB = nullptr;
 static __declspec(naked) void g_bThunk_SetPixelShaderConstantB() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_SetPixelShaderConstantB]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_SetPixelShaderConstantB]
+    }
 }
 
 static void* g_bOrig_MultiplyTransform = nullptr;
 static __declspec(naked) void g_bThunk_MultiplyTransform() {
-    __asm inc dword ptr [g_stateEpoch]
-
-    __asm jmp dword ptr [g_bOrig_MultiplyTransform]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_MultiplyTransform]
+    }
 }
 
 static void* g_bOrig_CreateStateBlock = nullptr;
 static __declspec(naked) void g_bThunk_CreateStateBlock() {
-    __asm inc dword ptr [g_stateEpoch]
-    __asm inc dword ptr [g_stateBlockCreates]
-    __asm jmp dword ptr [g_bOrig_CreateStateBlock]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        inc dword ptr [g_stateBlockCreates]
+        pushad
+        call D3D9DrawMerge_Disable
+        popad
+        jmp dword ptr [g_bOrig_CreateStateBlock]
+    }
 }
 
 static void* g_bOrig_EndStateBlock = nullptr;
 static __declspec(naked) void g_bThunk_EndStateBlock() {
-    __asm inc dword ptr [g_stateEpoch]
-    __asm inc dword ptr [g_stateBlockCreates]
-    __asm jmp dword ptr [g_bOrig_EndStateBlock]
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        inc dword ptr [g_stateBlockCreates]
+        pushad
+        call D3D9DrawMerge_Disable
+        popad
+        jmp dword ptr [g_bOrig_EndStateBlock]
+    }
 }
 
 struct Barrier { int vt; const char* name; void* thunk; void** origSlot; bool patched; };
@@ -1109,6 +1381,12 @@ static bool PatchDeviceVTable(void* pDevice) {
     }
 
     PatchBarriers(vtable);
+
+    // The draw census and the merger hook the two draw entry points through
+    // MinHook, on the addresses this loop just replaced in the vtable. Their
+    // own installer is unreachable - see InstallDrawHooks - so this is the only
+    // thing that calls it.
+    D3D9StateCache::InstallDrawHooks(g_vtableOriginals[16], g_vtableOriginals[17]);
 
     g_pDevice = pDevice;
     g_pPatchedVTable = vtable;
@@ -1425,6 +1703,7 @@ void D3D9StateManager_LogStats(void) {
             "the draws are already as large as they get.",
             g_drawTiny, 100.0 * (double)g_drawTiny / (double)draws);
         D3D9StateCache::LogMergeCensus();
+        D3D9StateCache::DrawMerge_LogStats();
     }
 }
 

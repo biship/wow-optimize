@@ -560,7 +560,7 @@ static uint32_t g_drawsThisFrame = 0;
 //
 // This counts and does not act. Merging draw calls is a renderer change; the
 // point of this is to find out in one session whether it is worth making.
-extern "C" unsigned long g_stateEpoch;
+#include "draw_merge.h"
 
 static uint64_t g_mergeable      = 0;   // draws that could join the one before
 static uint64_t g_mergeablePrims = 0;
@@ -603,6 +603,151 @@ static inline void NoteMergeChance(DWORD type, INT baseVertex,
     g_havePrev       = true;
 }
 
+// ---------------------------------------------------------------------------
+// And now the merger.
+//
+// The census counts pairs that could have been one call. This issues them as
+// one. It holds a DrawIndexedPrimitive instead of passing it on, and when the
+// next one turns out to be its continuation it folds it in and issues nothing.
+// The held draw goes out the moment anything happens that could change what it
+// produces.
+//
+// Two draws become one when they are triangle lists from the same vertex base
+// and the second picks up exactly where the first stopped in the index buffer:
+// [startIndex, startIndex + 3*primCount) and the range beginning at its end are
+// one contiguous run of indices, so a single call over the whole run draws the
+// same triangles in the same order. MinVertexIndex and NumVertices only bound
+// which vertices the run touches, so the union of both bounds is correct for
+// the merged call.
+//
+// What must flush it, and where each one is caught:
+//
+//   the fourteen wrapped setters      D3D9_StateBarrier() in d3d9_state_manager
+//   thirty more device methods        the naked barrier thunks, same file
+//   Present and Reset                 their hooks in d3d9_state_manager
+//   a different kind of draw          Hooked_DrawPrimitive below
+//   a vertex or index buffer lock     the Lock thunks in d3d9_state_manager
+//   a chain getting long              kMaxHeld
+//
+// What is NOT caught, and is why this is off by default:
+//
+//   IDirect3DStateBlock9::Apply changes device state without touching the
+//   device vtable. The census counts state block creation and says outright
+//   that its number is unsound if the client made any; the merger is bound by
+//   the same limit and refuses to hold anything once one has been created.
+//
+//   A texture rewritten through LockRect between two draws that both use it.
+//   Merging would show both with the later content. No renderer edits a bound
+//   texture inside a batch, but nothing here proves it.
+//
+// The client is told D3D_OK for a draw that has not been issued yet. WoW does
+// not read it, and a failure surfaces on the flush instead, counted below.
+// ---------------------------------------------------------------------------
+extern "C" unsigned char g_drawMergePending = 0;
+
+static bool g_mergeOn = false;   // switch on AND the draw hook actually in
+
+static IDirect3DDevice9* g_pendDevice = nullptr;
+static D3DPRIMITIVETYPE  g_pendType   = D3DPT_TRIANGLELIST;
+static INT      g_pendBase  = 0;
+static UINT     g_pendMin   = 0;   // lowest vertex index the held run touches
+static UINT     g_pendEnd   = 0;   // one past the highest
+static UINT     g_pendStart = 0;
+static UINT     g_pendPrims = 0;
+static UINT     g_pendHeld  = 0;   // draws folded into it, one or more
+static unsigned long g_pendEpoch = 0;
+
+// Long chains are where the win is, but an unbounded one delays geometry for
+// no extra saving worth the exposure.
+static constexpr UINT kMaxHeld = 64;
+
+static uint64_t g_drawsHeld    = 0;   // calls that returned without drawing
+static uint64_t g_drawsIssued  = 0;   // calls this actually made
+static uint64_t g_callsSaved   = 0;
+static uint32_t g_longestMerge = 0;
+static uint64_t g_mergedPrims  = 0;
+static uint64_t g_flushNotNext = 0;   // the next draw was not the continuation
+static uint64_t g_flushCap     = 0;   // the chain hit kMaxHeld
+static uint64_t g_flushLock    = 0;   // a buffer was locked
+static uint64_t g_mergeFailed  = 0;   // the merged call itself returned an error
+
+extern "C" void __cdecl D3D9DrawMerge_FlushPending(void) {
+    if (!g_drawMergePending) return;
+    g_drawMergePending = 0;
+
+    if (g_pendHeld >= 2) {
+        g_callsSaved += g_pendHeld - 1;
+        if (g_pendHeld > g_longestMerge) g_longestMerge = g_pendHeld;
+        g_mergedPrims += g_pendPrims;
+    }
+    ++g_drawsIssued;
+    HRESULT hr = orig_DrawIndexedPrimitive(g_pendDevice, g_pendType, g_pendBase,
+                                           g_pendMin, g_pendEnd - g_pendMin,
+                                           g_pendStart, g_pendPrims);
+    if (FAILED(hr)) ++g_mergeFailed;
+}
+
+extern "C" void __cdecl D3D9DrawMerge_BufferLockBarrier(unsigned long flags) {
+    // D3DLOCK_NOOVERWRITE is the client promising not to touch anything already
+    // drawn from, which is the whole of what the held draw reads.
+    if (flags & 0x00001000UL) return;
+    if (g_drawMergePending) { ++g_flushLock; D3D9DrawMerge_FlushPending(); }
+    ++g_stateEpoch;
+}
+
+// The client created a state block. Applying one changes device state without
+// touching the device vtable, so from here on nothing can be held safely. This
+// is one-way: there is no way to know that the last state block is gone.
+static bool g_disabledByStateBlock = false;
+extern "C" void __cdecl D3D9DrawMerge_Disable(void) {
+    if (!g_mergeOn) return;
+    D3D9DrawMerge_FlushPending();
+    g_mergeOn = false;
+    g_disabledByStateBlock = true;
+}
+
+// Returns true when the call was absorbed and the caller must not draw.
+static inline bool MergeIndexedDraw(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
+                                    INT baseVertex, UINT minIndex, UINT numVertices,
+                                    UINT startIndex, UINT primCount) {
+    if (g_drawMergePending) {
+        if (g_pendHeld >= kMaxHeld) {
+            ++g_flushCap;
+            D3D9DrawMerge_FlushPending();
+        } else if (device       == g_pendDevice &&
+                   type         == D3DPT_TRIANGLELIST &&
+                   g_pendType   == D3DPT_TRIANGLELIST &&
+                   baseVertex   == g_pendBase &&
+                   g_stateEpoch == g_pendEpoch &&
+                   startIndex   == g_pendStart + g_pendPrims * 3) {
+            g_pendPrims += primCount;
+            if (minIndex < g_pendMin)               g_pendMin = minIndex;
+            if (minIndex + numVertices > g_pendEnd) g_pendEnd = minIndex + numVertices;
+            ++g_pendHeld;
+            ++g_drawsHeld;
+            return true;
+        } else {
+            ++g_flushNotNext;
+            D3D9DrawMerge_FlushPending();
+        }
+    }
+
+    if (type != D3DPT_TRIANGLELIST) return false;
+
+    g_pendDevice = device;
+    g_pendType   = type;
+    g_pendBase   = baseVertex;
+    g_pendMin    = minIndex;
+    g_pendEnd    = minIndex + numVertices;
+    g_pendStart  = startIndex;
+    g_pendPrims  = primCount;
+    g_pendEpoch  = g_stateEpoch;
+    g_pendHeld   = 1;
+    g_drawMergePending = 1;
+    ++g_drawsHeld;
+    return true;
+}
+
 // Buckets of 100 draws, up to 5000, then an overflow bin.
 static constexpr int DRAW_BUCKETS = 51;
 static uint32_t g_drawHistogram[DRAW_BUCKETS] = {};
@@ -640,6 +785,7 @@ static inline void NoteDrawShape(UINT primCount) {
 static HRESULT WINAPI Hooked_DrawPrimitive(IDirect3DDevice9* device,
                                            D3DPRIMITIVETYPE type,
                                            UINT startVertex, UINT primCount) {
+    if (g_drawMergePending) { ++g_flushNotNext; D3D9DrawMerge_FlushPending(); }
     ++g_drawsThisFrame;
     NoteDrawShape(primCount);
     return orig_DrawPrimitive(device, type, startVertex, primCount);
@@ -653,6 +799,12 @@ static HRESULT WINAPI Hooked_DrawIndexedPrimitiveCount(IDirect3DDevice9* device,
     ++g_drawsThisFrame;
     NoteDrawShape(primCount);
     NoteMergeChance((DWORD)type, baseVertex, startIndex, primCount);
+    if (g_mergeOn &&
+        MergeIndexedDraw(device, type, baseVertex, minIndex, numVertices,
+                         startIndex, primCount)) {
+        return D3D_OK;
+    }
+    ++g_drawsIssued;
     return orig_DrawIndexedPrimitive(device, type, baseVertex, minIndex,
                                      numVertices, startIndex, primCount);
 }
@@ -718,6 +870,62 @@ void LogMergeCensus() {
         Log("[DrawMerge]   the client created no state blocks, so the one state "
             "change this cannot see - a state block applying itself, which "
             "never touches the device vtable - did not happen.");
+    }
+}
+
+void DrawMerge_LogStats(void) {
+    if (!Config::g_settings.OptDrawMerge) {
+        Log("[DrawMerger] not measured: switched off.");
+        return;
+    }
+    if (!orig_DrawIndexedPrimitive) {
+        Log("[DrawMerger] not measured: the draw hook is not installed, so "
+            "nothing could be merged. It needs the same device vtable the draw "
+            "census uses.");
+        return;
+    }
+    if (g_disabledByStateBlock) {
+        Log("[DrawMerger] STOPPED: the client created a state block. Applying "
+            "one changes device state without touching the device vtable, so a "
+            "held draw could be issued under state it never saw. Merging was "
+            "switched off at that point and stayed off.");
+    }
+    // Two ways of counting the same thing. The difference between what the
+    // client asked for and what D3D9 received is the saving; adding up the
+    // chain lengths is the saving too. They must agree, and if they do not the
+    // number is wrong rather than interesting.
+    //
+    // A chain can be open while this runs, and its draws are counted as asked
+    // for and not yet issued, so it is exactly `held` of the difference.
+    const uint64_t held   = g_drawMergePending ? (uint64_t)g_pendHeld : 0;
+    const uint64_t before = g_indexedDraws;
+    const uint64_t after  = g_drawsIssued;
+    if (g_callsSaved == 0) {
+        Log("[DrawMerger] measured and zero: %llu indexed draws went through "
+            "and none was merged into another.", before);
+        return;
+    }
+    const uint64_t saved = (before > after) ? (before - after) : 0;
+    Log("[DrawMerger] %llu calls saved. The client made %llu indexed draw calls "
+        "and %llu reached D3D9, so %.1f%% of them never happened.",
+        g_callsSaved, before, after,
+        before ? 100.0 * (double)g_callsSaved / (double)before : 0.0);
+    if (saved != g_callsSaved + held) {
+        Log("[DrawMerger]   DISAGREEMENT: the chain lengths add up to %llu saved "
+            "calls, the call counts say %llu with %llu still held. One of the "
+            "two is wrong; do not use either.", g_callsSaved, saved, held);
+    }
+    Log("[DrawMerger]   longest chain %lu draws, %llu primitives went out in a "
+        "merged call.", (unsigned long)g_longestMerge, g_mergedPrims);
+    Log("[DrawMerger]   held draws let go because: %llu were not the "
+        "continuation, %llu hit the %u-draw cap, %llu had a buffer locked under "
+        "them. Everything else was a state change.",
+        g_flushNotNext, g_flushCap, (unsigned)kMaxHeld, g_flushLock);
+    if (g_mergeFailed) {
+        Log("[DrawMerger]   WARNING: %llu merged call(s) returned an error. The "
+            "client was already told D3D_OK for those draws.", g_mergeFailed);
+    } else {
+        Log("[DrawMerger]   no merged call returned an error.");
     }
 }
 
@@ -802,6 +1010,61 @@ void ReportDrawCensus() {
     }
 }
 
+// The draw census and the merger, installed from wherever a device vtable is
+// available.
+//
+// This used to live inside OnCreateDevice, which is reached only from
+// render_state_dedup's CreateDevice hook - and that file is compiled out by
+// TEST_DISABLE_RENDER_STATE_DEDUP, which has been 1 since the dedup was found
+// to triple-hook the same setters. So the linker dropped OnCreateDevice, and
+// with it the census, and the DrawCensus switch has never installed anything.
+// The state manager patches the same vtable and does run, so it calls this.
+//
+// It takes the original DrawPrimitive and DrawIndexedPrimitive addresses rather
+// than the vtable, because by the time the state manager can call it those two
+// slots hold its own hooks. MinHook detours the function bodies, so the state
+// manager's hook calls the raw address, lands here, and this calls the
+// trampoline - three layers, each running once.
+static bool g_drawHooksInstalled = false;
+
+void InstallDrawHooks(void* origDrawPrimitive, void* origDrawIndexed) {
+    if (g_drawHooksInstalled) return;
+    if (!origDrawPrimitive || !origDrawIndexed) {
+        Log("[DrawCensus] not installed: the draw entry points were not "
+            "resolved, so nothing counts draws this session.");
+        return;
+    }
+    g_drawHooksInstalled = true;
+
+    orig_DrawPrimitive        = (DrawPrimitive_fn)origDrawPrimitive;
+    orig_DrawIndexedPrimitive = (DrawIndexedPrimitive_fn)origDrawIndexed;
+
+    // The merger needs the same trampoline and the same barriers, so it brings
+    // the census with it rather than duplicating either.
+    if (!Config::g_settings.OptDrawCensus && !Config::g_settings.OptDrawMerge) {
+        orig_DrawIndexedPrimitive = nullptr;   // marks the census as not installed
+        return;
+    }
+
+    if (MH_CreateHook(origDrawPrimitive, (void*)Hooked_DrawPrimitive,
+                      (void**)&orig_DrawPrimitive) == MH_OK &&
+        MH_CreateHook(origDrawIndexed, (void*)Hooked_DrawIndexedPrimitiveCount,
+                      (void**)&orig_DrawIndexedPrimitive) == MH_OK) {
+        MH_EnableHook(origDrawPrimitive);
+        MH_EnableHook(origDrawIndexed);
+        Log("[DrawCensus] Counting draw calls per frame");
+        if (Config::g_settings.OptDrawMerge) {
+            g_mergeOn = true;
+            Log("[DrawMerger] ACTIVE: consecutive triangle-list draws that "
+                "continue each other in the index buffer with no state change "
+                "between them go out as one call.");
+        }
+    } else {
+        orig_DrawIndexedPrimitive = nullptr;
+        Log("[DrawCensus] ERROR: could not hook the draw calls");
+    }
+}
+
 void OnCreateDevice(IDirect3DDevice9* device) {
     if (!device) return;
 
@@ -823,25 +1086,7 @@ void OnCreateDevice(IDirect3DDevice9* device) {
     orig_SetTextureStageState = (SetTextureStageState_fn)vtable[67];
     orig_SetVertexShader = (SetVertexShader_fn)vtable[92];
 
-    // 81 and 82 are DrawPrimitive and DrawIndexedPrimitive. Resolved always,
-    // hooked only when the census is switched on.
-    orig_DrawPrimitive        = (DrawPrimitive_fn)vtable[81];
-    orig_DrawIndexedPrimitive = (DrawIndexedPrimitive_fn)vtable[82];
-    if (Config::g_settings.OptDrawCensus) {
-        if (MH_CreateHook((void*)vtable[81], (void*)Hooked_DrawPrimitive,
-                          (void**)&orig_DrawPrimitive) == MH_OK &&
-            MH_CreateHook((void*)vtable[82], (void*)Hooked_DrawIndexedPrimitiveCount,
-                          (void**)&orig_DrawIndexedPrimitive) == MH_OK) {
-            MH_EnableHook((void*)vtable[81]);
-            MH_EnableHook((void*)vtable[82]);
-            Log("[DrawCensus] Counting draw calls per frame");
-        } else {
-            orig_DrawIndexedPrimitive = nullptr;
-            Log("[DrawCensus] ERROR: could not hook the draw calls");
-        }
-    } else {
-        orig_DrawIndexedPrimitive = nullptr;   // marks the census as not installed
-    }
+    InstallDrawHooks((void*)vtable[81], (void*)vtable[82]);
 
     // Only install state cache hooks if it is actually enabled by the user config
     if (!Config::g_settings.OptVulkanDXVK && !Config::g_settings.OptD3d9RenderThread) {

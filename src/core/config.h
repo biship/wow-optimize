@@ -508,6 +508,11 @@ namespace Config {
         // wraps the hottest call in the renderer, so it is meant to answer the
         // question in one session and be switched off again.
         bool OptDrawCensus = false;
+        // Issues consecutive triangle-list draws that continue each other
+        // in the index buffer, with no state change between them, as one
+        // call. A renderer change: it holds a draw so the next one can join
+        // it. Experimental, off by default.
+        bool OptDrawMerge = false;
         // Counts Lua VM allocations by size through G->frealloc. A measurement,
         // like the draw census - it decides whether a dedicated Lua arena is
         // worth building.
