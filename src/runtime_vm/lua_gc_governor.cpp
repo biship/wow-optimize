@@ -117,6 +117,20 @@ static double   g_gcStepMsTotal = 0.0;
 static uint64_t g_gcStepCount   = 0;
 static LARGE_INTEGER g_qpcFreq  = {};
 
+// Why a frame did not get a collection step.
+//
+// A session reported "no collection steps requested this session" with the
+// feature switched on. OnFrame has six exits and the report could name one of
+// them, so a zero meant any of: never initialised, the VM being reloaded or
+// swapped, a loading screen, a null lua_State, an OFF stint of the A/B test, or
+// the stock-pace control run. Six causes, one number, and no way to tell.
+static uint64_t g_exitUninit   = 0;
+static uint64_t g_exitReload   = 0;
+static uint64_t g_exitNullL    = 0;
+static uint64_t g_exitAbOff    = 0;
+static uint64_t g_exitStock    = 0;
+static uint64_t g_reachedPace  = 0;   // got as far as choosing a step size
+
 static inline void StepTimed(void* L, int kb) {
     if (g_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&g_qpcFreq);
     FlightRecorder::Bump(g_frSlotStep);
@@ -231,12 +245,12 @@ void LogStats() {
 // counted rather than silent, so a session can say whether the window was ever
 // entered at all.
 void OnFrame(double frameMs) {
-    if (!g_initialized) return;
-    if (LuaOpt::IsReloading() || LuaOpt::IsSwapping()) return;
+    if (!g_initialized) { g_exitUninit++; return; }
+    if (LuaOpt::IsReloading() || LuaOpt::IsSwapping()) { g_exitReload++; return; }
     if (LuaOpt::IsLoadingMode()) { g_declinedLoading++; return; }
 
     void* L = *(void**)0x00D3F78C;
-    if (!L) return;
+    if (!L) { g_exitNullL++; return; }
 
     // The A/B phase, when the harness names this feature. Handing the collector
     // back is not optional on the way out: this governor stops it, and a stint
@@ -254,7 +268,7 @@ void OnFrame(double frameMs) {
             }
             g_lastMemoryKB = GetLuaMemoryKB(L);
         }
-        if (phase == 0) return;
+        if (phase == 0) { g_exitAbOff++; return; }
     }
 
     // The control case. Stock Lua is 200/200 and no manual stepping at all, so
@@ -272,9 +286,11 @@ void OnFrame(double frameMs) {
             Log("[GCGovernor] LuaGcStockPace is on: the collector is left at "
                 "200/200 and nothing here steps it. This is the control run.");
         }
+        g_exitStock++;
         return;
     }
 
+    g_reachedPace++;
     double memKB = GetLuaMemoryKB(L);
     double diffKB = memKB - g_lastMemoryKB;
     if (diffKB < 0.0) diffKB = 0.0;
