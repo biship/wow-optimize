@@ -384,7 +384,12 @@ namespace Config {
         // file's size against what the client handed over.
         bool OptClientWriteBatch = false;
         bool OptMimallocHighArena = false;
-        int  MimallocHighArenaMB = 512;
+        // The size of each block handed over, and the most that will ever be
+        // handed over in total. One block only postpones the problem: when the
+        // allocator has used it, it reserves from the OS again and the low half
+        // starts filling as before.
+        int  MimallocHighArenaMB = 256;
+        int  MimallocHighArenaMaxMB = 1024;
         // The box-overlap predicate (sub_78F370) that seventeen culling and
         // pick functions call once per scene node per pass. Six x87 compares,
         // each leaving the FPU through fnstsw and a data-dependent branch,

@@ -60,16 +60,118 @@ extern "C" void Log(const char* fmt, ...);
 namespace MimallocHighArena {
 namespace {
 
-// Below this there is no high half worth moving into. A client without
-// /LARGEADDRESSAWARE, or one on 32-bit Windows without the /3GB switch, tops out
-// at 0x7FFEFFFF, and reserving there would take from the low half.
-const uintptr_t kMinTopAddress = 0xC0000000u;
+// Below this there is no high half worth moving into.
+//
+// A client without /LARGEADDRESSAWARE tops out at 0x7FFEFFFF and there is
+// nothing above 2GB to move into at all. One with it, on 32-bit Windows with
+// the /3GB switch, tops out at 0xBFFEFFFF - a whole gigabyte above 2GB, which is
+// exactly the case this module is for.
+//
+// This was 0xC0000000 and refused that client by one byte. Half a gigabyte of
+// high space is the bar now: enough to be worth the reservation, and still far
+// above anything a 2GB process can offer.
+const uintptr_t kMinTopAddress = 0xA0000000u;
 const uintptr_t kLowHalfEnd    = 0x80000000u;
 
-void*  g_base = nullptr;
-SIZE_T g_size = 0;
+void*  g_base = nullptr;          // the first block, for the log
+SIZE_T g_size = 0;               // and its size
+SIZE_T g_handed = 0;             // everything handed over, across all blocks
+unsigned g_blocks = 0;
+unsigned g_growFailed = 0;
+unsigned g_growLow = 0;          // refused because Windows placed it below 2GB
+SIZE_T g_highTotal = 0;          // how much address space exists above 2GB
+SIZE_T g_maxHanded = 0;          // and the most this module will ever take of it
+
+// One reservation, handed over, with every guard the first one has.
+//
+// Returns the bytes handed to mimalloc, or zero. A block that comes back below
+// 2GB is released rather than used: reserving low takes the exact resource this
+// exists to protect, and doing it while trying to protect it would be worse than
+// not running at all.
+SIZE_T ReserveAndHand(SIZE_T want, const char* why) {
+    if (want == 0) return 0;
+    const SIZE_T align = mi_arena_min_alignment();
+    if (align > 1) want = (want + align - 1) & ~(align - 1);
+
+    void* base = VirtualAlloc(nullptr, want, MEM_RESERVE | MEM_TOP_DOWN,
+                              PAGE_READWRITE);
+    if (!base) {
+        ++g_growFailed;
+        Log("[HighArena] could not reserve another %u MB (%s, error %lu). What is "
+            "already handed over stays; the allocator will go to the OS for the "
+            "rest, which is where it was before this module existed.",
+            (unsigned)(want / (1024 * 1024)), why, GetLastError());
+        return 0;
+    }
+    if ((uintptr_t)base < kLowHalfEnd) {
+        VirtualFree(base, 0, MEM_RELEASE);
+        ++g_growLow;
+        Log("[HighArena] Windows placed a %u MB reservation at 0x%08X, below 2GB. "
+            "Released it - taking the low half is the one thing this must not do.",
+            (unsigned)(want / (1024 * 1024)), (unsigned)(uintptr_t)base);
+        return 0;
+    }
+    if (!mi_manage_os_memory(base, want, false, false, false, -1)) {
+        VirtualFree(base, 0, MEM_RELEASE);
+        ++g_growFailed;
+        Log("[HighArena] mimalloc declined a %u MB block at 0x%08X (%s). Released "
+            "it.", (unsigned)(want / (1024 * 1024)),
+            (unsigned)(uintptr_t)base, why);
+        return 0;
+    }
+    g_handed += want;
+    ++g_blocks;
+    if (!g_base) { g_base = base; g_size = want; }
+    return want;
+}
 
 }  // namespace
+
+// Hand over more before the allocator has to ask the OS for it.
+//
+// One block was the first shape of this and it only postpones the problem: when
+// mimalloc has used what it was given it reserves from the OS again, bottom-up,
+// and the low half starts filling exactly as before. A tester session ended with
+// 890 MB reserved and never committed, all of it below 2GB, in blocks of 128 MB.
+//
+// So this runs from the heap monitor thread and watches what mimalloc has
+// committed against what it has been handed. Within a block's worth of the end,
+// it reserves another one high and hands that over too. The allocator never has
+// a reason to go to the OS, and the low half stays the client's.
+//
+// Bounded twice: by the configured maximum and by half of what exists above 2GB.
+// The renderer and the translation layer want space up there as well, and a
+// client that cannot get a texture buffer high is no better off than one that
+// cannot get it low.
+void Grow() {
+    if (!Config::g_settings.OptMimallocHighArena) return;
+    if (g_handed == 0 || g_handed >= g_maxHanded) return;
+
+    size_t elapsed = 0, userMs = 0, sysMs = 0, rss = 0, peakRss = 0,
+           commit = 0, peakCommit = 0, faults = 0;
+    mi_process_info(&elapsed, &userMs, &sysMs, &rss, &peakRss,
+                    &commit, &peakCommit, &faults);
+
+    const SIZE_T step = (SIZE_T)Config::g_settings.MimallocHighArenaMB * 1024 * 1024;
+    // The headroom is one step: by the time the allocator is within a block of
+    // the end it is about to need the next one, and reserving after it has
+    // already gone to the OS would be too late to matter.
+    if ((SIZE_T)commit + step < g_handed) return;
+
+    SIZE_T want = step;
+    if (g_handed + want > g_maxHanded) want = g_maxHanded - g_handed;
+    const SIZE_T got = ReserveAndHand(want, "the allocator is close to the end of "
+                                            "what it has been given");
+    if (got) {
+        Log("[HighArena] handed over another %u MB above 2GB - %u MB in %u "
+            "block(s) now, against %u MB the allocator has committed. The ceiling "
+            "is %u MB.",
+            (unsigned)(got / (1024 * 1024)),
+            (unsigned)(g_handed / (1024 * 1024)), g_blocks,
+            (unsigned)(commit / (1024 * 1024)),
+            (unsigned)(g_maxHanded / (1024 * 1024)));
+    }
+}
 
 bool Init() {
     if (!Config::g_settings.OptMimallocHighArena) return true;
@@ -90,57 +192,29 @@ bool Init() {
     if (want < minSize) want = minSize;
     if (align > 1) want = (want + align - 1) & ~(align - 1);
 
-    // Never take more than half of what lies above 2GB. The renderer and the
-    // translation layer want space up there too, and a client that cannot get a
-    // texture buffer high is no better off than one that cannot get it low.
-    const SIZE_T highTotal = (SIZE_T)(top - kLowHalfEnd);
-    if (want > highTotal / 2) {
-        want = (highTotal / 2) & ~(align - 1);
-        Log("[HighArena] asking for %u MB instead of the configured %d MB: the "
-            "space above 2GB is %u MB and this takes at most half of it.",
-            (unsigned)(want / (1024 * 1024)),
-            Config::g_settings.MimallocHighArenaMB,
-            (unsigned)(highTotal / (1024 * 1024)));
-    }
+    // The ceiling, set once. Half of what lies above 2GB, or the configured
+    // maximum, whichever is smaller.
+    g_highTotal = (SIZE_T)(top - kLowHalfEnd);
+    g_maxHanded = (SIZE_T)Config::g_settings.MimallocHighArenaMaxMB * 1024 * 1024;
+    if (g_maxHanded > g_highTotal / 2) g_maxHanded = g_highTotal / 2;
+    if (want > g_maxHanded) want = g_maxHanded;
 
-    void* base = VirtualAlloc(nullptr, want, MEM_RESERVE | MEM_TOP_DOWN,
-                              PAGE_READWRITE);
-    if (!base) {
-        Log("[HighArena] NOT active: could not reserve %u MB (error %lu). "
-            "Nothing was changed.",
-            (unsigned)(want / (1024 * 1024)), GetLastError());
+    if (!ReserveAndHand(want, "first block")) {
+        Log("[HighArena] NOT active - the first reservation is described above "
+            "and nothing was changed.");
         return false;
     }
 
-    // The guard this module exists for. MEM_TOP_DOWN is a hint; a block below
-    // 2GB would have taken the resource this is protecting.
-    if ((uintptr_t)base < kLowHalfEnd) {
-        VirtualFree(base, 0, MEM_RELEASE);
-        Log("[HighArena] NOT active: Windows placed the reservation at 0x%08X, "
-            "below 2GB, which is the half this exists to keep free. Released it "
-            "and did nothing.", (unsigned)(uintptr_t)base);
-        return false;
-    }
-
-    if (!mi_manage_os_memory(base, want, /*is_committed*/ false,
-                             /*is_pinned*/ false, /*is_zero*/ false,
-                             /*numa_node*/ -1)) {
-        VirtualFree(base, 0, MEM_RELEASE);
-        Log("[HighArena] NOT active: mimalloc declined the %u MB block at "
-            "0x%08X. Released it and did nothing.",
-            (unsigned)(want / (1024 * 1024)), (unsigned)(uintptr_t)base);
-        return false;
-    }
-
-    g_base = base;
-    g_size = want;
     Log("[HighArena] ACTIVE: %u MB reserved at 0x%08X-0x%08X and handed to "
         "mimalloc as an arena. It takes memory it has been given before asking "
         "the OS, so the allocator grows up there instead of into the half the "
         "client allocates from. Nothing is committed yet - this is address "
-        "space, not memory.",
-        (unsigned)(want / (1024 * 1024)), (unsigned)(uintptr_t)base,
-        (unsigned)((uintptr_t)base + want - 1));
+        "space, not memory. More is handed over as it fills, up to %u MB of the "
+        "%u MB that exists above 2GB.",
+        (unsigned)(g_size / (1024 * 1024)), (unsigned)(uintptr_t)g_base,
+        (unsigned)((uintptr_t)g_base + g_size - 1),
+        (unsigned)(g_maxHanded / (1024 * 1024)),
+        (unsigned)(g_highTotal / (1024 * 1024)));
     return true;
 }
 
@@ -153,10 +227,27 @@ void LogStats() {
     // What mimalloc has done with it is not directly queryable; the figure that
     // answers the question is the low half, which the heap monitor reports and
     // the occupancy dump breaks down by owner.
-    Log("[HighArena] %u MB at 0x%08X handed to mimalloc. Whether it helped is "
-        "the largest free block below 2GB elsewhere in this report, not a "
-        "number here.",
-        (unsigned)(g_size / (1024 * 1024)), (unsigned)(uintptr_t)g_base);
+    size_t elapsed = 0, userMs = 0, sysMs = 0, rss = 0, peakRss = 0,
+           commit = 0, peakCommit = 0, faults = 0;
+    mi_process_info(&elapsed, &userMs, &sysMs, &rss, &peakRss,
+                    &commit, &peakCommit, &faults);
+    Log("[HighArena] %u MB handed to mimalloc in %u block(s), first at 0x%08X, "
+        "ceiling %u MB. The allocator has %u MB committed, so it has %u MB of "
+        "high address space left before it would have to ask the OS.",
+        (unsigned)(g_handed / (1024 * 1024)), g_blocks,
+        (unsigned)(uintptr_t)g_base,
+        (unsigned)(g_maxHanded / (1024 * 1024)),
+        (unsigned)(commit / (1024 * 1024)),
+        (unsigned)(g_handed > (SIZE_T)commit
+                   ? (g_handed - (SIZE_T)commit) / (1024 * 1024) : 0));
+    if (g_growLow || g_growFailed) {
+        Log("[HighArena]   %u later reservation(s) came back below 2GB and were "
+            "released, %u failed outright. Both mean the allocator went to the "
+            "OS for that memory instead, which is where it was going before.",
+            g_growLow, g_growFailed);
+    }
+    Log("[HighArena]   whether it helped is the largest free block below 2GB "
+        "elsewhere in this report, not a number here.");
 }
 
 }  // namespace MimallocHighArena

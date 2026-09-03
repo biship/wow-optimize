@@ -58,6 +58,7 @@ extern "C" void mi_collect(bool force);
 #include <mimalloc.h>
 #include "crash_dumper.h"
 #include "perf_diagnostics.h"
+#include "mimalloc_high_arena.h"
 
 // Largest free virtual address range, measured twice.
 //
@@ -220,6 +221,12 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         g_lastWalkLow  = largestLow;
         g_lastWalkLowTotal = lowTotal;
         g_lastWalkTick = GetTickCount();
+
+        // Top the high arena up before the allocator has to go to the OS for
+        // more, which it does bottom-up and into the half the client needs.
+        // Here rather than on the main thread because it reserves address
+        // space, and this thread already exists to do that kind of work.
+        MimallocHighArena::Grow();
 
         // The low half is what actually runs out, and it is what the trigger
         // reads now.

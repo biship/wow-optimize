@@ -7,6 +7,9 @@
 namespace MimallocHighArena {
 
 bool Init();
+// Hands over another block before the allocator runs out of what it has. Call
+// from a background thread; it reserves address space.
+void Grow();
 void LogStats();
 
 }  // namespace MimallocHighArena
