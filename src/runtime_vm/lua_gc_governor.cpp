@@ -158,6 +158,22 @@ void LogStats() {
         Log("[GCGovernor] no collection steps requested this session%s",
             Config::g_settings.OptLuaGcManual
                 ? "" : " - LuaGcManual is off, which is what stops them");
+        Log("[GCGovernor]   where the frames went instead: %llu before this was "
+            "initialised, %llu during a VM reload or swap, %llu on a loading "
+            "screen, %llu with no lua_State, %llu in an OFF stint of the A/B "
+            "test, %llu on the stock-pace control run, and %llu got as far as "
+            "choosing a step size.",
+            (unsigned long long)g_exitUninit, (unsigned long long)g_exitReload,
+            (unsigned long long)g_declinedLoading,
+            (unsigned long long)g_exitNullL, (unsigned long long)g_exitAbOff,
+            (unsigned long long)g_exitStock, (unsigned long long)g_reachedPace);
+        if (g_reachedPace > 0) {
+            Log("[GCGovernor]   %llu frame(s) reached the pacing code and none of "
+                "them stepped, which leaves one explanation: they were in combat "
+                "under the 256 MB threshold, where this governor stops the "
+                "collector rather than stepping it.",
+                (unsigned long long)g_reachedPace);
+        }
     } else {
         Log("[GCGovernor] %llu steps requested, %.1f ms total, %.3f ms average",
             (unsigned long long)g_gcStepCount, g_gcStepMsTotal,
