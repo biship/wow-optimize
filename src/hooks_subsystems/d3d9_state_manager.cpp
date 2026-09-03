@@ -413,11 +413,18 @@ static HRESULT __stdcall Hooked_SetTexture(void* dev, DWORD stage, void* tex) {
     // old, which for new == old is a no-op in net, and it marks the stage dirty
     // for the next draw, which is what we would be avoiding on purpose.
     //
-    // Two things that are NOT settled and would have to be before acting:
-    // whether calls arrive from more than one thread when D3d9RenderThread is on,
-    // because none of these caches take a lock; and whether DXVK's own SetTexture
-    // does bookkeeping beyond the D3D9 contract. Until the share below says the
-    // saving is worth asking those questions, they stay unasked.
+    // ANSWERED, and the answer is no. 2026-09-02: **23,825 of 28,624,247 calls**
+    // - 0.083% - set the stage to the texture already bound. The safety argument
+    // above is sound and there is nothing behind it worth having. The two
+    // questions it was waiting on, whether calls arrive from more than one
+    // thread and whether DXVK does bookkeeping beyond the D3D9 contract, stay
+    // unasked because a tenth of a percent does not justify asking them.
+    //
+    // The comparison stays. It costs one compare and two stores on a call the
+    // client makes twenty-eight million times, which is worth paying to keep the
+    // answer current rather than have someone re-derive it from first principles
+    // in a year. If a future client or a future addon set moves it, the number
+    // in the report moves with it.
     //
     // Measurement only for now. The pointer is compared and counted, never acted
     // on, so a recycled address costs a wrong count and nothing else.
