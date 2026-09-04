@@ -7565,6 +7565,15 @@ static DWORD WINAPI MainThread(LPVOID param) {
     LoadingState::Init();
 #if !TEST_DISABLE_EVENT_COALESCER
     EventCoalescer::Init();
+#else
+    // Compiled out, so the launcher no longer offers a checkbox for it. It
+    // suppressed whitelisted events and re-emitted them a frame later from the
+    // Sleep hook, which runs Lua handlers at a point in the frame the client
+    // does not expect, and it was never validated across the in-world to glue
+    // teardown where the character-switch crashes happen.
+    Log("[EventCoalescer] not in this build: compiled out via "
+        "TEST_DISABLE_EVENT_COALESCER. The Combat_Net/EventCoalescer key is "
+        "read and has nothing to turn on.");
 #endif
 #if !TEST_DISABLE_LUAS_NEWLSTR_SSE2
     // The launcher has always offered a switch for this; nothing read it, so the
@@ -8181,7 +8190,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool luaRefFastOk = false, luaUnrefFastOk = false, luaCallMetaFastOk = false;
     bool pushResultFastOk = false, addLStringFastOk = false;
     bool loadstrFastOk = false, yieldFastOk = false;
-    Log("[LuaInlineBatch] ALL DISABLED via TEST_DISABLE_LUA_INLINE_BATCH");
+    Log("[LuaInlineBatch] ALL DISABLED via TEST_DISABLE_LUA_INLINE_BATCH: "
+        "21 hooks, after confirmed TValue corruption at luaD_precall 0x5565E9.");
+    Log("[LuaInlineBatch] every install gated on UI_Lua/LuaOpcacheWrites is in "
+        "that group, all ten of them, so that key now turns nothing on and the "
+        "launcher no longer offers it. Reads, Strings and Tables still gate 20, "
+        "4 and 7 live installs.");
 #endif
 
     // --- Safe group 1: string/number validation ---
@@ -8456,7 +8470,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("");
     Log("--- Object Visibility Cache ---");
 #if TEST_DISABLE_OBJ_VIS_CACHE
-    Log("[ObjVisCache] DISABLED (feature flag)");
+    // Compiled out, so the launcher no longer offers a checkbox for it. It had
+    // been sitting there default ON, describing itself as "on unless you turn
+    // it off", above a build that never contained it.
+    Log("[ObjVisCache] not in this build: compiled out via "
+        "TEST_DISABLE_OBJ_VIS_CACHE. The General/ObjVisCache key is read and "
+        "has nothing to turn on.");
 #else
     if (Config::g_settings.OptObjVisCache) ObjVisCache::Init();
 #endif
