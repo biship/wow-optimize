@@ -165,6 +165,7 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "MatrixMultiplySse2", &Settings::OptMatrixMultiplySse2 },
     { "Graphics_Sound", "DrawCensus", &Settings::OptDrawCensus },
     { "Graphics_Sound", "DrawMerge", &Settings::OptDrawMerge },
+    { "Graphics_Sound", "M2MatrixSlotSse2", &Settings::OptM2MatrixSlotSse2 },
     { "UI_Lua", "LuaAllocCensus", &Settings::OptLuaAllocCensus },
     { "Graphics_Sound", "AnimCensus", &Settings::OptAnimCensus },
     { "Graphics_Sound", "HorizonOcclusionSse2", &Settings::OptHorizonOcclusionSse2 },
@@ -700,6 +701,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptMatrixMultiplySse2 = GetPrivateProfileIntA("Graphics_Sound", "MatrixMultiplySse2", 1, iniPath.c_str()) != 0;
         g_settings.OptDrawCensus = GetPrivateProfileIntA("Graphics_Sound", "DrawCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptDrawMerge = GetPrivateProfileIntA("Graphics_Sound", "DrawMerge", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2MatrixSlotSse2 = GetPrivateProfileIntA("Graphics_Sound", "M2MatrixSlotSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaAllocCensus = GetPrivateProfileIntA("UI_Lua", "LuaAllocCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimCensus = GetPrivateProfileIntA("Graphics_Sound", "AnimCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptHorizonOcclusionSse2 = GetPrivateProfileIntA("Graphics_Sound", "HorizonOcclusionSse2", 0, iniPath.c_str()) != 0;

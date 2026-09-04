@@ -43,6 +43,7 @@
 #include "anim_lod.h"
 #include "collision_outcode_sse2.h"
 #include "bone_matrix_upload_sse2.h"
+#include "m2_matrix_slot_sse2.h"
 #include "mimalloc_high_arena.h"
 #include "client_write_batch.h"
 #include "aabb_overlap_sse2.h"
@@ -5268,6 +5269,7 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     AnimLod::LogStats();
     CollisionOutcode::LogStats();
     BoneMatrixUpload::LogStats();
+    M2MatrixSlot::LogStats();
     MimallocHighArena::LogStats();
     ClientWriteBatch::LogStats();
     AabbOverlap::LogStats();
@@ -7939,6 +7941,9 @@ static DWORD WINAPI MainThread(LPVOID param) {
     AnimLod::Init();
     CollisionOutcode::Init();
     BoneMatrixUpload::Init();
+
+    Log("--- M2 Matrix Slot Copy (SSE2) ---");
+    M2MatrixSlot::Install();
     AabbOverlap::Init();
     AnimQuatUnpack::Init();
     AnimVec3Track::Init();
@@ -10941,6 +10946,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             // first, which is why every other flush point exists.
             ClientWriteBatch::FlushAll("process detach");
             BoneMatrixUpload::Shutdown();
+            M2MatrixSlot::Shutdown();
             SamplingProfiler::Shutdown();
 #endif
             TextureUnloadDelay::Shutdown();

@@ -513,6 +513,10 @@ namespace Config {
         // call. A renderer change: it holds a draw so the next one can join
         // it. Experimental, off by default.
         bool OptDrawMerge = false;
+        // Replaces the two sixteen-float matrix slot copies in sub_82F0F0
+        // with four SSE2 moves each. No arithmetic, so the bytes written are
+        // the bytes read.
+        bool OptM2MatrixSlotSse2 = false;
         // Counts Lua VM allocations by size through G->frealloc. A measurement,
         // like the draw census - it decides whether a dedicated Lua arena is
         // worth building.
