@@ -658,9 +658,10 @@ static inline void NoteMergeChance(DWORD type, INT baseVertex,
 //   that its number is unsound if the client made any; the merger is bound by
 //   the same limit and refuses to hold anything once one has been created.
 //
-//   A texture rewritten through LockRect between two draws that both use it.
-//   Merging would show both with the later content. No renderer edits a bound
-//   texture inside a batch, but nothing here proves it.
+//   Nothing else. A texture rewritten through LockRect between two draws used to
+//   be the second hole here; the lock sits at vtable slot 19 for all three
+//   texture types and is a barrier now, and merging stops outright if a texture
+//   type turns up whose lock cannot be patched.
 //
 // The client is told D3D_OK for a draw that has not been issued yet. WoW does
 // not read it, and a failure surfaces on the flush instead, counted below.
@@ -691,6 +692,7 @@ static uint64_t g_mergedPrims  = 0;
 static uint64_t g_flushNotNext = 0;   // the next draw was not the continuation
 static uint64_t g_flushCap     = 0;   // the chain hit kMaxHeld
 static uint64_t g_flushLock    = 0;   // a buffer was locked
+static uint64_t g_flushTexLock = 0;   // a texture was locked
 static uint64_t g_mergeFailed  = 0;   // the merged call itself returned an error
 
 extern "C" void __cdecl D3D9DrawMerge_FlushPending(void) {
@@ -726,6 +728,14 @@ extern "C" void __cdecl D3D9DrawMerge_Disable(void) {
     D3D9DrawMerge_FlushPending();
     g_mergeOn = false;
     g_disabledByStateBlock = true;
+}
+
+extern "C" void __cdecl D3D9DrawMerge_TextureLockBarrier(unsigned long flags) {
+    // D3DLOCK_READONLY: the client promises to read and not write, so no pixel
+    // a held draw samples can change under it.
+    if (flags & 0x00000010UL) return;
+    if (g_drawMergePending) { ++g_flushTexLock; D3D9DrawMerge_FlushPending(); }
+    ++g_stateEpoch;
 }
 
 // Returns true when the call was absorbed and the caller must not draw.
@@ -941,8 +951,10 @@ void DrawMerge_LogStats(void) {
         "merged call.", (unsigned long)g_longestMerge, g_mergedPrims);
     Log("[DrawMerger]   held draws let go because: %llu were not the "
         "continuation, %llu hit the %u-draw cap, %llu had a buffer locked under "
-        "them. Everything else was a state change.",
-        g_flushNotNext, g_flushCap, (unsigned)kMaxHeld, g_flushLock);
+        "them, %llu had a texture rewritten under them. Everything else was a "
+        "state change.",
+        g_flushNotNext, g_flushCap, (unsigned)kMaxHeld, g_flushLock,
+        g_flushTexLock);
     if (g_mergeFailed) {
         Log("[DrawMerger]   WARNING: %llu merged call(s) returned an error. The "
             "client was already told D3D_OK for those draws.", g_mergeFailed);

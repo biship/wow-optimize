@@ -390,9 +390,121 @@ static HRESULT __stdcall Hooked_SetSamplerState(void* dev, DWORD sampler, DWORD 
     return hr;
 }
 
+// The last thing that can change what a held draw produces without going near
+// the device: the client rewriting a bound texture's pixels.
+//
+// IDirect3DTexture9, CubeTexture9 and VolumeTexture9 all put their lock at
+// vtable slot 19 - LockRect, LockRect and LockBox - and all three take
+// (Level, out, rect-or-box, Flags), so the flags sit at [esp+20] on entry for
+// every one of them and a single thunk shape covers the lot. Each type has its
+// own vtable, so there is a small table of them rather than one slot; every
+// texture a D3D9 implementation hands out shares the vtable of its type.
+//
+// D3DLOCK_READONLY promises not to write, so it is not a barrier. Everything
+// else is.
+//
+// If a fourth vtable turns up, or a patch fails, merging stops for the session
+// rather than continuing with a hole in it. Refusing to merge is always correct;
+// merging across a texture rewrite is not.
+static const int kMaxTexVTables = 4;
+static uintptr_t* g_texLockVT[kMaxTexVTables] = {};
+static int        g_texLockCount = 0;
+
+// One original per vtable, named rather than indexed: a naked thunk has to
+// name the pointer it jumps through.
+static void* g_texLockOrig0 = nullptr;
+static void* g_texLockOrig1 = nullptr;
+static void* g_texLockOrig2 = nullptr;
+static void* g_texLockOrig3 = nullptr;
+
+static __declspec(naked) void g_bThunk_TexLock0() {
+    __asm {
+        mov  eax, [esp+20]
+        push eax
+        call D3D9DrawMerge_TextureLockBarrier
+        add  esp, 4
+        jmp  dword ptr [g_texLockOrig0]
+    }
+}
+static __declspec(naked) void g_bThunk_TexLock1() {
+    __asm {
+        mov  eax, [esp+20]
+        push eax
+        call D3D9DrawMerge_TextureLockBarrier
+        add  esp, 4
+        jmp  dword ptr [g_texLockOrig1]
+    }
+}
+static __declspec(naked) void g_bThunk_TexLock2() {
+    __asm {
+        mov  eax, [esp+20]
+        push eax
+        call D3D9DrawMerge_TextureLockBarrier
+        add  esp, 4
+        jmp  dword ptr [g_texLockOrig2]
+    }
+}
+static __declspec(naked) void g_bThunk_TexLock3() {
+    __asm {
+        mov  eax, [esp+20]
+        push eax
+        call D3D9DrawMerge_TextureLockBarrier
+        add  esp, 4
+        jmp  dword ptr [g_texLockOrig3]
+    }
+}
+
+static void** const g_texLockOrigSlot[kMaxTexVTables] = {
+    &g_texLockOrig0, &g_texLockOrig1, &g_texLockOrig2, &g_texLockOrig3
+};
+
+static void* const g_texLockThunks[kMaxTexVTables] = {
+    (void*)g_bThunk_TexLock0, (void*)g_bThunk_TexLock1,
+    (void*)g_bThunk_TexLock2, (void*)g_bThunk_TexLock3
+};
+
+// Called from Hooked_SetTexture for every texture the client binds. The common
+// case is the third instruction: a vtable already in the table.
+static void NoteBoundTexture(void* tex) {
+    if (!tex || !IsReadable((uintptr_t)tex)) return;
+    uintptr_t* vt = *(uintptr_t**)tex;
+    if (!vt) return;
+    for (int i = 0; i < g_texLockCount; i++)
+        if (g_texLockVT[i] == vt) return;
+
+    if (g_texLockCount >= kMaxTexVTables || !IsReadable((uintptr_t)vt)) {
+        Log("[DrawMerger] more than %d texture vtables appeared, so one type's "
+            "lock cannot be made a barrier. Merging stops here.", kMaxTexVTables);
+        D3D9DrawMerge_Disable();
+        g_texLockCount = kMaxTexVTables;   // stop looking
+        return;
+    }
+
+    const int slot = g_texLockCount;
+    uintptr_t orig = vt[19];
+    DWORD prot;
+    if (!IsReadable(orig) ||
+        !VirtualProtect(&vt[19], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[DrawMerger] could not make a texture lock a merge barrier. "
+            "Merging stops here.");
+        D3D9DrawMerge_Disable();
+        g_texLockCount = kMaxTexVTables;
+        return;
+    }
+    *g_texLockOrigSlot[slot] = (void*)orig;
+    g_texLockVT[slot]        = vt;
+    vt[19] = (uintptr_t)g_texLockThunks[slot];
+    VirtualProtect(&vt[19], sizeof(void*), prot, &prot);
+    ++g_texLockCount;
+    Log("[DrawMerger] texture lock is a merge barrier now (%d of %d vtables).",
+        g_texLockCount, kMaxTexVTables);
+}
+
 static HRESULT __stdcall Hooked_SetTexture(void* dev, DWORD stage, void* tex) {
     CheckDeviceChange(dev);
     ++g_statCalls[3];
+    if (Config::g_settings.OptDrawMerge && g_texLockCount < kMaxTexVTables)
+        NoteBoundTexture(tex);
 
     // The recycling argument, written out because the measurement below exists to
     // decide whether to act on it and the reasoning should not be invented on the

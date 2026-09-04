@@ -39,6 +39,11 @@ static inline unsigned long D3D9_StateBarrier(void) {
 // Called from the naked Lock thunks in d3d9_state_manager.cpp.
 extern "C" void __cdecl D3D9DrawMerge_BufferLockBarrier(unsigned long flags);
 
+// A texture was locked. D3DLOCK_READONLY cannot change a pixel, so it is not a
+// barrier; anything else rewrites content a held draw may already read from.
+// Called from the naked texture Lock thunks in d3d9_state_manager.cpp.
+extern "C" void __cdecl D3D9DrawMerge_TextureLockBarrier(unsigned long flags);
+
 // The client created a state block, which can change device state without ever
 // touching the device vtable. Merging stops for the rest of the session.
 extern "C" void __cdecl D3D9DrawMerge_Disable(void);
