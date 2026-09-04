@@ -34,6 +34,21 @@
 // profile had already named.
 //
 // ---------------------------------------------------------------------------
+// What the profile did and did not say
+//
+// It named the function, not these blocks. The entry in the 2026-08-28 uncapped
+// profile is `M2_AnimateModel+0x600` at 3.00%, and the fine histogram's buckets
+// are 512 bytes, so what was measured is [+0x600, +0x800) - a stretch of
+// branching with two fcom/fnstsw pairs in it, and none of the three sites here.
+// Site C is at +0x264 and sites A and B at +0xD64 and +0xDDB.
+//
+// So the case for these three is that they are pure waste in a function the
+// profile puts a fifth of the frame in, not that they are the bucket it named.
+// They are off by default and an A/B subject for exactly that reason: the
+// harness says what they were worth, and if the answer is nothing then nothing
+// is what they cost to leave off.
+//
+// ---------------------------------------------------------------------------
 // The register contracts, read off the disassembly rather than assumed
 //
 // Site A, 0x0082FE54 through 0x0082FEC3, falls through to 0x0082FEC4:
