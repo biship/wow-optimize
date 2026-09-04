@@ -1112,10 +1112,15 @@ namespace WowOptimizeLauncher {
         // MatrixVectorSse2 belongs in the list precisely because it is known to be
         // slower than the code it replaces. If a run reports it as faster, the
         // measurement is what is wrong, and the DLL says so in the log itself.
+        // Every name here must be one a module passes to AbTest::IsSubject,
+        // or the run turns the feature on and the harness never alternates it.
+        // SimdGeometry was in this list and registers no subject; M2MatrixSimd
+        // registers one and was missing. The A/B report prints the names that
+        // did register, so a log says which side drifted.
         private static readonly string[] AbSubjectKeys = new string[] {
             "LayoutRelinkFast", "M2SortKey", "LuaPoolFast", "LuaHGetDispatch",
             "QuatLerpSse2", "AnimQuatUnpack", "AnimVec3Track", "FrustumAabb",
-            "AabbOverlap", "SegmentAabb", "SimdGeometry", "FastMemsetOpt",
+            "AabbOverlap", "SegmentAabb", "M2MatrixSimd", "FastMemsetOpt",
             "StrncmpSse2", "LuaGcManual", "MatrixVectorSse2", "BoneMatrixUpload"
         };
 

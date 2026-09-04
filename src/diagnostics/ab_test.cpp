@@ -687,6 +687,12 @@ void LogStats() {
             kPairsPerSubject, g_periodMs / 1000, g_offeredCount,
             (unsigned)(2 * kPairsPerSubject * (g_periodMs / 1000) *
                        (g_offeredCount > 0 ? g_offeredCount : 1)));
+        // The names, in a rotating run too. It used to be printed only when a
+        // named run matched nothing, so a session that measured fifteen of the
+        // sixteen features the launcher offers looked exactly like one that
+        // measured all sixteen. The list is the only thing that says which
+        // launcher tickbox has no module answering to it.
+        LogOffered("these are the subjects that registered");
     }
     // Which name a slot is reported under.
     //
