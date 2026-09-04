@@ -996,6 +996,34 @@ static __declspec(naked) void g_bThunk_UpdateTexture() {
     }
 }
 
+static void* g_bOrig_DrawRectPatch = nullptr;
+static __declspec(naked) void g_bThunk_DrawRectPatch() {
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_DrawRectPatch]
+    }
+}
+
+static void* g_bOrig_DrawTriPatch = nullptr;
+static __declspec(naked) void g_bThunk_DrawTriPatch() {
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_DrawTriPatch]
+    }
+}
+
 // Reading back what has been drawn. A held draw has not reached the target
 // yet, so a readback that happens first sees the frame without it - a
 // screenshot missing a model, a portrait missing its character.
@@ -1438,6 +1466,66 @@ static __declspec(naked) void g_bThunk_QueryIssue() {
     }
 }
 
+// A texture's pixels can also be written through a surface. The client asks a
+// texture for GetSurfaceLevel, or the device for a back buffer or the current
+// render target, and locks that - which never touches the texture vtable this
+// module patched. IDirect3DSurface9 puts LockRect at slot 13, and every surface
+// a D3D9 implementation returns shares one vtable, so the first surface seen
+// through GetBackBuffer or GetRenderTarget closes the whole path.
+//
+// Both are real hooks rather than naked thunks because the surface only exists
+// after the original has run. D3DLOCK_READONLY is not a barrier.
+static void* g_bOrig_SurfLock = nullptr;
+static __declspec(naked) void g_bThunk_SurfLock() {
+    __asm {
+        mov  eax, [esp+16]
+        push eax
+        call D3D9DrawMerge_TextureLockBarrier
+        add  esp, 4
+        jmp  dword ptr [g_bOrig_SurfLock]
+    }
+}
+
+static bool g_surfLockPatched = false;
+
+static void PatchSurfaceLock(void* surf) {
+    if (g_surfLockPatched || !surf) return;
+    g_surfLockPatched = true;        // one attempt, win or lose
+    if (!IsReadable((uintptr_t)surf)) { D3D9DrawMerge_Disable(); return; }
+    uintptr_t* vt = *(uintptr_t**)surf;
+    if (!vt || !IsReadable((uintptr_t)vt)) { D3D9DrawMerge_Disable(); return; }
+    uintptr_t orig = vt[13];
+    DWORD prot;
+    if (!IsReadable(orig) ||
+        !VirtualProtect(&vt[13], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[DrawMerger] could not make surface LockRect a merge barrier. "
+            "Merging stops here.");
+        D3D9DrawMerge_Disable();
+        return;
+    }
+    g_bOrig_SurfLock = (void*)orig;
+    vt[13] = (uintptr_t)g_bThunk_SurfLock;
+    VirtualProtect(&vt[13], sizeof(void*), prot, &prot);
+    Log("[DrawMerger] surface LockRect is a merge barrier now.");
+}
+
+typedef HRESULT (__stdcall *GetBackBuffer_t)(void*, UINT, UINT, D3DBACKBUFFER_TYPE, void**);
+static GetBackBuffer_t g_origGetBackBuffer = nullptr;
+static HRESULT __stdcall Hooked_GetBackBuffer(void* dev, UINT swap, UINT idx,
+                                              D3DBACKBUFFER_TYPE type, void** ppSurf) {
+    HRESULT hr = g_origGetBackBuffer(dev, swap, idx, type, ppSurf);
+    if (SUCCEEDED(hr) && ppSurf && *ppSurf) PatchSurfaceLock(*ppSurf);
+    return hr;
+}
+
+typedef HRESULT (__stdcall *GetRenderTarget_t)(void*, DWORD, void**);
+static GetRenderTarget_t g_origGetRenderTarget = nullptr;
+static HRESULT __stdcall Hooked_GetRenderTarget(void* dev, DWORD idx, void** ppSurf) {
+    HRESULT hr = g_origGetRenderTarget(dev, idx, ppSurf);
+    if (SUCCEEDED(hr) && ppSurf && *ppSurf) PatchSurfaceLock(*ppSurf);
+    return hr;
+}
+
 typedef HRESULT (__stdcall *CreateQuery_t)(void*, DWORD, void**);
 static CreateQuery_t g_origCreateQuery = nullptr;
 static bool g_queryIssuePatched = false;
@@ -1473,6 +1561,8 @@ struct Barrier { int vt; const char* name; void* thunk; void** origSlot; bool pa
 static Barrier g_barriers[] = {
     {  30, "UpdateSurface", (void*)g_bThunk_UpdateSurface, &g_bOrig_UpdateSurface, false },
     {  31, "UpdateTexture", (void*)g_bThunk_UpdateTexture, &g_bOrig_UpdateTexture, false },
+    { 115, "DrawRectPatch", (void*)g_bThunk_DrawRectPatch, &g_bOrig_DrawRectPatch, false },
+    { 116, "DrawTriPatch", (void*)g_bThunk_DrawTriPatch, &g_bOrig_DrawTriPatch, false },
     {  32, "GetRenderTargetData", (void*)g_bThunk_GetRenderTargetData, &g_bOrig_GetRenderTargetData, false },
     {  33, "GetFrontBufferData", (void*)g_bThunk_GetFrontBufferData, &g_bOrig_GetFrontBufferData, false },
     {  34, "StretchRect", (void*)g_bThunk_StretchRect, &g_bOrig_StretchRect, false },
@@ -1504,6 +1594,8 @@ static Barrier g_barriers[] = {
     {  59, "CreateStateBlock", (void*)g_bThunk_CreateStateBlock, &g_bOrig_CreateStateBlock, false },
     {  61, "EndStateBlock", (void*)g_bThunk_EndStateBlock, &g_bOrig_EndStateBlock, false },
     { 118, "CreateQuery", (void*)Hooked_CreateQuery, (void**)&g_origCreateQuery, false },
+    {  18, "GetBackBuffer", (void*)Hooked_GetBackBuffer, (void**)&g_origGetBackBuffer, false },
+    {  38, "GetRenderTarget", (void*)Hooked_GetRenderTarget, (void**)&g_origGetRenderTarget, false },
 };
 static const int NUM_BARRIERS = (int)(sizeof(g_barriers) / sizeof(g_barriers[0]));
 static int g_barriersPatched = 0;
