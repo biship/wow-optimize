@@ -1376,8 +1376,12 @@ namespace WowOptimizeLauncher {
             InheritIfAbsent(present, "ThreadAffinity", "DefragLf");
             InheritIfAbsent(present, "SimdGeometry", "StrStrSse2");
             InheritIfAbsent(present, "LuaAddonProfile", "SamplingProfiler");
-            InheritIfAbsent(present, "UiScriptHandlerCache", "UIFrameBatch");
-            InheritIfAbsent(present, "UnitApiFastPath", "UIFrameBatch");
+            // UiScriptHandlerCache and UnitApiFastPath used to inherit UIFrameBatch
+            // here. Their checkboxes are gone because both gate an install that
+            // can only return false, so there is nothing left to inherit and
+            // InheritIfAbsent would find no control anyway. The DLL still reads
+            // both keys and still inherits UIFrameBatch for them; that costs a
+            // branch and turns on nothing.
         }
 
         private void SaveSettingsToPath(string path) {
