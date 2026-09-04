@@ -22,6 +22,10 @@ extern "C" void Log(const char* fmt, ...);
 // ----------------------------------------------------------------
 // Statistics (diagnostic only; plain increments)
 // ----------------------------------------------------------------
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static volatile LONG64 g_total_calls = 0;
 static volatile LONG64 g_array_hits = 0;
 static volatile LONG64 g_nil_returns = 0;
@@ -169,7 +173,27 @@ bool InstallLuaRawGetIInline()
     }
 
     Log("[RawGetIInline] Hook ACTIVE (fast inline stack lookup + array fast path)");
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void LuaRawGetIInline_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[RawGetIInline] not measured: the hook is not installed.");
+        return;
+    }
+    const LONG64 total = g_total_calls, arr = g_array_hits;
+    if (total == 0) {
+        Log("[RawGetIInline] measured and zero: no indexed read reached it.");
+        return;
+    }
+    Log("[RawGetIInline] %lld calls, %lld from the array part (%.1f%%), "
+        "%lld fell back.",
+        (long long)total, (long long)arr,
+        100.0 * (double)arr / (double)total, (long long)(total - arr));
 }
 
 void UninstallLuaRawGetIInline()

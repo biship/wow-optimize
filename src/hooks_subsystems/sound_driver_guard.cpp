@@ -18,6 +18,10 @@
 extern "C" void Log(const char* fmt, ...);
 
 typedef void (__cdecl* sub_508260_fn)(int a1, char a2);
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static sub_508260_fn g_orig_sub_508260 = nullptr;
 
 static volatile LONG64 g_total_calls  = 0;
@@ -63,7 +67,20 @@ bool InstallSoundDriverGuard()
     CrashDumper::FeatureSetActive("SndDriver", true);
 
     Log("[SndDriver] ACTIVE: SEH guard on sub_508260 (sound mode toggle)");
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void SoundDriverGuard_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[SndDriver] not measured: the guard is not installed.");
+        return;
+    }
+    Log("[SndDriver] %lld call(s), %lld recovered from a crash.",
+        (long long)g_total_calls, (long long)g_recovered);
 }
 
 void UninstallSoundDriverGuard()

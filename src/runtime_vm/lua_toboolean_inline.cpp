@@ -86,6 +86,24 @@ bool InstallLuaTobooleanInline() {
     return true;
 }
 
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void LuaTobooleanInline_LogStats(void) {
+    if (!orig_toboolean) {
+        Log("[LuaTBool] not measured: the hook is not installed.");
+        return;
+    }
+    const LONG64 total = g_tobooleanCalls, fast = g_tobooleanFast;
+    if (total == 0) {
+        Log("[LuaTBool] measured and zero: nothing asked the VM for a boolean.");
+        return;
+    }
+    Log("[LuaTBool] %lld calls, %lld inline (%.1f%%).",
+        (long long)total, (long long)fast,
+        100.0 * (double)fast / (double)total);
+}
+
 void UninstallLuaTobooleanInline() {
     MH_DisableHook((void*)0x0084E0B0);
     MH_RemoveHook((void*)0x0084E0B0);

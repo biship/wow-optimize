@@ -786,6 +786,10 @@ void ClearCombatLogCache();
 #include "version.h"
 #include "config.h"
 
+// These two have no header of their own.
+void ObjectUnlinkSafety_LogStats(void);
+void TypeCheckSafety_LogStats(void);
+
 // The diagnostic mode that writes nothing into the wow.exe image, and what it
 // turned away. Read straight from the settings rather than mirrored into a flag,
 // so there is no window in which a hook installs before the mirror is set.
@@ -5267,6 +5271,24 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     CombatLogFilter::LogStats();
     LuaThisCache_LogStats();
     LuaAllocCensus::LogStats();
+
+    // These modules printed their counters only from an uninstall path that
+    // nothing calls; the DLL leaves through TerminateProcess and the linker had
+    // dropped those functions entirely. Seven of them count averted crashes,
+    // which is the number that says whether a guard is earning its hook.
+    ObjectUnlinkSafety_LogStats();
+    TypeCheckSafety_LogStats();
+    SoundBufferGuard_LogStats();
+    SoundDriverGuard_LogStats();
+    SoundEmitterGuard_LogStats();
+    LuaGetTableSafety_LogStats();
+    LuaNewKeySafety_LogStats();
+    LuaGetStrInline_LogStats();
+    LuaRawGetInline_LogStats();
+    LuaRawGetIInline_LogStats();
+    LuaTobooleanInline_LogStats();
+    StrtodFast_LogStats();
+    RegexCache_LogStats();
     ReportCrtFreeStats();
     if (g_spinTaken > 0 || g_spinSkipped > 0) {
         Log("[SleepPrecision] busy-wait taken %ld, handed back %ld (frames over "

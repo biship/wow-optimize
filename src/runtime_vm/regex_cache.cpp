@@ -17,6 +17,10 @@
 extern "C" void Log(const char* fmt, ...);
 
 // Teardown state helper
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static inline bool IsTeardownState() {
     uintptr_t gL = *(uintptr_t*)0x00D3F78C;
     return (gL < 0x10000 || gL > 0xFFE00000);
@@ -183,7 +187,27 @@ bool InstallRegexCache() {
     Log("[RegexCache] Initialized (%d slots, %dB max pattern, %dB max compiled, %ds TTL)",
         REGEX_CACHE_SIZE, REGEX_MAX_PATTERN, REGEX_MAX_COMPILED, REGEX_TTL_MS / 1000);
 
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void RegexCache_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[RegexCache] not measured: the cache is not installed.");
+        return;
+    }
+    const LONG64 hits = g_regexHits, misses = g_regexMisses;
+    if (hits + misses == 0) {
+        Log("[RegexCache] measured and zero: no pattern was compiled.");
+        return;
+    }
+    Log("[RegexCache] %lld hits, %lld misses (%.1f%% hit rate), %lld evictions.",
+        (long long)hits, (long long)misses,
+        100.0 * (double)hits / (double)(hits + misses),
+        (long long)g_regexEvictions);
 }
 
 void ShutdownRegexCache() {
