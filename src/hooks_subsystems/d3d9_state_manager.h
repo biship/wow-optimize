@@ -28,6 +28,9 @@ bool IsD3D9DeviceHooked(void);
 // How many merge barriers went in, of how many, and how many state blocks the
 // client created. The draw-merge census needs all three to say whether its own
 // answer can be trusted.
+// Whether the surface and query barriers, which are not device methods,
+// both went in. The merger will not run without them.
+bool D3D9StateManager_DerivedBarriersOk(void);
 void D3D9StateManager_GetBarrierState(int* installed, int* total,
                                       unsigned long* stateBlocks);
 

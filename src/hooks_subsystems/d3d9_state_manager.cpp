@@ -1443,15 +1443,33 @@ static __declspec(naked) void g_bThunk_EndStateBlock() {
     }
 }
 
-// An occlusion query counts the pixels drawn between its two Issue calls. A
-// held draw issued after the closing Issue is not counted, and the client then
-// hides something it should have drawn - or draws something it should not.
+// A texture's pixels can also be written through a surface, and an occlusion
+// query counts the pixels drawn between its two Issue calls. Neither goes
+// through the device vtable, and neither can be reached from a hook that waits
+// for the client to hand one over: a surface comes from GetSurfaceLevel as
+// readily as from GetBackBuffer, and waiting means the merger runs from the
+// first frame with those two barriers missing, which is the shape of the defect
+// that put smeared triangles on a tester's screen.
 //
-// Issue lives on the query object, not the device, so nothing in the device
-// vtable can see it. IDirect3DQuery9 puts Issue at slot 6 and every query a
-// D3D9 implementation returns shares one vtable, so the first query created
-// gets that slot patched. CreateQuery is a real hook rather than a naked thunk
-// because the object only exists after the original has run.
+// So this asks the device for one of each, patches the vtable every object of
+// that type shares, and releases them. It happens before anything is held and
+// before anything else is patched, so the calls go to the client's own
+// implementation.
+//
+// IDirect3DSurface9 puts LockRect at slot 13 and takes (pLockedRect, pRect,
+// Flags) with no Level, so the flags are at [esp+16] rather than the [esp+20]
+// the texture and buffer locks use. IDirect3DQuery9 puts Issue at slot 6.
+static void* g_bOrig_SurfLock = nullptr;
+static __declspec(naked) void g_bThunk_SurfLock() {
+    __asm {
+        mov  eax, [esp+16]
+        push eax
+        call D3D9DrawMerge_TextureLockBarrier
+        add  esp, 4
+        jmp  dword ptr [g_bOrig_SurfLock]
+    }
+}
+
 static void* g_bOrig_QueryIssue = nullptr;
 static __declspec(naked) void g_bThunk_QueryIssue() {
     __asm {
@@ -1466,100 +1484,64 @@ static __declspec(naked) void g_bThunk_QueryIssue() {
     }
 }
 
-// A texture's pixels can also be written through a surface. The client asks a
-// texture for GetSurfaceLevel, or the device for a back buffer or the current
-// render target, and locks that - which never touches the texture vtable this
-// module patched. IDirect3DSurface9 puts LockRect at slot 13, and every surface
-// a D3D9 implementation returns shares one vtable, so the first surface seen
-// through GetBackBuffer or GetRenderTarget closes the whole path.
-//
-// Both are real hooks rather than naked thunks because the surface only exists
-// after the original has run. D3DLOCK_READONLY is not a barrier.
-static void* g_bOrig_SurfLock = nullptr;
-static __declspec(naked) void g_bThunk_SurfLock() {
-    __asm {
-        mov  eax, [esp+16]
-        push eax
-        call D3D9DrawMerge_TextureLockBarrier
-        add  esp, 4
-        jmp  dword ptr [g_bOrig_SurfLock]
-    }
+// Both barriers in, or neither: the merger refuses to start on anything less.
+static bool g_derivedBarriersOk = false;
+
+static bool PatchSharedSlot(void* obj, int slot, void* thunk, void** origSlot,
+                            const char* what) {
+    if (!obj || !IsReadable((uintptr_t)obj)) return false;
+    uintptr_t* vt = *(uintptr_t**)obj;
+    if (!vt || !IsReadable((uintptr_t)vt)) return false;
+    uintptr_t orig = vt[slot];
+    if (!IsReadable(orig)) return false;
+    if (orig == (uintptr_t)thunk) return true;      // already ours
+    DWORD prot;
+    if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot))
+        return false;
+    *origSlot = (void*)orig;
+    vt[slot] = (uintptr_t)thunk;
+    VirtualProtect(&vt[slot], sizeof(void*), prot, &prot);
+    Log("[DrawMerger] %s is a merge barrier now.", what);
+    return true;
 }
 
-static bool g_surfLockPatched = false;
-
-static void PatchSurfaceLock(void* surf) {
-    // The barriers install for the census too, where they only need to move the
-    // epoch. Patching another vtable is for the merger.
+// Called from PatchDeviceVTable before anything else is patched.
+static void PatchDerivedVTables(IDirect3DDevice9* dev) {
     if (!Config::g_settings.OptDrawMerge) return;
-    if (g_surfLockPatched || !surf) return;
-    g_surfLockPatched = true;        // one attempt, win or lose
-    if (!IsReadable((uintptr_t)surf)) { D3D9DrawMerge_Disable(); return; }
-    uintptr_t* vt = *(uintptr_t**)surf;
-    if (!vt || !IsReadable((uintptr_t)vt)) { D3D9DrawMerge_Disable(); return; }
-    uintptr_t orig = vt[13];
-    DWORD prot;
-    if (!IsReadable(orig) ||
-        !VirtualProtect(&vt[13], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot)) {
-        Log("[DrawMerger] could not make surface LockRect a merge barrier. "
-            "Merging stops here.");
-        D3D9DrawMerge_Disable();
-        return;
+
+    bool surfOk = false;
+    IDirect3DSurface9* surf = nullptr;
+    if (SUCCEEDED(dev->GetRenderTarget(0, &surf)) && surf) {
+        surfOk = PatchSharedSlot(surf, 13, (void*)g_bThunk_SurfLock,
+                                 &g_bOrig_SurfLock, "surface LockRect");
+        surf->Release();
     }
-    g_bOrig_SurfLock = (void*)orig;
-    vt[13] = (uintptr_t)g_bThunk_SurfLock;
-    VirtualProtect(&vt[13], sizeof(void*), prot, &prot);
-    Log("[DrawMerger] surface LockRect is a merge barrier now.");
-}
+    if (!surfOk)
+        Log("[DrawMerger] could not reach a surface to make its LockRect a "
+            "barrier, so a texture written through one would go unseen.");
 
-typedef HRESULT (__stdcall *GetBackBuffer_t)(void*, UINT, UINT, D3DBACKBUFFER_TYPE, void**);
-static GetBackBuffer_t g_origGetBackBuffer = nullptr;
-static HRESULT __stdcall Hooked_GetBackBuffer(void* dev, UINT swap, UINT idx,
-                                              D3DBACKBUFFER_TYPE type, void** ppSurf) {
-    HRESULT hr = g_origGetBackBuffer(dev, swap, idx, type, ppSurf);
-    if (SUCCEEDED(hr) && ppSurf && *ppSurf) PatchSurfaceLock(*ppSurf);
-    return hr;
-}
-
-typedef HRESULT (__stdcall *GetRenderTarget_t)(void*, DWORD, void**);
-static GetRenderTarget_t g_origGetRenderTarget = nullptr;
-static HRESULT __stdcall Hooked_GetRenderTarget(void* dev, DWORD idx, void** ppSurf) {
-    HRESULT hr = g_origGetRenderTarget(dev, idx, ppSurf);
-    if (SUCCEEDED(hr) && ppSurf && *ppSurf) PatchSurfaceLock(*ppSurf);
-    return hr;
-}
-
-typedef HRESULT (__stdcall *CreateQuery_t)(void*, DWORD, void**);
-static CreateQuery_t g_origCreateQuery = nullptr;
-static bool g_queryIssuePatched = false;
-
-static HRESULT __stdcall Hooked_CreateQuery(void* dev, DWORD type, void** ppQuery) {
-    HRESULT hr = g_origCreateQuery(dev, type, ppQuery);
-    // A null ppQuery is the client asking whether the type is supported.
-    if (!Config::g_settings.OptDrawMerge) return hr;
-    if (g_queryIssuePatched || FAILED(hr) || !ppQuery || !*ppQuery) return hr;
-
-    g_queryIssuePatched = true;   // one attempt, win or lose
-    void* q = *ppQuery;
-    if (!IsReadable((uintptr_t)q)) { D3D9DrawMerge_Disable(); return hr; }
-    uintptr_t* vt = *(uintptr_t**)q;
-    if (!vt || !IsReadable((uintptr_t)vt)) { D3D9DrawMerge_Disable(); return hr; }
-    uintptr_t orig = vt[6];
-    DWORD prot;
-    if (!IsReadable(orig) ||
-        !VirtualProtect(&vt[6], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot)) {
-        Log("[DrawMerger] could not make query Issue a merge barrier. Merging "
-            "stops here.");
-        D3D9DrawMerge_Disable();
-        return hr;
+    bool queryOk = false;
+    IDirect3DQuery9* q = nullptr;
+    HRESULT qhr = dev->CreateQuery(D3DQUERYTYPE_OCCLUSION, &q);
+    if (SUCCEEDED(qhr) && q) {
+        queryOk = PatchSharedSlot(q, 6, (void*)g_bThunk_QueryIssue,
+                                  &g_bOrig_QueryIssue, "query Issue");
+        q->Release();
+    } else if (qhr == D3DERR_NOTAVAILABLE) {
+        // The device cannot make occlusion queries, so the client cannot have
+        // one, so nothing can Issue one. Nothing to guard.
+        queryOk = true;
+        Log("[DrawMerger] this device has no occlusion queries, so none can be "
+            "issued across a held draw.");
     }
-    g_bOrig_QueryIssue = (void*)orig;
-    vt[6] = (uintptr_t)g_bThunk_QueryIssue;
-    VirtualProtect(&vt[6], sizeof(void*), prot, &prot);
-    Log("[DrawMerger] query Issue is a merge barrier now (first query type %lu).",
-        (unsigned long)type);
-    return hr;
+    if (!queryOk)
+        Log("[DrawMerger] could not reach a query to make its Issue a barrier, "
+            "so an occlusion count taken across a held draw would be short.");
+
+    g_derivedBarriersOk = surfOk && queryOk;
 }
+
+bool D3D9StateManager_DerivedBarriersOk(void) { return g_derivedBarriersOk; }
 
 struct Barrier { int vt; const char* name; void* thunk; void** origSlot; bool patched; };
 static Barrier g_barriers[] = {
@@ -1597,9 +1579,6 @@ static Barrier g_barriers[] = {
     { 113, "SetPixelShaderConstantB", (void*)g_bThunk_SetPixelShaderConstantB, &g_bOrig_SetPixelShaderConstantB, false },
     {  59, "CreateStateBlock", (void*)g_bThunk_CreateStateBlock, &g_bOrig_CreateStateBlock, false },
     {  61, "EndStateBlock", (void*)g_bThunk_EndStateBlock, &g_bOrig_EndStateBlock, false },
-    { 118, "CreateQuery", (void*)Hooked_CreateQuery, (void**)&g_origCreateQuery, false },
-    {  18, "GetBackBuffer", (void*)Hooked_GetBackBuffer, (void**)&g_origGetBackBuffer, false },
-    {  38, "GetRenderTarget", (void*)Hooked_GetRenderTarget, (void**)&g_origGetRenderTarget, false },
 };
 static const int NUM_BARRIERS = (int)(sizeof(g_barriers) / sizeof(g_barriers[0]));
 static int g_barriersPatched = 0;
@@ -1645,6 +1624,10 @@ static bool PatchDeviceVTable(void* pDevice) {
 
     uintptr_t* vtable = *(uintptr_t**)pDevice;
     if (!vtable || !IsReadable((uintptr_t)vtable)) return false;
+
+    // Before anything is patched, so these calls reach the client's own
+    // implementation rather than one of our thunks.
+    PatchDerivedVTables((IDirect3DDevice9*)pDevice);
 
     int patched = 0;
     for (int i = 0; i < NUM_HOOKS; i++) {

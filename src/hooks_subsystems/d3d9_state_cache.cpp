@@ -645,15 +645,25 @@ static inline void NoteMergeChance(DWORD type, INT baseVertex,
 // What must flush it, and where each one is caught:
 //
 //   the fourteen wrapped setters      D3D9_StateBarrier() in d3d9_state_manager
-//   thirty-seven device methods      the barrier thunks, same file
+//   thirty-four device methods       the barrier thunks, same file
 //   Present and Reset                 their hooks in d3d9_state_manager
 //   a different kind of draw          Hooked_DrawPrimitive below
 //   a vertex or index buffer lock     the Lock thunks in d3d9_state_manager
 //   a texture lock that can write     the texture Lock thunks, same file
-//   a surface lock that can write     the surface LockRect thunk, patched from
-//                                       GetBackBuffer and GetRenderTarget
-//   an occlusion query opening or     the query Issue thunk, patched from
-//     closing                           CreateQuery
+//   a surface lock that can write     the surface LockRect thunk
+//   an occlusion query opening or     the query Issue thunk
+//     closing
+//
+// The last two are on vtables no device method returns reliably - a surface
+// comes from GetSurfaceLevel as readily as from GetBackBuffer - so the state
+// manager asks the device for one of each at install time, patches the vtable
+// every object of that type shares, and releases them. Both have to be in
+// before the merger starts.
+//
+// The buffer and texture locks are patched the first time SetStreamSource,
+// SetIndices or SetTexture hands one over, which is safe by construction: a
+// draw needs a vertex and an index buffer, and a draw that samples a texture
+// had that texture bound, so all three precede the first draw that could care.
 //   a readback of the render target   GetRenderTargetData, GetFrontBufferData
 //   a chain getting long              kMaxHeld
 //
@@ -1135,18 +1145,20 @@ void InstallDrawHooks(void* origDrawPrimitive, void* origDrawIndexed) {
             int installed = 0, total = 0;
             unsigned long stateBlocks = 0;
             D3D9StateManager_GetBarrierState(&installed, &total, &stateBlocks);
-            if (total > 0 && installed == total) {
+            const bool derived = D3D9StateManager_DerivedBarriersOk();
+            if (total > 0 && installed == total && derived) {
                 g_mergeOn = true;
                 Log("[DrawMerger] ACTIVE: consecutive triangle-list draws that "
                     "continue each other in the index buffer with no state "
                     "change between them go out as one call. All %d barriers "
                     "are in.", total);
             } else {
-                Log("[DrawMerger] REFUSED TO START: %d of %d merge barriers are "
-                    "installed. Without all of them a held draw can be issued "
-                    "under state it never saw, which draws geometry in the "
-                    "wrong place. Nothing is being merged this session.",
-                    installed, total);
+                Log("[DrawMerger] REFUSED TO START: %d of %d device barriers "
+                    "installed, surface and query barriers %s. Without all of "
+                    "them a held draw can be issued under state it never saw, "
+                    "which draws geometry in the wrong place. Nothing is being "
+                    "merged this session.",
+                    installed, total, derived ? "in" : "MISSING");
             }
         }
     } else {
