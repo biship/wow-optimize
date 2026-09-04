@@ -1489,6 +1489,9 @@ static __declspec(naked) void g_bThunk_SurfLock() {
 static bool g_surfLockPatched = false;
 
 static void PatchSurfaceLock(void* surf) {
+    // The barriers install for the census too, where they only need to move the
+    // epoch. Patching another vtable is for the merger.
+    if (!Config::g_settings.OptDrawMerge) return;
     if (g_surfLockPatched || !surf) return;
     g_surfLockPatched = true;        // one attempt, win or lose
     if (!IsReadable((uintptr_t)surf)) { D3D9DrawMerge_Disable(); return; }
@@ -1533,6 +1536,7 @@ static bool g_queryIssuePatched = false;
 static HRESULT __stdcall Hooked_CreateQuery(void* dev, DWORD type, void** ppQuery) {
     HRESULT hr = g_origCreateQuery(dev, type, ppQuery);
     // A null ppQuery is the client asking whether the type is supported.
+    if (!Config::g_settings.OptDrawMerge) return hr;
     if (g_queryIssuePatched || FAILED(hr) || !ppQuery || !*ppQuery) return hr;
 
     g_queryIssuePatched = true;   // one attempt, win or lose
