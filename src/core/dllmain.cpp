@@ -2238,7 +2238,10 @@ static int WINAPI hooked_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCou
 
 static bool InstallNetworkHooks() {
     Log("Network hook: DISABLED for stability (native socket layer is optimal)");
-    return true;
+    // Returns false: it did not install. Returning true put it in the
+    // feature summary as a working feature, which is the same lie the
+    // summary was fixed for telling in the other direction.
+    return false;
 }
 
 // ================================================================
@@ -3365,7 +3368,10 @@ static BOOL WINAPI hooked_HeapValidate(HANDLE hHeap, DWORD dwFlags, LPCVOID lpMe
 
 static bool InstallHeapRedirectToMimalloc() {
     Log("Heap safety redirect bridge: DISABLED for stability (HeapAlloc redirection is inactive)");
-    return true;
+    // Returns false: it did not install. Returning true put it in the
+    // feature summary as a working feature, which is the same lie the
+    // summary was fixed for telling in the other direction.
+    return false;
 }
 
 // ================================================================
@@ -3818,7 +3824,10 @@ static HANDLE WINAPI hooked_GetCurrentThread(void) {
 
 static bool InstallThreadIdCacheHook() {
     Log("ThreadId cache: DISABLED for stability (native GetCurrentThreadId is optimal).");
-    return true;
+    // Returns false: it did not install. Returning true put it in the
+    // feature summary as a working feature, which is the same lie the
+    // summary was fixed for telling in the other direction.
+    return false;
 }
 
 // ================================================================
@@ -7637,7 +7646,9 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #if !TEST_DISABLE_HEAP_REDIRECT
     Log("--- Process Heap Redirect ---");
     bool heapRedirectOk = InstallHeapRedirectToMimalloc();
-    if (!heapRedirectOk) Log("[HeapRedirect] install failed -- process heap stays stock");
+    // The install says why it declined; "failed" would be a second and
+    // wrong explanation for the same line.
+    (void)heapRedirectOk;
 #else
     Log("[HeapRedirect] DISABLED via TEST_DISABLE_HEAP_REDIRECT");
 #endif
