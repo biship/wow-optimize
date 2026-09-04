@@ -146,7 +146,6 @@ const char*   g_contractReason  = nullptr;
 // sixteen - the control half has to write the slot too, or the two halves are
 // not comparing the same frame.
 bool g_abOn = true;
-bool g_abSubject = false;
 unsigned long g_scalarCalls = 0;
 
 bool Readable(uintptr_t p) {
@@ -402,12 +401,18 @@ bool Install() {
         return false;
     }
 
-    g_abSubject = AbTest::IsSubject("M2MatrixSlotSse2", &g_abOn);
+    // The return says whether this is the subject being alternated right now,
+    // which in a rotating run is false for everything but one slot. What the
+    // module needs from it is the flag, and the report reads the scalar count
+    // rather than a snapshot taken here.
+    AbTest::IsSubject("M2MatrixSlotSse2", &g_abOn);
     Log("[M2Slot] ACTIVE on %d of %d sites in sub_82F0F0. Each replaces sixteen "
         "fld/fstp pairs with four SSE2 loads and four stores; there is no "
         "arithmetic in either, so the bytes written are the bytes read.%s",
         done, (int)kSites,
-        g_abSubject ? " This is the A/B subject this session." : "");
+        Config::g_settings.OptAbTest
+            ? " The A/B harness owns the switch between the two halves."
+            : "");
     return true;
 }
 
@@ -462,10 +467,14 @@ void LogStats() {
         Log("[M2Slot]   %s is patched and was never reached.", g_site[kSiteA].name);
     if (g_site[kSiteB].patched && g_callsB == 0)
         Log("[M2Slot]   %s is patched and was never reached.", g_site[kSiteB].name);
-    if (g_abSubject) {
+    if (g_scalarCalls) {
         Log("[M2Slot]   the A/B control half moved %lu slot(s) four bytes at a "
             "time, so both halves wrote the slot and the comparison is between "
             "two ways of doing it rather than doing it and not.", g_scalarCalls);
+    } else if (Config::g_settings.OptAbTest) {
+        Log("[M2Slot]   the A/B harness never handed this an OFF stint, so "
+            "every slot above went out through the SSE2 path and there is no "
+            "control half to compare against.");
     }
 }
 
