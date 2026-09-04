@@ -141,12 +141,32 @@ unsigned char g_checkedB = 0;
 bool          g_contractFailed  = false;
 const char*   g_contractReason  = nullptr;
 
-// The flag the A/B harness owns. False switches both thunks back to a scalar
-// copy, which is the same sixty-four bytes moved four at a time rather than
-// sixteen - the control half has to write the slot too, or the two halves are
-// not comparing the same frame.
-bool g_abOn = true;
+// The flag the A/B harness owns, and it means "I am the subject being measured
+// right now" - not "run the fast path". The harness sets it true for whichever
+// subject is under test and false for every other one, so a module that read it
+// as a fast-path switch would run its control half through every other
+// subject's stint and never run one during its own.
+//
+// So the thunks test it, and when it is set they ask StandAside() which half of
+// the stint this is. That call is also how the harness learns the hot path was
+// reached at all during an OFF stint, which is what its own warning about a
+// meaningless null result depends on.
+//
+// The control half writes the slot too, four bytes at a time rather than
+// sixteen floats, because two halves that do not both write it are not
+// comparing the same frame.
+bool          g_abSubject  = false;
+unsigned char g_standAside = 0;
 unsigned long g_scalarCalls = 0;
+
+}  // namespace
+
+// The thunks are naked, so the stint question goes through a byte they can test.
+extern "C" void __cdecl M2MatrixSlot_StandAside(void) {
+    g_standAside = AbTest::StandAside() ? 1 : 0;
+}
+
+namespace {
 
 bool Readable(uintptr_t p) {
     if (p < 0x10000 || p > 0xFFE00000) return false;
@@ -228,8 +248,14 @@ __declspec(naked) void ThunkA() {
         popad
     a_checked:
 
-        cmp  byte ptr [g_abOn], 0
-        je   a_scalar
+        cmp  byte ptr [g_abSubject], 0
+        je   a_sse
+        pushad
+        call M2MatrixSlot_StandAside
+        popad
+        cmp  byte ptr [g_standAside], 0
+        jne  a_scalar
+    a_sse:
 
         movups xmm0, [eax]
         movups xmm1, [eax+16]
@@ -291,8 +317,14 @@ __declspec(naked) void ThunkB() {
         popad
     b_checked:
 
-        cmp  byte ptr [g_abOn], 0
-        je   b_scalar
+        cmp  byte ptr [g_abSubject], 0
+        je   b_sse
+        pushad
+        call M2MatrixSlot_StandAside
+        popad
+        cmp  byte ptr [g_standAside], 0
+        jne  b_scalar
+    b_sse:
 
         movups xmm0, [ebx]
         movups xmm1, [ebx+16]
@@ -401,11 +433,11 @@ bool Install() {
         return false;
     }
 
-    // The return says whether this is the subject being alternated right now,
-    // which in a rotating run is false for everything but one slot. What the
-    // module needs from it is the flag, and the report reads the scalar count
-    // rather than a snapshot taken here.
-    AbTest::IsSubject("M2MatrixSlotSse2", &g_abOn);
+    // The return is the flag's initial value, which is what the harness will
+    // drive from here on. The report reads the scalar count rather than a
+    // snapshot taken at install, because a rotating run reaches this subject
+    // long after this line.
+    g_abSubject = AbTest::IsSubject("M2MatrixSlotSse2", &g_abSubject);
     Log("[M2Slot] ACTIVE on %d of %d sites in sub_82F0F0. Each replaces sixteen "
         "fld/fstp pairs with four SSE2 loads and four stores; there is no "
         "arithmetic in either, so the bytes written are the bytes read.%s",
