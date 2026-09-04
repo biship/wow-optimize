@@ -98,6 +98,11 @@
 extern "C" void Log(const char* fmt, ...);
 
 MH_STATUS WineSafe_CreateHook(void* target, void* detour, void** original);
+
+// AnimCensus counts from inside this module's hook when both are switched on.
+extern "C" unsigned char g_animCensusPiggyback;
+extern "C" void __cdecl AnimCensus_NoteCall(void* This, int a2, int a3,
+                                            float a4, float a5, float a6);
 MH_STATUS WO_EnableHook(void* target);
 
 // File scope, and deliberately not inside a namespace: the naked thunk below
@@ -491,6 +496,24 @@ __declspec(naked) void HookedAnimateModel() {
         push edi
 
         mov  ebx, ecx                 // the model
+
+        // Hand the call to AnimCensus when it is switched on. One address takes
+        // one hook, and this module has it, so the census counts from in here
+        // rather than standing down and leaving the session with neither number.
+        cmp  byte ptr [g_animCensusPiggyback], 0
+        je   no_census
+        pushad
+        push dword ptr [ebp+18h]
+        push dword ptr [ebp+14h]
+        push dword ptr [ebp+10h]
+        push dword ptr [ebp+0Ch]
+        push dword ptr [ebp+08h]
+        push ebx
+        call AnimCensus_NoteCall
+        add  esp, 24
+        popad
+    no_census:
+
         push ebx
         call AnimLod_ShouldSkip
         add  esp, 4

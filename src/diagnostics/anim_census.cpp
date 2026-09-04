@@ -310,11 +310,10 @@ static uint32_t BoneCountOf(void* This) {
     }
 }
 
-static int __fastcall Hooked_AnimateModel(void* This, void* edx,
-                                          int a2, int a3, float a4, float a5, float a6) {
-    if (!g_active || GetCurrentThreadId() != g_mainThreadId)
-        return orig_AnimateModel(This, edx, a2, a3, a4, a5, a6);
-
+// The accounting, split out of the hook so AnimLod can hand it the calls when
+// that module owns the address instead. Everything in here reads the arguments
+// and the model and writes nothing the client can see.
+static void NoteCallInner(void* This, int a2, int a3, float a4, float a5, float a6) {
     InterlockedIncrement(&g_callsThisFrame);
 
     // Before anything else: which of the client's two early exits this call
@@ -382,6 +381,15 @@ static int __fastcall Hooked_AnimateModel(void* This, void* edx,
         }
     }
 
+}
+
+static int __fastcall Hooked_AnimateModel(void* This, void* edx,
+                                          int a2, int a3, float a4, float a5, float a6) {
+    if (!g_active || GetCurrentThreadId() != g_mainThreadId)
+        return orig_AnimateModel(This, edx, a2, a3, a4, a5, a6);
+
+    NoteCallInner(This, a2, a3, a4, a5, a6);
+
     // Sampled timing. Note this measures the call including everything it
     // recurses into, which is what a level-of-detail decision would actually
     // save, so it is the number worth having.
@@ -427,6 +435,20 @@ void OnFrame() {
     }
 }
 
+// Read from AnimLod's naked thunk, so a byte rather than a bool through a
+// function call.
+extern "C" unsigned char g_animCensusPiggyback = 0;
+
+// Called from AnimLod's hook when that module owns sub_82F0F0. Same accounting,
+// no hook of our own, and no timing: the timing wraps the original call and
+// AnimLod's thunk makes that call in assembly, sometimes not at all.
+extern "C" void __cdecl AnimCensus_NoteCall(void* This, int a2, int a3,
+                                            float a4, float a5, float a6) {
+    if (!g_active || !g_animCensusPiggyback) return;
+    if (GetCurrentThreadId() != g_mainThreadId) return;
+    NoteCallInner(This, a2, a3, a4, a5, a6);
+}
+
 bool Init() {
     if (!Config::g_settings.OptAnimCensus) return true;
 
@@ -439,8 +461,21 @@ bool Init() {
     // a player asked for. Saying so is the point: an absent census with AnimLod
     // on is a decision, and an absent census with AnimLod off would be a defect.
     if (Config::g_settings.OptAnimLod) {
-        Log("[AnimCensus] not installing: AnimLod owns sub_%08X and both were "
-            "switched on. Turn AnimLod off to measure with this.",
+        // Both switched on used to mean the census silently stood down, and a
+        // tester wanting both numbers had to run two sessions - which is why
+        // neither number has ever arrived. The two are wanted together: this
+        // says what the animation work is made of, and AnimLod's own report
+        // says how much of it a distance rule would have been allowed to skip.
+        //
+        // So the census rides along instead. AnimLod hands it every call from
+        // inside its own hook and nothing is hooked twice.
+        g_animCensusPiggyback = 1;
+        g_active = true;
+        CrashDumper::RegisterFeature("AnimCensus");
+        Log("[AnimCensus] riding along inside AnimLod's hook on sub_%08X, "
+            "because both are switched on and one address takes one hook. "
+            "Everything is counted except the sampled timing, which wraps the "
+            "call AnimLod makes in assembly and sometimes does not make.",
             (unsigned)ADDR_AnimateModel);
         return true;
     }
@@ -476,6 +511,18 @@ void LogStats() {
     double avgCalls = g_sumCalls / (double)g_frames;
     double avgBones = g_sumBones / (double)g_frames;
     double avgNs    = (g_sampledCount > 0) ? (g_sampledNs / (double)g_sampledCount) : 0.0;
+
+    if (g_animCensusPiggyback) {
+        Log("[AnimCensus] counted from inside AnimLod's hook this session, so "
+            "there is no per-model timing below. Everything else is here, and "
+            "AnimLod's own report carries the share a distance rule would have "
+            "been allowed to skip.");
+    } else {
+        Log("[AnimCensus] AnimLod was off, so this says what the animation work "
+            "is made of and nothing says how much of it a distance rule could "
+            "have skipped. Switching both on gives both numbers in one session: "
+            "the census rides inside AnimLod's hook rather than standing down.");
+    }
 
     Log("[AnimCensus] %.1f models/frame (peak %ld), %.0f bones/frame (peak %ld), "
         "%.0f bones per model, over %llu presented frames that animated something "
