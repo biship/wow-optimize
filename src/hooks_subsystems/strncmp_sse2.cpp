@@ -240,7 +240,18 @@ bool Init() {
 }
 
 void LogStats() {
-    if (!g_active) return;
+    // An A/B subject. A subject that prints nothing cannot answer whether its
+    // hot path was reached during an OFF stint, which is what decides whether a
+    // null result means anything.
+    if (!g_active) {
+        Log("[StrncmpSSE2] not measured: the replacement is not installed.");
+        return;
+    }
+    if (g_calls == 0) {
+        Log("[StrncmpSSE2] measured and zero: installed, and the client did not "
+            "compare a string through it.");
+        return;
+    }
     Log("[StrncmpSSE2] %ld calls", g_calls);
 }
 

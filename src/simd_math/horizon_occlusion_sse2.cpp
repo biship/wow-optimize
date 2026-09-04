@@ -537,7 +537,14 @@ bool Init() {
 }
 
 void LogStats() {
-    if (!g_active) return;
+    if (!g_active) {
+        // This is in the diagnostic run, so a tester who ticks it and gets no
+        // line back cannot tell a failed install from a quiet one.
+        Log("[Horizon] not measured: the replacement is not active. Either the "
+            "switch is off or the install refused - the reason is earlier in "
+            "this log.");
+        return;
+    }
     Log("[Horizon] %ld calls, %s",
         g_calls,
         g_abandoned ? "abandoned - the client's routine is doing the work"
