@@ -1990,9 +1990,13 @@ void D3D9StateManager_LogStats(void) {
             "that share is what a batching pass could remove; a small share means "
             "the draws are already as large as they get.",
             g_drawTiny, 100.0 * (double)g_drawTiny / (double)draws);
-        D3D9StateCache::LogMergeCensus();
-        D3D9StateCache::DrawMerge_LogStats();
     }
+
+    // Outside the "did this file count any draws" guard on purpose. Both of
+    // these say which of the three states they are in, and a session where the
+    // state manager counted nothing is exactly when that answer is wanted.
+    D3D9StateCache::LogMergeCensus();
+    D3D9StateCache::DrawMerge_LogStats();
 }
 
 // DXVK (and some other D3D9-on-Vulkan translation layers) can resize its
