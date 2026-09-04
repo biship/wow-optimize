@@ -357,7 +357,17 @@ bool Init() {
 static constexpr uint64_t QUIET_BELOW = 2000;
 
 void LogStats() {
-    if (!g_active || g_total == 0) return;
+    // In the diagnostic run and on by default, so a session with no [LuaCompile]
+    // line in it has to mean something other than "we did not look".
+    if (!g_active) {
+        Log("[LuaCompile] not measured: the census is not installed.");
+        return;
+    }
+    if (g_total == 0) {
+        Log("[LuaCompile] measured and zero: the client compiled no Lua through "
+            "the hooked entry point.");
+        return;
+    }
     if (g_total < QUIET_BELOW && g_reports > 0) return;
 
     ++g_reports;

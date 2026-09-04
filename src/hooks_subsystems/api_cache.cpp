@@ -447,7 +447,9 @@ void LogStats() {
         Log("[ApiCache] GetItemInfo: %ld hits, %ld misses (%.1f%% hit rate), %ld bypassed",
             g_itemHits, g_itemMisses, (double)g_itemHits / total * 100.0, g_itemBypassed);
     } else if (g_active) {
-        Log("[ApiCache] GetItemInfo: no calls");
+        Log("[ApiCache] GetItemInfo: measured and zero, no call reached it");
+    } else {
+        Log("[ApiCache] not measured: the cache is not installed.");
     }
 }
 

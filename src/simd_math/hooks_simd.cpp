@@ -1540,8 +1540,14 @@ bool InstallSimdHooks(void) {
 // appeared in a log, the same way the D3D9 hook counts had not. Called from the
 // periodic report now.
 void SimdHooks_LogStats(void) {
+    if (!Config::g_settings.OptSimdGeometry) {
+        Log("[SimdHooks] not measured: switched off.");
+        return;
+    }
     if (!g_matMulCalls && !g_quatNormCalls && !g_frustumCalls && !g_rayTriangleCalls) {
-        Log("[SimdHooks] no hooked call was seen this session");
+        Log("[SimdHooks] measured and zero: no hooked call was seen this "
+            "session. Whether that is because the hooks did not install is "
+            "earlier in this log.");
         return;
     }
     Log("[SimdHooks] calls, all lower bounds: matMul=%ld quatNorm=%ld "

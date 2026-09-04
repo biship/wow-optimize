@@ -210,7 +210,10 @@ bool Init() {
 }
 
 void LogStats() {
-    if (!Config::g_settings.OptVertexFmtInline) return;
+    if (!Config::g_settings.OptVertexFmtInline) {
+        Log("[VertexFmt] not measured: switched off.");
+        return;
+    }
     Log("[VertexFmt] %d sites inlined, %d left alone", g_patched, g_rejected);
 }
 
