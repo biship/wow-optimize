@@ -1126,13 +1126,19 @@ namespace WowOptimizeLauncher {
 
         // The counting questions, which are not the same session as the A/B run.
         //
+        // Counters only. Draw Call Merging is deliberately not here even though
+        // it prints a count: it changes what the renderer sends, and a build of
+        // it put a tester's world on screen as smeared triangles. A button that
+        // says it turns on counters does not turn that on.
+        //
         // These answer "how much of X is there", not "is X faster". Several of
         // them cost something to measure - the draw census wraps the busiest call
         // in the renderer - so running them during an A/B test would move the very
         // frame times that test is comparing. Two buttons, two sessions.
         private static readonly string[] DiagnosticKeys = new string[] {
             "DrawCensus",            // how many draw calls, how small, how many could merge
-            "DrawMerge",             // and whether issuing them as one actually saves calls
+            "AnimCensus",            // how many models and bones the animation update does
+            "LuaAllocCensus",        // what sizes the Lua VM allocates, and how often
             "LuaProtoCache",         // how much of the compiling is repeat work
             "LuaCompileCensus",      // and what is being compiled
             "HorizonOcclusionSse2",  // how long the horizon column scans really are
