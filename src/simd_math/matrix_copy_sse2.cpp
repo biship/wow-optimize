@@ -19,6 +19,10 @@ extern "C" void Log(const char* fmt, ...);
 // Both hooked functions run on the main WoW thread only;
 // atomic overhead would dwarf the work itself.
 // ================================================================
+// Whether the hooks went in, so the report can tell "never reached" from
+// "never installed".
+static bool g_matrixInstalled = false;
+
 static volatile long g_matcopy_calls = 0;
 static volatile long g_matident_calls = 0;
 
@@ -1409,10 +1413,66 @@ bool InstallMatrixCopySSE2() {
     Log("[MatrixSSE2] CMatrix::TranslateLocal DISABLED via feature flag");
 #endif
 
+    g_matrixInstalled = true;
 #if !TEST_DISABLE_MATRIX_COPY
     return installed == (int)(sizeof(hooks) / sizeof(hooks[0]));
 #else
     return true;
+#endif
+}
+
+// ================================================================
+// Statistics
+// ================================================================
+//
+// Fifteen counters, printed only from ShutdownMatrixCopySSE2 until now, which
+// nothing calls - the DLL leaves through TerminateProcess and the linker had
+// dropped the whole function. M2MatrixSimd is an A/B subject, and a subject
+// whose call counts cannot be read cannot answer "was its hot path reached
+// during the OFF stint", which is the question that decides whether a null
+// result means anything.
+//
+// One line, because fifteen lines of two-digit numbers is not a report. The
+// counts are plain increments on hot paths and are lower bounds.
+void MatrixCopySSE2_LogStats(void) {
+    if (!g_matrixInstalled) {
+        Log("[MatrixSSE2] not measured: the hooks are not installed.");
+        return;
+    }
+    const long total =
+        g_matcopy_calls + g_matident_calls + g_matmul_calls + g_matvec3_calls +
+        g_matvec4_calls + g_quat2mat_calls + g_quat2matfull_calls +
+        g_vec3norm_calls + g_mattranspose_calls + g_scale3x3_calls +
+        g_matfrom3x3_calls + g_pointxformip_calls + g_matinvrigid_calls
+#if !TEST_DISABLE_MATRIX_MISC_SSE2
+        + g_matscalarmul_calls
+#endif
+#if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
+        + g_mattranslate_calls
+#endif
+        ;
+    if (total == 0) {
+        Log("[MatrixSSE2] measured and zero: the hooks are in and the client "
+            "reached none of them.");
+        return;
+    }
+    Log("[MatrixSSE2] %ld call(s) through the SSE2 matrix hooks, lower bounds: "
+        "copy %ld, identity %ld, multiply %ld, matvec3 %ld, matvec4 %ld, "
+        "quat2mat %ld, quat2mat-fused %ld, vec3normalize %ld",
+        total, g_matcopy_calls, g_matident_calls, g_matmul_calls,
+        g_matvec3_calls, g_matvec4_calls, g_quat2mat_calls,
+        g_quat2matfull_calls, g_vec3norm_calls);
+    Log("[MatrixSSE2]   transpose %ld, scale3x3 %ld, from3x3 %ld, "
+        "pointxform-in-place %ld, invert-rigid %ld",
+        g_mattranspose_calls, g_scale3x3_calls, g_matfrom3x3_calls,
+        g_pointxformip_calls, g_matinvrigid_calls);
+    // These two are behind feature flags that are off, so the counters do not
+    // exist in this build and neither does a line claiming they are zero.
+#if !TEST_DISABLE_MATRIX_MISC_SSE2
+    Log("[MatrixSSE2]   scalar-mul %ld", g_matscalarmul_calls);
+#endif
+#if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
+    Log("[MatrixSSE2]   translate-local %ld", g_mattranslate_calls);
 #endif
 }
 

@@ -5290,6 +5290,7 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     LuaTobooleanInline_LogStats();
     StrtodFast_LogStats();
     RegexCache_LogStats();
+    MatrixCopySSE2_LogStats();
     ReportCrtFreeStats();
     if (g_spinTaken > 0 || g_spinSkipped > 0) {
         Log("[SleepPrecision] busy-wait taken %ld, handed back %ld (frames over "
