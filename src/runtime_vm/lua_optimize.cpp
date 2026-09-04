@@ -314,15 +314,35 @@ static long g_luaAllocStats_reallocMigrate = 0;
 // Adaptive GC: track net allocation bytes between frames.
 // This lets StepGC scale collection to match actual allocation pressure,
 // so heavy-addon users (300MB) and light users (100MB) both stay stable.
-static volatile LONG64 g_netAllocBytes = 0;   // net bytes allocated since last reset
-static volatile LONG64 g_frameAllocBytes = 0; // bytes allocated this frame (for smoothing)
+// Plain 32-bit, added to without a lock prefix.
+//
+// This sits in WoW's lua_Alloc, so every Lua object the client or an addon
+// allocates passes through one of the four sites below. It was LONG64 with
+// InterlockedAdd64, which on 32-bit x86 is a lock cmpxchg8b retry loop with a
+// bus lock - the shape that has eaten three optimisations in this project
+// already, twice on the very branch the feature existed to make fast.
+//
+// Signed 32 bits is enough: the value is reset every frame and holds plus or
+// minus two gigabytes, and a frame that nets more than that does not exist.
+// Signed because a free subtracts.
+//
+// The counter is written from the allocator and read once a frame by the GC
+// pacing below, both on the main thread - WoW runs Lua on one thread. A plain
+// `add [mem], reg` is not atomic, so if that ever stops being true an update
+// can be lost, which is the documented trade: a 32-bit increment can only lose
+// one, where add/adc across two words can tear the value into a number that was
+// never true. What reads it is an exponential average feeding a GC step size,
+// and it clamps negatives to zero.
+//
+// The reset stays interlocked. It runs once a frame, not once an allocation.
+static volatile LONG g_netAllocBytes = 0;   // net bytes since the last reset
 
 static void ResetAllocCounter() {
-    InterlockedExchange64(&g_netAllocBytes, 0);
+    InterlockedExchange(&g_netAllocBytes, 0);
 }
 
-static LONG64 GetAndResetNetAlloc() {
-    return InterlockedExchange64(&g_netAllocBytes, 0);
+static LONG GetAndResetNetAlloc() {
+    return InterlockedExchange(&g_netAllocBytes, 0);
 }
 
 static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t nsize) {
@@ -341,7 +361,7 @@ static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t 
                     g_origLuaAlloc(g_origLuaAllocUD, ptr, osize, 0);
                     g_luaAllocStats_freeLegacy++;
                 }
-                InterlockedAdd64(&g_netAllocBytes, -(LONG64)freedSize);
+                g_netAllocBytes -= (LONG)freedSize;
             }
             return NULL;
         }
@@ -350,7 +370,7 @@ static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t 
             g_luaAllocStats_malloc++;
             void* p = mi_malloc(nsize);
             if (p) {
-                InterlockedAdd64(&g_netAllocBytes, (LONG64)nsize);
+                g_netAllocBytes += (LONG)nsize;
             }
             return p;
         }
@@ -360,7 +380,7 @@ static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t 
             size_t oldUsable = mi_usable_size(ptr);
             void* p = mi_realloc(ptr, nsize);
             if (p) {
-                InterlockedAdd64(&g_netAllocBytes, (LONG64)nsize - (LONG64)oldUsable);
+                g_netAllocBytes += (LONG)nsize - (LONG)oldUsable;
             }
             return p;
         }
@@ -371,7 +391,7 @@ static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t 
             size_t copySize = (osize < nsize) ? osize : nsize;
             memcpy(newPtr, ptr, copySize);
             g_origLuaAlloc(g_origLuaAllocUD, ptr, osize, 0);
-            InterlockedAdd64(&g_netAllocBytes, (LONG64)nsize - (LONG64)osize);
+            g_netAllocBytes += (LONG)nsize - (LONG)osize;
         }
         return newPtr;
     }
