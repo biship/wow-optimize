@@ -151,6 +151,7 @@
 
 #include <windows.h>
 #include <cstdint>
+#include <cstdio>
 #include "MinHook.h"
 #include "version.h"
 #include "config.h"
@@ -187,6 +188,51 @@ double        g_nodesTotal   = 0.0;   // whole list length
 unsigned long g_scanNoMatch  = 0;     // walked it all and found nothing
 unsigned long g_scanLongest  = 0;
 
+// Can the found case be answered from the dependants list?
+//
+// The module cannot shortcut a call where the client will find a match, because
+// the answer is a position in the global list - put me immediately before the
+// first node that depends on me - and the dependants list at self+0x38 holds
+// those anchors in registration order, not list order.
+//
+// That argument only bites when there is more than one candidate. If exactly one
+// node in the whole list carries an accepting anchor to `self`, that node is the
+// match whatever the order is, and no order question arises. Two anchors on the
+// same frame are still one node.
+//
+// Which needs one fact nobody has: whether the owning node can be recovered from
+// an anchor. The scan reads anchors out of `node + 12 + s*4`, so if an anchor
+// lives at a fixed offset inside its own frame, `fn - node` is one of nine
+// constants and the owner is `fn` minus that constant. If it is not, the anchors
+// are separately allocated and the found case stays the client's.
+//
+// So the replay records `fn - node` for every match it sees. Nine distinct small
+// values, and the found case opens up; anything else, and it is closed for good
+// and the report says so rather than leaving it to be re-derived.
+constexpr int kMaxDeltas = 16;
+long     g_deltaValue[kMaxDeltas] = {};
+unsigned long g_deltaCount[kMaxDeltas] = {};
+int      g_deltaSeen  = 0;
+unsigned long g_deltaOverflow = 0;   // matches whose delta did not fit the table
+
+// How many accepting anchors `self` had when the client found a match, so the
+// share where a unique owner even exists is measured rather than assumed.
+unsigned long g_matchWithOneAccepting = 0;
+unsigned long g_matchWithManyAccepting = 0;
+
+void NoteDelta(long d) {
+    for (int i = 0; i < g_deltaSeen; i++) {
+        if (g_deltaValue[i] == d) { ++g_deltaCount[i]; return; }
+    }
+    if (g_deltaSeen < kMaxDeltas) {
+        g_deltaValue[g_deltaSeen] = d;
+        g_deltaCount[g_deltaSeen] = 1;
+        ++g_deltaSeen;
+        return;
+    }
+    ++g_deltaOverflow;
+}
+
 // Read-only replay of sub_489710's search: the first node in list order with an
 // anchor slot pointing at `self` and without 0x800 set. Nothing is written.
 void MeasureScan(uintptr_t self) {
@@ -196,6 +242,8 @@ void MeasureScan(uintptr_t self) {
         uint32_t walked  = 0;
         uint32_t matchAt = 0;
         bool     found   = false;
+        uint32_t matchFn = 0;
+        uint32_t matchNode = 0;
 
         while (node && (node & 1) == 0 && walked < 100000) {
             ++walked;
@@ -205,7 +253,9 @@ void MeasureScan(uintptr_t self) {
                     if (!fn) continue;
                     if (*(const uint32_t*)(fn + 12) & 0x800) continue;
                     if (*(const uint32_t*)(fn + 8) == (uint32_t)self) {
-                        found = true; matchAt = walked; break;
+                        found = true; matchAt = walked;
+                        matchFn = fn; matchNode = node;
+                        break;
                     }
                 }
             }
@@ -214,8 +264,24 @@ void MeasureScan(uintptr_t self) {
 
         g_scansSeen++;
         g_nodesTotal += (double)walked;
-        if (found) g_nodesToMatch += (double)matchAt;
-        else       g_scanNoMatch++;
+        if (found) {
+            g_nodesToMatch += (double)matchAt;
+            NoteDelta((long)((int32_t)matchFn - (int32_t)matchNode));
+
+            // And how many accepting anchors this frame has at all. One means
+            // the match is unambiguous without any notion of list order.
+            unsigned accepting = 0;
+            uint32_t e = *(const uint32_t*)(self + 0x38);
+            unsigned n = 0;
+            while (e != 0 && (e & 1) == 0 && ++n <= 64) {
+                if ((*(const uint32_t*)(e + 12) & 0x800) == 0) ++accepting;
+                e = *(const uint32_t*)(e + 4);
+            }
+            if (accepting == 1) ++g_matchWithOneAccepting;
+            else                ++g_matchWithManyAccepting;
+        } else {
+            g_scanNoMatch++;
+        }
         if (walked > g_scanLongest) g_scanLongest = walked;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
@@ -579,6 +645,36 @@ void LogStats() {
             "list means the scan cannot be where the time goes and the target "
             "is wrong; a long one with the match near the end is what an index "
             "would be worth.");
+
+        // Whether the found case can ever be answered from the dependants list.
+        if (matched == 0) {
+            Log("[LayoutRelink]   no sampled call found a match, so nothing here "
+                "says whether the owning node can be recovered from an anchor.");
+        } else {
+            Log("[LayoutRelink]   of those %lu matches, %lu had exactly one "
+                "accepting anchor on this frame and %lu had more. The single "
+                "ones need no notion of list order at all: one accepting anchor "
+                "means one node can match, whichever order the list is in.",
+                matched, g_matchWithOneAccepting, g_matchWithManyAccepting);
+            char line[512];
+            int w = _snprintf(line, sizeof(line) - 1,
+                              "[LayoutRelink]   anchor-minus-node offsets seen:");
+            for (int i = 0; i < g_deltaSeen && w > 0 && w < (int)sizeof(line) - 40; i++)
+                w += _snprintf(line + w, sizeof(line) - 1 - w, " %+ld(x%lu)",
+                               g_deltaValue[i], g_deltaCount[i]);
+            line[sizeof(line) - 1] = 0;
+            Log("%s", line);
+            if (g_deltaOverflow) {
+                Log("[LayoutRelink]   and %lu more that did not fit the table, "
+                    "which on its own means the offset is not a small fixed set.",
+                    g_deltaOverflow);
+            }
+            Log("[LayoutRelink]   a handful of small fixed values there means an "
+                "anchor sits at a known offset inside its own frame, the owning "
+                "node is the anchor minus that offset, and the found case stops "
+                "being the client's to answer. Scattered values mean anchors are "
+                "allocated apart from their frame and it stays closed.");
+        }
     }
     if (g_pessimistic > 0) {
         Log("[LayoutRelink] %ld of the deferred calls had a non-empty +0x38 but "
