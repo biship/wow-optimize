@@ -681,6 +681,10 @@ static HRESULT __stdcall Hooked_Present(void* dev, const RECT* src, const RECT* 
     // should never have anything to do. It is here so that nothing can be held
     // across a presented frame even if EndScene is skipped.
     if (g_drawMergePending) D3D9DrawMerge_FlushPending();
+    // The census counts draws per frame and needs the frame boundary. Its own
+    // Present hook is in the dead half of d3d9_state_cache.cpp, which is why
+    // every report so far said "installed but no frame was presented".
+    D3D9StateCache::NoteFrameForDrawCensus();
     FrameBench::OnPresent(FrameBench::Source::D3D9Present);
     WowOpt_OnFrameBoundary();
 
@@ -1316,7 +1320,12 @@ void D3D9StateManager_GetBarrierState(int* installed, int* total,
 }
 
 static void PatchBarriers(uintptr_t* vtable) {
-    if (!Config::g_settings.OptDrawCensus) return;
+    // Both, and not just the census. The merger holds a draw call and needs
+    // these to let it go again; gating them on the census alone meant a tester
+    // who ticked only Draw Call Merging ran the merger with thirty of its
+    // forty-four barriers missing, and geometry came out drawn under the
+    // transform of whatever was in front of it.
+    if (!Config::g_settings.OptDrawCensus && !Config::g_settings.OptDrawMerge) return;
     for (int i = 0; i < NUM_BARRIERS; i++) {
         Barrier& b = g_barriers[i];
         if (b.patched) continue;
@@ -1392,7 +1401,7 @@ static bool PatchDeviceVTable(void* pDevice) {
     g_pPatchedVTable = vtable;
     g_deviceHooked = true;
     InterlockedIncrement(&g_deviceResetCounter);
-    if (Config::g_settings.OptDrawCensus) {
+    if (Config::g_settings.OptDrawCensus || Config::g_settings.OptDrawMerge) {
         Log("[D3D9State] %d of %d merge barriers installed. These bump the state "
             "epoch and jump straight to the original, so the draw-merge census "
             "stops counting a pair as joinable when the client changed a shader "

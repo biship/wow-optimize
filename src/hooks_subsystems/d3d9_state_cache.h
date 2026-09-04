@@ -20,6 +20,8 @@ void ReportDrawCensus();
 // beside the draw census, because on its own it says nothing.
 void LogMergeCensus();
 void DrawMerge_LogStats(void);
+// One presented frame, for the draws-per-frame distribution.
+void NoteFrameForDrawCensus();
 
 // Handle device creation (resolve pointers and install hooks)
 void OnCreateDevice(struct IDirect3DDevice9* device);

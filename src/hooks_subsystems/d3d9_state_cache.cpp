@@ -1054,10 +1054,28 @@ void InstallDrawHooks(void* origDrawPrimitive, void* origDrawIndexed) {
         MH_EnableHook(origDrawIndexed);
         Log("[DrawCensus] Counting draw calls per frame");
         if (Config::g_settings.OptDrawMerge) {
-            g_mergeOn = true;
-            Log("[DrawMerger] ACTIVE: consecutive triangle-list draws that "
-                "continue each other in the index buffer with no state change "
-                "between them go out as one call.");
+            // Holding a draw is only safe while every way the client can change
+            // what that draw produces is caught. Thirty of those are barrier
+            // thunks in the device vtable, and running without them is not a
+            // degraded measurement, it is wrong output: a draw held across a
+            // vertex shader constant write comes back drawn under the previous
+            // object's transform, which is what the screen looked like.
+            int installed = 0, total = 0;
+            unsigned long stateBlocks = 0;
+            D3D9StateManager_GetBarrierState(&installed, &total, &stateBlocks);
+            if (total > 0 && installed == total) {
+                g_mergeOn = true;
+                Log("[DrawMerger] ACTIVE: consecutive triangle-list draws that "
+                    "continue each other in the index buffer with no state "
+                    "change between them go out as one call. All %d barriers "
+                    "are in.", total);
+            } else {
+                Log("[DrawMerger] REFUSED TO START: %d of %d merge barriers are "
+                    "installed. Without all of them a held draw can be issued "
+                    "under state it never saw, which draws geometry in the "
+                    "wrong place. Nothing is being merged this session.",
+                    installed, total);
+            }
         }
     } else {
         orig_DrawIndexedPrimitive = nullptr;
