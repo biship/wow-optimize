@@ -8760,8 +8760,9 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- SavedVariables Async Writer ---");
 #if !TEST_DISABLE_SAVED_VARS_ASYNC
     // Same correction as NameplateMT: InstallSavedVarsAsync is a stub that logs
-    // "Bypassed for stability" and returns true, so there is nothing on a
-    // background thread to keep off Wine either.
+    // "Bypassed for stability", so there is nothing on a background thread to
+    // keep off Wine either. It returns false now, so the feature summary stops
+    // counting it as a working feature.
     bool savedVarsAsyncOk = Config::g_settings.OptSavedVarsAsync && InstallSavedVarsAsync();
 #else
     bool savedVarsAsyncOk = false;
