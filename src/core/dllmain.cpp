@@ -5148,7 +5148,8 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
         double usedMB = (double)g_vaArenaUsedPages * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
         double peakMB = (double)g_vaArenaPeakPages * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
         double capMB  = (double)VA_ARENA_MAX_PAGES * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
-        Log("[Stats] VA Arena: %ld hits, %ld fallbacks, %ld fail (%.1f%% arena, %.1f MB used, %.1f MB peak of %.0f MB)",
+        Log("[Stats] VA Arena: %ld hits, %ld did not qualify, %ld qualified and "
+            "failed to commit (%.1f%% arena, %.1f MB used, %.1f MB peak of %.0f MB)",
             g_vaArenaHits, g_vaArenaFallbacks, g_vaArenaFailures,
             arenaPct, usedMB, peakMB, capMB);
         // g_vaArenaFull is the key sizing signal: qualifying allocations we had
@@ -10591,6 +10592,11 @@ static LPVOID WINAPI Hooked_VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD 
             SIZE_T spanSize = (SIZE_T)pagesNeeded * VA_ARENA_PAGE_SIZE;
             LPVOID committed = orig_VirtualAlloc(result, spanSize, MEM_COMMIT, flProtect);
             if (!committed) {
+                // The request qualified, the arena had room, and the commit
+                // failed anyway. That is a different thing from a request that
+                // never qualified, and both used to land in the fallback count
+                // while the "fail" column printed a zero nothing wrote to.
+                InterlockedIncrement(&g_vaArenaFailures);
                 // Rollback bitmap + span
                 AcquireSRWLockExclusive(&g_vaArenaLock);
                 for (DWORD i = 0; i < pagesNeeded; i++) {
@@ -10605,6 +10611,7 @@ static LPVOID WINAPI Hooked_VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD 
             InterlockedIncrement(&g_vaArenaHits);
             return result;
         } __except(EXCEPTION_EXECUTE_HANDLER) {
+            InterlockedIncrement(&g_vaArenaFailures);
             goto va_fallback;
         }
 #endif
