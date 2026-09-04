@@ -299,6 +299,21 @@ static void BuildKnownFuncTable() {
         // percentages were never the hard part, working out what they belonged to
         // was.
         { 0x0082F0F0,  6267, "M2_AnimateModel" },        // bone tracks + matrix per bone
+
+        // The four blocks the fld/fstp scan found and nothing has ever claimed.
+        // None of them has profile evidence, which is exactly why they are here:
+        // the fine histogram reports raw addresses for anything hot, and a raw
+        // address needs this build's linker map to resolve. Named, one uncapped
+        // session answers whether any of them is worth replacing, and the answer
+        // may well be no.
+        //
+        // Each holds a run of pure fld/fstp with no arithmetic between - the one
+        // shape that vectorises with no precision argument at all. See
+        // m2_matrix_slot_sse2.cpp for what claiming one looks like.
+        { 0x00823130,  2909, "PureFloatMove_sub823130" },   // 32/32 block at 0x008236B3
+        { 0x008EDFC0,  2410, "PureFloatMove_sub8EDFC0" },   // 24/24 at 0x008EE463, 0x008EE746
+        { 0x007762A0,  1303, "PureFloatMove_sub7762A0" },   // 20/20 at 0x00776448
+        { 0x0094A440,   785, "PureFloatMove_sub94A440" },   // 21/21 at 0x0094A649
         { 0x00828680,   885, "M2_AnimTrackQuat" },
         // 3.35% of executing time in the corrected profile, and it showed as
         // "wow!0x00829D29" - a raw address that cost a func_profile call to place.
