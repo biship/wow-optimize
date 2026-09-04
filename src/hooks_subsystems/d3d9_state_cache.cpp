@@ -680,6 +680,14 @@ static UINT     g_pendPrims = 0;
 static UINT     g_pendHeld  = 0;   // draws folded into it, one or more
 static unsigned long g_pendEpoch = 0;
 
+// The thread that held the first draw. Draws come from one thread here, but
+// D3d9RenderThread replays state setters on a second one, and a setter is a
+// barrier - so a held draw could be issued from a thread that never made it,
+// against state kept in plain non-atomic variables. Nothing in this build
+// actually reaches that path (the queueing hooks are in the dead half of this
+// file), which is a reason to check rather than a reason to assume.
+static unsigned long g_mergeThread = 0;
+
 // Long chains are where the win is, but an unbounded one delays geometry for
 // no extra saving worth the exposure.
 static constexpr UINT kMaxHeld = 64;
@@ -694,10 +702,20 @@ static uint64_t g_flushCap     = 0;   // the chain hit kMaxHeld
 static uint64_t g_flushLock    = 0;   // a buffer was locked
 static uint64_t g_flushTexLock = 0;   // a texture was locked
 static uint64_t g_mergeFailed  = 0;   // the merged call itself returned an error
+static unsigned char g_foreignThread = 0;  // a second thread reached the merger
 
 extern "C" void __cdecl D3D9DrawMerge_FlushPending(void) {
     if (!g_drawMergePending) return;
     g_drawMergePending = 0;
+
+    // Issued from whichever thread got here: the draw is already late and the
+    // client asked for it before whatever is about to happen. Merging stops
+    // after it, because the state it was held against is not shared safely.
+    const unsigned long here = GetCurrentThreadId();
+    if (g_mergeThread && here != g_mergeThread) {
+        g_foreignThread = 1;
+        g_mergeOn = false;
+    }
 
     if (g_pendHeld >= 2) {
         g_callsSaved += g_pendHeld - 1;
@@ -765,6 +783,14 @@ static inline bool MergeIndexedDraw(IDirect3DDevice9* device, D3DPRIMITIVETYPE t
     }
 
     if (type != D3DPT_TRIANGLELIST) return false;
+
+    const unsigned long here = GetCurrentThreadId();
+    if (g_mergeThread == 0) g_mergeThread = here;
+    if (here != g_mergeThread) {
+        g_foreignThread = 1;
+        g_mergeOn = false;
+        return false;
+    }
 
     g_pendDevice = device;
     g_pendType   = type;
@@ -915,6 +941,12 @@ void DrawMerge_LogStats(void) {
             "nothing could be merged. It needs the same device vtable the draw "
             "census uses.");
         return;
+    }
+    if (g_foreignThread) {
+        Log("[DrawMerger] STOPPED: a second thread reached the merger. Its "
+            "state is plain non-atomic variables held between two draws, so a "
+            "held draw could be issued against state another thread had "
+            "already changed. Merging was switched off at that point.");
     }
     if (g_disabledByStateBlock) {
         Log("[DrawMerger] STOPPED: the client created a state block. Applying "
