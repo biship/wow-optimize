@@ -996,6 +996,37 @@ static __declspec(naked) void g_bThunk_UpdateTexture() {
     }
 }
 
+// Reading back what has been drawn. A held draw has not reached the target
+// yet, so a readback that happens first sees the frame without it - a
+// screenshot missing a model, a portrait missing its character.
+static void* g_bOrig_GetRenderTargetData = nullptr;
+static __declspec(naked) void g_bThunk_GetRenderTargetData() {
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_GetRenderTargetData]
+    }
+}
+
+static void* g_bOrig_GetFrontBufferData = nullptr;
+static __declspec(naked) void g_bThunk_GetFrontBufferData() {
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_GetFrontBufferData]
+    }
+}
+
 static void* g_bOrig_StretchRect = nullptr;
 static __declspec(naked) void g_bThunk_StretchRect() {
     __asm {
@@ -1384,10 +1415,66 @@ static __declspec(naked) void g_bThunk_EndStateBlock() {
     }
 }
 
+// An occlusion query counts the pixels drawn between its two Issue calls. A
+// held draw issued after the closing Issue is not counted, and the client then
+// hides something it should have drawn - or draws something it should not.
+//
+// Issue lives on the query object, not the device, so nothing in the device
+// vtable can see it. IDirect3DQuery9 puts Issue at slot 6 and every query a
+// D3D9 implementation returns shares one vtable, so the first query created
+// gets that slot patched. CreateQuery is a real hook rather than a naked thunk
+// because the object only exists after the original has run.
+static void* g_bOrig_QueryIssue = nullptr;
+static __declspec(naked) void g_bThunk_QueryIssue() {
+    __asm {
+        inc dword ptr [g_stateEpoch]
+        cmp byte ptr [g_drawMergePending], 0
+        je  nothing_held
+        pushad
+        call D3D9DrawMerge_FlushPending
+        popad
+    nothing_held:
+        jmp dword ptr [g_bOrig_QueryIssue]
+    }
+}
+
+typedef HRESULT (__stdcall *CreateQuery_t)(void*, DWORD, void**);
+static CreateQuery_t g_origCreateQuery = nullptr;
+static bool g_queryIssuePatched = false;
+
+static HRESULT __stdcall Hooked_CreateQuery(void* dev, DWORD type, void** ppQuery) {
+    HRESULT hr = g_origCreateQuery(dev, type, ppQuery);
+    // A null ppQuery is the client asking whether the type is supported.
+    if (g_queryIssuePatched || FAILED(hr) || !ppQuery || !*ppQuery) return hr;
+
+    g_queryIssuePatched = true;   // one attempt, win or lose
+    void* q = *ppQuery;
+    if (!IsReadable((uintptr_t)q)) { D3D9DrawMerge_Disable(); return hr; }
+    uintptr_t* vt = *(uintptr_t**)q;
+    if (!vt || !IsReadable((uintptr_t)vt)) { D3D9DrawMerge_Disable(); return hr; }
+    uintptr_t orig = vt[6];
+    DWORD prot;
+    if (!IsReadable(orig) ||
+        !VirtualProtect(&vt[6], sizeof(void*), PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[DrawMerger] could not make query Issue a merge barrier. Merging "
+            "stops here.");
+        D3D9DrawMerge_Disable();
+        return hr;
+    }
+    g_bOrig_QueryIssue = (void*)orig;
+    vt[6] = (uintptr_t)g_bThunk_QueryIssue;
+    VirtualProtect(&vt[6], sizeof(void*), prot, &prot);
+    Log("[DrawMerger] query Issue is a merge barrier now (first query type %lu).",
+        (unsigned long)type);
+    return hr;
+}
+
 struct Barrier { int vt; const char* name; void* thunk; void** origSlot; bool patched; };
 static Barrier g_barriers[] = {
     {  30, "UpdateSurface", (void*)g_bThunk_UpdateSurface, &g_bOrig_UpdateSurface, false },
     {  31, "UpdateTexture", (void*)g_bThunk_UpdateTexture, &g_bOrig_UpdateTexture, false },
+    {  32, "GetRenderTargetData", (void*)g_bThunk_GetRenderTargetData, &g_bOrig_GetRenderTargetData, false },
+    {  33, "GetFrontBufferData", (void*)g_bThunk_GetFrontBufferData, &g_bOrig_GetFrontBufferData, false },
     {  34, "StretchRect", (void*)g_bThunk_StretchRect, &g_bOrig_StretchRect, false },
     {  35, "ColorFill", (void*)g_bThunk_ColorFill, &g_bOrig_ColorFill, false },
     {  37, "SetRenderTarget", (void*)g_bThunk_SetRenderTarget, &g_bOrig_SetRenderTarget, false },
@@ -1416,6 +1503,7 @@ static Barrier g_barriers[] = {
     { 113, "SetPixelShaderConstantB", (void*)g_bThunk_SetPixelShaderConstantB, &g_bOrig_SetPixelShaderConstantB, false },
     {  59, "CreateStateBlock", (void*)g_bThunk_CreateStateBlock, &g_bOrig_CreateStateBlock, false },
     {  61, "EndStateBlock", (void*)g_bThunk_EndStateBlock, &g_bOrig_EndStateBlock, false },
+    { 118, "CreateQuery", (void*)Hooked_CreateQuery, (void**)&g_origCreateQuery, false },
 };
 static const int NUM_BARRIERS = (int)(sizeof(g_barriers) / sizeof(g_barriers[0]));
 static int g_barriersPatched = 0;

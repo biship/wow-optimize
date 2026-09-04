@@ -645,10 +645,14 @@ static inline void NoteMergeChance(DWORD type, INT baseVertex,
 // What must flush it, and where each one is caught:
 //
 //   the fourteen wrapped setters      D3D9_StateBarrier() in d3d9_state_manager
-//   thirty more device methods        the naked barrier thunks, same file
+//   thirty-three device methods       the naked barrier thunks, same file
 //   Present and Reset                 their hooks in d3d9_state_manager
 //   a different kind of draw          Hooked_DrawPrimitive below
 //   a vertex or index buffer lock     the Lock thunks in d3d9_state_manager
+//   a texture lock that can write     the texture Lock thunks, same file
+//   an occlusion query opening or     the query Issue thunk, patched from
+//     closing                           CreateQuery
+//   a readback of the render target   GetRenderTargetData, GetFrontBufferData
 //   a chain getting long              kMaxHeld
 //
 // What is NOT caught, and is why this is off by default:
