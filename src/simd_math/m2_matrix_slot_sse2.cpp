@@ -93,12 +93,24 @@ namespace M2MatrixSlot {
 
 namespace {
 
-enum { kSiteA = 0, kSiteB = 1, kSites = 2 };
+enum { kSiteA = 0, kSiteB = 1, kSiteC = 2, kSites = 3 };
 
 const unsigned char kHeadA[8] = { 0xD9, 0x00, 0x8B, 0x8E, 0x98, 0x00, 0x00, 0x00 };
 const unsigned char kTailA[6] = { 0xD9, 0x40, 0x3C, 0xD9, 0x59, 0x3C };
 const unsigned char kHeadB[8] = { 0x8B, 0x86, 0x98, 0x00, 0x00, 0x00, 0xDD, 0xD8 };
 const unsigned char kTailB[6] = { 0xD9, 0x43, 0x3C, 0xD9, 0x58, 0x3C };
+const unsigned char kHeadC[6] = { 0xD9, 0x9E, 0x88, 0x00, 0x00, 0x00 };
+const unsigned char kTailC[6] = { 0xD9, 0x95, 0x68, 0xFF, 0xFF, 0xFF };
+
+// Row-major, which is what the thirty-five stores at site C write. Aligned
+// so the loads are the cheap encoding; the destinations are frame slots and
+// their alignment is the client's business, so the stores stay unaligned.
+__declspec(align(16)) const float kIdentity[16] = {
+    1.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 1.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 1.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 1.0f
+};
 
 struct Site {
     const char*          name;
@@ -115,12 +127,15 @@ struct Site {
 
 void ThunkA();
 void ThunkB();
+void ThunkC();
 
 Site g_site[kSites] = {
     { "sub_82F0F0 site A", 0x0082FE54, 0x0082FEBE, kHeadA, 8, kTailA, 6,
       nullptr, (void*)0x0082FEC4, false },
     { "sub_82F0F0 site B", 0x0082FECB, 0x0082FF34, kHeadB, 8, kTailB, 6,
       nullptr, (void*)0x0082FF3A, false },
+    { "sub_82F0F0 site C", 0x0082F354, 0x0082F3FB, kHeadC, 6, kTailC, 6,
+      nullptr, (void*)0x0082F401, false },
 };
 
 unsigned char g_saved[kSites][8] = {};
@@ -130,10 +145,12 @@ unsigned char g_saved[kSites][8] = {};
 // somewhere that was never checked.
 void* g_retA = (void*)0x0082FEC4;
 void* g_retB = (void*)0x0082FF3A;
+void* g_retC = (void*)0x0082F401;
 
 // Main thread only, so plain. Lower bounds if that ever stops being true.
 unsigned long g_callsA = 0;
 unsigned long g_callsB = 0;
+unsigned long g_callsC = 0;
 
 // The one-time contract check, per site.
 unsigned char g_checkedA = 0;
@@ -363,6 +380,100 @@ __declspec(naked) void ThunkB() {
     }
 }
 
+// Site C initialises two identity matrices and a zero vec3 in the frame, as
+// thirty-five x87 stores of fld1 and fldz with an fxch in the middle. It runs
+// once per call rather than once per bone, and a session on the animation hook
+// counted 24.8 million calls.
+//
+// Everything about it is a store of a constant, so there is nothing to measure
+// about precision: fld1 stores 0x3F800000 and fldz stores zero, and so does a
+// move of the same bytes.
+//
+// Two things the replacement has to preserve besides the values. The block
+// leaves both constants on the x87 stack - the stores are fst, not fstp - with
+// 1.0 on top after the fxch, so it ends fldz then fld1. And the flags the jz at
+// 0x0082F401 tests come from `cmp edx, edi` in the middle of the storm, so the
+// compare is the last thing before the jump and nothing after it touches flags.
+//
+// The frame offsets were decoded from the instruction bytes rather than read off
+// IDA's frame table: [ebp-0x50] for the first matrix, [ebp-0xD4] for the second,
+// [ebp-0x5C] for the three zeros, [ebp+0x10] for the argument slot. The head and
+// tail signatures are the check on those, because they are the same bytes the
+// offsets came out of.
+__declspec(naked) void ThunkC() {
+    __asm {
+        fstp dword ptr [esi+88h]
+
+        cmp  byte ptr [g_abSubject], 0
+        je   c_sse
+        pushad
+        call M2MatrixSlot_StandAside
+        popad
+        cmp  byte ptr [g_standAside], 0
+        jne  c_scalar
+    c_sse:
+        movups xmm0, [kIdentity]
+        movups xmm1, [kIdentity+16]
+        movups xmm2, [kIdentity+32]
+        movups xmm3, [kIdentity+48]
+        movups [ebp-50h], xmm0
+        movups [ebp-40h], xmm1
+        movups [ebp-30h], xmm2
+        movups [ebp-20h], xmm3
+        movups [ebp-0D4h], xmm0
+        movups [ebp-0C4h], xmm1
+        movups [ebp-0B4h], xmm2
+        movups [ebp-0A4h], xmm3
+        xorps  xmm4, xmm4
+        movlps qword ptr [ebp-5Ch], xmm4
+        movss  dword ptr [ebp-54h], xmm4
+        inc  dword ptr [g_callsC]
+        jmp  c_done
+
+    c_scalar:
+        push edi
+        push esi
+        lea  edi, [ebp-50h]
+        mov  esi, offset kIdentity
+        mov  ecx, 16
+    c_l1:
+        mov  eax, [esi]
+        mov  [edi], eax
+        add  esi, 4
+        add  edi, 4
+        dec  ecx
+        jnz  c_l1
+        lea  edi, [ebp-0D4h]
+        mov  esi, offset kIdentity
+        mov  ecx, 16
+    c_l2:
+        mov  eax, [esi]
+        mov  [edi], eax
+        add  esi, 4
+        add  edi, 4
+        dec  ecx
+        jnz  c_l2
+        xor  eax, eax
+        mov  [ebp-5Ch], eax
+        mov  [ebp-58h], eax
+        mov  [ebp-54h], eax
+        pop  esi
+        pop  edi
+        inc  dword ptr [g_scalarCalls]
+
+    c_done:
+        // Both constants back on the x87 stack, 1.0 on top, as the block left
+        // them.
+        fldz
+        fld1
+        mov  edx, [esi+64h]
+        mov  [ebp+10h], edi
+        // Last, because the jz at the return address reads these flags.
+        cmp  edx, edi
+        jmp  dword ptr [g_retC]
+    }
+}
+
 bool BytesMatch(uintptr_t addr, const unsigned char* want, int len) {
     if (!Readable(addr) || !Readable(addr + (uintptr_t)len - 1)) return false;
     return memcmp((const void*)addr, want, (size_t)len) == 0;
@@ -422,6 +533,7 @@ bool Install() {
 
     g_site[kSiteA].thunk = (void*)&ThunkA;
     g_site[kSiteB].thunk = (void*)&ThunkB;
+    g_site[kSiteC].thunk = (void*)&ThunkC;
 
     int done = 0;
     for (int i = 0; i < kSites; ++i)
@@ -438,9 +550,11 @@ bool Install() {
     // snapshot taken at install, because a rotating run reaches this subject
     // long after this line.
     g_abSubject = AbTest::IsSubject("M2MatrixSlotSse2", &g_abSubject);
-    Log("[M2Slot] ACTIVE on %d of %d sites in sub_82F0F0. Each replaces sixteen "
-        "fld/fstp pairs with four SSE2 loads and four stores; there is no "
-        "arithmetic in either, so the bytes written are the bytes read.%s",
+    Log("[M2Slot] ACTIVE on %d of %d sites in sub_82F0F0. Two replace sixteen "
+        "fld/fstp pairs each with four SSE2 loads and four stores; the third "
+        "replaces thirty-five stores of 1.0 and 0.0 that build two identity "
+        "matrices. There is no arithmetic in any of them, so the bytes written "
+        "are the bytes read.%s",
         done, (int)kSites,
         Config::g_settings.OptAbTest
             ? " The A/B harness owns the switch between the two halves."
@@ -483,7 +597,7 @@ void LogStats() {
             "disassembly and something about it is wrong.", g_contractReason);
     }
 
-    const unsigned long total = g_callsA + g_callsB;
+    const unsigned long total = g_callsA + g_callsB + g_callsC;
     if (total == 0 && g_scalarCalls == 0) {
         Log("[M2Slot] measured and zero: %d of %d sites patched and neither was "
             "reached. The client animated no model through this path.",
@@ -491,14 +605,18 @@ void LogStats() {
         return;
     }
 
-    Log("[M2Slot] %lu matrix slot(s) written, %lu at site A and %lu at site B, "
-        "%d of %d sites patched. Counts are plain increments on the animation "
-        "path and are lower bounds.",
-        total, g_callsA, g_callsB, patched, (int)kSites);
+    Log("[M2Slot] %lu block(s) written: %lu bone matrix slots at site A, %lu at "
+        "site B, and %lu frame initialisations at site C, over %d of %d sites "
+        "patched. A and B run once per bone and C once per call, so they are not "
+        "the same unit. Counts are plain increments on the animation path and "
+        "are lower bounds.",
+        total, g_callsA, g_callsB, g_callsC, patched, (int)kSites);
     if (g_site[kSiteA].patched && g_callsA == 0)
         Log("[M2Slot]   %s is patched and was never reached.", g_site[kSiteA].name);
     if (g_site[kSiteB].patched && g_callsB == 0)
         Log("[M2Slot]   %s is patched and was never reached.", g_site[kSiteB].name);
+    if (g_site[kSiteC].patched && g_callsC == 0)
+        Log("[M2Slot]   %s is patched and was never reached.", g_site[kSiteC].name);
     if (g_scalarCalls) {
         Log("[M2Slot]   the A/B control half moved %lu slot(s) four bytes at a "
             "time, so both halves wrote the slot and the comparison is between "
