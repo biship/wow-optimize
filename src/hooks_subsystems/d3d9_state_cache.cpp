@@ -501,7 +501,29 @@ bool Init() {
 
 
     InvalidateCache();
-    Log("[D3D9StateCache] Initialized (waiting for device hooks)");
+    // The device hooks are never going to arrive, and saying "waiting for" them
+    // for the length of a session is worse than saying nothing.
+    //
+    // They are installed by OnCreateDevice below, which is reached only from
+    // render_state_dedup's CreateDevice detour, and that file is compiled out by
+    // TEST_DISABLE_RENDER_STATE_DEDUP - set to 1 after it was found triple-
+    // hooking the same setters as this file and d3d9_state_manager. So the
+    // linker discards OnCreateDevice and everything only it calls.
+    //
+    // What is missing with it: this file's own redundant render state filter,
+    // which d3d9_state_manager does anyway and is the reason the dedup was
+    // disabled in the first place; the IDirect3DVertexBuffer9::Lock detour; and
+    // the low-latency GPU sync in Hooked_Present. The last one is a spin on an
+    // event query with a 16 ms cap on the main thread, so reviving it needs a
+    // measurement rather than a wire-up.
+    //
+    // The draw census and the merger used to be in the same position and are
+    // not any more: InstallDrawHooks is called from the state manager's
+    // PatchDeviceVTable, which runs.
+    Log("[D3D9StateCache] initialised, but its device hooks cannot install in "
+        "this build: they come from OnCreateDevice, which only the compiled-out "
+        "render_state_dedup calls. The render state filtering this switch names "
+        "is done by D3D9StateManager instead.");
     return true;
 }
 
