@@ -24,6 +24,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
+* [What's New in v3.19.3](#whats-new-in-v3193)
 * [What's New in v3.19.2](#whats-new-in-v3192)
 * [Send me your log](#send-me-your-log)
   * [Measuring rather than reporting](#if-you-want-to-measure-something-rather-than-report-a-bug)
@@ -36,6 +37,37 @@ The current public build is focused on real frametime stability, long-session sm
 * [Building](#building)
 * [Core Architecture](#core-architecture)
 * [Troubleshooting & Diagnostics](#troubleshooting)
+
+---
+
+## What's New in v3.19.3
+
+### New
+
+* **Reuse Compiled Scripts Between Sessions.** A measured loading screen spends
+  2128 ms inside the game's Lua compiler. Only 260 ms of that is text the session
+  had already compiled, which is what Reuse Compiled Scripts removes. The other
+  1868 ms is text the session had never seen, and nothing running inside the game
+  can help with it. It had been seen before, though, the last time the game ran.
+  This writes the compiled form to `Cache\wow_optimize_bytecode.bin` and reads it
+  back on the next launch. Off by default, in Experimental.
+
+  The game can write that form and has no code to read it back, so the reading is
+  ours. Every script rebuilt from the file is compared against a real compile of
+  the same text, field by field, into every nested function, each constant by
+  type, value and addon ownership. That runs for the first 2000 of them and one
+  in every 256 after, and the whole store switches off for good the first time
+  two of them differ. The file is discarded automatically whenever Wow.exe
+  changes.
+
+### Fixed
+
+* **The script cache turned away the files worth the most.** It refuses to keep
+  a copy of the source for anything over a megabyte, which is right for what it
+  holds in memory. The check sat in the wrong place, so those files were written
+  to the new disk store and could then never be read back from it. Those are
+  GlobalStrings.lua, ChatFrame and the rest of the large ones, where skipping a
+  compile is worth ten milliseconds rather than twenty microseconds.
 
 ---
 
