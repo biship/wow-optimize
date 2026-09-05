@@ -14,6 +14,7 @@
 #include "d3d9_state_manager.h"
 #include "config.h"
 #include "draw_merge.h"
+#include "m2_anim_stride.h"
 #include "session_verdict.h"
 #include "sampling_profiler.h"
 #include "font_glyph_cache.h"
@@ -868,6 +869,9 @@ static HRESULT __stdcall Hooked_Present(void* dev, const RECT* src, const RECT* 
     // Present hook is in the dead half of d3d9_state_cache.cpp, which is why
     // every report so far said "installed but no frame was presented".
     D3D9StateCache::NoteFrameForDrawCensus();
+    // A frame at any frame rate, which the stride phase needs and the
+    // maintenance tick cannot give it - that runs about once in four.
+    M2AnimStride::OnPresent();
     FrameBench::OnPresent(FrameBench::Source::D3D9Present);
     WowOpt_OnFrameBoundary();
 

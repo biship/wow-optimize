@@ -44,6 +44,7 @@
 #include "collision_outcode_sse2.h"
 #include "bone_matrix_upload_sse2.h"
 #include "m2_matrix_slot_sse2.h"
+#include "m2_anim_stride.h"
 #include "mimalloc_high_arena.h"
 #include "client_write_batch.h"
 #include "aabb_overlap_sse2.h"
@@ -1985,6 +1986,7 @@ static void MainThreadPump() {
 #endif
 
         // Enable D3D9 State Manager frame update
+        M2AnimStride::OnFrame();
         OnFrameD3D9StateManager(g_mainThreadId);
         OnFrameRenderHooks(g_mainThreadId);
         OnFrameLogicHooks(g_mainThreadId);
@@ -5281,6 +5283,7 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     CollisionOutcode::LogStats();
     BoneMatrixUpload::LogStats();
     M2MatrixSlot::LogStats();
+    M2AnimStride::LogStats();
     MimallocHighArena::LogStats();
     ClientWriteBatch::LogStats();
     AabbOverlap::LogStats();
@@ -7955,6 +7958,9 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("--- M2 Matrix Slot Copy (SSE2) ---");
     M2MatrixSlot::Install();
+
+    Log("--- M2 Animation Stride ---");
+    M2AnimStride::Install();
     AabbOverlap::Init();
     AnimQuatUnpack::Init();
     AnimVec3Track::Init();
@@ -10958,6 +10964,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             ClientWriteBatch::FlushAll("process detach");
             BoneMatrixUpload::Shutdown();
             M2MatrixSlot::Shutdown();
+            M2AnimStride::Shutdown();
             SamplingProfiler::Shutdown();
 #endif
             TextureUnloadDelay::Shutdown();
