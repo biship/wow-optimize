@@ -41,6 +41,15 @@ ClientWriteBatch::WriteFn GetClientWriter();
     // not, so the largest share of that load had nowhere to be counted.
     void NoteWrite(double ms, unsigned int bytes, const char* name);
 
+    // The third thing a loading screen is made of, and the one the split was
+    // missing. A measured load was 1576 ms with 49 ms inside ReadFile and no
+    // writes at all, so 97% of it had nowhere to be counted - while the same
+    // session spent 2128 ms inside the Lua compiler without anyone knowing how
+    // much of that fell inside a load.
+    //
+    // Called from the compile census, and only while IsLoading() is true.
+    void NoteCompile(double ms, bool repeat);
+
     // Whether the ReadFile hook that feeds NoteRead is actually installed. It is
     // compiled out by CRASH_TEST_DISABLE_READFILE in the shipped build, and the
     // first real log carrying this report said "0 ms (0%) inside ReadFile" for

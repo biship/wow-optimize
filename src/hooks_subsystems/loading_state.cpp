@@ -99,6 +99,12 @@ EventKind ClassifyEvent(int eventId) {
 // ---- where a loading screen's time goes -------------------------------------
 static LARGE_INTEGER g_qpcFreq      = {};
 static LARGE_INTEGER g_loadStartQpc = {};
+// Lua compiled inside this loading screen, split the way the census splits it.
+static double        g_compileMsThisLoad      = 0.0;
+static double        g_compileMsFirstThisLoad = 0.0;
+static unsigned long long g_compilesThisLoad  = 0;
+static bool          g_compileSeen            = false;
+
 static double        g_ioMsThisLoad = 0.0;
 
 // Writes, measured because reads alone did not account for a 139-second load.
@@ -170,6 +176,26 @@ static void LoadTimerEnd() {
             (unsigned long long)g_ioReadsThisLoad,
             (double)g_ioBytesThisLoad / (1024.0 * 1024.0));
     }
+
+    if (!g_compileSeen) {
+        Log("[LoadingState]   Lua compilation not measured - the compile census "
+            "is switched off, so the largest known candidate for the rest of "
+            "this load has no number here.");
+    } else if (g_compilesThisLoad == 0) {
+        Log("[LoadingState]   measured and zero: the client compiled no Lua "
+            "inside this loading screen.");
+    } else {
+        Log("[LoadingState]   %.0f ms (%.0f%%) compiling Lua over %llu chunk(s), "
+            "%.0f ms of it source never seen before. That second figure is the "
+            "part no cache living in this process can remove.",
+            g_compileMsThisLoad,
+            (ms > 0.0) ? (100.0 * g_compileMsThisLoad / ms) : 0.0,
+            (unsigned long long)g_compilesThisLoad,
+            g_compileMsFirstThisLoad);
+    }
+    g_compileMsThisLoad = 0.0;
+    g_compileMsFirstThisLoad = 0.0;
+    g_compilesThisLoad = 0;
 
     if (!g_writeHookOn) {
         Log("[LoadingState]   writes not measured - the client's write wrapper is "
@@ -384,6 +410,13 @@ void NoteWrite(double ms, unsigned int bytes, const char* name) {
             }
         }
     }
+}
+
+void NoteCompile(double ms, bool repeat) {
+    g_compileSeen = true;
+    g_compileMsThisLoad += ms;
+    if (!repeat) g_compileMsFirstThisLoad += ms;
+    ++g_compilesThisLoad;
 }
 
 void NoteRead(double ms, unsigned int bytes) {

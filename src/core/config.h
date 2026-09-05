@@ -382,7 +382,10 @@ namespace Config {
         // tester's loading screen spent 2470 ms of 16828 inside 593557 of
         // them. Opt-in, needs the CloseHandle hook, and checks every closed
         // file's size against what the client handed over.
-        bool OptClientWriteBatch = false;
+        // On by default since 3.19.2. A tester loading screen spent 2470 ms of
+        // 16828 inside 593557 nine-byte writes, and the module retires itself
+        // for the session the moment a file comes out the wrong size.
+        bool OptClientWriteBatch = true;
         bool OptMimallocHighArena = false;
         // The size of each block handed over, and the most that will ever be
         // handed over in total. One block only postpones the problem: when the

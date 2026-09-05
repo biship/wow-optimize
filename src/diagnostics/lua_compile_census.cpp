@@ -35,6 +35,11 @@
 #include <cstdio>
 
 #include "lua_compile_census.h"
+// For handing compile time to the loading screen it fell inside.
+namespace LoadingState {
+    bool IsLoading();
+    void NoteCompile(double ms, bool repeat);
+}
 #include "MinHook.h"
 #include "version.h"
 #include "config.h"
@@ -245,6 +250,9 @@ static void NoteCompileTime(const LARGE_INTEGER& a, bool repeat, const char* lab
     double ms = (double)(bnow.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
     if (repeat) { g_msRepeat += ms; ++g_timedRepeat; }
     else        { g_msFirst  += ms; ++g_timedFirst;  }
+    // A loading screen is 97% something other than file I/O and this is the
+    // largest known candidate, so hand it over while one is up.
+    if (LoadingState::IsLoading()) LoadingState::NoteCompile(ms, repeat);
     if (ms > g_msWorst) {
         g_msWorst = ms;
         lstrcpynA(g_worstName, label && *label ? label : "(unnamed)",
