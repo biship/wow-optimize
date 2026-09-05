@@ -65,8 +65,22 @@ The current public build is focused on real frametime stability, long-session sm
   draw call, which cannot happen. It was a 32-bit counter holding a five billion
   total.
 
+### Faster
+
+* **Batch the Game's File Writes** and **Reuse Compiled Scripts** are on by
+  default now. A loading screen was measured at 1576 ms with only 49 ms of it
+  reading files, and the same session spent 2470 ms of another load inside
+  593,557 nine-byte writes and 2128 ms inside the Lua compiler. Nothing in a
+  default install touched either.
+* Loading screens now report how much of themselves were spent compiling Lua,
+  split into source seen for the first time and source compiled again.
+
 ### New
 
+* **Model Animation Stride** holds a distant model's skeleton for a frame
+  instead of re-solving every bone. Its materials, particles and attached items
+  keep animating. Nothing within 45 yards is ever held. The animation family is
+  about a fifth of the frame. Off by default.
 * **M2 Matrix Slot Copy (SSE2)** replaces three blocks in the model animation
   update that move matrices one float at a time. No arithmetic, so the bytes
   written are the bytes read. Off by default.
