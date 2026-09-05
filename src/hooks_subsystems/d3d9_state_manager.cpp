@@ -714,6 +714,13 @@ static HRESULT __stdcall Hooked_SetIndices(void* dev, void* ib) {
 static HRESULT __stdcall Hooked_SetVertexDeclaration(void* dev, void* decl) {
     CheckDeviceChange(dev);
     ++g_statCalls[10];
+    // Setting a declaration clears the FVF - the two are the same piece of
+    // device state expressed two ways, and D3D9 has GetFVF return zero after
+    // this. So the FVF cache below has to be dropped here, or a later SetFVF
+    // matching what this file last cached is skipped while the device is still
+    // holding the declaration, and the draw reads its vertices under the wrong
+    // layout. Same shape as the viewport and the render target.
+    g_fvfValid = false;
     // Caching resource pointers is unsafe due to address recycling. Always call original.
     return (D3D9_StateBarrier(), g_orig_SetVertexDeclaration)(dev, decl);
 }
