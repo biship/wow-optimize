@@ -50,6 +50,11 @@ enum {
     V_SETTRANSFORM         = 44,
     V_SETMATERIAL          = 49,
     V_SETVIEWPORT          = 47,
+    // Not deduped, and hooked for the opposite reason: it changes state this
+    // file caches without going through any of the setters. See
+    // Hooked_SetRenderTarget.
+    V_SETRENDERTARGET      = 37,
+    V_SETDEPTHSTENCIL      = 39,
     V_SETSCISSORRECT       = 75,
     V_SETSTREAMSOURCE      = 100,
     V_SETINDICES           = 104,
@@ -75,14 +80,15 @@ enum {
     V_DRAWINDEXEDPRIMITIVE = 82,
 };
 
-static constexpr int NUM_HOOKS = 18;
+static constexpr int NUM_HOOKS = 20;
 static int g_vtableIndices[NUM_HOOKS] = {
     V_SETRENDERSTATE, V_SETTEXTURESTAGESTATE, V_SETSAMPLERSTATE,
     V_SETTEXTURE, V_SETTRANSFORM, V_SETMATERIAL,
     V_SETVIEWPORT, V_SETSCISSORRECT, V_SETSTREAMSOURCE,
     V_SETINDICES, V_SETVERTEXDECLARATION, V_SETFVF,
     V_SETVERTEXSHADER, V_SETPIXELSHADER, V_RESET,
-    V_PRESENT, V_DRAWPRIMITIVE, V_DRAWINDEXEDPRIMITIVE
+    V_PRESENT, V_DRAWPRIMITIVE, V_DRAWINDEXEDPRIMITIVE,
+    V_SETRENDERTARGET, V_SETDEPTHSTENCIL
 };
 
 static void* g_vtableOriginals[NUM_HOOKS] = {};
@@ -122,7 +128,8 @@ static const char* g_statNames[NUM_HOOKS] = {
     "SetViewport", "SetScissorRect", "SetStreamSource",
     "SetIndices", "SetVertexDeclaration", "SetFVF",
     "SetVertexShader", "SetPixelShader", "Reset",
-    "Present", "DrawPrimitive", "DrawIndexedPrimitive"
+    "Present", "DrawPrimitive", "DrawIndexedPrimitive",
+    "SetRenderTarget", "SetDepthStencilSurface"
 };
 
 static unsigned long g_totalFrames = 0;
@@ -741,6 +748,52 @@ static HRESULT __stdcall Hooked_SetPixelShader(void* dev, void* ps) {
     return (D3D9_StateBarrier(), g_orig_SetPixelShader)(dev, ps);
 }
 
+// Setting a render target resets the viewport. That is D3D9's documented
+// behaviour and it happens inside the driver, so nothing in this file sees it -
+// and this file caches the viewport and skips a SetViewport that matches what it
+// cached.
+//
+// The sequence that breaks is ordinary. The client sets a viewport for the main
+// scene, points the device at a shadow surface, renders into it using the
+// viewport SetRenderTarget implicitly gave it, points the device back at the
+// back buffer, and sets the main viewport again. That last call matches the
+// cache, so it was skipped - and the device had been left on whatever the
+// render target change reset it to. The pass renders into the wrong rectangle.
+//
+// A shadow atlas is where that shows first and worst, because it is the render
+// target whose size differs from the back buffer, and a slice rendered under the
+// wrong rectangle is a shadow that does not refresh or flickers between frames.
+// Two testers reported exactly that, and the switch this file lives behind is on
+// by default.
+//
+// The depth stencil surface is here for the same reason and out of caution
+// rather than from the specification. Both cost one redundant SetViewport per
+// render target change, which is nothing next to being wrong.
+typedef HRESULT (__stdcall *SetRenderTarget_t)(void*, DWORD, void*);
+static SetRenderTarget_t g_orig_SetRenderTargetHook = nullptr;
+static unsigned long g_rtInvalidations = 0;
+
+static HRESULT __stdcall Hooked_SetRenderTarget(void* dev, DWORD idx, void* surf) {
+    CheckDeviceChange(dev);
+    ++g_statCalls[18];
+    g_viewportValid = false;
+    g_scissorValid  = false;
+    ++g_rtInvalidations;
+    return (D3D9_StateBarrier(), g_orig_SetRenderTargetHook)(dev, idx, surf);
+}
+
+typedef HRESULT (__stdcall *SetDepthStencil_t)(void*, void*);
+static SetDepthStencil_t g_orig_SetDepthStencilHook = nullptr;
+
+static HRESULT __stdcall Hooked_SetDepthStencilSurface(void* dev, void* surf) {
+    CheckDeviceChange(dev);
+    ++g_statCalls[19];
+    g_viewportValid = false;
+    g_scissorValid  = false;
+    ++g_rtInvalidations;
+    return (D3D9_StateBarrier(), g_orig_SetDepthStencilHook)(dev, surf);
+}
+
 static HRESULT __stdcall Hooked_Reset(void* dev, D3DPRESENT_PARAMETERS* params) {
     CheckDeviceChange(dev);
     ++g_statCalls[14];
@@ -925,7 +978,9 @@ static void* g_hookFuncs[NUM_HOOKS] = {
     (void*)Hooked_Reset,
     (void*)Hooked_Present,
     (void*)Hooked_DrawPrimitive,
-    (void*)Hooked_DrawIndexedPrimitive
+    (void*)Hooked_DrawIndexedPrimitive,
+    (void*)Hooked_SetRenderTarget,
+    (void*)Hooked_SetDepthStencilSurface
 };
 
 static void SetHookOrigin(int idx, void* orig) {
@@ -948,6 +1003,8 @@ static void SetHookOrigin(int idx, void* orig) {
         case 15: g_orig_Present               = (PresentFn)orig; break;
         case 16: g_orig_DrawPrimitive         = (DrawPrim_t)orig; break;
         case 17: g_orig_DrawIndexedPrimitive  = (DrawIdxPrim_t)orig; break;
+        case 18: g_orig_SetRenderTargetHook = (SetRenderTarget_t)orig; break;
+        case 19: g_orig_SetDepthStencilHook = (SetDepthStencil_t)orig; break;
         default: break;
     }
 }
@@ -1041,6 +1098,11 @@ static __declspec(naked) void g_bThunk_DrawTriPatch() {
     }
 }
 
+// SetRenderTarget and SetDepthStencilSurface used to be barrier thunks here.
+// They are real hooks now, in the main table above, because they do more than
+// move the epoch: a render target change resets the viewport inside the driver
+// and this file caches the viewport. See Hooked_SetRenderTarget.
+//
 // Reading back what has been drawn. A held draw has not reached the target
 // yet, so a readback that happens first sees the frame without it - a
 // screenshot missing a model, a portrait missing its character.
@@ -1100,33 +1162,7 @@ static __declspec(naked) void g_bThunk_ColorFill() {
     }
 }
 
-static void* g_bOrig_SetRenderTarget = nullptr;
-static __declspec(naked) void g_bThunk_SetRenderTarget() {
-    __asm {
-        inc dword ptr [g_stateEpoch]
-        cmp byte ptr [g_drawMergePending], 0
-        je  nothing_held
-        pushad
-        call D3D9DrawMerge_FlushPending
-        popad
-    nothing_held:
-        jmp dword ptr [g_bOrig_SetRenderTarget]
-    }
-}
 
-static void* g_bOrig_SetDepthStencilSurface = nullptr;
-static __declspec(naked) void g_bThunk_SetDepthStencilSurface() {
-    __asm {
-        inc dword ptr [g_stateEpoch]
-        cmp byte ptr [g_drawMergePending], 0
-        je  nothing_held
-        pushad
-        call D3D9DrawMerge_FlushPending
-        popad
-    nothing_held:
-        jmp dword ptr [g_bOrig_SetDepthStencilSurface]
-    }
-}
 
 static void* g_bOrig_BeginScene = nullptr;
 static __declspec(naked) void g_bThunk_BeginScene() {
@@ -1570,8 +1606,6 @@ static Barrier g_barriers[] = {
     {  33, "GetFrontBufferData", (void*)g_bThunk_GetFrontBufferData, &g_bOrig_GetFrontBufferData, false },
     {  34, "StretchRect", (void*)g_bThunk_StretchRect, &g_bOrig_StretchRect, false },
     {  35, "ColorFill", (void*)g_bThunk_ColorFill, &g_bOrig_ColorFill, false },
-    {  37, "SetRenderTarget", (void*)g_bThunk_SetRenderTarget, &g_bOrig_SetRenderTarget, false },
-    {  39, "SetDepthStencilSurface", (void*)g_bThunk_SetDepthStencilSurface, &g_bOrig_SetDepthStencilSurface, false },
     {  41, "BeginScene", (void*)g_bThunk_BeginScene, &g_bOrig_BeginScene, false },
     {  42, "EndScene", (void*)g_bThunk_EndScene, &g_bOrig_EndScene, false },
     {  43, "Clear", (void*)g_bThunk_Clear, &g_bOrig_Clear, false },
@@ -2006,6 +2040,13 @@ void D3D9StateManager_LogStats(void) {
                          "draw call, which cannot happen - its primitive total "
                          "is broken");
         }
+        Log("[D3D9State]   %lu render target or depth surface change(s) dropped "
+            "the cached viewport and scissor. D3D9 resets the viewport inside "
+            "the driver when the render target changes, so a SetViewport that "
+            "matched the cache used to be skipped against a device that was no "
+            "longer where the cache said - which is a pass rendering into the "
+            "wrong rectangle, and a shadow atlas is where that shows first.",
+            g_rtInvalidations);
         Log("[D3D9State]   primitives per draw - the number that decides whether "
             "batching is worth anything, because an average hides it:");
         for (int b = 0; b < 6; b++) {
