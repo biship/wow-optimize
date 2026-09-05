@@ -626,7 +626,29 @@ static inline void NoteMergeChance(DWORD type, INT baseVertex,
 }
 
 // ---------------------------------------------------------------------------
-// And now the merger.
+// The merger, and the field result that says not to use it.
+//
+// 2026-09-05, build 1875f18b, a 2318 second session with all thirty-four
+// barriers installed and no state blocks created, so the census below is sound
+// rather than the over-counted 10.6% from the session where none of them went
+// in:
+//
+//     293,120,052 indexed draws, 2728 a frame, 26.0% carrying eight primitives
+//     or fewer. 2.4% of them could join the draw before them. The merger removed
+//     exactly those - 7,174,101 calls, longest chain 17, both ways of counting
+//     agreed, no merged call returned an error - and the frame rate went down.
+//
+// Which is the answer this was built to get. The module's own criterion is
+// written a few lines below: a share in the tens of percent says build it, a few
+// percent says the client already batches what it can. Two point four is a few
+// percent, and holding every triangle list draw for one step to find them costs
+// more on 293 million calls than removing seven million of them saves.
+//
+// The switch is gone from the launcher and the code stays, because the next
+// person to wonder about draw call batching should find the number rather than
+// the idea. What it does not close is batching by some other rule than index
+// contiguity: 26% of these draws carry eight primitives or fewer, and this only
+// ever looked at the ones already adjacent in the index buffer.
 //
 // The census counts pairs that could have been one call. This issues them as
 // one. It holds a DrawIndexedPrimitive instead of passing it on, and when the
@@ -1009,6 +1031,11 @@ void DrawMerge_LogStats(void) {
     } else {
         Log("[DrawMerger]   no merged call returned an error.");
     }
+    Log("[DrawMerger]   this measured negative once already: 2.4%% of 293 "
+        "million draws on a sound census, removed correctly, and the frame rate "
+        "went down. Holding every triangle list draw for one step costs more "
+        "than the calls it finds. Compare against that before concluding "
+        "anything from the numbers above.");
 }
 
 // Called from the Present hook, which already runs once per presented frame.
