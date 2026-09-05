@@ -24,7 +24,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
-* [What's New in v3.19.1](#whats-new-in-v3191)
+* [What's New in v3.19.2](#whats-new-in-v3192)
 * [Send me your log](#send-me-your-log)
   * [Measuring rather than reporting](#if-you-want-to-measure-something-rather-than-report-a-bug)
 * [Reviews & Acknowledgments](#reviews)
@@ -39,73 +39,40 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
-## What's New in v3.19.1
-
-### New
-
-* **A/B Test a Feature** turns one feature on and off in stints while you play
-  and compares the two halves. Press **SET UP A MEASUREMENT RUN** in the launcher
-  and it does the setup for you.
-* **Flight Recorder** keeps the last 512 frames. Press Scroll Lock when you see
-  something wrong and they go into the log. On by default; writes nothing until
-  something marks it.
-* Every log now opens with **what went wrong this session**: freezes, long loads,
-  disconnects, address space running out, bad SavedVariables filenames.
-* **Bone Matrix Upload (SSE2)** replaces the bone matrix transpose in the draw
-  path. 3.35% of main-thread time in the profile; measured 8.6% faster per frame
-  in one session, on too few samples to call it settled. Off by default.
-* **Object Tick Prefetch** prefetches the two fields the object tick reads.
-  1.39% of main-thread time in a measured session. Off by default.
-* **Keep the Allocator Above 2GB** reserves address space above 2GB and gives
-  it to the allocator, so it stops growing into the half a 32-bit client has
-  to allocate from. Needs a large-address-aware client on 64-bit Windows.
-  Off by default.
-* **Batch the Game's File Writes** gathers the game's nine-byte SavedVariables
-  writes into 64KB pieces. One tester's loading screen spent 2470 ms of 16828
-  inside 593557 of those calls. Off by default.
-* **Reuse Compiled Scripts** now keeps the large files too. The game spent 461
-  ms of a six minute session recompiling Lua it had already compiled, and the
-  cache was refusing 14 of those 40 megabytes for being over a size cap. Off
-  by default.
-* **Draw Call Census** now also counts how many of the game's draw calls could
-  have been issued as one. It makes 355 a frame and a third of them carry
-  eight triangles or fewer. Off by default; a measurement, not a speed-up.
-* **No Client Patches** stops the DLL writing anything into WoW.exe. See the
-  warning at the top of this file. Off by default.
-* **Table Emptiness Census** and **Leave Lua Garbage Collection Alone** are
-  diagnostics for the Lua collector. Off by default.
+## What's New in v3.19.2
 
 ### Fixed
 
-* **Garbled SavedVariables filenames**, reported by
-  [txtsd](https://github.com/txtsd) - `ElvUI.lua` written as `)_.lua`. The client
-  had run out of contiguous memory below 2GB and nothing here reacted, because
-  the two things watching it were reading the wrong half of the address space.
-* **WoWCircle disconnects**, reported by
-  [Flokj](https://github.com/suprepupre/wow-optimize/issues/58) and confirmed by
-  asslol. Fixed by the new **No Client Patches** option, which turns the
-  optimizations off - a trade, not a fix.
-* **Glowing characters, weapons and shoulder pads**, reported by
-  [txtsd](https://github.com/txtsd). Spread Model Animation skipped material and
-  attachment animation along with the bones.
-* **Crash in the game's error formatter** with Reuse Compiled Scripts on.
-* **Combat Log Filter did nothing** unless a second, unrelated option was on.
-  Reported by Anarom.
-* **Freezes of eight to fifteen seconds were never captured.** The watchdog only
-  fired past 45 seconds.
-* **The DLL needed the Visual C++ Redistributable.** It does not now.
-* **Steadier Shadows did nothing** unless the diagnostic probe was also on. It
-  still does not fix the flicker; leave it off.
-* **Stalls of 40ms every five minutes** caused by this tool's own reporting.
-* **Roughly 120 locked instructions removed from hot paths.**
-* Several options were gated behind unrelated ones and are now separate, each
-  keeping your existing setting: **Render Hooks**, **Async Worker Pool**,
-  **Thread Affinity**, **SSE2 Frustum Cull and Quaternion Normalize**, **Cache
-  Script Handlers**, **Unit API Fast Path**.
-* Wrong numbers in the log: feature counts, draw calls per frame, the CVar
-  watchdog reporting a corrupted client in every log ever collected, and short
-  sessions printing no report at all.
+* **Shadows that did not refresh and flickered**, reported by prince [SANC] and
+  Sicsoo. Setting a render target resets the viewport, and the render state cache
+  did not know, so it skipped the next `SetViewport` and the shadow pass drew into
+  the wrong rectangle. On by default, so this was everyone. Turning the two shadow
+  options was never going to help and they stay off.
+* **Wrong vertex layout after a vertex declaration.** Setting a declaration clears
+  the FVF; the FVF cache kept skipping the call that put it back.
+* **The draw call census had never installed.** Its hooks came from a module
+  compiled out months ago, so every session with that box ticked measured nothing.
+* **The animation census stood down whenever Animation LOD was on**, so neither of
+  the two numbers has ever arrived. It counts from inside the other one now.
+* **Thirteen modules counted on hot paths and could not print the number**, seven
+  of them counting crashes they had averted.
+* **Five launcher options turned on features this build does not contain**, and two
+  more gated an install that always fails. All gone.
+* **Four of the six render state filters skipped nothing at all** over 206 million
+  calls in one session. They only count now.
+* **A locked 64-bit instruction on every Lua allocation the game makes.**
+* **The primitive count in the log went down between reports** and ended at 0.8 per
+  draw call, which cannot happen. It was a 32-bit counter holding a five billion
+  total.
 
+### New
+
+* **M2 Matrix Slot Copy (SSE2)** replaces three blocks in the model animation
+  update that move matrices one float at a time. No arithmetic, so the bytes
+  written are the bytes read. Off by default.
+* **Draw Call Merging** was built, measured and removed. 2.4% of 293 million draw
+  calls could be merged, merging exactly those worked, and the frame rate fell.
+  The census keeps its switch; the merger's is gone.
 ---
 
 ## Send me your log
