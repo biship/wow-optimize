@@ -11,6 +11,109 @@ using System.Reflection;
 
 namespace WowOptimizeLauncher {
 
+
+    // ───────────────────────────────────────────────────────────────
+    //  What a switch is for
+    // ───────────────────────────────────────────────────────────────
+    //
+    // A tester asked for the fastest possible configuration and could not tell
+    // which switches were making the game faster and which were only counting
+    // things. Nothing in the list said. The four kinds below are on every
+    // entry now, and MAX PERFORMANCE turns on the ones that help.
+    //
+    // Keyed by ini key rather than by the label, because labels get reworded
+    // and a mis-keyed classification would quietly put a profiler in a
+    // performance preset.
+    public static class Kinds {
+        public const string Perf  = "[+]";   // makes the game faster
+        public const string Fix   = "[=]";   // protects or repairs; no speed claim
+        public const string Diag  = "[?]";   // measures - costs frames, gives numbers
+        public const string Trade = "[-]";   // more frames by changing how it looks
+        public const string Log   = "[.]";   // records; negligible cost
+        public const string Lost  = "[x]";   // measured and lost, or a known failure
+
+        // Badged apart from the rest because otherwise they read as speed
+        // and the preset below silently disagrees with their own label.
+        // Each was believed to help until something measured it.
+        private static readonly string[] LostKeys = new string[] {
+            "MatrixVectorSse2",    // 3.3 ns a call against the client's 2.5
+            "TextureUnloadDelay",  // 0.4% and 0.2% of held textures ever reused
+            "UIFrameBatch",        // switches nothing any more
+            "LuaGcCoalesce"        // the one tester crash with us truly in the stack
+        };
+
+        private static readonly string[] DiagKeys = new string[] {
+            "AbTest", "SamplingProfiler", "AddonProfiler", "LuaAddonProfile",
+            "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
+            "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
+        };
+        private static readonly string[] LogKeys = new string[] {
+            "SessionLogs", "FlightRecorder", "NetDiag", "CpuTopology",
+        };
+        private static readonly string[] FixKeys = new string[] {
+            "CompatMode", "MemoryPressure", "TimingCvarPin", "CvarNullGuard",
+            "PriorityGuard", "DeviceCbGuard", "OomGovernor", "HardwareCursor",
+            "MouseClipRelease", "SavedVarsBackup", "MimallocHighArena",
+            "RenderNullGuard", "CombatLogLeakFix", "ShadowCascadeHold",
+            "LuaGcStockPace", "UIFrameBatch",
+        };
+        private static readonly string[] TradeKeys = new string[] {
+            "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
+            "AnimLod", "M2AnimStride", "SoundVolumeLimit", "FrameLimiter",
+        };
+
+        private static bool In(string[] set, string key) {
+            for (int i = 0; i < set.Length; i++) {
+                if (set[i] == key) return true;
+            }
+            return false;
+        }
+
+        // Anything not named above speeds the game up. That is what most of
+        // this tool is, and listing the exceptions is shorter and stays right
+        // as features are added.
+        public static string Of(string key) {
+            if (In(LostKeys, key))  return Lost;
+            if (In(DiagKeys, key))  return Diag;
+            if (In(TradeKeys, key)) return Trade;
+            if (In(LogKeys, key))   return Log;
+            if (In(FixKeys, key))   return Fix;
+            return Perf;
+        }
+
+        // Left off by MAX PERFORMANCE, each for a reason recorded beside it.
+        public static readonly string[] NotForSpeed = new string[] {
+            // Measures the game. Every one of these costs frames to produce a
+            // number, and a player wants the frames.
+            "AbTest", "SamplingProfiler", "AddonProfiler", "LuaAddonProfile",
+            "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
+            "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
+
+            // Buys frames by making the game look or sound different. That is a
+            // real trade and it is the player's to make, not this button's. A
+            // tester turned all of these on, saw his view distance pulled from
+            // 350 to 262 and back seven times in four minutes, and could only
+            // say that something was wrong with the graphics.
+            "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
+            "AnimLod", "M2AnimStride", "SoundVolumeLimit", "FrameLimiter",
+
+            // Left off because something measured them and the answer was no.
+            "CompatMode",          // slower on purpose; it repairs a broken connection
+            "MatrixVectorSse2",    // measured against the client: 3.3 ns to its 2.5
+            "TextureUnloadDelay",  // two testers: 0.4% and 0.2% of held textures reused
+            "UIFrameBatch",        // switches nothing; the two it named have their own
+            "LuaGcStockPace",      // turns the GC pacing below it off again
+            "LuaGcCoalesce",
+        };
+
+        public static bool HelpsSpeed(string key) {
+            for (int i = 0; i < NotForSpeed.Length; i++) {
+                if (NotForSpeed[i] == key) return false;
+            }
+            return true;
+        }
+    }
+
     public class SettingItem {
         public string Section;
         public string Key;
@@ -256,7 +359,7 @@ namespace WowOptimizeLauncher {
         // remote version.txt to decide whether to show the update notification,
         // and shown in the version label. Keep in sync with version.txt and
         // src/core/version.h on every release.
-        private const string APP_VERSION = "3.19.4";
+        private const string APP_VERSION = "3.19.5";
 
         private string iniPath;
         private Dictionary<string, SettingItem> settingsMap;
@@ -645,6 +748,24 @@ namespace WowOptimizeLauncher {
             // ── Master Buttons ──────────────────────────────────
             int btnWidth = 248;
 
+            DarkButton btnMaxPerf = new DarkButton(Color.FromArgb(255, 170, 0), false);
+            btnMaxPerf.Text = "MAX PERFORMANCE";
+            btnMaxPerf.Size = new Size(btnWidth, 30);
+            btnMaxPerf.Location = new Point(15, y);
+            btnMaxPerf.Click += delegate { SetUpMaxPerformance(); };
+            toolTip.SetToolTip(btnMaxPerf,
+                "Everything that makes the game faster, on. Everything that only "
+                + "measures it, off - a census or a profiler costs frames to produce "
+                + "a number.\r\n\r\n"
+                + "Also left off: the ones that buy frames by changing how the game "
+                + "looks or sounds, and the handful that were measured and lost. "
+                + "Each of those is still yours to tick; hover it to read what was "
+                + "measured.\r\n\r\n"
+                + "This is not the same as ENABLE ALL FEATURES, which turns on the "
+                + "profilers too.");
+            leftPanel.Controls.Add(btnMaxPerf);
+            y += 36;
+
             DarkButton btnEnableAll = new DarkButton(CyanAccent, false);
             btnEnableAll.Text = "ENABLE ALL FEATURES";
             btnEnableAll.Size = new Size(btnWidth, 30);
@@ -811,7 +932,10 @@ namespace WowOptimizeLauncher {
 
             // Tip label
             Label tipLabel = new Label();
-            tipLabel.Text = "Tip: Hover over any optimization feature to view a detailed description of its behavior.";
+            tipLabel.Text = "[+] makes the game faster   [=] protects or repairs   "
+                          + "[?] measures it, and costs frames to do so   "
+                          + "[-] more frames, different look   [.] writes a log   [x] measured and lost\r\n"
+                          + "Tip: Hover over any optimization feature to view a detailed description of its behavior.";
             tipLabel.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
             tipLabel.ForeColor = CyanAccent;
             tipLabel.AutoSize = false;
@@ -907,7 +1031,8 @@ namespace WowOptimizeLauncher {
             foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
                 string name = pair.Key;
                 SettingItem data = pair.Value;
-                DarkCheckBox chk = CreateStyledCheckBox(name, data.Tooltip);
+                DarkCheckBox chk = CreateStyledCheckBox(
+                    Kinds.Of(data.Key) + " " + name, data.Tooltip);
 
                 data.Ctrl = chk;
 
@@ -1148,6 +1273,32 @@ namespace WowOptimizeLauncher {
             "MimallocHighArena",     // whether the allocator can be moved above 2GB
             "SamplingProfiler"       // where the main thread actually is
         };
+
+        // Every switch that speeds the game up, on. Everything that measures it,
+        // off. See Kinds.NotForSpeed for what else is left off and why.
+        //
+        // This exists because ENABLE ALL FEATURES is not the answer to "make it
+        // as fast as possible" and reads exactly as if it were. A tester pressed
+        // it, got twelve profilers and a census on every draw call, and an A/B
+        // harness rotating eighteen features on and off every twenty seconds.
+        private void SetUpMaxPerformance() {
+            int on = 0, off = 0;
+            foreach (SettingItem item in settingsMap.Values) {
+                if (item.Ctrl == null) continue;
+                bool want = Kinds.HelpsSpeed(item.Key);
+                item.Ctrl.Checked = want;
+                if (want) on++; else off++;
+            }
+            UpdateActiveModulesCount();
+            SaveSettings();
+            MessageBox.Show(
+                on.ToString() + " features on, " + off.ToString() + " left off.\r\n\r\n"
+                + "Off: everything that measures the game, everything that buys "
+                + "frames by changing how it looks or sounds, and the few that "
+                + "were measured against the client and lost.\r\n\r\n"
+                + "Saved. Launch when ready.",
+                "Max Performance", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
 
         private void SetUpDiagnosticRun() {
             if (settingsMap == null) return;

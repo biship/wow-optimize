@@ -24,6 +24,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
+* [What's New in v3.19.5](#whats-new-in-v3195)
 * [What's New in v3.19.4](#whats-new-in-v3194)
 * [What's New in v3.19.3](#whats-new-in-v3193)
 * [What's New in v3.19.2](#whats-new-in-v3192)
@@ -38,6 +39,36 @@ The current public build is focused on real frametime stability, long-session sm
 * [Building](#building)
 * [Core Architecture](#core-architecture)
 * [Troubleshooting & Diagnostics](#troubleshooting)
+
+---
+
+## What's New in v3.19.5
+
+### New
+
+* **MAX PERFORMANCE button, and every switch now says what it is for.** The
+  tester who asked for the fastest possible setup pressed ENABLE ALL FEATURES,
+  which is the reasonable thing to do and the wrong thing to do: it also turned
+  on twelve profilers, a census on every draw call and every Lua allocation, and
+  an A/B harness rotating eighteen features on and off every twenty seconds all
+  session. Nothing in the list said which was which.
+
+  Every entry carries a mark now:
+
+  * `[+]` makes the game faster - 81 of them
+  * `[=]` protects or repairs, no speed claim - 15
+  * `[?]` measures the game, and costs frames to do it - 12
+  * `[-]` buys frames by changing how the game looks or sounds - 7
+  * `[x]` was measured against the client and lost - 4
+  * `[.]` writes a log - 4
+
+  MAX PERFORMANCE turns on the 98 that help and leaves 25 off. The four marked
+  `[x]` are there because something measured them: Matrix-Vector SSE2 runs at
+  3.3 ns a call against the client's own 2.5; Texture Smart Unload Delay was
+  measured by two testers at 0.4% and 0.2% of held textures ever reused; UI
+  Frame Batch no longer switches anything; and Adaptive Lua GC Governor is the
+  one module with a tester crash that still has us in the call stack. Every one
+  of the 25 is still yours to tick, and hovering it says what was measured.
 
 ---
 
