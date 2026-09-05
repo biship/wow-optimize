@@ -347,7 +347,11 @@ namespace Config {
         // the compiled Proto; the client still builds the closure, environment
         // and taint, so nothing about ownership is shared. Opt-in, and it checks
         // reuses against a fresh compile before trusting itself.
-        bool OptLuaProtoCache = false;
+        // On by default since 3.19.2. A measured session spent 2128 ms inside
+        // the client's Lua compiler and nothing in a default install touched
+        // any of it. A stale Proto is refused by its own fingerprint rather
+        // than handed back, and a state swap drops everything.
+        bool OptLuaProtoCache = true;
         // The object lookup every Lua call into a UI method starts with
         // (sub_4A81B0, 674 call sites). Four Lua API calls replaced by direct
         // reads, including the taint move lua_rawgeti performs. Opt-in, and it
