@@ -40,6 +40,8 @@
 #include "objmgr_find_fast.h"
 #include "quat_lerp_sse2.h"
 #include "lua_proto_cache.h"
+#include "lua_bytecode_store.h"
+#include "lua_undump.h"
 #include "anim_lod.h"
 #include "collision_outcode_sse2.h"
 #include "bone_matrix_upload_sse2.h"
@@ -5279,6 +5281,9 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     ObjMgrFindFast::LogStats();
     QuatLerpSse2::LogStats();
     LuaProtoCache::LogStats();
+    LuaBytecodeStore::LogStats();
+    LuaUndump::LogStats();
+    LuaBytecodeStore::SaveIfDirty();
     AnimLod::LogStats();
     CollisionOutcode::LogStats();
     BoneMatrixUpload::LogStats();
@@ -7952,6 +7957,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- Quaternion Interpolation (SSE2) ---");
     QuatLerpSse2::Init();
     LuaProtoCache::Init();
+    LuaBytecodeStore::Init();
     AnimLod::Init();
     CollisionOutcode::Init();
     BoneMatrixUpload::Init();

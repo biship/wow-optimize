@@ -352,6 +352,14 @@ namespace Config {
         // any of it. A stale Proto is refused by its own fingerprint rather
         // than handed back, and a state swap drops everything.
         bool OptLuaProtoCache = true;
+        // The other 1868 ms of that same loading screen: source the session had
+        // never seen, which no cache inside the process can help with. This one
+        // keeps the compiled form on disk between sessions. Off by default -
+        // it writes a file into the game folder and it reconstructs Proto
+        // objects the client itself has no code to read back, so it wants field
+        // evidence before it is anyone's default. Every chunk it rebuilds is
+        // compared against a real parse until a few thousand have matched.
+        bool OptLuaBytecodeStore = false;
         // The object lookup every Lua call into a UI method starts with
         // (sub_4A81B0, 674 call sites). Four Lua API calls replaced by direct
         // reads, including the taint move lua_rawgeti performs. Opt-in, and it

@@ -106,6 +106,7 @@
 #include <unordered_set>
 
 #include "lua_proto_cache.h"
+#include "lua_bytecode_store.h"
 #include "MinHook.h"
 #include "version.h"
 #include "config.h"
@@ -440,6 +441,21 @@ bool ProtosAgree(void* a, void* b, const char** what) {
 // Pulls the source out of the reader and decides what to do with this chunk.
 // Returns the cached Proto on a reuse that needs no check, or null to let the
 // client compile - with g_pending armed when the result is worth keeping.
+// What the client is compiling right now, filled whether or not the cache wants
+// to keep it. The in-memory cache only arms g_pending for chunks it has decided
+// to store; the disk store wants the ones it has never seen before, which is
+// precisely the set g_pending leaves out.
+struct {
+    bool        valid;
+    const char* src;
+    size_t      srcLen;
+    const char* name;
+    size_t      nameLen;
+} g_lastCompile = { false, nullptr, 0, nullptr, 0 };
+
+unsigned long g_diskServed = 0;
+unsigned long g_diskProved = 0;
+
 void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
     *checked = false;
 
@@ -455,6 +471,12 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
 
     size_t nameLen = strlen(name);
     g_seen++;
+
+    g_lastCompile.valid   = true;
+    g_lastCompile.src     = src;
+    g_lastCompile.srcLen  = srcLen;
+    g_lastCompile.name    = name;
+    g_lastCompile.nameLen = nameLen;
 
     if (srcLen > kMaxChunkBytes) {
         g_tooBig++;
@@ -522,6 +544,47 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
         return nullptr;
     }
 
+    // Nothing in memory. The disk store may still have it from an earlier
+    // session, and if it does the parse can be skipped on this first sighting
+    // rather than the third - which is the whole point of it, because a first
+    // sighting is what the in-memory cache can never help with.
+    //
+    // While the store is still proving itself the client parses as well and the
+    // two Protos are compared, and the caller is handed the client's. That is
+    // the same shape as the verification above and for the same reason.
+    if (Config::g_settings.OptLuaBytecodeStore) {
+        bool  needsCheck = false;
+        void* fromDisk = LuaBytecodeStore::Lookup(L, src, srcLen, name, nameLen,
+                                                  &needsCheck);
+        if (fromDisk) {
+            void* use = fromDisk;
+            if (needsCheck) {
+                void* fresh = orig_luaY_parser(L, z, buff, name);
+                *checked = true;
+                if (!fresh) return nullptr;
+                if (!LuaBytecodeStore::Confirm(fromDisk, fresh, name)) return fresh;
+                g_diskProved++;
+                use = fresh;
+            } else {
+                g_diskServed++;
+            }
+            // Keep it in memory too, so the next occurrence this session costs
+            // a hash lookup rather than a file read and a rebuild. Armed the
+            // same way a fresh compile is, and anchored at the same place.
+            if (g_cache.size() < kMaxEntries &&
+                g_blobBytes + srcLen + nameLen + 2 <= kMaxTotalBytes) {
+                g_pending.want    = true;
+                g_pending.key     = key;
+                g_pending.src     = src;
+                g_pending.srcLen  = srcLen;
+                g_pending.name    = name;
+                g_pending.nameLen = nameLen;
+                g_pending.proto   = use;
+            }
+            return use;
+        }
+    }
+
     // A first sighting leaves a key and a length behind and nothing else. Only
     // something the client has now compiled twice is worth a copy of its source.
     std::unordered_map<uint64_t, uint32_t>::iterator seen = g_seenOnce.find(key);
@@ -571,6 +634,7 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
 
 void* __cdecl Hooked_luaY_parser(void* L, void* z, void* buff, const char* name) {
     g_pending.want = false;
+    g_lastCompile.valid = false;
 
     // Taken before Classify, so a timed hit covers the lookup as well as the
     // skipped parse - which is what the client actually pays on a hit.
@@ -649,7 +713,19 @@ bool AnchorTopClosure(void* L, void* proto) {
 
 int __cdecl Hooked_luaL_loadbuffer(void* L, const char* buf, size_t sz, const char* name) {
     g_pending.want = false;
+    g_lastCompile.valid = false;
     int rc = orig_luaL_loadbuffer(L, buf, sz, name);
+
+    // The closure is on top of the stack here, which is what lua_dump needs, and
+    // the source bytes are the ones Classify read out of the reader rather than
+    // `buf` - luaL_loadbuffer skips a UTF-8 BOM before handing them on, so the
+    // two are not always the same bytes and the key has to be built from the
+    // ones the parser actually saw.
+    if (rc == 0 && !g_dead && g_lastCompile.valid) {
+        LuaBytecodeStore::Capture(L, g_lastCompile.src, g_lastCompile.srcLen,
+                                  g_lastCompile.name, g_lastCompile.nameLen);
+    }
+    g_lastCompile.valid = false;
 
     if (rc != 0 || g_dead || !g_pending.want || !g_pending.proto) {
         g_pending.want = false;
@@ -800,6 +876,17 @@ void LogStats() {
         g_verified, g_tooBig, (unsigned)(kMaxChunkBytes / 1024),
         g_bytesTooBig / 1024, g_capped, g_notBuffer, g_anchorFailed,
         g_swapFlushes);
+    if (Config::g_settings.OptLuaBytecodeStore) {
+        // The store counts how many parses it skipped; only this module knows
+        // what a parse costs, so the two numbers have to meet somewhere.
+        if (g_missTimed)
+            LuaBytecodeStore::NoteParseCost(g_missMsTotal / (double)g_missTimed);
+        Log("[ProtoCache]   %lu chunks came back from the disk store on a first "
+            "sighting - compiles no in-process cache could have removed - and "
+            "%lu more were rebuilt from it and checked against a real parse "
+            "before anything was reused.", g_diskServed, g_diskProved);
+    }
+
     if (g_stale)
         Log("[ProtoCache]   %lu times a kept Proto had stopped looking like "
             "itself and the cache was emptied. Anything above zero here means a "

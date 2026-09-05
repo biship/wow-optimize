@@ -141,6 +141,8 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_hget_dispatch.cpp
     src/runtime_vm/lua_pool_fast.cpp
     src/runtime_vm/lua_proto_cache.cpp
+    src/runtime_vm/lua_bytecode_store.cpp
+    src/runtime_vm/lua_undump.cpp
     src/simd_math/quat_lerp_sse2.cpp
     src/simd_math/bone_matrix_upload_sse2.cpp
     src/simd_math/m2_matrix_slot_sse2.cpp
