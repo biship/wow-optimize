@@ -179,6 +179,25 @@ static unsigned long g_texWouldSkip   = 0;
 static unsigned long g_texCompared    = 0;
 static DWORD         g_shadowRs[256]  = {};
 static bool          g_shadowRsValid[256] = {};
+// The four setters below skipped nothing at all in a 2318 second session:
+// SetRenderState 0 of 83,139,937, SetSamplerState 0 of 119,490,300,
+// SetTextureStageState 0 of 3,398,084, SetMaterial 0 of 251,855. Not "almost
+// nothing" - zero, at every report point in the session, and the independent
+// shadow measurement on the eight excluded render states agrees at 0 of
+// 33,937,602.
+//
+// Two hundred and six million calls cannot all carry a new value by accident.
+// The likely reason is structural rather than statistical: these detours sit on
+// the D3D9 vtable, which the client reaches only after CGxDevice has decided the
+// state actually changed, so everything arriving here has already passed a
+// filter. That is not proven from the disassembly and is labelled as a guess.
+//
+// What is measured is that the skip cannot fire, and a skip that cannot fire is
+// a return that bypasses D3D9 for no gain - the same shape as the viewport bug
+// above, carried for nothing. They count what they would have skipped and always
+// call through now. If the number below ever comes back non-zero on some client,
+// the dedup is worth putting back.
+static unsigned long g_wouldSkip[NUM_HOOKS] = {};
 static unsigned long g_rsCritWouldSkip = 0;
 static unsigned long g_rsCritCompared  = 0;
 
@@ -351,10 +370,8 @@ static HRESULT __stdcall Hooked_SetRenderState(void* dev, DWORD state, DWORD val
         g_shadowRsValid[state] = true;
     }
 
-    if (state < 256 && !isCriticalState && g_rsValid[state] && g_rsCache[state] == value) {
-        ++g_statSkipped[0];
-        return 0;
-    }
+    if (state < 256 && !isCriticalState && g_rsValid[state] && g_rsCache[state] == value)
+        ++g_wouldSkip[0];
     HRESULT hr = (D3D9_StateBarrier(), g_orig_SetRenderState)(dev, state, value);
     if (SUCCEEDED(hr) && state < 256) {
         g_rsCache[state] = value;
@@ -368,10 +385,8 @@ static HRESULT __stdcall Hooked_SetTextureStageState(void* dev, DWORD stage, DWO
     ++g_statCalls[1];
 
     DWORD idx = (stage & 7) * 32 + (type & 31);
-    if (idx < 256 && g_tssValid[idx] && g_tssCache[idx] == value) {
-        ++g_statSkipped[1];
-        return 0;
-    }
+    if (idx < 256 && g_tssValid[idx] && g_tssCache[idx] == value)
+        ++g_wouldSkip[1];
     HRESULT hr = (D3D9_StateBarrier(), g_orig_SetTextureStageState)(dev, stage, type, value);
     if (SUCCEEDED(hr) && idx < 256) {
         g_tssCache[idx] = value;
@@ -385,10 +400,8 @@ static HRESULT __stdcall Hooked_SetSamplerState(void* dev, DWORD sampler, DWORD 
     ++g_statCalls[2];
 
     DWORD idx = (sampler & 15) * 16 + (type & 15);
-    if (idx < 256 && g_ssValid[idx] && g_ssCache[idx] == value) {
-        ++g_statSkipped[2];
-        return 0;
-    }
+    if (idx < 256 && g_ssValid[idx] && g_ssCache[idx] == value)
+        ++g_wouldSkip[2];
     HRESULT hr = (D3D9_StateBarrier(), g_orig_SetSamplerState)(dev, sampler, type, value);
     if (SUCCEEDED(hr) && idx < 256) {
         g_ssCache[idx] = value;
@@ -577,10 +590,8 @@ static HRESULT __stdcall Hooked_SetMaterial(void* dev, const void* material) {
     }
 
     uint32_t hash = HashMaterial((const DWORD*)material);
-    if (g_materialValid && g_materialHash == hash) {
-        ++g_statSkipped[5];
-        return 0;
-    }
+    if (g_materialValid && g_materialHash == hash)
+        ++g_wouldSkip[5];
     HRESULT hr = (D3D9_StateBarrier(), g_orig_SetMaterial)(dev, material);
     if (SUCCEEDED(hr)) {
         g_materialHash = hash;
@@ -1988,7 +1999,25 @@ void D3D9StateManager_LogStats(void) {
 
     // What the two exclusions cost. Counted, never acted on.
     if (g_texCompared) {
-        Log("[D3D9State]   SetTexture is never deduped, on purpose - a texture "
+        {
+        const unsigned long ws = g_wouldSkip[0] + g_wouldSkip[1] + g_wouldSkip[2] +
+                                 g_wouldSkip[5];
+        if (ws == 0) {
+            Log("[D3D9State]   SetRenderState, SetTextureStageState, "
+                "SetSamplerState and SetMaterial no longer skip anything, they "
+                "only count: a 2318 second session put 206 million calls through "
+                "them and not one carried a value that was already set. A skip "
+                "that cannot fire is a return that bypasses D3D9 for no gain, "
+                "and this session agrees - zero would have been skipped.");
+        } else {
+            Log("[D3D9State]   THE DEDUP IS WORTH PUTTING BACK ON THIS CLIENT: "
+                "%lu call(s) to SetRenderState, SetTextureStageState, "
+                "SetSamplerState or SetMaterial carried a value that was already "
+                "set. They only count now, because a 206 million call session "
+                "measured exactly zero.", ws);
+        }
+    }
+    Log("[D3D9State]   SetTexture is never deduped, on purpose - a texture "
             "freed and reallocated at the same address inside one frame would "
             "match a stale entry. Measured anyway: %lu of %lu calls set the stage "
             "to the pointer it already held (%.1f%%). Under DXVK each of those is "
