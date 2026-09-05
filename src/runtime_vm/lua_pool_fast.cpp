@@ -126,7 +126,11 @@ unsigned long g_hits       = 0;   // answered from the cache
 unsigned long g_misses     = 0;   // had to walk the pool
 unsigned long g_notFound   = 0;   // block belongs to no chunk of this pool
 unsigned long g_torn       = 0;   // candidate failed its check against the chunk
+// Two words, because this accumulates a value rather than counting calls
+// and thirty-two bits is not enough for a long session. A plain 64-bit
+// counter on a hot path is a lock cmpxchg8b; two 32-bit stores are not.
 unsigned long g_scanSteps  = 0;   // chunks stepped over, misses and learning only
+unsigned long g_scanStepWraps = 0;
 unsigned long g_scanCalls  = 0;
 unsigned long g_worstScan  = 0;
 unsigned long g_poolChunks = 0;   // chunk count last seen, for the report
@@ -264,7 +268,9 @@ int __fastcall Hooked_PoolFreeBody(void* pool, void* edx, void* block) {
         }
 
         g_scanCalls++;
-        g_scanSteps += steps;
+        { const unsigned long before = g_scanSteps;
+          g_scanSteps += steps;
+          if (g_scanSteps < before) ++g_scanStepWraps; }
         if (steps > g_worstScan) g_worstScan = steps;
 
         int rc = orig_PoolFree(pool, edx, block);
@@ -305,7 +311,8 @@ int __fastcall Hooked_PoolFreeBody(void* pool, void* edx, void* block) {
                 "client pushed onto. The scan it is replacing averaged %.1f chunks "
                 "and reached %lu at worst, over a pool holding %lu.",
                 g_verified,
-                g_scanCalls ? (double)g_scanSteps / (double)g_scanCalls : 0.0,
+                g_scanCalls ? ((double)g_scanStepWraps * 4294967296.0 +
+                       (double)g_scanSteps) / (double)g_scanCalls : 0.0,
                 g_worstScan, g_poolChunks);
         }
         return rc;
@@ -326,7 +333,9 @@ int __fastcall Hooked_PoolFreeBody(void* pool, void* edx, void* block) {
         chunk = ScanPool(p, b, &steps, &idx);
         g_misses++;
         g_scanCalls++;
-        g_scanSteps += steps;
+        { const unsigned long before = g_scanSteps;
+          g_scanSteps += steps;
+          if (g_scanSteps < before) ++g_scanStepWraps; }
         if (steps > g_worstScan) g_worstScan = steps;
         if (!chunk) { g_notFound++; return 0; }
         CacheInsert(p, chunk, idx);
@@ -413,7 +422,8 @@ void LogStats() {
         g_calls,
         g_dead ? " - RETIRED on a disagreement"
                : (g_armed ? "" : " - still predicting, the client still does every free"),
-        g_scanCalls ? (double)g_scanSteps / (double)g_scanCalls : 0.0,
+        g_scanCalls ? ((double)g_scanStepWraps * 4294967296.0 +
+                       (double)g_scanSteps) / (double)g_scanCalls : 0.0,
         g_scanCalls, g_worstScan, g_poolChunks);
     if (looked)
         Log("[LuaPoolFast]   %lu answered from the cache (%.1f%%), %lu needed "

@@ -2200,17 +2200,23 @@ static recv_fn      orig_recv      = nullptr;
 static WSARecv_fn   orig_WSARecv   = nullptr;
 
 static long g_recvCalls      = 0;
-static long g_recvBytes      = 0;
+// Bytes, not calls, so two words: a session that receives more than two
+// gigabytes used to report a negative kilobyte count.
+static unsigned long g_recvBytes      = 0;
+static unsigned long g_recvBytesWraps = 0;
 static long g_recvWouldBlock = 0;
 static long g_WSARecvCalls   = 0;
-static long g_WSARecvBytes   = 0;
+static unsigned long g_WSARecvBytes   = 0;
+static unsigned long g_WSARecvBytesWraps = 0;
 static long g_WSARecvWouldBlock = 0;
 
 static int WINAPI hooked_recv(SOCKET s, char* buf, int len, int flags) {
     int result = orig_recv(s, buf, len, flags);
     if (result > 0) {
         g_recvCalls++;
-        g_recvBytes += result;
+        { const unsigned long before = g_recvBytes;
+          g_recvBytes += (unsigned long)result;
+          if (g_recvBytes < before) ++g_recvBytesWraps; }
     } else if (result == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
@@ -2227,7 +2233,9 @@ static int WINAPI hooked_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCou
                                lpFlags, lpOverlapped, lpCompletionRoutine);
     if (result == 0 && lpNumberOfBytesRecvd) {
         g_WSARecvCalls++;
-        g_WSARecvBytes += *lpNumberOfBytesRecvd;
+        { const unsigned long before = g_WSARecvBytes;
+          g_WSARecvBytes += *lpNumberOfBytesRecvd;
+          if (g_WSARecvBytes < before) ++g_WSARecvBytesWraps; }
     } else if (result == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
@@ -5191,8 +5199,11 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     // Receive-side network stats
     if (g_recvCalls > 0 || g_WSARecvCalls > 0)
         Log("[Stats] Network RX: recv=%ld calls, %.1f KB, %ld wouldblock | WSARecv=%ld calls, %.1f KB, %ld wouldblock",
-            g_recvCalls, g_recvBytes / 1024.0, g_recvWouldBlock,
-            g_WSARecvCalls, g_WSARecvBytes / 1024.0, g_WSARecvWouldBlock);
+            g_recvCalls,
+            ((double)g_recvBytesWraps * 4294967296.0 + (double)g_recvBytes) / 1024.0,
+            g_recvWouldBlock, g_WSARecvCalls,
+            ((double)g_WSARecvBytesWraps * 4294967296.0 + (double)g_WSARecvBytes) / 1024.0,
+            g_WSARecvWouldBlock);
     if (fps.phase2Active) {
         Log("[Stats] Phase2: find=%ld/%ld match=%ld/%ld type=%ld math=%ld strlen=%ld byte=%ld tostr=%ld/%ld tonum=%ld next=%ld/%ld rawget=%ld/%ld rawset=%ld/%ld tins=%ld/%ld trem=%ld/%ld concat=%ld/%ld unpack=%ld/%ld select=%ld/%ld raweq=%ld/%ld sub=%ld lower=%ld upper=%ld ipairs=%ld/%ld iter=%ld/%ld random=%ld/%ld sqrt=%ld/%ld rep=%ld/%ld find_full=%ld/%ld",
             fps.findPlainHits, fps.findFallbacks, fps.matchHits, fps.matchFallbacks, fps.typeHits, fps.mathHits, fps.strlenHits, fps.strbyteHits,

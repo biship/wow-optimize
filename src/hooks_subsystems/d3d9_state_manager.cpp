@@ -855,13 +855,30 @@ static DrawIdxPrim_t g_orig_DrawIndexedPrimitive = nullptr;
 
 // Plain 32-bit on the hottest calls in the frame, for the reason written above
 // the state counters. Lower bounds, and the report says so.
-static unsigned long g_drawPrims  = 0;    // primitives summed over all draws
+// Primitives, in two words rather than one.
+//
+// This was a single `unsigned long`, and a tester's session summed 293 million
+// draws at roughly seventeen primitives each - five billion, which does not fit
+// in thirty-two bits. It wrapped, and the report printed the total going down
+// between reports: 3.40 billion, then 1.44 billion, then 479 million, then 223
+// million, ending at "0.8 primitives per call" for a client whose draws are all
+// triangle lists and therefore carry at least one each.
+//
+// A plain sixty-four-bit counter is not the fix here: this is the busiest call
+// in the frame and a lock cmpxchg8b on it is the shape that has eaten three
+// optimisations in this project. Two thirty-two-bit words are. Each store is
+// atomic on x86, the wrap count can only lose an increment the way any plain
+// counter can, and the report puts them back together.
+static unsigned long g_drawPrims  = 0;    // low word, wraps
+static unsigned long g_drawPrimWraps = 0; // how many times it has
 static unsigned long g_drawTiny   = 0;    // draws of eight primitives or fewer
 static unsigned long g_drawBucket[6] = {};  // 1-2, 3-8, 9-32, 33-128, 129-512, 513+
 static const char*   g_bucketName[6] = { "1-2", "3-8", "9-32", "33-128", "129-512", "513+" };
 
 static inline void NoteDraw(UINT prims) {
+    const unsigned long before = g_drawPrims;
     g_drawPrims += prims;
+    if (g_drawPrims < before) ++g_drawPrimWraps;
     int b;
     if      (prims <= 2)   b = 0;
     else if (prims <= 8)   b = 1;
@@ -1972,11 +1989,23 @@ void D3D9StateManager_LogStats(void) {
                          "no client produces - suspect the frame count",
                          perFrame);
         }
+        const double prims = (double)g_drawPrimWraps * 4294967296.0 +
+                             (double)g_drawPrims;
         Log("[D3D9State] draw calls: %lu over %lu frames = %.0f per frame, "
-            "carrying %lu primitives = %.0f per frame and %.1f per call.",
+            "carrying %.0f primitives = %.0f per frame and %.1f per call.",
             draws, frames, (double)draws / (double)frames,
-            g_drawPrims, (double)g_drawPrims / (double)frames,
-            (double)g_drawPrims / (double)draws);
+            prims, prims / (double)frames, prims / (double)draws);
+        // A triangle list draw carries at least one primitive and this client
+        // issues nothing else through here, so anything under one means the
+        // count is wrong rather than interesting.
+        if (prims / (double)draws < 1.0) {
+            Log("[D3D9State]   THAT IS IMPOSSIBLE: fewer than one primitive per "
+                "draw call. The primitive total is wrong; do not use it.");
+            Verdict::Add(Verdict::Warn,
+                         "the draw census reports fewer than one primitive per "
+                         "draw call, which cannot happen - its primitive total "
+                         "is broken");
+        }
         Log("[D3D9State]   primitives per draw - the number that decides whether "
             "batching is worth anything, because an average hides it:");
         for (int b = 0; b < 6; b++) {
