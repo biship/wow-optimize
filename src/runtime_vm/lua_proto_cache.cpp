@@ -478,12 +478,6 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
     g_lastCompile.name    = name;
     g_lastCompile.nameLen = nameLen;
 
-    if (srcLen > kMaxChunkBytes) {
-        g_tooBig++;
-        g_bytesTooBig += srcLen;
-        return nullptr;
-    }
-
     // A new global state means every Proto from the old one is gone with it.
     // Two independent reasons to drop everything, and the second is the one
     // that matters. l_G changing proves a new state; l_G staying the same
@@ -570,8 +564,10 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
             }
             // Keep it in memory too, so the next occurrence this session costs
             // a hash lookup rather than a file read and a rebuild. Armed the
-            // same way a fresh compile is, and anchored at the same place.
-            if (g_cache.size() < kMaxEntries &&
+            // same way a fresh compile is, and anchored at the same place - and
+            // subject to the source-copy cap this block now sits above.
+            if (srcLen <= kMaxChunkBytes &&
+                g_cache.size() < kMaxEntries &&
                 g_blobBytes + srcLen + nameLen + 2 <= kMaxTotalBytes) {
                 g_pending.want    = true;
                 g_pending.key     = key;
@@ -583,6 +579,16 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
             }
             return use;
         }
+    }
+
+    // Too large to keep a copy of the source for, which is what this module
+    // spends its budget on. It sits below the disk store rather than above it:
+    // the store keeps no source, so the chunks this turns away are the ones it
+    // most wants, and a 492 KB file is where skipping a parse is worth the most.
+    if (srcLen > kMaxChunkBytes) {
+        g_tooBig++;
+        g_bytesTooBig += srcLen;
+        return nullptr;
     }
 
     // A first sighting leaves a key and a length behind and nothing else. Only
