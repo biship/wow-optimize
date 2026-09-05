@@ -24,6 +24,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
+* [What's New in v3.19.4](#whats-new-in-v3194)
 * [What's New in v3.19.3](#whats-new-in-v3193)
 * [What's New in v3.19.2](#whats-new-in-v3192)
 * [Send me your log](#send-me-your-log)
@@ -37,6 +38,36 @@ The current public build is focused on real frametime stability, long-session sm
 * [Building](#building)
 * [Core Architecture](#core-architecture)
 * [Troubleshooting & Diagnostics](#troubleshooting)
+
+---
+
+## What's New in v3.19.4
+
+### Fixed
+
+* **The quality governor cut your view distance every time you zoned**, reported
+  by the tester who turned every option on and said something was off with the
+  graphics while running around. Twelve seconds after entering the world it read
+  the frame tail at 125 ms and halved particle density; twenty-six seconds later
+  it read 248 ms and pulled farclip from 350 down to 262; a minute after that it
+  read 15 ms and put both back. Seven times in four minutes, on a session whose
+  average frame time was 4.16 ms. It was reading the end of a loading screen as
+  slow gameplay, and its 512-frame window made one burst of hitches look like a
+  trend for eight seconds when it only calls five seconds sustained. It now
+  ignores loading screens, throws its window away when one ends, and waits for
+  real frames before deciding anything. Off by default, so this only affected
+  people who enable everything.
+* **The quality governor never said what it was doing.** Its only report was in
+  shutdown, which does not run in this client, so a session where it changed
+  nothing said nothing at all. It reports every interval now, with the values it
+  is holding against your own.
+* **Reuse Compiled Scripts Between Sessions switched itself off on the first real
+  client**, 26 seconds in, after 215 rebuilt scripts matched a fresh compile and
+  the 216th differed in one constant's addon ownership. Nothing wrong was ever
+  handed to the game - that is what the checking is for. The cause was reading
+  that ownership once per script instead of once per constant, which is what the
+  game does. Fixed, and the message now carries both values so the next report
+  settles it rather than describing it.
 
 ---
 
