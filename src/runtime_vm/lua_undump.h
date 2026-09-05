@@ -29,6 +29,10 @@ void* Load(void* L, const void* data, size_t len);
 // On a difference, *what names the field.
 bool Equal(void* a, void* b, const char** what);
 
+// After Equal returns false, the numbers behind *what, or an empty string when
+// the difference had none. Valid until the next Equal.
+const char* LastDetail();
+
 // Stops Load from returning anything for the rest of the session.
 void Retire(const char* why);
 bool Retired();

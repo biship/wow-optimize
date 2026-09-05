@@ -375,9 +375,14 @@ void* BuildFunction(void* L, Reader& r, void* parentSource, int depth) {
         WRP (f, kP_k, k);
         WR32(f, kP_sizek, sizek);
 
-        const uint32_t taint = CurrentTaint();
         for (uint32_t i = 0; i < sizek; i++) {
             char* tv = k + (size_t)i * kTV_size;
+            // Read for each constant rather than once for the array. The client
+            // adds constants one at a time through addk, and every TValue store
+            // it makes reads this global at the moment of the store, so a value
+            // that moves during a parse moves for it too. Reading it once was
+            // the first thing a field session disagreed with.
+            const uint32_t taint = CurrentTaint();
             uint8_t tag = U8(r);
             switch (tag) {
                 case kTagNil:
@@ -450,6 +455,11 @@ void* BuildFunction(void* L, Reader& r, void* parentSource, int depth) {
 
 // --- Comparison -------------------------------------------------------------
 
+// Filled in when a comparison fails, so the log can carry the numbers instead
+// of a category. A mismatch retires the feature permanently, so the one report
+// it produces has to be enough to work from.
+char g_detail[256];
+
 bool SameConstants(void* a, void* b, const char** what) {
     uint32_t n = RD32(a, kP_sizek);
     const char* ka = (const char*)RDP(a, kP_k);
@@ -459,8 +469,22 @@ bool SameConstants(void* a, void* b, const char** what) {
         const char* x = ka + (size_t)i * kTV_size;
         const char* y = kb + (size_t)i * kTV_size;
         uint32_t tx = RD32(x, kTV_tt);
-        if (tx != RD32(y, kTV_tt))       { *what = "a constant's type";  return false; }
-        if (RD32(x, kTV_taint) != RD32(y, kTV_taint)) { *what = "a constant's taint"; return false; }
+        if (tx != RD32(y, kTV_tt)) {
+            _snprintf(g_detail, sizeof(g_detail) - 1,
+                      "constant %u of %u: rebuilt type %u, parsed type %u",
+                      i, n, tx, RD32(y, kTV_tt));
+            *what = "a constant's type";
+            return false;
+        }
+        if (RD32(x, kTV_taint) != RD32(y, kTV_taint)) {
+            _snprintf(g_detail, sizeof(g_detail) - 1,
+                      "constant %u of %u, type %u: rebuilt taint 0x%08X, parsed "
+                      "taint 0x%08X, the global reads 0x%08X now",
+                      i, n, tx, RD32(x, kTV_taint), RD32(y, kTV_taint),
+                      CurrentTaint());
+            *what = "a constant's taint";
+            return false;
+        }
         // Only the bytes the tag gives meaning to. The client's constant array
         // comes from an uninitialised allocation, so the upper half of a
         // boolean or a string slot holds whatever was there before.
@@ -604,10 +628,13 @@ void* Load(void* L, const void* data, size_t len) {
     return f;
 }
 
+const char* LastDetail() { return g_detail; }
+
 bool Equal(void* a, void* b, const char** what) {
     const char* ignored = "";
     if (!what) what = &ignored;
     *what = "";
+    g_detail[0] = 0;
     __try {
         return EqualInner(a, b, what, 0);
     } __except (EXCEPTION_EXECUTE_HANDLER) {

@@ -491,10 +491,15 @@ bool Confirm(void* mine, void* fresh, const char* name) {
     }
     g_dead = true;
     LuaUndump::Retire("a Proto rebuilt from the store did not match a fresh parse");
+    const char* detail = LuaUndump::LastDetail();
     Log("[BytecodeStore] Retired: the Proto rebuilt for \"%s\" differs from the "
-        "one the client just parsed, in %s. The store is not being used again "
-        "this session and the file will be discarded on the next start.",
-        name ? name : "?", what);
+        "one the client just parsed, in %s%s%s. It had agreed on %lu before this "
+        "one. The store is not used again this session and the files are "
+        "discarded on the next start.",
+        name ? name : "?", what,
+        (detail && detail[0]) ? " - " : "",
+        (detail && detail[0]) ? detail : "",
+        g_proved);
     // Clear the index so the next session starts from nothing rather than
     // reading a store this one has decided it cannot trust. The blob file is
     // left alone; without an index it is unreachable and will be truncated the
