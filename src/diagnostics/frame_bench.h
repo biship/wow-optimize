@@ -53,6 +53,16 @@ void Report(const char* reason);
 // returns.
 double RecentP95Ms();
 
+// Throws away the recent window. For a caller that has just been told the
+// frames in it were not gameplay - the far side of a loading screen - so that
+// what it reads next is only frames from after the boundary.
+void ResetRecent();
+
+// Whether the recent window is full again. A caller that acts on the tail has
+// to wait for this after a reset, or it judges the first seconds after a load
+// against a handful of samples.
+bool RecentWindowFull();
+
 // Smoothed frame time in milliseconds, or 0.0 before any frame has been measured.
 // Constant time, unlike RecentP95Ms, so it is safe to consult on a per-frame or
 // per-Sleep path.

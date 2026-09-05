@@ -22,6 +22,10 @@
 
 extern "C" void Log(const char* fmt, ...);
 
+// Declared rather than included: loading_state.h pulls in the whole loading
+// subsystem for one predicate.
+namespace LoadingState { bool IsLoading(); }
+
 namespace QualityGovernor {
 
 typedef char (__fastcall* CVar_Set_fn)(void* cvar, void* edx, const char* value,
@@ -111,6 +115,8 @@ static DWORD  g_lastAction  = 0;
 static int    g_featureToken = -1;
 static int    g_deepest     = 0;
 static bool   g_enabled     = false;
+static bool   g_wasLoading  = false;
+static unsigned long g_loadsIgnored = 0;
 
 static int Find(const char* name) {
     for (int i = 0; i < M_COUNT; i++) {
@@ -255,6 +261,45 @@ void OnFrame() {
     }
     if (!anyKnown) return;
 
+    // A loading screen is not slow gameplay, and the frames on the far side of
+    // one are not evidence about this one.
+    //
+    // This is what a tester saw as "something wrong with the graphics while I
+    // run around" and could not describe further. Twelve seconds after entering
+    // the world the governor read p95 at 125 ms and halved particle density;
+    // twenty-six seconds later it read 248.5 ms and cut the view distance from
+    // 350 to 262; a minute after that it read 15 ms and put both back. The
+    // machine was never slow. It was reacting to a zone-in, and it did that
+    // seven times in a four-minute session.
+    //
+    // Two things let that happen. FrameBench discards frames while
+    // LuaOpt::IsLoadingMode is set, but its own comment records that
+    // LoadingDefrag force-exits that state after thirty seconds and did so on
+    // seven of twelve loads, so the end of a long load lands in the window as
+    // ordinary frames. And the window remembers 512 of them: twenty-six slow
+    // ones anywhere in it hold p95 above the threshold for the eight seconds it
+    // takes to roll them out, which is longer than the five seconds the
+    // governor calls sustained. A burst therefore always reads as a trend.
+    //
+    // So: no opinion while a load is up, the window thrown away when one ends,
+    // and nothing decided until it has refilled with frames from this side of
+    // the boundary. That makes "sustained" mean at least the eight seconds the
+    // window spans plus the five the dwell asks for, rather than one burst.
+    bool loading = LoadingState::IsLoading();
+    if (loading || g_wasLoading) {
+        if (loading) {
+            g_wasLoading = true;
+        } else {
+            g_wasLoading = false;
+            FrameBench::ResetRecent();
+            g_loadsIgnored++;
+        }
+        g_badSince = 0;
+        g_goodSince = 0;
+        return;
+    }
+    if (!FrameBench::RecentWindowFull()) { g_badSince = 0; g_goodSince = 0; return; }
+
     double p95 = FrameBench::RecentP95Ms();
     if (p95 <= 0.0) return;            // not enough frames to have an opinion
 
@@ -305,6 +350,28 @@ bool Init() {
         }
     }
     return true;
+}
+
+void LogStats() {
+    if (!g_enabled) {
+        Log("[QualityGovernor] Off. Nothing is changing the player's graphics "
+            "settings.");
+        return;
+    }
+    if (g_deepest == 0) {
+        Log("[QualityGovernor] Measured and zero: it has not reduced anything "
+            "this session, and %lu loading screen(s) were ignored rather than "
+            "read as slow gameplay.", g_loadsIgnored);
+        return;
+    }
+    Log("[QualityGovernor] Reduced quality this session; deepest step %d of %d, "
+        "currently at %d. %lu loading screen(s) were ignored rather than read "
+        "as slow gameplay.", g_deepest, MAX_STEP, g_step, g_loadsIgnored);
+    for (int i = 0; i < M_COUNT; i++) {
+        if (!g_managed[i] || !g_set[i].known) continue;
+        Log("[QualityGovernor]   %s is at %.3g against the player's own %.3g",
+            g_set[i].cvar, g_set[i].current, g_set[i].userValue);
+    }
 }
 
 void Shutdown() {

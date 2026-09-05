@@ -5280,6 +5280,7 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     VertexFmtInline::LogStats();
     ObjMgrFindFast::LogStats();
     QuatLerpSse2::LogStats();
+    QualityGovernor::LogStats();
     LuaProtoCache::LogStats();
     LuaBytecodeStore::LogStats();
     LuaUndump::LogStats();

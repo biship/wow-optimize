@@ -208,6 +208,13 @@ static void NoteRecent(double ms) {
     if (g_recentCount < RECENT_SIZE) g_recentCount++;
 }
 
+void ResetRecent() {
+    g_recentCount = 0;
+    g_recentPos   = 0;
+}
+
+bool RecentWindowFull() { return g_recentCount >= RECENT_SIZE; }
+
 double RecentP95Ms() {
     int n = g_recentCount;
     if (n < 64) return 0.0;          // too early to have an opinion
