@@ -359,7 +359,7 @@ namespace WowOptimizeLauncher {
         // remote version.txt to decide whether to show the update notification,
         // and shown in the version label. Keep in sync with version.txt and
         // src/core/version.h on every release.
-        private const string APP_VERSION = "3.19.5";
+        private const string APP_VERSION = "3.19.2";
 
         private string iniPath;
         private Dictionary<string, SettingItem> settingsMap;
@@ -932,15 +932,23 @@ namespace WowOptimizeLauncher {
 
             // Tip label
             Label tipLabel = new Label();
-            tipLabel.Text = "[+] makes the game faster   [=] protects or repairs   "
-                          + "[?] measures it, and costs frames to do so   "
-                          + "[-] more frames, different look   [.] writes a log   [x] measured and lost\r\n"
-                          + "Tip: Hover over any optimization feature to view a detailed description of its behavior.";
-            tipLabel.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            // Two lines. It was one line 20 pixels tall holding six marks and a
+            // sentence, so it showed three of the marks and cut the third in half.
+            tipLabel.Text = "[+] faster   [=] protects   [?] measures, costs frames\r\n"
+                          + "[-] changes the look   [x] lost a measurement   [.] log";
+            tipLabel.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
             tipLabel.ForeColor = CyanAccent;
             tipLabel.AutoSize = false;
-            tipLabel.Size = new Size(rightW - 270, 20);
-            tipLabel.Location = new Point(rightX, 15);
+            tipLabel.Size = new Size(rightW - 270, 30);
+            tipLabel.Location = new Point(rightX, 8);
+            toolTip.SetToolTip(tipLabel,
+                "[+] makes the game faster.\r\n"
+                + "[=] protects or repairs something; no speed claim.\r\n"
+                + "[?] measures the game, and costs frames to produce the number.\r\n"
+                + "[-] buys frames by changing how the game looks or sounds.\r\n"
+                + "[x] was measured against the client and lost; hover it to read what.\r\n"
+                + "[.] writes a log; negligible cost.\r\n\r\n"
+                + "Hover any feature for what it does.");
             tipLabel.BackColor = Color.Transparent;
             Controls.Add(tipLabel);
 
@@ -967,8 +975,8 @@ namespace WowOptimizeLauncher {
 
             // TabControl
             tabs = new DarkTabControl();
-            tabs.Location = new Point(rightX, 40);
-            tabs.Size = new Size(rightW, ClientSize.Height - 55);
+            tabs.Location = new Point(rightX, 44);
+            tabs.Size = new Size(rightW, ClientSize.Height - 59);
             tabs.SelectedIndexChanged += delegate {
                 if (searchBox != null) {
                     FilterFeatures(searchBox.Text);
@@ -1017,9 +1025,10 @@ namespace WowOptimizeLauncher {
             // find out what one of them does.
             Label expNote = new Label();
             experimentalNote = expNote;
-            expNote.Text = "Under investigation, or new enough that nobody has proven them yet.\r\n"
+            expNote.Text = "Believed to help, and nobody has proven it yet.\r\n"
                          + "Turn on ONE at a time, play, and send the log - that is what makes them\r\n"
-                         + "either real features or deleted ones. Left off by Enable All.";
+                         + "either real features or deleted ones. Left off by Enable All, on for\r\n"
+                         + "Max Performance. Anything already measured sits in its own tab instead.";
             expNote.AutoSize = false;
             expNote.Size = new Size(tabs.Width - 60, 58);
             expNote.ForeColor = Color.FromArgb(150, 163, 178);
@@ -1038,27 +1047,9 @@ namespace WowOptimizeLauncher {
 
                 chk.CheckedChanged += delegate { UpdateActiveModulesCount(); };
 
-                // The ini section still decides where the value is written; this
-                // flag only decides which tab the switch is shown on.
-                if (data.Experimental) {
-                    experimentalFlow.Controls.Add(chk);
-                    continue;
-                }
-
-                switch (data.Section) {
-                    case "General":
-                        generalFlow.Controls.Add(chk);
-                        break;
-                    case "UI_Lua":
-                        uiLuaFlow.Controls.Add(chk);
-                        break;
-                    case "Combat_Net":
-                        combatNetFlow.Controls.Add(chk);
-                        break;
-                    case "Graphics_Sound":
-                        graphicsSoundFlow.Controls.Add(chk);
-                        break;
-                }
+                // The ini section still decides where the value is written; the
+                // tab is only where it is shown. See FlowFor.
+                FlowFor(data).Controls.Add(chk);
             }
 
             Controls.Add(tabs);
@@ -1122,24 +1113,12 @@ namespace WowOptimizeLauncher {
                         data.Ctrl.Visible = false;
                     }
                 } else {
-                    // Restore to original tab flows
+                    // Restore to original tab flows. Same rule as the initial
+                    // build, from the same method, so the two cannot disagree -
+                    // they did once, and the first tab switch emptied a tab.
                     if (data.Ctrl != null) {
                         data.Ctrl.Visible = true;
-                        // Experimental wins over the ini section, exactly as it does
-                        // when the tabs are first built. Routing on Section alone
-                        // here is what emptied the Experimental tab: the first tab
-                        // switch moved both switches onto Graphics & Sound and
-                        // UI & Lua and left the tab with nothing but its note.
-                        if (data.Experimental) {
-                            experimentalFlow.Controls.Add(data.Ctrl);
-                        } else {
-                            switch (data.Section) {
-                                case "General": generalFlow.Controls.Add(data.Ctrl); break;
-                                case "UI_Lua": uiLuaFlow.Controls.Add(data.Ctrl); break;
-                                case "Combat_Net": combatNetFlow.Controls.Add(data.Ctrl); break;
-                                case "Graphics_Sound": graphicsSoundFlow.Controls.Add(data.Ctrl); break;
-                            }
-                        }
+                        FlowFor(data).Controls.Add(data.Ctrl);
                     }
                 }
             }
@@ -1188,6 +1167,34 @@ namespace WowOptimizeLauncher {
             btn.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
             btn.Margin = new Padding(5, 5, 5, 12);
             return btn;
+        }
+
+        // Which tab a switch belongs on. Both the initial build and the search
+        // filter route through here, because they are the two places that have
+        // already drifted apart once and emptied a tab between them.
+        //
+        // The Experimental tab is for what nobody has proven yet - its own note
+        // asks a tester to turn on one at a time and send the log, and that is
+        // only a sensible request for a switch whose answer is still open.
+        // Fifty-six of the hundred and twenty-three were landing there, which
+        // is not a shortlist, and it left the four category tabs half empty.
+        //
+        // Anything that has been measured now sits in its own category with its
+        // mark on it, whichever way the measurement went. A draw call census is
+        // a graphics entry, not an open question; so is a governor that trades
+        // frames for looks, and so is a replacement that came out slower than
+        // the code it replaced.
+        private FlowLayoutPanel FlowFor(SettingItem data) {
+            if (data.Experimental && Kinds.HelpsSpeed(data.Key)) {
+                return experimentalFlow;
+            }
+            switch (data.Section) {
+                case "General":        return generalFlow;
+                case "UI_Lua":         return uiLuaFlow;
+                case "Combat_Net":     return combatNetFlow;
+                case "Graphics_Sound": return graphicsSoundFlow;
+            }
+            return generalFlow;
         }
 
         private DarkCheckBox CreateStyledCheckBox(string name, string tooltipText) {

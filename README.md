@@ -24,9 +24,6 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
-* [What's New in v3.19.5](#whats-new-in-v3195)
-* [What's New in v3.19.4](#whats-new-in-v3194)
-* [What's New in v3.19.3](#whats-new-in-v3193)
 * [What's New in v3.19.2](#whats-new-in-v3192)
 * [Send me your log](#send-me-your-log)
   * [Measuring rather than reporting](#if-you-want-to-measure-something-rather-than-report-a-bug)
@@ -42,7 +39,7 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
-## What's New in v3.19.5
+## What's New in v3.19.2
 
 ### New
 
@@ -69,10 +66,48 @@ The current public build is focused on real frametime stability, long-session sm
   Frame Batch no longer switches anything; and Adaptive Lua GC Governor is the
   one module with a tester crash that still has us in the call stack. Every one
   of the 25 is still yours to tick, and hovering it says what was measured.
+* **The tabs hold what their names say now.** Fifty-six of the hundred and
+  twenty-three switches were landing on Experimental, which is not a shortlist,
+  and it left the four category tabs half empty. Anything that has been measured
+  now sits in its own category with its mark on it, whichever way the
+  measurement went - a draw call census is a graphics entry, not an open
+  question. Experimental keeps the thirty-seven nobody has proven yet, which is
+  what its note actually asks a tester to work through.
+* **Reuse Compiled Scripts Between Sessions.** A measured loading screen spends
+  2128 ms inside the game's Lua compiler. Only 260 ms of that is text the session
+  had already compiled, which is what Reuse Compiled Scripts removes. The other
+  1868 ms is text the session had never seen, and nothing running inside the game
+  can help with it. It had been seen before, though, the last time the game ran.
+  This writes the compiled form to `Cache\wow_optimize_bytecode.bin` and reads it
+  back on the next launch. Off by default, in Experimental.
 
----
+  The game can write that form and has no code to read it back, so the reading is
+  ours. Every script rebuilt from the file is compared against a real compile of
+  the same text, field by field, into every nested function, each constant by
+  type, value and addon ownership. That runs for the first 2000 of them and one
+  in every 256 after, and the whole store switches off for good the first time
+  two of them differ. The file is discarded automatically whenever Wow.exe
+  changes.
+* **Model Animation Stride** holds a distant model's skeleton for a frame
+  instead of re-solving every bone. Its materials, particles and attached items
+  keep animating. Nothing within 45 yards is ever held. The animation family is
+  about a fifth of the frame. Off by default.
+* **M2 Matrix Slot Copy (SSE2)** replaces three blocks in the model animation
+  update that move matrices one float at a time. No arithmetic, so the bytes
+  written are the bytes read. Off by default.
+* **Draw Call Merging** was built, measured and removed. 2.4% of 293 million draw
+  calls could be merged, merging exactly those worked, and the frame rate fell.
+  The census keeps its switch; the merger's is gone.
 
-## What's New in v3.19.4
+### Faster
+
+* **Batch the Game's File Writes** and **Reuse Compiled Scripts** are on by
+  default now. A loading screen was measured at 1576 ms with only 49 ms of it
+  reading files, and the same session spent 2470 ms of another load inside
+  593,557 nine-byte writes and 2128 ms inside the Lua compiler. Nothing in a
+  default install touched either.
+* Loading screens now report how much of themselves were spent compiling Lua,
+  split into source seen for the first time and source compiled again.
 
 ### Fixed
 
@@ -99,44 +134,12 @@ The current public build is focused on real frametime stability, long-session sm
   that ownership once per script instead of once per constant, which is what the
   game does. Fixed, and the message now carries both values so the next report
   settles it rather than describing it.
-
----
-
-## What's New in v3.19.3
-
-### New
-
-* **Reuse Compiled Scripts Between Sessions.** A measured loading screen spends
-  2128 ms inside the game's Lua compiler. Only 260 ms of that is text the session
-  had already compiled, which is what Reuse Compiled Scripts removes. The other
-  1868 ms is text the session had never seen, and nothing running inside the game
-  can help with it. It had been seen before, though, the last time the game ran.
-  This writes the compiled form to `Cache\wow_optimize_bytecode.bin` and reads it
-  back on the next launch. Off by default, in Experimental.
-
-  The game can write that form and has no code to read it back, so the reading is
-  ours. Every script rebuilt from the file is compared against a real compile of
-  the same text, field by field, into every nested function, each constant by
-  type, value and addon ownership. That runs for the first 2000 of them and one
-  in every 256 after, and the whole store switches off for good the first time
-  two of them differ. The file is discarded automatically whenever Wow.exe
-  changes.
-
-### Fixed
-
 * **The script cache turned away the files worth the most.** It refuses to keep
   a copy of the source for anything over a megabyte, which is right for what it
   holds in memory. The check sat in the wrong place, so those files were written
   to the new disk store and could then never be read back from it. Those are
   GlobalStrings.lua, ChatFrame and the rest of the large ones, where skipping a
   compile is worth ten milliseconds rather than twenty microseconds.
-
----
-
-## What's New in v3.19.2
-
-### Fixed
-
 * **Shadows that did not refresh and flickered**, reported by prince [SANC] and
   Sicsoo. Setting a render target resets the viewport, and the render state cache
   did not know, so it skipped the next `SetViewport` and the shadow pass drew into
@@ -159,28 +162,6 @@ The current public build is focused on real frametime stability, long-session sm
   draw call, which cannot happen. It was a 32-bit counter holding a five billion
   total.
 
-### Faster
-
-* **Batch the Game's File Writes** and **Reuse Compiled Scripts** are on by
-  default now. A loading screen was measured at 1576 ms with only 49 ms of it
-  reading files, and the same session spent 2470 ms of another load inside
-  593,557 nine-byte writes and 2128 ms inside the Lua compiler. Nothing in a
-  default install touched either.
-* Loading screens now report how much of themselves were spent compiling Lua,
-  split into source seen for the first time and source compiled again.
-
-### New
-
-* **Model Animation Stride** holds a distant model's skeleton for a frame
-  instead of re-solving every bone. Its materials, particles and attached items
-  keep animating. Nothing within 45 yards is ever held. The animation family is
-  about a fifth of the frame. Off by default.
-* **M2 Matrix Slot Copy (SSE2)** replaces three blocks in the model animation
-  update that move matrices one float at a time. No arithmetic, so the bytes
-  written are the bytes read. Off by default.
-* **Draw Call Merging** was built, measured and removed. 2.4% of 293 million draw
-  calls could be merged, merging exactly those worked, and the frame rate fell.
-  The census keeps its switch; the merger's is gone.
 ---
 
 ## Send me your log
