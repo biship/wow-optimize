@@ -1347,6 +1347,71 @@ struct LogEntry {
     volatile LONG ready;
 };
 
+// --- What is not working, collected as it is said --------------------------
+//
+// prince [SANC]'s three-hour log is forty-eight thousand lines. The things in
+// it that were actually wrong are three lines: a feature he had switched on
+// whose dependency he had not, and three hooks an overlay had taken before we
+// got there. They sit around line five hundred. Nobody reads to line five
+// hundred, so a bug report arrives as "something is off" and the answer was in
+// the file all along.
+//
+// Every module already says when it refuses to install, stands down or
+// retires. Those lines are copied here as they are written and reprinted
+// together at the top of every report. No module had to be changed for it, and
+// one written tomorrow is covered by the same words it would use anyway.
+//
+// What is deliberately not collected: a switch the player left off. "DISABLED
+// via configuration" is not a fault, and on a default install there are a
+// hundred of them. Only a module that was asked to run and did not.
+static constexpr int  PROBLEM_MAX  = 48;
+// Compared over this much, so a line that ends in "(3630s ago)" is recognised
+// as the one that already ends in "(30s ago)" and is kept once.
+static constexpr int  PROBLEM_KEY  = 120;
+static char           g_problem[PROBLEM_MAX][208];
+static volatile LONG  g_problemCount = 0;
+static volatile LONG  g_problemDropped = 0;
+
+static bool ProblemWorthKeeping(const char* m) {
+    static const char* kNotAFault[] = {
+        "via configuration", "switched off", "compiled out", "not in this build",
+        "crash isolation", "for stability", "on purpose"
+    };
+    for (int i = 0; i < 7; i++) if (strstr(m, kNotAFault[i])) return false;
+
+    static const char* kFault[] = {
+        "NOT active", "not installed:", "STANDING DOWN", "STOOD DOWN",
+        "Retired", "RETIRED", "BAD PROLOGUE", "already detoured",
+        "hook targets skipped", "could not hook", "Could not hook"
+    };
+    for (int i = 0; i < 11; i++) if (strstr(m, kFault[i])) return true;
+    return false;
+}
+
+// The dedup scan races with other producers; the worst it can do is keep a
+// line twice, and a report that says a thing twice is not a defect worth a
+// lock on the logging path.
+static void NoteProblem(const char* m) {
+    if (g_problemCount > PROBLEM_MAX) return;
+    if (!ProblemWorthKeeping(m)) return;
+
+    LONG n = g_problemCount;
+    if (n > PROBLEM_MAX) n = PROBLEM_MAX;
+    for (LONG i = 0; i < n; i++) {
+        if (strncmp(g_problem[i], m, PROBLEM_KEY) == 0) return;
+    }
+
+    LONG slot = InterlockedIncrement(&g_problemCount) - 1;
+    if (slot >= PROBLEM_MAX) { InterlockedIncrement(&g_problemDropped); return; }
+    _snprintf(g_problem[slot], sizeof(g_problem[0]) - 1, "%s", m);
+    g_problem[slot][sizeof(g_problem[0]) - 1] = '\0';
+    // The ring's text carries the newline it will be written with.
+    size_t len = strlen(g_problem[slot]);
+    while (len && (g_problem[slot][len - 1] == '\n' || g_problem[slot][len - 1] == '\r')) {
+        g_problem[slot][--len] = '\0';
+    }
+}
+
 static LogEntry g_logRing[LOG_RING_SIZE] = {};
 static volatile LONG g_logWritePos = 0;
 // A full ring drops the line. That was already true and silent, which is the
@@ -1594,10 +1659,15 @@ void LogFlushImmediate() {
         case LOG_LEVEL_CRITICAL: lvlStr = "CRITICAL"; break;
     }
 
-    int offset = _snprintf(g_logRing[slot].text, 128, "[%02u-%02u-%02u %02u:%02u:%02u.%03u] [TID: %u] [%s] [%s] ",
+    // Kept, because the collector below has to skip it: the timestamp sits in
+    // the first forty-odd characters, and comparing lines that include it makes
+    // every repeat of the same fault look like a new one.
+    int prefixLen = _snprintf(g_logRing[slot].text, 128, "[%02u-%02u-%02u %02u:%02u:%02u.%03u] [TID: %u] [%s] [%s] ",
         st.wYear % 100, st.wMonth, st.wDay,
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
         GetCurrentThreadId(), lvlStr, context);
+    if (prefixLen < 0) prefixLen = 0;
+    int offset = prefixLen;
 
     va_list args;
     va_start(args, fmt);
@@ -1608,6 +1678,10 @@ void LogFlushImmediate() {
 
     g_logRing[slot].text[offset] = '\n';
     g_logRing[slot].text[offset + 1] = '\0';
+
+    // Read while the slot is still ours. After the handover below the consumer
+    // may free it and another producer may be writing over this text.
+    NoteProblem(g_logRing[slot].text + prefixLen);
 
     // WRITING -> FILLED hands the slot to whichever consumer gets there first.
     // InterlockedExchange is a full barrier on x86, so the text above is
@@ -4904,16 +4978,32 @@ static void TryRemoveFPSCap() {
 static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     extern long g_assetPathHits;
 
-    // A log with lines missing reads exactly like a log of a quiet session, so
-    // say when the ring overflowed rather than letting the reader assume the
-    // file is complete.
+    // The first thing in the report, because it is the first thing anyone
+    // reading a bug report needs and it used to be scattered over six thousand
+    // lines of start-up.
     {
+        LONG n = g_problemCount;
+        if (n > PROBLEM_MAX) n = PROBLEM_MAX;
+        Log("========================================");
+        if (n == 0) {
+            Log("[Wrong] Nothing has reported a fault. Every module that was "
+                "switched on installed, and none has stood down or retired.");
+        } else {
+            Log("[Wrong] %ld thing(s) did not work. Each was asked to run and "
+                "did not; a switch left off is not counted here.", (long)n);
+            for (LONG i = 0; i < n; i++) Log("[Wrong]   %s", g_problem[i]);
+            if (g_problemDropped > 0) {
+                Log("[Wrong]   and %ld more that did not fit.",
+                    (long)g_problemDropped);
+            }
+        }
         LONG dropped = g_logDropped;
         if (dropped > 0) {
-            Log("[Log] %ld line(s) were dropped because the ring was full when "
-                "they were written. Everything below is missing that many "
+            Log("[Wrong] %ld log line(s) were dropped because the ring was full "
+                "when they were written, so this file is missing that many "
                 "entries.", (long)dropped);
         }
+        Log("========================================");
     }
     extern long g_assetPathMisses;
     extern long g_tvalueMemcpyHits;
