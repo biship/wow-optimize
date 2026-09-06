@@ -1331,6 +1331,16 @@ static constexpr int LOG_RING_MASK = LOG_RING_SIZE - 1;
 static constexpr LONG LOG_SLOT_FREE = 0;
 static constexpr LONG LOG_SLOT_FILLED = 1;
 static constexpr LONG LOG_SLOT_CLAIMED = 2;
+// A producer owns the slot while it formats into it. Without this state the
+// producer only read `ready` and then spent microseconds inside _vsnprintf
+// with no claim on the buffer, so a second producer that wrapped onto the same
+// slot in the meantime saw 0 as well and wrote into it too.
+//
+// prince [SANC]'s three-hour log has the result at offset 2425790: a line that
+// stops after eight characters of its message with another thread's complete
+// line, prefix and all, written into the wound. Two threads, one 2 KB buffer.
+// The consumer side was already careful; this side was not.
+static constexpr LONG LOG_SLOT_WRITING = 3;
 
 struct LogEntry {
     char text[2048];
@@ -1339,6 +1349,10 @@ struct LogEntry {
 
 static LogEntry g_logRing[LOG_RING_SIZE] = {};
 static volatile LONG g_logWritePos = 0;
+// A full ring drops the line. That was already true and silent, which is the
+// shape this project keeps being caught by: a log with lines missing reads
+// exactly like a log of a session where nothing happened.
+static volatile LONG g_logDropped = 0;
 static volatile LONG g_logReadPos = 0;
 static HANDLE g_logEvent = NULL;
 static HANDLE g_logThread = NULL;
@@ -1559,7 +1573,14 @@ void LogFlushImmediate() {
     LONG idx = InterlockedIncrement(&g_logWritePos) - 1;
     int slot = idx & LOG_RING_MASK;
 
-    if (g_logRing[slot].ready) return;
+    // Take the slot before touching its buffer. A plain read here is what tore
+    // a tester's line in half: the check passed, formatting began, the ring
+    // wrapped, and a second producer passed the same check on the same slot.
+    if (InterlockedCompareExchange(&g_logRing[slot].ready,
+                                   LOG_SLOT_WRITING, LOG_SLOT_FREE) != LOG_SLOT_FREE) {
+        InterlockedIncrement(&g_logDropped);
+        return;
+    }
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -1588,7 +1609,10 @@ void LogFlushImmediate() {
     g_logRing[slot].text[offset] = '\n';
     g_logRing[slot].text[offset + 1] = '\0';
 
-    InterlockedExchange(&g_logRing[slot].ready, 1);
+    // WRITING -> FILLED hands the slot to whichever consumer gets there first.
+    // InterlockedExchange is a full barrier on x86, so the text above is
+    // visible before the state that advertises it.
+    InterlockedExchange(&g_logRing[slot].ready, LOG_SLOT_FILLED);
     SetEvent(g_logEvent);
 
     // Only flush immediately on ERROR or CRITICAL events to preserve FPS performance
@@ -4879,6 +4903,18 @@ static void TryRemoveFPSCap() {
 
 static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     extern long g_assetPathHits;
+
+    // A log with lines missing reads exactly like a log of a quiet session, so
+    // say when the ring overflowed rather than letting the reader assume the
+    // file is complete.
+    {
+        LONG dropped = g_logDropped;
+        if (dropped > 0) {
+            Log("[Log] %ld line(s) were dropped because the ring was full when "
+                "they were written. Everything below is missing that many "
+                "entries.", (long)dropped);
+        }
+    }
     extern long g_assetPathMisses;
     extern long g_tvalueMemcpyHits;
     extern long g_sysInfoHits;
