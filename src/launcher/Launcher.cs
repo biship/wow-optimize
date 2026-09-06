@@ -31,6 +31,7 @@ namespace WowOptimizeLauncher {
         public const string Trade = "[-]";   // more frames by changing how it looks
         public const string Log   = "[.]";   // records; negligible cost
         public const string Lost  = "[x]";   // measured and lost, or a known failure
+        public const string Unproven = "[!]";   // should help; nobody has proven it
 
         // Badged apart from the rest because otherwise they read as speed
         // and the preset below silently disagrees with their own label.
@@ -72,13 +73,16 @@ namespace WowOptimizeLauncher {
         // Anything not named above speeds the game up. That is what most of
         // this tool is, and listing the exceptions is shorter and stays right
         // as features are added.
-        public static string Of(string key) {
+        // `unproven` is the SettingItem's Experimental flag. It only changes
+        // what a helping switch is called, so a census stays a census and a
+        // governor stays a governor whether or not anyone has proven it.
+        public static string Of(string key, bool unproven) {
             if (In(LostKeys, key))  return Lost;
             if (In(DiagKeys, key))  return Diag;
             if (In(TradeKeys, key)) return Trade;
             if (In(LogKeys, key))   return Log;
             if (In(FixKeys, key))   return Fix;
-            return Perf;
+            return unproven ? Unproven : Perf;
         }
 
         // Left off by MAX PERFORMANCE, each for a reason recorded beside it.
@@ -380,8 +384,6 @@ namespace WowOptimizeLauncher {
         private FlowLayoutPanel uiLuaFlow;
         private FlowLayoutPanel combatNetFlow;
         private FlowLayoutPanel graphicsSoundFlow;
-        private FlowLayoutPanel experimentalFlow;
-        private Label experimentalNote;
         private TextBox searchBox;
 
         // Background image
@@ -766,69 +768,22 @@ namespace WowOptimizeLauncher {
             leftPanel.Controls.Add(btnMaxPerf);
             y += 36;
 
-            DarkButton btnEnableAll = new DarkButton(CyanAccent, false);
-            btnEnableAll.Text = "ENABLE ALL FEATURES";
-            btnEnableAll.Size = new Size(btnWidth, 30);
-            btnEnableAll.Location = new Point(15, y);
-            btnEnableAll.Click += delegate { ToggleAll(true); };
-            leftPanel.Controls.Add(btnEnableAll);
-            y += 36;
 
-            DarkButton btnDisableAll = new DarkButton(Color.FromArgb(255, 23, 68), false);
-            btnDisableAll.Text = "DISABLE ALL (VANILLA)";
-            btnDisableAll.Size = new Size(btnWidth, 30);
-            btnDisableAll.Location = new Point(15, y);
-            btnDisableAll.Click += delegate { ToggleAll(false); };
-            leftPanel.Controls.Add(btnDisableAll);
-            y += 36;
 
-            DarkButton btnDefaults = new DarkButton(Color.FromArgb(100, 110, 140), false);
-            btnDefaults.Text = "RESTORE SAFE DEFAULTS";
+            DarkButton btnDefaults = new DarkButton(Color.FromArgb(120, 132, 160), false);
+            btnDefaults.Text = "DEFAULT";
             btnDefaults.Size = new Size(btnWidth, 30);
             btnDefaults.Location = new Point(15, y);
             btnDefaults.Click += delegate { RestoreDefaults(); };
+            toolTip.SetToolTip(btnDefaults,
+                "Back to what a fresh install runs: the features that are on for everyone, and nothing else.");
             leftPanel.Controls.Add(btnDefaults);
             y += 36;
 
-            DarkButton btnMeasure = new DarkButton(Color.FromArgb(0, 200, 120), false);
-            btnMeasure.Text = "MEASUREMENT RUN (A/B)";
-            btnMeasure.Size = new Size(btnWidth, 30);
-            btnMeasure.Location = new Point(15, y);
-            btnMeasure.Click += delegate { SetUpMeasurementRun(); };
-            leftPanel.Controls.Add(btnMeasure);
-            y += 36;
 
-            DarkButton btnDiag = new DarkButton(Color.FromArgb(160, 120, 220), false);
-            btnDiag.Text = "DIAGNOSTIC RUN";
-            btnDiag.Size = new Size(btnWidth, 30);
-            btnDiag.Location = new Point(15, y);
-            btnDiag.Click += delegate { SetUpDiagnosticRun(); };
-            leftPanel.Controls.Add(btnDiag);
-            y += 36;
 
-            DarkButton btnSaveProfile = new DarkButton(CyanAccent, false);
-            btnSaveProfile.Text = "SAVE PROFILE...";
-            btnSaveProfile.Size = new Size(btnWidth, 30);
-            btnSaveProfile.Location = new Point(15, y);
-            btnSaveProfile.Click += delegate { SaveProfile(); };
-            leftPanel.Controls.Add(btnSaveProfile);
-            y += 36;
 
-            DarkButton btnLoadProfile = new DarkButton(CyanAccent, false);
-            btnLoadProfile.Text = "LOAD PROFILE...";
-            btnLoadProfile.Size = new Size(btnWidth, 30);
-            btnLoadProfile.Location = new Point(15, y);
-            btnLoadProfile.Click += delegate { LoadProfile(); };
-            leftPanel.Controls.Add(btnLoadProfile);
-            y += 36;
 
-            DarkButton btnShareProfile = new DarkButton(Color.FromArgb(255, 179, 0), false);
-            btnShareProfile.Text = "SHARE WITH DEVELOPER";
-            btnShareProfile.Size = new Size(btnWidth, 30);
-            btnShareProfile.Location = new Point(15, y);
-            btnShareProfile.Click += delegate { ShareProfileWithDev(); };
-            leftPanel.Controls.Add(btnShareProfile);
-            y += 36;
 
             // ── Separator ───────────────────────────────────────
             DoubleBufferedPanel separator = new DoubleBufferedPanel();
@@ -934,15 +889,17 @@ namespace WowOptimizeLauncher {
             Label tipLabel = new Label();
             // Two lines. It was one line 20 pixels tall holding six marks and a
             // sentence, so it showed three of the marks and cut the third in half.
-            tipLabel.Text = "[+] faster   [=] protects   [?] measures, costs frames\r\n"
-                          + "[-] changes the look   [x] lost a measurement   [.] log";
+            tipLabel.Text = "[+] faster   [!] should be, unproven   [=] protects   [.] log\r\n"
+                          + "[?] measures, costs frames   [-] changes the look   [x] lost";
             tipLabel.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
             tipLabel.ForeColor = CyanAccent;
             tipLabel.AutoSize = false;
             tipLabel.Size = new Size(rightW - 270, 30);
             tipLabel.Location = new Point(rightX, 8);
             toolTip.SetToolTip(tipLabel,
-                "[+] makes the game faster.\r\n"
+                "[+] makes the game faster, and something measured it.\r\n"
+                + "[!] should make it faster and nobody has proven it. Turn one on, "
+                + "play, and the log says what it did.\r\n"
                 + "[=] protects or repairs something; no speed claim.\r\n"
                 + "[?] measures the game, and costs frames to produce the number.\r\n"
                 + "[-] buys frames by changing how the game looks or sounds.\r\n"
@@ -988,20 +945,17 @@ namespace WowOptimizeLauncher {
             TabPage tpUiLua = CreateTabPage("UI & LUA");
             TabPage tpCombatNet = CreateTabPage("COMBAT & NET");
             TabPage tpGraphicsSound = CreateTabPage("GRAPHICS & SOUND");
-            TabPage tpExperimental = CreateTabPage("EXPERIMENTAL");
 
             tabs.TabPages.Add(tpGeneral);
             tabs.TabPages.Add(tpUiLua);
             tabs.TabPages.Add(tpCombatNet);
             tabs.TabPages.Add(tpGraphicsSound);
-            tabs.TabPages.Add(tpExperimental);
 
             // Get the scroll panels from each tab page
             generalFlow = (FlowLayoutPanel)((Panel)tpGeneral.Controls[0]).Controls[0];
             uiLuaFlow = (FlowLayoutPanel)((Panel)tpUiLua.Controls[0]).Controls[0];
             combatNetFlow = (FlowLayoutPanel)((Panel)tpCombatNet.Controls[0]).Controls[0];
             graphicsSoundFlow = (FlowLayoutPanel)((Panel)tpGraphicsSound.Controls[0]).Controls[0];
-            experimentalFlow = (FlowLayoutPanel)((Panel)tpExperimental.Controls[0]).Controls[0];
 
             // Add "ENABLE ALL IN ..." buttons at top of each flow
             btnEnableGeneral = CreateCategoryButton("ENABLE ALL IN GENERAL");
@@ -1020,28 +974,13 @@ namespace WowOptimizeLauncher {
             btnEnableGfx.Click += delegate { ToggleCategoryAction("Graphics_Sound", btnEnableGfx, "GRAPHICS & SOUND"); };
             graphicsSoundFlow.Controls.Add(btnEnableGfx);
 
-            // No "enable all" button here on purpose. These are the switches that
-            // are meant to be turned on one at a time, by someone who wants to
-            // find out what one of them does.
-            Label expNote = new Label();
-            experimentalNote = expNote;
-            expNote.Text = "Believed to help, and nobody has proven it yet.\r\n"
-                         + "Turn on ONE at a time, play, and send the log - that is what makes them\r\n"
-                         + "either real features or deleted ones. Left off by Enable All, on for\r\n"
-                         + "Max Performance. Anything already measured sits in its own tab instead.";
-            expNote.AutoSize = false;
-            expNote.Size = new Size(tabs.Width - 60, 58);
-            expNote.ForeColor = Color.FromArgb(150, 163, 178);
-            expNote.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
-            expNote.Margin = new Padding(10, 6, 10, 10);
-            experimentalFlow.Controls.Add(expNote);
 
             // Populate checkboxes
             foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
                 string name = pair.Key;
                 SettingItem data = pair.Value;
                 DarkCheckBox chk = CreateStyledCheckBox(
-                    Kinds.Of(data.Key) + " " + name, data.Tooltip);
+                    Kinds.Of(data.Key, data.Experimental) + " " + name, data.Tooltip);
 
                 data.Ctrl = chk;
 
@@ -1070,7 +1009,7 @@ namespace WowOptimizeLauncher {
             }
 
             if (generalFlow == null || uiLuaFlow == null || combatNetFlow == null ||
-                graphicsSoundFlow == null || experimentalFlow == null) {
+                graphicsSoundFlow == null) {
                 return;
             }
 
@@ -1079,10 +1018,6 @@ namespace WowOptimizeLauncher {
             uiLuaFlow.Controls.Clear();
             combatNetFlow.Controls.Clear();
             graphicsSoundFlow.Controls.Clear();
-            experimentalFlow.Controls.Clear();
-            if (!hasSearch && experimentalNote != null) {
-                experimentalFlow.Controls.Add(experimentalNote);
-            }
 
             // Category buttons visibility
             if (btnEnableGeneral != null) btnEnableGeneral.Visible = !hasSearch;
@@ -1173,21 +1108,13 @@ namespace WowOptimizeLauncher {
         // filter route through here, because they are the two places that have
         // already drifted apart once and emptied a tab between them.
         //
-        // The Experimental tab is for what nobody has proven yet - its own note
-        // asks a tester to turn on one at a time and send the log, and that is
-        // only a sensible request for a switch whose answer is still open.
-        // Fifty-six of the hundred and twenty-three were landing there, which
-        // is not a shortlist, and it left the four category tabs half empty.
-        //
-        // Anything that has been measured now sits in its own category with its
-        // mark on it, whichever way the measurement went. A draw call census is
-        // a graphics entry, not an open question; so is a governor that trades
-        // frames for looks, and so is a replacement that came out slower than
-        // the code it replaced.
+        // There is no Experimental tab any more. It was a maturity axis wearing
+        // a category tab's clothes, and it held nearly half the switches, so
+        // the four real categories were half empty and nothing could be found
+        // where its name said it would be. Maturity is a property of a switch,
+        // not a place to keep it, so it is a mark on the row instead - [!] for
+        // what should help and nobody has proven.
         private FlowLayoutPanel FlowFor(SettingItem data) {
-            if (data.Experimental && Kinds.HelpsSpeed(data.Key)) {
-                return experimentalFlow;
-            }
             switch (data.Section) {
                 case "General":        return generalFlow;
                 case "UI_Lua":         return uiLuaFlow;
@@ -1223,16 +1150,7 @@ namespace WowOptimizeLauncher {
 
         // ── Settings Logic ───────────────────────────────────────
 
-        private void ToggleAll(bool enabled) {
-            foreach (SettingItem item in settingsMap.Values) {
-                if (item.Ctrl == null) continue;
-                // Turning everything off is always safe and always honoured.
-                // Turning everything on skips the experimental ones on purpose.
-                if (enabled && item.Experimental) continue;
-                item.Ctrl.Checked = enabled;
-            }
-        }
-
+        
         // The features the A/B harness can measure, by ini key.
         //
         // It can only alternate a feature that installed, and a feature installs
@@ -1249,14 +1167,7 @@ namespace WowOptimizeLauncher {
         // SimdGeometry was in this list and registers no subject; M2MatrixSimd
         // registers one and was missing. The A/B report prints the names that
         // did register, so a log says which side drifted.
-        private static readonly string[] AbSubjectKeys = new string[] {
-            "LayoutRelinkFast", "M2SortKey", "LuaPoolFast", "LuaHGetDispatch",
-            "QuatLerpSse2", "AnimQuatUnpack", "AnimVec3Track", "FrustumAabb",
-            "AabbOverlap", "SegmentAabb", "M2MatrixSimd", "FastMemsetOpt",
-            "M2MatrixSlotSse2", "M2AnimStride",
-            "StrncmpSse2", "LuaGcManual", "MatrixVectorSse2", "BoneMatrixUpload"
-        };
-
+        
         // The counting questions, which are not the same session as the A/B run.
         //
         // Counters only. Draw Call Merging is deliberately not here even though
@@ -1268,19 +1179,7 @@ namespace WowOptimizeLauncher {
         // them cost something to measure - the draw census wraps the busiest call
         // in the renderer - so running them during an A/B test would move the very
         // frame times that test is comparing. Two buttons, two sessions.
-        private static readonly string[] DiagnosticKeys = new string[] {
-            "DrawCensus",            // how many draw calls, how small, how many could merge
-            "AnimCensus",            // how many models and bones the animation update does
-            "LuaAllocCensus",        // what sizes the Lua VM allocates, and how often
-            "LuaProtoCache",         // how much of the compiling is repeat work
-            "LuaBytecodeStore",      // and how much of it repeats across sessions
-            "LuaCompileCensus",      // and what is being compiled
-            "HorizonOcclusionSse2",  // how long the horizon column scans really are
-            "ClientWriteBatch",      // how many file writes get gathered
-            "MimallocHighArena",     // whether the allocator can be moved above 2GB
-            "SamplingProfiler"       // where the main thread actually is
-        };
-
+        
         // Every switch that speeds the game up, on. Everything that measures it,
         // off. See Kinds.NotForSpeed for what else is left off and why.
         //
@@ -1307,76 +1206,8 @@ namespace WowOptimizeLauncher {
                 "Max Performance", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
-        private void SetUpDiagnosticRun() {
-            if (settingsMap == null) return;
-
-            DialogResult answer = MessageBox.Show(
-                "Turns on the counters and turns the A/B test off. Run it on its own session, not together with a measurement run.\r\n\r\n"
-                + "Play 20 minutes, send the log, then turn them back off.\r\n\r\nSave?",
-                "Diagnostic run",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (answer != DialogResult.Yes) return;
-
-            SettingItem ab = FindByKey("AbTest");
-            if (ab != null && ab.Ctrl != null) ab.Ctrl.Checked = false;
-
-            int turnedOn = 0, notFound = 0;
-            for (int i = 0; i < DiagnosticKeys.Length; i++) {
-                SettingItem item = FindByKey(DiagnosticKeys[i]);
-                if (item == null || item.Ctrl == null) { notFound++; continue; }
-                if (!item.Ctrl.Checked) { item.Ctrl.Checked = true; turnedOn++; }
-            }
-            SaveSettings();
-
-            string note = turnedOn.ToString()
-                + " counter(s) on, A/B test off. Saved. Play 20 minutes, then send the log.";
-            if (notFound > 0) {
-                note = note + "\r\n\r\n" + notFound.ToString()
-                    + " of them has no entry in this launcher. That is a bug here - please mention it with the log.";
-            }
-            MessageBox.Show(note, "Diagnostic run",
-                            MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-
-        private void SetUpMeasurementRun() {
-            if (settingsMap == null) return;
-
-            DialogResult answer = MessageBox.Show(
-                "Turns on the A/B test and the 16 features it can measure. Nothing else changes.\r\n\r\n"
-                + "Play 45 minutes or more where the processor is busy - a raid, a battleground, a crowded city. Standing in a field measures nothing. Then send the log.\r\n\r\n"
-                + "These are experimental. If the game misbehaves, this is why.\r\n\r\nSave?",
-                "Measurement run",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (answer != DialogResult.Yes) return;
-
-            int turnedOn = 0;
-            int notFound = 0;
-            SettingItem ab = FindByKey("AbTest");
-            if (ab != null && ab.Ctrl != null) ab.Ctrl.Checked = true;
-            for (int i = 0; i < AbSubjectKeys.Length; i++) {
-                SettingItem item = FindByKey(AbSubjectKeys[i]);
-                if (item == null || item.Ctrl == null) { notFound++; continue; }
-                if (!item.Ctrl.Checked) { item.Ctrl.Checked = true; turnedOn++; }
-            }
-
-            // Saved here rather than left to the tester. A tester on issue #58
-            // ran a whole session with the settings he thought he had chosen and
-            // wrote back "last time I forgot to save the config" - a week gone to
-            // an unpressed button. Nothing this does is worth losing that way.
-            SaveSettings();
-
-            // A key in the list with no tickbox is a defect in this file, not in
-            // the run, and saying nothing about it is how it would survive.
-            string note = turnedOn.ToString()
-                + " feature(s) switched on. Saved. Play for 45 minutes, then send the log.";
-            if (notFound > 0) {
-                note = note + "\r\n\r\n" + notFound.ToString()
-                    + " of the sixteen has no entry in this launcher. That is a bug here - please mention it with the log.";
-            }
-            MessageBox.Show(note, "Measurement run",
-                            MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-
+        
+        
         private void ToggleTabFeatures(string section, bool enabled) {
             foreach (SettingItem item in settingsMap.Values) {
                 if (item.Section != section || item.Ctrl == null) continue;
@@ -1619,69 +1450,9 @@ namespace WowOptimizeLauncher {
             }
         }
 
-        private void SaveProfile() {
-            SaveFileDialog sfd = new SaveFileDialog();
-            sfd.Filter = "Configuration Profiles (*.ini)|*.ini";
-            sfd.FileName = "wow_opt_profile.ini";
-            sfd.Title = "Save Configuration Profile";
-            if (sfd.ShowDialog() == DialogResult.OK) {
-                SaveSettingsToPath(sfd.FileName);
-                MessageBox.Show("Profile successfully saved to:\n" + sfd.FileName, "Profile Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-        }
-
-        private void LoadProfile() {
-            OpenFileDialog ofd = new OpenFileDialog();
-            ofd.Filter = "Configuration Profiles (*.ini)|*.ini";
-            ofd.Title = "Load Configuration Profile";
-            if (ofd.ShowDialog() == DialogResult.OK) {
-                LoadSettingsFromPath(ofd.FileName);
-                MessageBox.Show("Profile successfully loaded from:\n" + ofd.FileName, "Profile Loaded", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-        }
-
-        private void ShareProfileWithDev() {
-            try {
-                StringBuilder sb = new StringBuilder();
-                sb.AppendLine("; SUGGESTED SAFE PROFILE PRESET");
-                sb.AppendLine("; Submit to Suprematist");
-                sb.AppendLine();
-
-                Dictionary<string, List<string>> sections = new Dictionary<string, List<string>>() {
-                    { "General", new List<string>() },
-                    { "UI_Lua", new List<string>() },
-                    { "Combat_Net", new List<string>() },
-                    { "Graphics_Sound", new List<string>() }
-                };
-
-                foreach (SettingItem item in settingsMap.Values) {
-                    string val = (item.Ctrl != null && item.Ctrl.Checked) ? "1" : "0";
-                    sections[item.Section].Add(item.Key + "=" + val);
-                }
-
-                foreach (KeyValuePair<string, List<string>> section in sections) {
-                    sb.AppendLine("[" + section.Key + "]");
-                    foreach (string line in section.Value) {
-                        sb.AppendLine(line);
-                    }
-                    sb.AppendLine();
-                }
-
-                Clipboard.SetText(sb.ToString());
-
-                MessageBox.Show(
-                    "Your current profile settings have been copied to the clipboard!\n\n" +
-                    "Please paste and share them with the developer (Suprematist) via Discord or GitHub Issues " +
-                    "to suggest making this profile safe by default in future updates.",
-                    "Profile Copied to Clipboard",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information
-                );
-            } catch (Exception ex) {
-                MessageBox.Show("Failed to copy profile to clipboard: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
+        
+        
+        
         private void CheckForUpdatesAsync() {
             System.Threading.ThreadPool.QueueUserWorkItem(delegate {
                 try {
