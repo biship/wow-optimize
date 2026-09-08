@@ -43,6 +43,42 @@ The current public build is focused on real frametime stability, long-session sm
 
 ### New
 
+* **The launcher is two presets and a bug switch, not nine buttons.** MAX
+  PERFORMANCE, DEFAULT and EVERYTHING OFF set every switch at once; save, load
+  and copy-for-the-dev move a whole configuration; LOGGING: NORMAL / FULL turns
+  on the recorders when something is wrong and off again when it is not. The
+  Experimental tab is gone: it held fifty-six of the hundred and twenty-three
+  switches, so the four real categories were half empty. Every switch now sits
+  in its own category under a heading that says what the run below it is for -
+  makes it faster, not proven yet, stability and fixes, logging, diagnostics
+  (costs frames), changes how it looks or sounds, tried and didn't help.
+* **A bug report is legible from its first screen.** Every module already
+  announced a refusal or a stand-down; those lines are now collected as they are
+  written and reprinted together under `[Wrong]` at the top of every report. On a
+  tester's three-hour, forty-eight thousand line log that is five lines, and one
+  of them was the answer: Batch the Game's File Writes was on, File I/O Hooks was
+  off, and it had done nothing all session.
+* **Two log lines could be written into one buffer at once.** A producer read the
+  ring slot's state instead of claiming it, then spent microseconds formatting
+  into a buffer it did not own. A tester's log has the result: a line that stops
+  eight characters into its message with another thread's whole line written into
+  the wound.
+* **Loading screens say where they went.** The split could only say what a load
+  was not - a 5504 ms load with 156 ms of reads, no writes and no Lua compiled -
+  while the profiler had been keeping a loading-screen histogram all along and
+  reporting it once per session. The load report now ends with the addresses the
+  main thread was actually in during that load. Needs LOGGING: FULL.
+* **Two worker threads were started every session for a queue nothing writes to.**
+  The guard against that asked whether an offload address was filled in; the
+  addresses were filled in while the paths behind them stayed compiled out, so it
+  read "wired" and stopped protecting. It asks about producers now.
+* **Reuse Compiled Scripts Between Sessions understands addon ownership.** A
+  constant's ownership is copied from the token that made it, not stamped from
+  the current context, and the game's own dump format does not record it - so it
+  cannot be reconstructed. Only chunks with no ownership on any constant are
+  kept, only served into a context that has none, and the report counts what that
+  leaves behind rather than hiding it.
+
 * **MAX PERFORMANCE button, and every switch now says what it is for.** The
   tester who asked for the fastest possible setup pressed ENABLE ALL FEATURES,
   which is the reasonable thing to do and the wrong thing to do: it also turned
