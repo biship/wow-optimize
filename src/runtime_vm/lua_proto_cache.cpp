@@ -319,6 +319,9 @@ bool g_dead      = false;
 
 unsigned long g_seen = 0, g_hits = 0, g_stored = 0;
 unsigned long g_tooBig = 0, g_notBuffer = 0, g_capped = 0, g_anchorFailed = 0;
+// Of the capped ones, those already known to repeat. See the capped branch.
+unsigned long      g_cappedRepeats     = 0;
+unsigned long long g_cappedRepeatBytes = 0;
 unsigned long g_verified = 0, g_firstSighting = 0, g_flushes = 0, g_onSight = 0;
 // Chunks large enough to be worth keeping the moment they are first seen. The
 // number that says whether raising the cap was the right call.
@@ -614,6 +617,19 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
     if (g_cache.size() >= kMaxEntries ||
         g_blobBytes + srcLen + nameLen + 2 > kMaxTotalBytes) {
         g_capped++;
+        // What the budget costs, rather than only how often it binds.
+        //
+        // A session turned away 37362 chunks here against 4693 reuses, and the
+        // compile census in the same log put 3439 ms into repeats of which this
+        // module removed 391. The gap is either the budget or chunks that were
+        // never coming back, and "turned away" cannot tell them apart. So count
+        // the ones already known to repeat on their own: those are the ones a
+        // larger budget would have served, and multiplied by the measured cost
+        // of a parse they are the case for raising it - or for leaving it be.
+        if (known) {
+            g_cappedRepeats++;
+            g_cappedRepeatBytes += srcLen;
+        }
         return nullptr;
     }
 
@@ -882,6 +898,28 @@ void LogStats() {
         g_verified, g_tooBig, (unsigned)(kMaxChunkBytes / 1024),
         g_bytesTooBig / 1024, g_capped, g_notBuffer, g_anchorFailed,
         g_swapFlushes);
+    if (g_cappedRepeats) {
+        double meanMiss = g_missTimed ? (g_missMsTotal / (double)g_missTimed) : 0.0;
+        if (meanMiss > 0.0) {
+            Log("[ProtoCache]   the budget turned away %lu chunk(s) it already "
+                "knew repeat, %llu KB of source. At %.3f ms a parse that is "
+                "about %.0f ms a larger cache would have removed this session; "
+                "the rest of what was turned away had not repeated yet and may "
+                "never.",
+                g_cappedRepeats, g_cappedRepeatBytes / 1024, meanMiss,
+                meanMiss * (double)g_cappedRepeats);
+        } else {
+            Log("[ProtoCache]   the budget turned away %lu chunk(s) it already "
+                "knew repeat, %llu KB of source. What that cost is not "
+                "measured: no parse was timed, so there is nothing to multiply "
+                "by.", g_cappedRepeats, g_cappedRepeatBytes / 1024);
+        }
+    } else if (g_capped) {
+        Log("[ProtoCache]   measured and zero: of the %lu chunk(s) the budget "
+            "turned away, not one had repeated before. Raising it would have "
+            "bought nothing this session.", g_capped);
+    }
+
     if (Config::g_settings.OptLuaBytecodeStore) {
         // The store counts how many parses it skipped; only this module knows
         // what a parse costs, so the two numbers have to meet somewhere.
