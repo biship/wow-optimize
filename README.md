@@ -88,6 +88,17 @@ The current public build is focused on real frametime stability, long-session sm
 
 ### Faster
 
+* **Fourteen of the twenty Direct3D hooks stay out of the vtable.** Two of them
+  skip redundant work and are kept, along with the four the shadow fix and the
+  device lifecycle need. The rest could only count, and what they counted has
+  been answered on two clients: 430 million render states, 601 million sampler
+  states and 1.2 billion texture binds, none of them redundant. That is about
+  five thousand fewer detours a frame. Draw Call Census puts them all back when
+  you want the numbers.
+* **string.match decides on the pattern before it reads the string.** A pattern
+  none of the fast paths handles goes straight to the game, so the subject is no
+  longer walked byte by byte, up to four kilobytes of it, to reach a comparison
+  that was never going to match.
 * **Batch the Game's File Writes** and **Reuse Compiled Scripts** are on by
   default. One measured loading screen ran 1576 ms with 49 ms of it reading
   files; another spent 2470 ms inside 593,557 nine-byte writes, and 2128 ms
@@ -97,6 +108,21 @@ The current public build is focused on real frametime stability, long-session sm
 
 ### Fixed
 
+* **The matrix hook counter printed a negative number.** Fifteen counters were
+  signed 32-bit and the matrix multiply takes about four thousand calls a frame,
+  so one of them ran out inside the second hour and took the total with it. The
+  count that overflows carries a wrap counter now and the total is summed
+  without one.
+* **The fault list at the top of each report counted its own output** and called
+  two deliberate decisions failures. It also reported an unresolved draw entry
+  point on machines where Draw Call Census was simply switched off.
+* **The periodic report says which part of it is slow.** It pauses the main
+  thread for a tenth of a second on some machines, and could only report that
+  the cost was itself. Each of its seventy-odd sections is timed and the slowest
+  are named.
+* **GetItemInfo caching says why a miss missed** - an empty slot, a different
+  item in the slot, or the game returning nothing because the item is not in its
+  own cache yet. Only the middle one is a cache that is too small.
 * **Shadows that did not refresh and flickered**, reported by prince [SANC] and
   Sicsoo. Setting a render target resets the viewport, and the render state cache
   skipped the `SetViewport` that put it back, so the shadow pass drew into the
