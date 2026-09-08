@@ -59,8 +59,13 @@ namespace WowOptimizeLauncher {
             "LuaGcStockPace", "UIFrameBatch",
         };
         private static readonly string[] TradeKeys = new string[] {
+            // Each of these buys frames by changing something the player can see
+            // or hear. Frame Rate Limiter Override was in here and does not
+            // belong: it replaces the client's own per-frame limiter with a
+            // waitable-timer and spin hybrid, which changes when a frame is
+            // handed over and nothing about what is in it.
             "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
-            "AnimLod", "M2AnimStride", "SoundVolumeLimit", "FrameLimiter",
+            "AnimLod", "M2AnimStride", "SoundVolumeLimit",
         };
 
         private static bool In(string[] set, string key) {
@@ -99,7 +104,7 @@ namespace WowOptimizeLauncher {
             // 350 to 262 and back seven times in four minutes, and could only
             // say that something was wrong with the graphics.
             "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
-            "AnimLod", "M2AnimStride", "SoundVolumeLimit", "FrameLimiter",
+            "AnimLod", "M2AnimStride", "SoundVolumeLimit",
 
             // Left off because something measured them and the answer was no.
             "CompatMode",          // slower on purpose; it repairs a broken connection
