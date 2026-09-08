@@ -59,10 +59,6 @@ The current public build is focused on real frametime stability, long-session sm
 * **A bug report is legible from its first screen.** Every report opens with
   `[Wrong]`: the modules that were asked to run and did not, each with the line
   it printed. A switch you left off is not counted there.
-
-  On one tester's three-hour log that is five lines, and one of them was the
-  answer - Batch the Game's File Writes was on, File I/O Hooks was off, and it
-  had done nothing all session.
 * **Loading screens say where they went.** A load report ends with the addresses
   the main thread was actually in during that load, so the time that is neither
   reading, writing nor compiling has a name on it. Needs LOGGING: FULL.
@@ -93,9 +89,9 @@ The current public build is focused on real frametime stability, long-session sm
 ### Faster
 
 * **Batch the Game's File Writes** and **Reuse Compiled Scripts** are on by
-  default. A loading screen was measured at 1576 ms with 49 ms of it reading
-  files, and the same session spent 2470 ms of another load inside 593,557
-  nine-byte writes and 2128 ms inside the Lua compiler.
+  default. One measured loading screen ran 1576 ms with 49 ms of it reading
+  files; another spent 2470 ms inside 593,557 nine-byte writes, and 2128 ms
+  inside the Lua compiler.
 * Loading screens report how much of themselves went into compiling Lua, split
   into source seen for the first time and source compiled again.
 
@@ -107,12 +103,10 @@ The current public build is focused on real frametime stability, long-session sm
   wrong rectangle. On by default, so this was everyone.
 * **Wrong vertex layout after a vertex declaration.** Setting a declaration clears
   the FVF; the FVF cache kept skipping the call that put it back.
-* **The quality governor pulled your view distance down when you zoned**,
-  reported by the tester who turned every option on and said something was off
-  with the graphics while running around. It read the end of a loading screen as
-  slow gameplay, halved particle density and cut farclip, then put both back a
-  minute later. It ignores loading screens now and waits for real frames before
-  deciding anything. Off by default.
+* **The quality governor pulled your view distance down when you zoned.** It
+  read the end of a loading screen as slow gameplay, halved particle density and
+  cut farclip, then put both back a minute later. It ignores loading screens now
+  and waits for real frames before deciding anything. Off by default.
 * **The quality governor reports every interval**, with the values it is holding
   against your own.
 * **Two threads could write into one log buffer.** A line would stop mid-message
@@ -132,15 +126,15 @@ The current public build is focused on real frametime stability, long-session sm
   any constant are kept, and they are served only into a context that has none.
   The report counts what that leaves behind.
 * **The draw call census had never installed.** Its hooks came from a module
-  compiled out months ago, so every session with that box ticked measured nothing.
+  compiled out months ago, so ticking that box measured nothing.
 * **The animation census stood down whenever Animation LOD was on**, so neither of
   the two numbers ever arrived. It counts from inside the other one now.
 * **Thirteen modules counted on hot paths and could not print the number**, seven
   of them counting crashes they had averted.
 * **Five launcher options turned on features this build does not contain**, and two
   more gated an install that always fails. All gone.
-* **Four of the six render state filters skipped nothing at all** over 206 million
-  calls in one session. They only count now.
+* **Four of the six render state filters skipped nothing at all** over 206
+  million measured calls. They only count now.
 * **A locked 64-bit instruction on every Lua allocation the game makes.**
 * **The primitive count in the log went down between reports** and ended at 0.8 per
   draw call, which cannot happen. It was a 32-bit counter holding a five billion
