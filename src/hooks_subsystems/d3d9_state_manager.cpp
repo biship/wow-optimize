@@ -982,6 +982,52 @@ static HRESULT __stdcall Hooked_DrawIndexedPrimitive(void* dev, D3DPRIMITIVETYPE
     return g_orig_DrawIndexedPrimitive(dev, t, base, minV, numV, startIdx, count);
 }
 
+// Which of the twenty are worth a place in the device's vtable when nobody is
+// measuring anything.
+//
+// A three-hour session put 4.8 billion calls through them, and the per-hook
+// table in that log says what each one did with its share:
+//
+//     SetViewport             18,994,540   skipped 1,123,888  (5.9%)
+//     SetScissorRect           6,635,708   skipped   442,464  (6.7%)
+//     SetRenderState         430,665,355   skipped         0
+//     SetSamplerState        601,228,496   skipped         0
+//     SetTexture           1,206,479,830   skipped         0
+//     SetStreamSource        270,949,042   skipped         0
+//     SetIndices             359,576,568   skipped         0
+//     SetVertexDeclaration    69,030,300   skipped         0
+//     SetTransform            51,235,171   skipped         0
+//     DrawIndexedPrimitive 1,462,163,962   counting only
+//
+// Two of them do work. The rest increment a counter and return to the client,
+// and the numbers they were counting have been answered twice over on two
+// different machines. That is about five thousand detours a frame, every frame,
+// for arithmetic nobody is reading.
+//
+// So they install while something is measuring and stay out of the way
+// otherwise. What is kept and why:
+//
+//   SetViewport, SetScissorRect      they are the cache, and it skips
+//   SetRenderTarget, SetDepthStencil they drop that cache, which is the fix for
+//                                    shadows drawing into the wrong rectangle
+//   Present                          the frame counter, and it is once a frame
+//   Reset                            the device lifecycle; it must be there for
+//                                    the one call in a session that arrives
+static bool HookEarnsItsPlace(int i) {
+    switch (i) {
+        case 6:   // SetViewport
+        case 7:   // SetScissorRect
+        case 14:  // Reset
+        case 15:  // Present
+        case 18:  // SetRenderTarget
+        case 19:  // SetDepthStencilSurface
+            return true;
+        default:
+            return Config::g_settings.OptDrawCensus ||
+                   Config::g_settings.OptDrawMerge;
+    }
+}
+
 static void* g_hookFuncs[NUM_HOOKS] = {
     (void*)Hooked_SetRenderState,
     (void*)Hooked_SetTextureStageState,
@@ -1703,9 +1749,11 @@ static bool PatchDeviceVTable(void* pDevice) {
     PatchDerivedVTables((IDirect3DDevice9*)pDevice);
 
     int patched = 0;
+    int measuringOnly = 0;
     for (int i = 0; i < NUM_HOOKS; i++) {
         int vtIndex = g_vtableIndices[i];
         if (!g_hookFuncs[i]) continue;
+        if (!HookEarnsItsPlace(i)) { measuringOnly++; continue; }
 
         uintptr_t origFunc = vtable[vtIndex];
         if (!IsReadable(origFunc)) {
@@ -1763,7 +1811,14 @@ static bool PatchDeviceVTable(void* pDevice) {
               : " Any that did not install leave the census over-counting, and "
                 "the census says so.");
     }
-    Log("[D3D9State] Device vtable patched: %d/%d state hooks installed (vtable: %p, resetCounter: %ld)", patched, NUM_HOOKS, vtable, g_deviceResetCounter);
+    Log("[D3D9State] Device vtable patched: %d/%d state hooks installed "
+        "(vtable: %p, resetCounter: %ld)", patched, NUM_HOOKS, vtable,
+        g_deviceResetCounter);
+    if (measuringOnly) {
+        Log("[D3D9State]   %d of them are not installed: their dedup was "
+            "measured against two clients and skipped nothing, so all they can "
+            "do now is count. Draw Call Census puts them back.", measuringOnly);
+    }
 
     // Name these to the profiler. Sixteen detours on the device vtable are among
     // the most frequently entered code this DLL owns - a tester's session put
@@ -1972,7 +2027,17 @@ void D3D9StateManager_LogStats(void) {
         "and skips, all lower bounds:", frames, g_totalFrames);
     bool anySkip = false;
     for (int i = 0; i < NUM_HOOKS; i++) {
-        if (g_statCalls[i] == 0) continue;
+        if (g_statCalls[i] == 0) {
+            // Not installed is not the same as installed and idle. Without this
+            // the table simply loses a row and the reader is left to assume the
+            // hook was there and the client never called it.
+            if (!HookEarnsItsPlace(i) && g_hookFuncs[i]) {
+                Log("[D3D9State]   %-22s: not installed - it only counts, and "
+                    "the count is already answered. Draw Call Census puts it "
+                    "back.", g_statNames[i]);
+            }
+            continue;
+        }
         // Indices 12 and 13 are SetVertexShader and SetPixelShader, which never
         // attempt a skip: caching a resource pointer is unsafe because the
         // address can be recycled, so those two detours only count. Reporting
