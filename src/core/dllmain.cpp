@@ -1427,6 +1427,8 @@ static volatile LONG g_logWritePos = 0;
 // shape this project keeps being caught by: a log with lines missing reads
 // exactly like a log of a session where nothing happened.
 static volatile LONG g_logDropped = 0;
+// For the per-reporter timing in the periodic dump.
+static LARGE_INTEGER g_statsFreq = {};
 static volatile LONG g_logReadPos = 0;
 static HANDLE g_logEvent = NULL;
 static HANDLE g_logThread = NULL;
@@ -4984,8 +4986,44 @@ static void TryRemoveFPSCap() {
 // Periodic stats dump called from hooked_Sleep.
 //
 
+// --- which reporter is the slow one ------------------------------------------
+//
+// A field log carries "periodic stats dump took 112.2 ms" on the main thread,
+// with the outer maintenance probe reporting the same figure - so all of it is
+// the report and none of it is the rest of maintenance. At a 4.84 ms median
+// that is twenty-three frames in a row, once every five minutes, caused
+// entirely by this DLL talking about itself.
+//
+// The probe could narrow it to the report or not-the-report and no further,
+// and there are seventy-odd reporters in here. This times each one and names
+// the worst few, so the next log says which rather than which half.
+namespace {
+struct StatTimeRec { const char* name; double ms; };
+StatTimeRec g_statTimes[96];
+int         g_statTimeCount = 0;
+
+struct StatTimer {
+    const char*   name;
+    LARGE_INTEGER a;
+    StatTimer(const char* n) : name(n) { QueryPerformanceCounter(&a); }
+    ~StatTimer() {
+        if (g_statTimeCount >= 96 || !g_statsFreq.QuadPart) return;
+        LARGE_INTEGER b;
+        QueryPerformanceCounter(&b);
+        g_statTimes[g_statTimeCount].name = name;
+        g_statTimes[g_statTimeCount].ms =
+            (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_statsFreq.QuadPart;
+        g_statTimeCount++;
+    }
+};
+}  // namespace
+#define STAT_TIME(nm, call) do { StatTimer _st(nm); call; } while (0)
+
 static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     extern long g_assetPathHits;
+
+    if (!g_statsFreq.QuadPart) QueryPerformanceFrequency(&g_statsFreq);
+    g_statTimeCount = 0;
 
     // The first thing in the report, because it is the first thing anyone
     // reading a bug report needs and it used to be scattered over six thousand
@@ -5406,71 +5444,71 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
 #endif
     CpuTopology::Report();
     FrameBench::Report(why);
-    CrashDumper::ReportFeatureActivity();
+    STAT_TIME("CrashDumper::ReportFeatureActivity", CrashDumper::ReportFeatureActivity());
     CrashDumper::ReportFirstChanceSummary();
-    PerfDiagnostics::LogStats();
-    LuaGCGovernor::LogStats();
-    LuaMemPoolFast::LogStats();
-    HeapCompactor_LogStats();
-    VertexFmtInline::LogStats();
-    ObjMgrFindFast::LogStats();
-    QuatLerpSse2::LogStats();
-    QualityGovernor::LogStats();
-    LuaProtoCache::LogStats();
-    LuaBytecodeStore::LogStats();
-    LuaUndump::LogStats();
+    STAT_TIME("PerfDiagnostics::LogStats", PerfDiagnostics::LogStats());
+    STAT_TIME("LuaGCGovernor::LogStats", LuaGCGovernor::LogStats());
+    STAT_TIME("LuaMemPoolFast::LogStats", LuaMemPoolFast::LogStats());
+    STAT_TIME("HeapCompactor_LogStats", HeapCompactor_LogStats());
+    STAT_TIME("VertexFmtInline::LogStats", VertexFmtInline::LogStats());
+    STAT_TIME("ObjMgrFindFast::LogStats", ObjMgrFindFast::LogStats());
+    STAT_TIME("QuatLerpSse2::LogStats", QuatLerpSse2::LogStats());
+    STAT_TIME("QualityGovernor::LogStats", QualityGovernor::LogStats());
+    STAT_TIME("LuaProtoCache::LogStats", LuaProtoCache::LogStats());
+    STAT_TIME("LuaBytecodeStore::LogStats", LuaBytecodeStore::LogStats());
+    STAT_TIME("LuaUndump::LogStats", LuaUndump::LogStats());
     LuaBytecodeStore::SaveIfDirty();
-    AnimLod::LogStats();
-    CollisionOutcode::LogStats();
-    BoneMatrixUpload::LogStats();
-    M2MatrixSlot::LogStats();
-    M2AnimStride::LogStats();
-    MimallocHighArena::LogStats();
-    ClientWriteBatch::LogStats();
-    AabbOverlap::LogStats();
-    AnimQuatUnpack::LogStats();
-    AnimVec3Track::LogStats();
-    M2SortKey::LogStats();
-    FrustumAabb::LogStats();
-    SegmentAabb::LogStats();
-    LuaHGetDispatch::LogStats();
-    LuaPoolFast::LogStats();
-    CombatLogFilter::LogStats();
-    LuaThisCache_LogStats();
-    LuaAllocCensus::LogStats();
+    STAT_TIME("AnimLod::LogStats", AnimLod::LogStats());
+    STAT_TIME("CollisionOutcode::LogStats", CollisionOutcode::LogStats());
+    STAT_TIME("BoneMatrixUpload::LogStats", BoneMatrixUpload::LogStats());
+    STAT_TIME("M2MatrixSlot::LogStats", M2MatrixSlot::LogStats());
+    STAT_TIME("M2AnimStride::LogStats", M2AnimStride::LogStats());
+    STAT_TIME("MimallocHighArena::LogStats", MimallocHighArena::LogStats());
+    STAT_TIME("ClientWriteBatch::LogStats", ClientWriteBatch::LogStats());
+    STAT_TIME("AabbOverlap::LogStats", AabbOverlap::LogStats());
+    STAT_TIME("AnimQuatUnpack::LogStats", AnimQuatUnpack::LogStats());
+    STAT_TIME("AnimVec3Track::LogStats", AnimVec3Track::LogStats());
+    STAT_TIME("M2SortKey::LogStats", M2SortKey::LogStats());
+    STAT_TIME("FrustumAabb::LogStats", FrustumAabb::LogStats());
+    STAT_TIME("SegmentAabb::LogStats", SegmentAabb::LogStats());
+    STAT_TIME("LuaHGetDispatch::LogStats", LuaHGetDispatch::LogStats());
+    STAT_TIME("LuaPoolFast::LogStats", LuaPoolFast::LogStats());
+    STAT_TIME("CombatLogFilter::LogStats", CombatLogFilter::LogStats());
+    STAT_TIME("LuaThisCache_LogStats", LuaThisCache_LogStats());
+    STAT_TIME("LuaAllocCensus::LogStats", LuaAllocCensus::LogStats());
 
     // These modules printed their counters only from an uninstall path that
     // nothing calls; the DLL leaves through TerminateProcess and the linker had
     // dropped those functions entirely. Seven of them count averted crashes,
     // which is the number that says whether a guard is earning its hook.
-    ObjectUnlinkSafety_LogStats();
-    TypeCheckSafety_LogStats();
-    SoundBufferGuard_LogStats();
-    SoundDriverGuard_LogStats();
-    SoundEmitterGuard_LogStats();
-    LuaGetTableSafety_LogStats();
-    LuaNewKeySafety_LogStats();
-    LuaGetStrInline_LogStats();
-    LuaRawGetInline_LogStats();
-    LuaRawGetIInline_LogStats();
-    LuaTobooleanInline_LogStats();
-    StrtodFast_LogStats();
-    RegexCache_LogStats();
-    MatrixCopySSE2_LogStats();
+    STAT_TIME("ObjectUnlinkSafety_LogStats", ObjectUnlinkSafety_LogStats());
+    STAT_TIME("TypeCheckSafety_LogStats", TypeCheckSafety_LogStats());
+    STAT_TIME("SoundBufferGuard_LogStats", SoundBufferGuard_LogStats());
+    STAT_TIME("SoundDriverGuard_LogStats", SoundDriverGuard_LogStats());
+    STAT_TIME("SoundEmitterGuard_LogStats", SoundEmitterGuard_LogStats());
+    STAT_TIME("LuaGetTableSafety_LogStats", LuaGetTableSafety_LogStats());
+    STAT_TIME("LuaNewKeySafety_LogStats", LuaNewKeySafety_LogStats());
+    STAT_TIME("LuaGetStrInline_LogStats", LuaGetStrInline_LogStats());
+    STAT_TIME("LuaRawGetInline_LogStats", LuaRawGetInline_LogStats());
+    STAT_TIME("LuaRawGetIInline_LogStats", LuaRawGetIInline_LogStats());
+    STAT_TIME("LuaTobooleanInline_LogStats", LuaTobooleanInline_LogStats());
+    STAT_TIME("StrtodFast_LogStats", StrtodFast_LogStats());
+    STAT_TIME("RegexCache_LogStats", RegexCache_LogStats());
+    STAT_TIME("MatrixCopySSE2_LogStats", MatrixCopySSE2_LogStats());
     ReportCrtFreeStats();
     if (g_spinTaken > 0 || g_spinSkipped > 0) {
         Log("[SleepPrecision] busy-wait taken %ld, handed back %ld (frames over "
             "%.0f ms give the time to the scheduler instead)",
             (long)g_spinTaken, (long)g_spinSkipped, SPIN_ABORT_FRAME_MS);
     }
-    LuaFastPath::LogStats();
-    ObjVisCache::LogStats();
-    FontGlyphCache::LogStats();
+    STAT_TIME("LuaFastPath::LogStats", LuaFastPath::LogStats());
+    STAT_TIME("ObjVisCache::LogStats", ObjVisCache::LogStats());
+    STAT_TIME("FontGlyphCache::LogStats", FontGlyphCache::LogStats());
     WowOpt_ReportForeignDetours();
-    ApiCache::LogStats();
-    TextureUnloadDelay::LogStats();
-    Verdict::LogStats();
-    NetDiag::LogStats();
+    STAT_TIME("ApiCache::LogStats", ApiCache::LogStats());
+    STAT_TIME("TextureUnloadDelay::LogStats", TextureUnloadDelay::LogStats());
+    STAT_TIME("Verdict::LogStats", Verdict::LogStats());
+    STAT_TIME("NetDiag::LogStats", NetDiag::LogStats());
     // Said every report, not once at startup, because the whole value of this
     // mode is that a log from it cannot be read as a log from a normal run.
     if (Config::g_settings.OptNoClientPatches) {
@@ -5479,28 +5517,68 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
             "reporter and the frame timing live outside the client and did.",
             g_clientPatchesRefused, g_clientPatchesRefused == 1 ? "" : "s");
     }
-    RenderNullGuard_LogStats();
-    StrncmpSse2::LogStats();
-    DbcLookupCache_LogStats();
-    LuaCompileCensus::LogStats();
-    FlightRecorder::LogStats();
-    AbTest::LogStats();
-    AnimCensus::LogStats();
-    PredictivePrefetch::LogStats();
-    TickListPrefetch::LogStats();
-    LuaTableCensus::LogStats();
-    D3D9StateManager_LogStats();
-    SimdHooks_LogStats();
-    DeviceCallbackGuard::LogStats();
-    LayoutRelinkFast::LogStats();
-    HorizonOcclusion::LogStats();
-    D3D9StateCache::LogStats();
+    STAT_TIME("RenderNullGuard_LogStats", RenderNullGuard_LogStats());
+    STAT_TIME("StrncmpSse2::LogStats", StrncmpSse2::LogStats());
+    STAT_TIME("DbcLookupCache_LogStats", DbcLookupCache_LogStats());
+    STAT_TIME("LuaCompileCensus::LogStats", LuaCompileCensus::LogStats());
+    STAT_TIME("FlightRecorder::LogStats", FlightRecorder::LogStats());
+    STAT_TIME("AbTest::LogStats", AbTest::LogStats());
+    STAT_TIME("AnimCensus::LogStats", AnimCensus::LogStats());
+    STAT_TIME("PredictivePrefetch::LogStats", PredictivePrefetch::LogStats());
+    STAT_TIME("TickListPrefetch::LogStats", TickListPrefetch::LogStats());
+    STAT_TIME("LuaTableCensus::LogStats", LuaTableCensus::LogStats());
+    STAT_TIME("D3D9StateManager_LogStats", D3D9StateManager_LogStats());
+    STAT_TIME("SimdHooks_LogStats", SimdHooks_LogStats());
+    STAT_TIME("DeviceCallbackGuard::LogStats", DeviceCallbackGuard::LogStats());
+    STAT_TIME("LayoutRelinkFast::LogStats", LayoutRelinkFast::LogStats());
+    STAT_TIME("HorizonOcclusion::LogStats", HorizonOcclusion::LogStats());
+    STAT_TIME("D3D9StateCache::LogStats", D3D9StateCache::LogStats());
     D3D9StateCache::ReportDrawCensus();
-    AsyncSoundLoader::LogStats();
-    VertexBufferPrealloc::LogStats();
-    LuaBytecodeCache::LogStats();
-    CombatLogBuffer::LogStats();
-    MpqAsyncDecompress::LogStats();
+    STAT_TIME("AsyncSoundLoader::LogStats", AsyncSoundLoader::LogStats());
+    STAT_TIME("VertexBufferPrealloc::LogStats", VertexBufferPrealloc::LogStats());
+    STAT_TIME("LuaBytecodeCache::LogStats", LuaBytecodeCache::LogStats());
+    STAT_TIME("CombatLogBuffer::LogStats", CombatLogBuffer::LogStats());
+    STAT_TIME("MpqAsyncDecompress::LogStats", MpqAsyncDecompress::LogStats());
+
+    // Last, so it covers everything above it. The report is the only thing in
+    // this DLL that reliably costs the player a visible pause, and it costs it
+    // for our benefit rather than theirs, so it has to be able to say where it
+    // went.
+    if (g_statTimeCount > 0) {
+        double sum = 0.0;
+        for (int i = 0; i < g_statTimeCount; i++) sum += g_statTimes[i].ms;
+
+        int worst[5];
+        int found = 0;
+        for (int i = 0; i < g_statTimeCount; i++) {
+            int at = found;
+            if (found < 5) {
+                found++;
+            } else if (g_statTimes[i].ms > g_statTimes[worst[4]].ms) {
+                at = 4;
+            } else {
+                continue;
+            }
+            while (at > 0 && g_statTimes[i].ms > g_statTimes[worst[at - 1]].ms) {
+                worst[at] = worst[at - 1];
+                at--;
+            }
+            worst[at] = i;
+        }
+
+        Log("[Report] %d reporter(s) took %.1f ms of main thread between them. "
+            "That is a pause the player sees, so the slowest are named:",
+            g_statTimeCount, sum);
+        for (int i = 0; i < found; i++) {
+            if (g_statTimes[worst[i]].ms < 0.5) break;
+            Log("[Report]   %-38s %6.1f ms", g_statTimes[worst[i]].name,
+                g_statTimes[worst[i]].ms);
+        }
+        if (found == 0 || g_statTimes[worst[0]].ms < 0.5) {
+            Log("[Report]   none of them reached half a millisecond, so the "
+                "cost is spread rather than in one place.");
+        }
+    }
 }
 
 // ================================================================
