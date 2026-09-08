@@ -154,6 +154,13 @@ constexpr unsigned kLV_startpc = 4;
 constexpr unsigned kLV_endpc   = 8;
 constexpr unsigned kLV_size    = 12;
 
+// lua_State: top at 0x0C. LClosure: isC at +10, p at +24. The proto cache reads
+// the same two objects at the same offsets.
+constexpr unsigned kL_top       = 0x0C;
+constexpr unsigned kC_isC       = 10;
+constexpr unsigned kC_p         = 24;
+constexpr uint32_t kTagFunction = 6;
+
 constexpr uint8_t kTagNil     = 0;
 constexpr uint8_t kTagBoolean = 1;
 constexpr uint8_t kTagNumber  = 3;
@@ -377,12 +384,6 @@ void* BuildFunction(void* L, Reader& r, void* parentSource, int depth) {
 
         for (uint32_t i = 0; i < sizek; i++) {
             char* tv = k + (size_t)i * kTV_size;
-            // Read for each constant rather than once for the array. The client
-            // adds constants one at a time through addk, and every TValue store
-            // it makes reads this global at the moment of the store, so a value
-            // that moves during a parse moves for it too. Reading it once was
-            // the first thing a field session disagreed with.
-            const uint32_t taint = CurrentTaint();
             uint8_t tag = U8(r);
             switch (tag) {
                 case kTagNil:
@@ -398,8 +399,18 @@ void* BuildFunction(void* L, Reader& r, void* parentSource, int depth) {
                     *(void**)tv = BuildString(L, r);
                     break;
             }
-            WR32(tv, kTV_tt,    tag);
-            WR32(tv, kTV_taint, taint);
+            WR32(tv, kTV_tt, tag);
+            // Zero, and left zero. addk (0x00861F80) copies the token's whole
+            // TValue into f->k[n] - taint included - rather than stamping the
+            // current one, and then writes that taint back into the global, so
+            // the global moves during a parse as constants are added. A
+            // constant's taint belongs to the compile that made it, lua_dump
+            // does not write it out, and nothing here can reconstruct it.
+            //
+            // So the store only keeps chunks whose constants were all zero and
+            // only replays them while the current taint is zero. See the note
+            // in the header.
+            WR32(tv, kTV_taint, 0);
         }
     }
 
@@ -561,6 +572,66 @@ bool EqualInner(void* a, void* b, const char** what, int depth) {
 }
 
 }  // namespace
+
+// --- Taint ------------------------------------------------------------------
+
+unsigned long CurrentTaintValue() {
+    __try {
+        return (unsigned long)CurrentTaint();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Unreadable means "not clean", which is the safe answer: every caller
+        // treats a non-zero value as a reason to leave the chunk alone.
+        return 0xFFFFFFFFul;
+    }
+}
+
+void* ProtoOnStackTop(void* L) {
+    if (!L) return nullptr;
+    __try {
+        uintptr_t top = *(const uintptr_t*)((const char*)L + kL_top);
+        if (top < 0x10000) return nullptr;
+        const char* tv = (const char*)(top - kTV_size);
+        if (RD32(tv, kTV_tt) != kTagFunction) return nullptr;
+        void* cl = RDP(tv, 0);
+        if (!cl) return nullptr;
+        if (RD8(cl, kC_isC) != 0) return nullptr;     // a C function has no Proto
+        return RDP(cl, kC_p);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+namespace {
+
+bool UntaintedInner(void* f, int depth) {
+    if (!f) return false;
+    if (depth > kMaxDepth) return false;
+
+    uint32_t n = RD32(f, kP_sizek);
+    const char* k = (const char*)RDP(f, kP_k);
+    if (n && !k) return false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (RD32(k + (size_t)i * kTV_size, kTV_taint) != 0) return false;
+    }
+
+    n = RD32(f, kP_sizep);
+    void* const* ps = (void* const*)RDP(f, kP_p);
+    if (n && !ps) return false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!UntaintedInner(ps[i], depth + 1)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool ProtoIsUntainted(void* proto) {
+    __try {
+        return UntaintedInner(proto, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
 bool Retired() { return g_dead; }
 

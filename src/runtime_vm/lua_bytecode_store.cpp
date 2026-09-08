@@ -190,6 +190,11 @@ unsigned long g_fullBytes   = 0;
 unsigned long g_undumpFail  = 0;
 unsigned long g_loadedIndex = 0;
 unsigned long g_saves       = 0;
+// Chunks left alone because a taint was involved. Not failures: they are the
+// part of the problem this store is not able to solve, and the log has to be
+// able to say how big that part is.
+unsigned long g_taintedChunk = 0;   // a constant in it carried a taint
+unsigned long g_taintedNow   = 0;   // the context was tainted at the time
 double        g_msPerParse  = 0.0;   // measured by the proto cache, see below
 unsigned long g_parseSeq    = 0;
 
@@ -448,6 +453,12 @@ void* Lookup(void* L, const char* src, size_t srcLen, const char* name,
     if (!g_ready || g_dead || LuaUndump::Retired()) return nullptr;
     if (!L || !src || !name) return nullptr;
 
+    // Only into a clean context. Everything in the store was captured with
+    // every constant's taint at zero, and that is what it will be rebuilt with;
+    // handing it to a tainted caller would produce a Proto less tainted than a
+    // parse would have made, which is the wrong direction to be wrong in.
+    if (LuaUndump::CurrentTaintValue() != 0) { g_taintedNow++; return nullptr; }
+
     uint64_t k1 = Key1(src, srcLen, name, nameLen);
     std::unordered_map<uint64_t, Entry>::iterator it = g_index.find(k1);
     if (it == g_index.end()) { g_misses++; return nullptr; }
@@ -516,6 +527,15 @@ void Capture(void* L, const char* src, size_t srcLen, const char* name,
              size_t nameLen) {
     if (!g_ready || g_dead || !L || !src || !name) return;
     if (srcLen == 0 || nameLen == 0 || nameLen > 4096) return;
+
+    // A constant's taint is copied from the token that made it and lua_dump
+    // does not write it out, so a chunk with one cannot be rebuilt faithfully.
+    // Keep the clean ones - the game's own interface code, which is where the
+    // seconds are - and leave the rest to the compiler.
+    if (LuaUndump::CurrentTaintValue() != 0) { g_taintedNow++; return; }
+    void* proto = LuaUndump::ProtoOnStackTop(L);
+    if (!proto) { g_captureFail++; return; }
+    if (!LuaUndump::ProtoIsUntainted(proto)) { g_taintedChunk++; return; }
 
     uint64_t k1 = Key1(src, srcLen, name, nameLen);
     if (g_index.find(k1) != g_index.end()) return;
@@ -653,6 +673,14 @@ void LogStats() {
     } else {
         Log("[BytecodeStore]   time saved not measured: the proto cache has no "
             "average parse cost yet, so there is nothing to multiply by.");
+    }
+    if (g_taintedChunk || g_taintedNow) {
+        Log("[BytecodeStore]   left alone because of addon ownership: %lu chunk(s) "
+            "had a constant carrying it, and %lu request(s) came from a context "
+            "that had it. Neither is a failure - a constant's ownership is fixed "
+            "when it is first compiled and the game's own dump format does not "
+            "record it, so only untouched code can be rebuilt exactly.",
+            g_taintedChunk, g_taintedNow);
     }
     if (g_undumpFail || g_captureFail)
         Log("[BytecodeStore]   %lu stored chunks would not rebuild, %lu would not "
