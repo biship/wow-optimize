@@ -115,6 +115,12 @@ static constexpr int WOW_FINE_SLOTS = (int)((WOW_END - WOW_BASE) >> WOW_FINE_SHI
 // histogram and not a function lookup. Naming happens at dump time, against the
 // same symbol table the rest of the report uses.
 static uint32_t g_loadFineCounts[WOW_FINE_SLOTS];
+// A copy of the above taken when a loading screen starts, so the one that just
+// finished can be reported on its own. 64 KB, written once per load.
+static uint32_t g_loadWindowBase[WOW_FINE_SLOTS];
+static uint64_t g_loadWindowInWow = 0;
+static uint64_t g_loadWindowTotal = 0;
+static bool     g_loadWindowOpen  = false;
 static uint64_t g_loadSamples   = 0;   // taken while loading, anywhere
 static uint64_t g_loadInWow     = 0;   // and of those, inside wow.exe
 static uint64_t g_loadInSelf    = 0;   // inside this DLL
@@ -949,24 +955,36 @@ static void DumpSelfSymbolTable() {
     }
 }
 
+// `baseline`, when given, is a copy of `counts` taken earlier and every slot is
+// read as the difference. That is how one loading screen is reported out of a
+// histogram that accumulates across all of them, without a second 64 KB array
+// to hold the subtraction.
+static inline uint32_t SlotAt(const uint32_t* counts, const uint32_t* baseline, int i) {
+    uint32_t c = counts[i];
+    if (!baseline) return c;
+    uint32_t b = baseline[i];
+    return (c > b) ? (c - b) : 0u;
+}
+
 static void DumpFineHistogram(const uint32_t* counts, int slots, int shift,
                               uint64_t total, const char* title,
-                              const char* addrFormat, uintptr_t addrBase) {
+                              const char* addrFormat, uintptr_t addrBase,
+                              const uint32_t* baseline = nullptr) {
     int idx[SELF_FINE_TOP];
     int found = 0;
 
     for (int i = 0; i < slots; i++) {
-        uint32_t c = counts[i];
+        uint32_t c = SlotAt(counts, baseline, i);
         if (!c) continue;
         int at = found;
         if (found < SELF_FINE_TOP) {
             found++;
-        } else if (c > counts[idx[SELF_FINE_TOP - 1]]) {
+        } else if (c > SlotAt(counts, baseline, idx[SELF_FINE_TOP - 1])) {
             at = SELF_FINE_TOP - 1;
         } else {
             continue;
         }
-        while (at > 0 && c > counts[idx[at - 1]]) {
+        while (at > 0 && c > SlotAt(counts, baseline, idx[at - 1])) {
             idx[at] = idx[at - 1];
             at--;
         }
@@ -977,7 +995,7 @@ static void DumpFineHistogram(const uint32_t* counts, int slots, int shift,
 
     Log("[SamplingProfiler] === %s ===", title);
     for (int i = 0; i < found; i++) {
-        uint32_t c = counts[idx[i]];
+        uint32_t c = SlotAt(counts, baseline, idx[i]);
         char addr[32];
         uintptr_t slotAddr = addrBase + ((uintptr_t)idx[i] << shift);
         uintptr_t delta = 0;
@@ -1667,6 +1685,65 @@ uint64_t GetSampleCount() { return g_totalSamples; }
 void DumpNow() {
     if (!g_running) return;
     DumpResults();
+}
+
+
+// --- one loading screen at a time -------------------------------------------
+
+void MarkLoadWindowStart() {
+    if (!g_running) { g_loadWindowOpen = false; return; }
+    // The sampler writes these from its own thread while this copies them. A
+    // slot that changes mid-copy moves one sample between this window and the
+    // next, which is not a difference a profile can show.
+    memcpy(g_loadWindowBase, g_loadFineCounts, sizeof(g_loadWindowBase));
+    g_loadWindowInWow = g_loadInWow;
+    g_loadWindowTotal = g_loadSamples;
+    g_loadWindowOpen  = true;
+}
+
+void ReportLoadWindow() {
+    if (!g_running) {
+        Log("[LoadingState]   where it went is not measured: the sampling "
+            "profiler is off. LOGGING: FULL in the launcher turns it on, and "
+            "the next load says which addresses the time was in.");
+        return;
+    }
+    if (!g_loadWindowOpen) {
+        Log("[LoadingState]   where it went is not measured: the profiler "
+            "started after this load began.");
+        return;
+    }
+    g_loadWindowOpen = false;
+
+    uint64_t inWow = (g_loadInWow > g_loadWindowInWow)
+                   ? (g_loadInWow - g_loadWindowInWow) : 0;
+    uint64_t took  = (g_loadSamples > g_loadWindowTotal)
+                   ? (g_loadSamples - g_loadWindowTotal) : 0;
+
+    if (took == 0) {
+        Log("[LoadingState]   not measured: the profiler took no sample at all "
+            "during this load, which at a %lu ms interval means it was not "
+            "running rather than that the load was short.",
+            (unsigned long)SAMPLE_INTERVAL_MS);
+        return;
+    }
+    if (inWow == 0) {
+        Log("[LoadingState]   measured and zero: %llu sample(s) were taken "
+            "during this load and not one landed inside wow.exe. The time was "
+            "in a driver, a system library or a wait, and the address "
+            "histogram cannot name those.", (unsigned long long)took);
+        return;
+    }
+
+    Log("[LoadingState]   the main thread during this load: %llu sample(s), "
+        "%llu of them inside wow.exe (%.0f%%). The rest were in a driver, a "
+        "system library or a wait. This is where the time went that was neither "
+        "read, written nor compiled.",
+        (unsigned long long)took, (unsigned long long)inWow,
+        100.0 * (double)inWow / (double)took);
+    DumpFineHistogram(g_loadFineCounts, WOW_FINE_SLOTS, WOW_FINE_SHIFT,
+                      inWow, "THIS LOADING SCREEN (512-byte resolution)",
+                      "0x%08X", WOW_BASE, g_loadWindowBase);
 }
 
 } // namespace SamplingProfiler

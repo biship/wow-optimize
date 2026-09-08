@@ -32,6 +32,7 @@
 #include "combat_log_filter.h"
 #include "runtime_vm/lua_gc_governor.h"
 #include "diagnostics/crash_dumper.h"
+#include "diagnostics/sampling_profiler.h"
 
 extern "C" void Log(const char* fmt, ...);
 extern "C" void ReserveLoadingArena();
@@ -211,6 +212,12 @@ static void LoadTimerEnd() {
         Log("[LoadingState]   and no file writes at all - so the time is neither "
             "reading nor writing");
     }
+
+    // Whatever the three lines above could not account for, this says where it
+    // actually was. Reads, writes and compiles have never added up to more than
+    // a few percent of a load, and the rest had no name until the profiler's
+    // loading histogram was reported per load rather than per session.
+    SamplingProfiler::ReportLoadWindow();
 }
 
 // The client's own file-write wrapper, sub_454910. Found from a freeze capture:
@@ -270,6 +277,7 @@ void ApplyEventKind(EventKind kind) {
                 LoadTimerBegin();
                 CrashDumper::Trace("LOADING begin (PLAYER_LEAVING_WORLD)");
                 Log("[LoadingState] Loading screen started (PLAYER_LEAVING_WORLD)");
+                SamplingProfiler::MarkLoadWindowStart();
                 ReserveLoadingArena();
             }
             break;

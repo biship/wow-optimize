@@ -85,4 +85,17 @@ bool ShareForRange(uintptr_t lo, uintptr_t hi, unsigned long minSamples,
                    double* outPercent, unsigned long* outSamples,
                    unsigned long* outWindow);
 
+// --- Where a single loading screen went -------------------------------------
+//
+// The loading-screen split can say what a load was not: a measured 5504 ms load
+// spent 156 ms inside ReadFile, nothing compiling Lua and nothing writing. That
+// leaves 97% with no name on it, and the profiler already samples through a
+// loading screen into its own histogram - the two had just never been joined.
+//
+// MarkLoadWindowStart takes a copy of that histogram; ReportLoadWindow prints
+// the difference, which is where the main thread was during that one load
+// rather than across every load of the session.
+void MarkLoadWindowStart();
+void ReportLoadWindow();
+
 } // namespace SamplingProfiler
