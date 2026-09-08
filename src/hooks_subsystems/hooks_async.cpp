@@ -615,17 +615,32 @@ bool InstallAsyncHooks(void) {
     g_tasksQueued = g_tasksProcessed = g_tasksDropped = 0;
     ::memset((void*)g_tasksByType, 0, sizeof(g_tasksByType));
 
-    // The async task pool only has producers if at least one of the offload
-    // hooks below is wired to a real address. They are all still 0x0 placeholders,
-    // so EnqueueTask is never called -- spawning the worker pool would just leave
-    // idle threads spinning on the event wait. Skip it until a hook is filled in.
-    const bool anyAsyncHook =
-        (ADDR_PARTICLE_EMITTER_UPDATE | ADDR_ADT_CHUNK_LOAD |
-         ADDR_DBC_LOAD_DISPATCH | ADDR_CDATASTORE_PROCESS) != 0;
-    if (!anyAsyncHook) {
+    // The pool is worth starting only if something can put work in it.
+    //
+    // This used to ask whether any of the four offload addresses was non-zero,
+    // and it stopped protecting anything the day they were filled in. The
+    // addresses are real now - 0x007C2700, 0x007D9A20, 0x006337D0 - while all
+    // four offload paths are still compiled out behind their own flags, so the
+    // guard read "wired" and the branch below became unreachable. Two threads
+    // were created every session to block on an event nothing ever sets: the
+    // only EnqueueTask call site in this file is inside the ADT prefetch, which
+    // is one of the paths that is off.
+    //
+    // Idle threads are not free here. Each reserves a megabyte of stack in the
+    // low 2GB, which is the half this client allocates from and the half that
+    // has run out on three tester machines. Ask about producers instead.
+    const bool anyProducer =
+        (!TEST_DISABLE_PARTICLE_ASYNC && ADDR_PARTICLE_EMITTER_UPDATE) ||
+        (!TEST_DISABLE_ADT_PREFETCH   && ADDR_ADT_CHUNK_LOAD)          ||
+        (!TEST_DISABLE_DBC_PARALLEL   && ADDR_DBC_LOAD_DISPATCH)       ||
+        (!TEST_DISABLE_CDATA_ASYNC    && ADDR_CDATASTORE_PROCESS);
+    if (!anyProducer) {
         g_asyncInit = true;          // allow Shutdown()/stats to run as no-ops
         memset(g_adtCache, 0, sizeof(g_adtCache));
-        Log("[AsyncHooks] Worker pool: not started (no offload hooks wired)");
+        Log("[AsyncHooks] Worker pool: not started. Every offload path is "
+            "compiled out, so nothing would queue a task and the threads would "
+            "wait for the life of the session. The switch is on and this is "
+            "what it does today.");
         return true;
     }
 
