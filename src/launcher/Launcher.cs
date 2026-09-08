@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Diagnostics;
 using System.Collections.Generic;
@@ -110,6 +110,24 @@ namespace WowOptimizeLauncher {
             "LuaGcCoalesce",
         };
 
+        // The order a tab lists them in, and what each run is called. Worst
+        // last: a person scrolling a tab meets the reasons to tick something
+        // before the reasons not to.
+        public static readonly string[] Order = new string[] {
+            Perf, Unproven, Fix, Log, Diag, Trade, Lost
+        };
+
+        public static string Heading(string kind) {
+            if (kind == Perf)     return "MAKES THE GAME FASTER";
+            if (kind == Unproven) return "SHOULD, AND NOBODY HAS PROVEN IT";
+            if (kind == Fix)      return "PROTECTS OR REPAIRS";
+            if (kind == Log)      return "WRITES A LOG";
+            if (kind == Diag)     return "MEASURES THE GAME, AND COSTS FRAMES";
+            if (kind == Trade)    return "MORE FRAMES, DIFFERENT LOOK";
+            if (kind == Lost)     return "MEASURED AGAINST THE CLIENT AND LOST";
+            return "";
+        }
+
         public static bool HelpsSpeed(string key) {
             for (int i = 0; i < NotForSpeed.Length; i++) {
                 if (NotForSpeed[i] == key) return false;
@@ -162,7 +180,9 @@ namespace WowOptimizeLauncher {
             ForeColor = Color.White;
             Font = new Font("Segoe UI", 9.75f, FontStyle.Regular);
             Cursor = Cursors.Hand;
-            Margin = new Padding(5, 5, 5, 12);
+            // Twelve pixels of gap under every row meant a forty-two entry
+            // tab showed twelve of them and the rest was scrolling.
+            Margin = new Padding(5, 3, 5, 5);
             AutoSize = true;
         }
 
@@ -313,7 +333,8 @@ namespace WowOptimizeLauncher {
                 Color textColor = selected ? CyanAccent : TabIdle;
                 using (Font tabFont = new Font("Segoe UI", 8f, FontStyle.Bold)) {
                     TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter;
-                    TextRenderer.DrawText(g, TabPages[i].Text, tabFont, tabRect, textColor, flags);
+                    TextRenderer.DrawText(g, TabPages[i].Text, tabFont, tabRect, textColor,
+                                          flags | TextFormatFlags.NoPrefix);
                 }
 
                 if (selected) {
@@ -377,10 +398,6 @@ namespace WowOptimizeLauncher {
         private DarkTabControl tabs;
         private ToolTip toolTip;
 
-        private DarkButton btnEnableGeneral;
-        private DarkButton btnEnableUiLua;
-        private DarkButton btnEnableCombatNet;
-        private DarkButton btnEnableGfx;
 
         private FlowLayoutPanel generalFlow;
         private FlowLayoutPanel uiLuaFlow;
@@ -741,6 +758,10 @@ namespace WowOptimizeLauncher {
             // Subheader
             Label subHeaderLabel = new Label();
             subHeaderLabel.Text = "MOD CONFIGURATOR & LAUNCHER";
+            // Same reason the tab strip needed NoPrefix: a Label eats & as a
+            // mnemonic and underlines what follows, so this read CONFIGURATOR
+            // with a gap where the ampersand should be.
+            subHeaderLabel.UseMnemonic = false;
             subHeaderLabel.Font = new Font("Segoe UI", 7.5f, FontStyle.Regular);
             subHeaderLabel.ForeColor = SubHeaderColor;
             subHeaderLabel.AutoSize = true;
@@ -749,12 +770,25 @@ namespace WowOptimizeLauncher {
             leftPanel.Controls.Add(subHeaderLabel);
             y += subHeaderLabel.PreferredHeight + 18;
 
-            // ── Master Buttons ──────────────────────────────────
+            // ── Actions ────────────────────────────────────────
+            //
+            // Three that set every switch at once, three that move a whole
+            // configuration around, and Launch pinned to the bottom of the
+            // column so it is in the same place whatever else is above it.
+            //
+            // What is not here: the two buttons that set up a measuring
+            // session. They put a profiler on the main thread and an A/B
+            // harness that flips eighteen features every twenty seconds, and
+            // sitting in the same column as MAX PERFORMANCE they read like
+            // something a player should press. Every switch they touched is
+            // still a checkbox on the right.
             int btnWidth = 248;
+
+            y += AddSectionLabel(leftPanel, "SET EVERYTHING AT ONCE", y);
 
             DarkButton btnMaxPerf = new DarkButton(Color.FromArgb(255, 170, 0), false);
             btnMaxPerf.Text = "MAX PERFORMANCE";
-            btnMaxPerf.Size = new Size(btnWidth, 30);
+            btnMaxPerf.Size = new Size(btnWidth, 32);
             btnMaxPerf.Location = new Point(15, y);
             btnMaxPerf.Click += delegate { SetUpMaxPerformance(); };
             toolTip.SetToolTip(btnMaxPerf,
@@ -764,35 +798,71 @@ namespace WowOptimizeLauncher {
                 + "Also left off: the ones that buy frames by changing how the game "
                 + "looks or sounds, and the handful that were measured and lost. "
                 + "Each of those is still yours to tick; hover it to read what was "
-                + "measured.\r\n\r\n"
-                + "DEFAULT beside it puts back what a fresh install runs.");
+                + "measured.");
             leftPanel.Controls.Add(btnMaxPerf);
-            y += 36;
-
-
+            y += 38;
 
             DarkButton btnDefaults = new DarkButton(Color.FromArgb(120, 132, 160), false);
             btnDefaults.Text = "DEFAULT";
-            btnDefaults.Size = new Size(btnWidth, 30);
+            btnDefaults.Size = new Size(btnWidth, 32);
             btnDefaults.Location = new Point(15, y);
             btnDefaults.Click += delegate { RestoreDefaults(); };
             toolTip.SetToolTip(btnDefaults,
-                "Back to what a fresh install runs: the features that are on for everyone, and nothing else.");
+                "Back to what a fresh install runs: the features that are on for "
+                + "everyone, and nothing else.");
             leftPanel.Controls.Add(btnDefaults);
+            y += 38;
+
+            DarkButton btnVanilla = new DarkButton(Color.FromArgb(255, 23, 68), false);
+            btnVanilla.Text = "EVERYTHING OFF";
+            btnVanilla.Size = new Size(btnWidth, 32);
+            btnVanilla.Location = new Point(15, y);
+            btnVanilla.Click += delegate { TurnEverythingOff(); };
+            toolTip.SetToolTip(btnVanilla,
+                "The game as it ships, with the DLL loaded and doing nothing.\r\n\r\n"
+                + "This is the first thing to try when something is wrong. If the "
+                + "problem is still there with everything off, it is not us.");
+            leftPanel.Controls.Add(btnVanilla);
+            y += 44;
+
+            y += AddSectionLabel(leftPanel, "MOVE A CONFIGURATION", y);
+
+            DarkButton btnSaveProfile = new DarkButton(CyanAccent, false);
+            btnSaveProfile.Text = "SAVE TO FILE...";
+            btnSaveProfile.Size = new Size(btnWidth, 30);
+            btnSaveProfile.Location = new Point(15, y);
+            btnSaveProfile.Click += delegate { SaveProfile(); };
+            toolTip.SetToolTip(btnSaveProfile, "Write every switch to an ini you can keep or send.");
+            leftPanel.Controls.Add(btnSaveProfile);
             y += 36;
 
+            DarkButton btnLoadProfile = new DarkButton(CyanAccent, false);
+            btnLoadProfile.Text = "LOAD FROM FILE...";
+            btnLoadProfile.Size = new Size(btnWidth, 30);
+            btnLoadProfile.Location = new Point(15, y);
+            btnLoadProfile.Click += delegate { LoadProfile(); };
+            toolTip.SetToolTip(btnLoadProfile, "Read a saved ini back in. Nothing is written until you launch.");
+            leftPanel.Controls.Add(btnLoadProfile);
+            y += 36;
 
-
-
-
+            DarkButton btnShareProfile = new DarkButton(Color.FromArgb(255, 179, 0), false);
+            btnShareProfile.Text = "COPY FOR THE DEV";
+            btnShareProfile.Size = new Size(btnWidth, 30);
+            btnShareProfile.Location = new Point(15, y);
+            btnShareProfile.Click += delegate { ShareProfileWithDev(); };
+            toolTip.SetToolTip(btnShareProfile,
+                "Puts every switch on the clipboard as ini text. Paste it with a bug "
+                + "report and the log so the two can be read together.");
+            leftPanel.Controls.Add(btnShareProfile);
+            y += 42;
 
             // ── Separator ───────────────────────────────────────
             DoubleBufferedPanel separator = new DoubleBufferedPanel();
             separator.Size = new Size(btnWidth, 1);
-            separator.Location = new Point(15, y + 4);
+            separator.Location = new Point(15, y);
             separator.BackColor = SeparatorColor;
             leftPanel.Controls.Add(separator);
-            y += 18;
+            y += 14;
 
             // ── DLL Status Card ─────────────────────────────────
             DoubleBufferedPanel statusCard = new DoubleBufferedPanel();
@@ -815,26 +885,21 @@ namespace WowOptimizeLauncher {
             statusTitle.BackColor = Color.Transparent;
             statusCard.Controls.Add(statusTitle);
 
-            string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-            bool dllActive = File.Exists(Path.Combine(exeDir, "version.dll")) &&
-                             File.Exists(Path.Combine(exeDir, "wow_optimize.dll"));
-
+            bool dllActive = File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "version.dll"));
             Label statusVal = new Label();
             statusVal.Text = dllActive ? "OPTIMIZER ACTIVE (version.dll)" : "NOT LOADED / MISSING DLLs";
-            statusVal.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            statusVal.ForeColor = dllActive ? Color.FromArgb(0, 230, 118) : Color.FromArgb(255, 145, 0);
+            statusVal.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+            statusVal.ForeColor = dllActive ? Color.FromArgb(0, 230, 118) : Color.FromArgb(255, 82, 82);
             statusVal.AutoSize = true;
             statusVal.Location = new Point(10, 26);
             statusVal.BackColor = Color.Transparent;
             statusCard.Controls.Add(statusVal);
-
             leftPanel.Controls.Add(statusCard);
-            y += 64;
+            y += 62;
 
-            // ── Active Modules Counter ──────────────────────────
             activeCountLabel = new Label();
-            activeCountLabel.Font = new Font("Segoe UI", 8.5f, FontStyle.Regular);
-            activeCountLabel.ForeColor = SubtextColor;
+            activeCountLabel.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
+            activeCountLabel.ForeColor = Color.FromArgb(150, 163, 178);
             activeCountLabel.AutoSize = true;
             activeCountLabel.Location = new Point(17, y);
             activeCountLabel.BackColor = Color.Transparent;
@@ -842,35 +907,48 @@ namespace WowOptimizeLauncher {
             leftPanel.Controls.Add(activeCountLabel);
             y += 20;
 
-            // ── Progress Bar ────────────────────────────────────
             progressBarPanel = new DoubleBufferedPanel();
             progressBarPanel.Size = new Size(btnWidth, 4);
             progressBarPanel.Location = new Point(17, y);
-            progressBarPanel.BackColor = SeparatorColor;
+            progressBarPanel.BackColor = Color.FromArgb(30, 30, 45);
             progressBarPanel.Paint += ProgressBar_Paint;
             leftPanel.Controls.Add(progressBarPanel);
-            y += 16;
+            y += 18;
 
-            // ── LAUNCH WOW Button ───────────────────────────────
-            DarkButton btnLaunch = new DarkButton(CyanAccent, true);
-            btnLaunch.Text = "LAUNCH WOW";
-            btnLaunch.Size = new Size(btnWidth, 45);
-            btnLaunch.Font = new Font("Segoe UI", 11f, FontStyle.Bold);
-            btnLaunch.Location = new Point(15, y);
-            btnLaunch.Click += delegate { LaunchWow(); };
-            leftPanel.Controls.Add(btnLaunch);
-            y += 51;
+            // Where the log is, because a bug report is worth nothing without it
+            // and nobody should have to be told the path twice.
+            Label logHint = new Label();
+            logHint.Text = "Bug? Send Logs\\wow_optimize.log - the report\r\ninside it starts with what did not work.";
+            logHint.Font = new Font("Segoe UI", 7.5f, FontStyle.Regular);
+            logHint.ForeColor = Color.FromArgb(130, 142, 158);
+            logHint.AutoSize = false;
+            logHint.Size = new Size(btnWidth, 30);
+            logHint.Location = new Point(17, y);
+            logHint.BackColor = Color.Transparent;
+            leftPanel.Controls.Add(logHint);
 
-            // ── EXIT Button ─────────────────────────────────────
-            DarkButton btnExit = new DarkButton(Color.FromArgb(60, 60, 70), false);
+            // ── Launch, pinned to the bottom ────────────────────
+            //
+            // Anchored rather than flowed, so the column can gain or lose a
+            // button above without Launch moving. It used to follow the flow
+            // and ended up halfway up the panel with a void underneath.
+            int bottom = leftPanel.Height - 10;
+
+            DarkButton btnExit = new DarkButton(Color.FromArgb(80, 88, 110), false);
             btnExit.Text = "EXIT LAUNCHER";
             btnExit.Size = new Size(btnWidth, 30);
-            btnExit.Location = new Point(15, y);
-            btnExit.Click += delegate { Close(); };
+            btnExit.Location = new Point(15, bottom - 30);
+            btnExit.Click += delegate { Application.Exit(); };
             leftPanel.Controls.Add(btnExit);
-            y += 36;
 
-            // ── Version Label ───────────────────────────────────
+            DarkButton btnLaunch = new DarkButton(CyanAccent, true);
+            btnLaunch.Text = "LAUNCH WOW";
+            btnLaunch.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
+            btnLaunch.Size = new Size(btnWidth, 46);
+            btnLaunch.Location = new Point(15, bottom - 30 - 8 - 46);
+            btnLaunch.Click += delegate { LaunchWow(); };
+            leftPanel.Controls.Add(btnLaunch);
+
             versionLabel = new Label();
             versionLabel.Text = "v" + APP_VERSION + "-Release";
             versionLabel.Font = new Font("Segoe UI", 7f, FontStyle.Regular);
@@ -890,8 +968,10 @@ namespace WowOptimizeLauncher {
             Label tipLabel = new Label();
             // Two lines. It was one line 20 pixels tall holding six marks and a
             // sentence, so it showed three of the marks and cut the third in half.
-            tipLabel.Text = "[+] faster   [!] should be, unproven   [=] protects   [.] log\r\n"
-                          + "[?] measures, costs frames   [-] changes the look   [x] lost";
+            // The headings inside a tab carry this. The marks come back
+            // onto the rows only while a search has flattened the groups.
+            tipLabel.Text = "[+] faster   [!] unproven   [=] protects   [.] log\r\n"
+                          + "[?] measures   [-] changes the look   [x] lost";
             tipLabel.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
             tipLabel.ForeColor = CyanAccent;
             tipLabel.AutoSize = false;
@@ -958,106 +1038,102 @@ namespace WowOptimizeLauncher {
             combatNetFlow = (FlowLayoutPanel)((Panel)tpCombatNet.Controls[0]).Controls[0];
             graphicsSoundFlow = (FlowLayoutPanel)((Panel)tpGraphicsSound.Controls[0]).Controls[0];
 
-            // Add "ENABLE ALL IN ..." buttons at top of each flow
-            btnEnableGeneral = CreateCategoryButton("ENABLE ALL IN GENERAL");
-            btnEnableGeneral.Click += delegate { ToggleCategoryAction("General", btnEnableGeneral, "GENERAL"); };
-            generalFlow.Controls.Add(btnEnableGeneral);
-
-            btnEnableUiLua = CreateCategoryButton("ENABLE ALL IN UI & LUA");
-            btnEnableUiLua.Click += delegate { ToggleCategoryAction("UI_Lua", btnEnableUiLua, "UI & LUA"); };
-            uiLuaFlow.Controls.Add(btnEnableUiLua);
-
-            btnEnableCombatNet = CreateCategoryButton("ENABLE ALL IN COMBAT & NET");
-            btnEnableCombatNet.Click += delegate { ToggleCategoryAction("Combat_Net", btnEnableCombatNet, "COMBAT & NET"); };
-            combatNetFlow.Controls.Add(btnEnableCombatNet);
-
-            btnEnableGfx = CreateCategoryButton("ENABLE ALL IN GRAPHICS & SOUND");
-            btnEnableGfx.Click += delegate { ToggleCategoryAction("Graphics_Sound", btnEnableGfx, "GRAPHICS & SOUND"); };
-            graphicsSoundFlow.Controls.Add(btnEnableGfx);
 
 
-            // Populate checkboxes
+            // One control per switch, made once. Where it goes and what it is
+            // called are decided by Rebuild, which runs again on every search.
             foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
-                string name = pair.Key;
                 SettingItem data = pair.Value;
-                DarkCheckBox chk = CreateStyledCheckBox(
-                    Kinds.Of(data.Key, data.Experimental) + " " + name, data.Tooltip);
-
+                DarkCheckBox chk = CreateStyledCheckBox(pair.Key, data.Tooltip);
                 data.Ctrl = chk;
-
                 chk.CheckedChanged += delegate { UpdateActiveModulesCount(); };
-
-                // The ini section still decides where the value is written; the
-                // tab is only where it is shown. See FlowFor.
-                FlowFor(data).Controls.Add(chk);
             }
+            Rebuild("");
 
             Controls.Add(tabs);
             ResumeLayout(false);
         }
 
         private void FilterFeatures(string query) {
-            query = (query ?? "").Trim().ToLower();
-            bool hasSearch = !string.IsNullOrEmpty(query);
+            Rebuild(query);
+        }
 
-            TabPage activeTab = (tabs != null) ? tabs.SelectedTab : null;
-            FlowLayoutPanel activeFlow = null;
-            if (activeTab != null && activeTab.Controls.Count > 0) {
-                Control scrollPanel = activeTab.Controls[0];
-                if (scrollPanel.Controls.Count > 0) {
-                    activeFlow = scrollPanel.Controls[0] as FlowLayoutPanel;
-                }
-            }
-
-            if (generalFlow == null || uiLuaFlow == null || combatNetFlow == null ||
-                graphicsSoundFlow == null) {
+        // Fills the four tabs. Called once at start-up and again on every
+        // keystroke in the search box.
+        //
+        // Without a search the rows are grouped by what the switch is for, with
+        // a heading over each run. A hundred and twenty-three checkboxes in one
+        // column is a wall, and reading it told you nothing about which of them
+        // you would want. Grouped, a tab opens on the ones that make the game
+        // faster and the profilers are at the bottom under a heading that says
+        // they cost frames.
+        //
+        // The mark is on the row only while searching. A search flattens the
+        // groups, so the row has to carry its own label again; under a heading
+        // that already says MAKES THE GAME FASTER, a [+] in front of every line
+        // is the same word twice.
+        private void Rebuild(string query) {
+            if (generalFlow == null || uiLuaFlow == null ||
+                combatNetFlow == null || graphicsSoundFlow == null) {
                 return;
             }
 
-            // Temporarily clear all flow panels
-            generalFlow.Controls.Clear();
-            uiLuaFlow.Controls.Clear();
-            combatNetFlow.Controls.Clear();
-            graphicsSoundFlow.Controls.Clear();
+            query = (query ?? "").Trim().ToLower();
+            bool hasSearch = !string.IsNullOrEmpty(query);
 
-            // Category buttons visibility
-            if (btnEnableGeneral != null) btnEnableGeneral.Visible = !hasSearch;
-            if (btnEnableUiLua != null) btnEnableUiLua.Visible = !hasSearch;
-            if (btnEnableCombatNet != null) btnEnableCombatNet.Visible = !hasSearch;
-            if (btnEnableGfx != null) btnEnableGfx.Visible = !hasSearch;
-
-            // Put category buttons back if not searching
-            if (!hasSearch) {
-                generalFlow.Controls.Add(btnEnableGeneral);
-                uiLuaFlow.Controls.Add(btnEnableUiLua);
-                combatNetFlow.Controls.Add(btnEnableCombatNet);
-                graphicsSoundFlow.Controls.Add(btnEnableGfx);
+            FlowLayoutPanel[] flows = new FlowLayoutPanel[] {
+                generalFlow, uiLuaFlow, combatNetFlow, graphicsSoundFlow
+            };
+            // The checkboxes are made once and reused, so they are only removed.
+            // The group headings are made fresh every time this runs, which is
+            // every keystroke in the search box, so they have to be disposed or
+            // they pile up for the life of the window.
+            for (int i = 0; i < flows.Length; i++) {
+                List<Control> headings = new List<Control>();
+                foreach (Control c in flows[i].Controls) {
+                    if (c is Label) headings.Add(c);
+                }
+                flows[i].Controls.Clear();
+                for (int h = 0; h < headings.Count; h++) headings[h].Dispose();
             }
 
             foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
-                string name = pair.Key;
-                SettingItem data = pair.Value;
+                if (pair.Value.Ctrl == null) continue;
+                pair.Value.Ctrl.Visible =
+                    !hasSearch || pair.Key.ToLower().Contains(query);
+            }
 
-                // Match only by name (case-insensitive)
-                bool isMatch = !hasSearch || name.ToLower().Contains(query);
+            for (int f = 0; f < flows.Length; f++) {
+                for (int k = 0; k < Kinds.Order.Length; k++) {
+                    string kind = Kinds.Order[k];
+                    bool headed = false;
 
-                if (hasSearch) {
-                    if (isMatch && data.Ctrl != null && activeFlow != null) {
-                        data.Ctrl.Visible = true;
-                        activeFlow.Controls.Add(data.Ctrl);
-                    } else if (data.Ctrl != null) {
-                        data.Ctrl.Visible = false;
-                    }
-                } else {
-                    // Restore to original tab flows. Same rule as the initial
-                    // build, from the same method, so the two cannot disagree -
-                    // they did once, and the first tab switch emptied a tab.
-                    if (data.Ctrl != null) {
-                        data.Ctrl.Visible = true;
-                        FlowFor(data).Controls.Add(data.Ctrl);
+                    foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
+                        SettingItem data = pair.Value;
+                        if (data.Ctrl == null || !data.Ctrl.Visible) continue;
+                        if (FlowFor(data) != flows[f]) continue;
+                        if (Kinds.Of(data.Key, data.Experimental) != kind) continue;
+
+                        if (!headed && !hasSearch) {
+                            flows[f].Controls.Add(MakeGroupHeader(Kinds.Heading(kind)));
+                            headed = true;
+                        }
+                        data.Ctrl.Text = hasSearch ? (kind + " " + pair.Key) : pair.Key;
+                        flows[f].Controls.Add(data.Ctrl);
                     }
                 }
             }
+        }
+
+        private Label MakeGroupHeader(string text) {
+            Label l = new Label();
+            l.Text = text;
+            l.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+            l.ForeColor = Color.FromArgb(110, 122, 140);
+            l.AutoSize = true;
+            l.Margin = new Padding(6, 14, 5, 4);
+            l.BackColor = Color.Transparent;
+            return l;
         }
 
         private TabPage CreateTabPage(string title) {
@@ -1096,15 +1172,7 @@ namespace WowOptimizeLauncher {
             return tp;
         }
 
-        private DarkButton CreateCategoryButton(string text) {
-            DarkButton btn = new DarkButton(CyanAccent, false);
-            btn.Text = text;
-            btn.Size = new Size(tabs.Width - 60, 28);
-            btn.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
-            btn.Margin = new Padding(5, 5, 5, 12);
-            return btn;
-        }
-
+        
         // Which tab a switch belongs on. Both the initial build and the search
         // filter route through here, because they are the two places that have
         // already drifted apart once and emptied a tab between them.
@@ -1123,6 +1191,85 @@ namespace WowOptimizeLauncher {
                 case "Graphics_Sound": return graphicsSoundFlow;
             }
             return generalFlow;
+        }
+
+        // A quiet heading over a run of buttons. Returns the height it used so
+        // the caller's running y stays the only place that knows the layout.
+        private int AddSectionLabel(Control parent, string text, int y) {
+            Label l = new Label();
+            l.Text = text;
+            l.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+            l.ForeColor = Color.FromArgb(110, 122, 140);
+            l.AutoSize = true;
+            l.Location = new Point(17, y);
+            l.BackColor = Color.Transparent;
+            parent.Controls.Add(l);
+            return l.PreferredHeight + 4;
+        }
+
+        // Every switch off. The one direction that is always safe, and the first
+        // thing to try when something is wrong.
+        private void TurnEverythingOff() {
+            foreach (SettingItem item in settingsMap.Values) {
+                if (item.Ctrl != null) item.Ctrl.Checked = false;
+            }
+            UpdateActiveModulesCount();
+            SaveSettings();
+        }
+
+        private void SaveProfile() {
+            SaveFileDialog sfd = new SaveFileDialog();
+            sfd.Filter = "Configuration Profiles (*.ini)|*.ini";
+            sfd.FileName = "wow_opt_profile.ini";
+            sfd.Title = "Save Configuration Profile";
+            if (sfd.ShowDialog() == DialogResult.OK) {
+                SaveSettingsToPath(sfd.FileName);
+                MessageBox.Show("Saved to:\n" + sfd.FileName, "Profile saved",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private void LoadProfile() {
+            OpenFileDialog ofd = new OpenFileDialog();
+            ofd.Filter = "Configuration Profiles (*.ini)|*.ini";
+            ofd.Title = "Load Configuration Profile";
+            if (ofd.ShowDialog() == DialogResult.OK) {
+                LoadSettingsFromPath(ofd.FileName);
+                MessageBox.Show("Loaded from:\n" + ofd.FileName, "Profile loaded",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        // Straight to the clipboard as ini text, because a bug report needs the
+        // configuration beside the log and retyping 123 switches is how the two
+        // stop matching.
+        private void ShareProfileWithDev() {
+            try {
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("; wow_optimize " + APP_VERSION + " - switches at the time of the report");
+                sb.AppendLine();
+
+                string[] order = new string[] { "General", "UI_Lua", "Combat_Net", "Graphics_Sound" };
+                for (int s = 0; s < order.Length; s++) {
+                    sb.AppendLine("[" + order[s] + "]");
+                    foreach (SettingItem item in settingsMap.Values) {
+                        if (item.Section != order[s]) continue;
+                        sb.AppendLine(item.Key + "=" +
+                                      ((item.Ctrl != null && item.Ctrl.Checked) ? "1" : "0"));
+                    }
+                    sb.AppendLine();
+                }
+
+                Clipboard.SetText(sb.ToString());
+                MessageBox.Show(
+                    "On the clipboard. Paste it with the log file - Logs" + "\\" +
+                    "wow_optimize.log - so the switches and what happened can be read "
+                    + "together.",
+                    "Copied", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            } catch (Exception ex) {
+                MessageBox.Show("Could not copy: " + ex.Message, "Error",
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private DarkCheckBox CreateStyledCheckBox(string name, string tooltipText) {
@@ -1210,76 +1357,9 @@ namespace WowOptimizeLauncher {
 
         
         
-        private void ToggleTabFeatures(string section, bool enabled) {
-            foreach (SettingItem item in settingsMap.Values) {
-                if (item.Section != section || item.Ctrl == null) continue;
-                if (enabled && item.Experimental) continue;
-                item.Ctrl.Checked = enabled;
-            }
-        }
-
-        private void ToggleCategoryAction(string section, DarkButton btn, string labelName) {
-            bool allChecked = true;
-            foreach (SettingItem item in settingsMap.Values) {
-                if (item.Section == section && item.Ctrl != null && !item.Ctrl.Checked) {
-                    allChecked = false;
-                    break;
-                }
-            }
-
-            bool nextState = !allChecked;
-            ToggleTabFeatures(section, nextState);
-            UpdateCategoryButtonTexts();
-        }
-
-        private void UpdateCategoryButtonTexts() {
-            if (settingsMap == null) return;
-
-            if (btnEnableGeneral != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.Section == "General" && item.Ctrl != null && !item.Ctrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableGeneral.Text = all ? "DISABLE ALL IN GENERAL" : "ENABLE ALL IN GENERAL";
-            }
-
-            if (btnEnableUiLua != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.Section == "UI_Lua" && item.Ctrl != null && !item.Ctrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableUiLua.Text = all ? "DISABLE ALL IN UI & LUA" : "ENABLE ALL IN UI & LUA";
-            }
-
-            if (btnEnableCombatNet != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.Section == "Combat_Net" && item.Ctrl != null && !item.Ctrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableCombatNet.Text = all ? "DISABLE ALL IN COMBAT & NET" : "ENABLE ALL IN COMBAT & NET";
-            }
-
-            if (btnEnableGfx != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.Section == "Graphics_Sound" && item.Ctrl != null && !item.Ctrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableGfx.Text = all ? "DISABLE ALL IN GRAPHICS & SOUND" : "ENABLE ALL IN GRAPHICS & SOUND";
-            }
-        }
-
+        
+        
+        
         private void RestoreDefaults() {
             foreach (SettingItem item in settingsMap.Values) {
                 if (item.Ctrl != null) {
@@ -1579,7 +1659,6 @@ namespace WowOptimizeLauncher {
             if (progressBarPanel != null) {
                 progressBarPanel.Invalidate();
             }
-            UpdateCategoryButtonTexts();
         }
     }
 
