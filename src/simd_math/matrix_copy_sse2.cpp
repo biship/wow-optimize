@@ -1506,7 +1506,7 @@ void ShutdownMatrixCopySSE2() {
 #if !TEST_DISABLE_QUAT_MATRIX_SSE2
     MH_DisableHook((void*)0x004C1C40);
     MH_DisableHook((void*)0x004C1DE0);
-    Log("[MatrixSSE2] Stats: QuatToMatrix core=%ld  fused wrapper=%ld",
+    Log("[MatrixSSE2] Stats: QuatToMatrix core=%lu  fused wrapper=%lu",
         g_quat2mat_calls, g_quat2matfull_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_VECTOR_SSE2
@@ -1516,30 +1516,30 @@ void ShutdownMatrixCopySSE2() {
 #if !TEST_DISABLE_VEC_NORMALIZE_SSE2
     MH_DisableHook((void*)0x004C3420);
     MH_DisableHook((void*)0x004C3600);
-    Log("[MatrixSSE2] Stats: Vec3Normalize=%ld", g_vec3norm_calls);
+    Log("[MatrixSSE2] Stats: Vec3Normalize=%lu", g_vec3norm_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_EXT_SSE2
     MH_DisableHook((void*)0x004C23D0);
     MH_DisableHook((void*)0x004C2300);
     MH_DisableHook((void*)0x004C1BF0);
     MH_DisableHook((void*)0x004C3680);
-    Log("[MatrixSSE2] Stats: Transpose=%ld  PointXformIP=%ld  Scale3x3=%ld  From3x3=%ld",
+    Log("[MatrixSSE2] Stats: Transpose=%lu  PointXformIP=%lu  Scale3x3=%lu  From3x3=%lu",
         g_mattranspose_calls, g_pointxformip_calls, g_scale3x3_calls, g_matfrom3x3_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_INVERT_SSE2
     MH_DisableHook((void*)0x004C2FC0);
-    Log("[MatrixSSE2] Stats: InvertRigid=%ld", g_matinvrigid_calls);
+    Log("[MatrixSSE2] Stats: InvertRigid=%lu", g_matinvrigid_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
     MH_DisableHook((void*)0x004C2120);
     MH_DisableHook((void*)0x004C2210);
-    Log("[MatrixSSE2] Stats: MatrixMisc(ScalarMul+RowAffine)=%ld", g_matscalarmul_calls);
+    Log("[MatrixSSE2] Stats: MatrixMisc(ScalarMul+RowAffine)=%lu", g_matscalarmul_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
     MH_DisableHook((void*)0x004C1B30);
-    Log("[MatrixSSE2] Stats: TranslateLocal=%ld", g_mattranslate_calls);
+    Log("[MatrixSSE2] Stats: TranslateLocal=%lu", g_mattranslate_calls);
 #endif
 
-    Log("[MatrixSSE2] Stats: MatrixCopy=%ld  MatrixIdentity=%ld  MatrixMul=%ld  MatVec3=%ld  MatVec4=%ld",
+    Log("[MatrixSSE2] Stats: MatrixCopy=%lu  MatrixIdentity=%lu  MatrixMul=%lu  MatVec3=%lu  MatVec4=%lu",
         g_matcopy_calls, g_matident_calls, g_matmul_calls, g_matvec3_calls, g_matvec4_calls);
 }
