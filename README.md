@@ -43,150 +43,98 @@ The current public build is focused on real frametime stability, long-session sm
 
 ### New
 
-* **The launcher is two presets and a bug switch, not nine buttons.** MAX
-  PERFORMANCE, DEFAULT and EVERYTHING OFF set every switch at once; save, load
-  and copy-for-the-dev move a whole configuration; LOGGING: NORMAL / FULL turns
-  on the recorders when something is wrong and off again when it is not. The
-  Experimental tab is gone: it held fifty-six of the hundred and twenty-three
-  switches, so the four real categories were half empty. Every switch now sits
-  in its own category under a heading that says what the run below it is for -
-  makes it faster, not proven yet, stability and fixes, logging, diagnostics
-  (costs frames), changes how it looks or sounds, tried and didn't help.
-* **A bug report is legible from its first screen.** Every module already
-  announced a refusal or a stand-down; those lines are now collected as they are
-  written and reprinted together under `[Wrong]` at the top of every report. On a
-  tester's three-hour, forty-eight thousand line log that is five lines, and one
-  of them was the answer: Batch the Game's File Writes was on, File I/O Hooks was
-  off, and it had done nothing all session.
-* **Two log lines could be written into one buffer at once.** A producer read the
-  ring slot's state instead of claiming it, then spent microseconds formatting
-  into a buffer it did not own. A tester's log has the result: a line that stops
-  eight characters into its message with another thread's whole line written into
-  the wound.
-* **Loading screens say where they went.** The split could only say what a load
-  was not - a 5504 ms load with 156 ms of reads, no writes and no Lua compiled -
-  while the profiler had been keeping a loading-screen histogram all along and
-  reporting it once per session. The load report now ends with the addresses the
-  main thread was actually in during that load. Needs LOGGING: FULL.
-* **Two worker threads were started every session for a queue nothing writes to.**
-  The guard against that asked whether an offload address was filled in; the
-  addresses were filled in while the paths behind them stayed compiled out, so it
-  read "wired" and stopped protecting. It asks about producers now.
-* **Reuse Compiled Scripts Between Sessions understands addon ownership.** A
-  constant's ownership is copied from the token that made it, not stamped from
-  the current context, and the game's own dump format does not record it - so it
-  cannot be reconstructed. Only chunks with no ownership on any constant are
-  kept, only served into a context that has none, and the report counts what that
-  leaves behind rather than hiding it.
+* **The launcher is two presets and a switch for bug reports.** MAX PERFORMANCE,
+  DEFAULT and EVERYTHING OFF set every switch at once. Save, load and copy-for-
+  the-dev move a whole configuration between machines. LOGGING: NORMAL / FULL
+  turns on the recorders when something is wrong and off again when it is not.
 
-* **MAX PERFORMANCE button, and every switch now says what it is for.** The
-  tester who asked for the fastest possible setup pressed ENABLE ALL FEATURES,
-  which is the reasonable thing to do and the wrong thing to do: it also turned
-  on twelve profilers, a census on every draw call and every Lua allocation, and
-  an A/B harness rotating eighteen features on and off every twenty seconds all
-  session. Nothing in the list said which was which.
+  Every switch carries a mark and sits under a heading that says what the run
+  below it is for: makes it faster, not proven yet, stability and fixes, logging,
+  diagnostics that cost frames, changes how it looks or sounds, tried and didn't
+  help. Hover any of them to read what was measured.
 
-  Every entry carries a mark now:
+  MAX PERFORMANCE turns on everything that makes the game faster and leaves off
+  everything that only measures it, buys frames by changing how the game looks,
+  or was measured against the client and lost. Those are still yours to tick.
+* **A bug report is legible from its first screen.** Every report opens with
+  `[Wrong]`: the modules that were asked to run and did not, each with the line
+  it printed. A switch you left off is not counted there.
 
-  * `[+]` makes the game faster - 81 of them
-  * `[=]` protects or repairs, no speed claim - 15
-  * `[?]` measures the game, and costs frames to do it - 12
-  * `[-]` buys frames by changing how the game looks or sounds - 7
-  * `[x]` was measured against the client and lost - 4
-  * `[.]` writes a log - 4
-
-  MAX PERFORMANCE turns on the 98 that help and leaves 25 off. The four marked
-  `[x]` are there because something measured them: Matrix-Vector SSE2 runs at
-  3.3 ns a call against the client's own 2.5; Texture Smart Unload Delay was
-  measured by two testers at 0.4% and 0.2% of held textures ever reused; UI
-  Frame Batch no longer switches anything; and Adaptive Lua GC Governor is the
-  one module with a tester crash that still has us in the call stack. Every one
-  of the 25 is still yours to tick, and hovering it says what was measured.
-* **The tabs hold what their names say now.** Fifty-six of the hundred and
-  twenty-three switches were landing on Experimental, which is not a shortlist,
-  and it left the four category tabs half empty. Anything that has been measured
-  now sits in its own category with its mark on it, whichever way the
-  measurement went - a draw call census is a graphics entry, not an open
-  question. Experimental keeps the thirty-seven nobody has proven yet, which is
-  what its note actually asks a tester to work through.
+  On one tester's three-hour log that is five lines, and one of them was the
+  answer - Batch the Game's File Writes was on, File I/O Hooks was off, and it
+  had done nothing all session.
+* **Loading screens say where they went.** A load report ends with the addresses
+  the main thread was actually in during that load, so the time that is neither
+  reading, writing nor compiling has a name on it. Needs LOGGING: FULL.
 * **Reuse Compiled Scripts Between Sessions.** A measured loading screen spends
   2128 ms inside the game's Lua compiler. Only 260 ms of that is text the session
-  had already compiled, which is what Reuse Compiled Scripts removes. The other
-  1868 ms is text the session had never seen, and nothing running inside the game
-  can help with it. It had been seen before, though, the last time the game ran.
-  This writes the compiled form to `Cache\wow_optimize_bytecode.bin` and reads it
-  back on the next launch. Off by default, in Experimental.
+  had already compiled, which is what Reuse Compiled Scripts removes. The rest is
+  text this session had never seen - and saw the last time the game ran. This
+  writes the compiled form to `Cache\wow_optimize_bytecode.bin` and reads it back
+  on the next launch. Off by default.
 
   The game can write that form and has no code to read it back, so the reading is
   ours. Every script rebuilt from the file is compared against a real compile of
   the same text, field by field, into every nested function, each constant by
   type, value and addon ownership. That runs for the first 2000 of them and one
   in every 256 after, and the whole store switches off for good the first time
-  two of them differ. The file is discarded automatically whenever Wow.exe
-  changes.
-* **Model Animation Stride** holds a distant model's skeleton for a frame
-  instead of re-solving every bone. Its materials, particles and attached items
-  keep animating. Nothing within 45 yards is ever held. The animation family is
+  two of them differ. The file is discarded whenever Wow.exe changes.
+* **Model Animation Stride** holds a distant model's skeleton for a frame instead
+  of re-solving every bone. Its materials, particles and attached items keep
+  animating, and nothing within 45 yards is ever held. The animation family is
   about a fifth of the frame. Off by default.
 * **M2 Matrix Slot Copy (SSE2)** replaces three blocks in the model animation
   update that move matrices one float at a time. No arithmetic, so the bytes
   written are the bytes read. Off by default.
 * **Draw Call Merging** was built, measured and removed. 2.4% of 293 million draw
   calls could be merged, merging exactly those worked, and the frame rate fell.
-  The census keeps its switch; the merger's is gone.
+  The census keeps its switch.
 
 ### Faster
 
 * **Batch the Game's File Writes** and **Reuse Compiled Scripts** are on by
-  default now. A loading screen was measured at 1576 ms with only 49 ms of it
-  reading files, and the same session spent 2470 ms of another load inside
-  593,557 nine-byte writes and 2128 ms inside the Lua compiler. Nothing in a
-  default install touched either.
-* Loading screens now report how much of themselves were spent compiling Lua,
-  split into source seen for the first time and source compiled again.
+  default. A loading screen was measured at 1576 ms with 49 ms of it reading
+  files, and the same session spent 2470 ms of another load inside 593,557
+  nine-byte writes and 2128 ms inside the Lua compiler.
+* Loading screens report how much of themselves went into compiling Lua, split
+  into source seen for the first time and source compiled again.
 
 ### Fixed
 
-* **The quality governor cut your view distance every time you zoned**, reported
-  by the tester who turned every option on and said something was off with the
-  graphics while running around. Twelve seconds after entering the world it read
-  the frame tail at 125 ms and halved particle density; twenty-six seconds later
-  it read 248 ms and pulled farclip from 350 down to 262; a minute after that it
-  read 15 ms and put both back. Seven times in four minutes, on a session whose
-  average frame time was 4.16 ms. It was reading the end of a loading screen as
-  slow gameplay, and its 512-frame window made one burst of hitches look like a
-  trend for eight seconds when it only calls five seconds sustained. It now
-  ignores loading screens, throws its window away when one ends, and waits for
-  real frames before deciding anything. Off by default, so this only affected
-  people who enable everything.
-* **The quality governor never said what it was doing.** Its only report was in
-  shutdown, which does not run in this client, so a session where it changed
-  nothing said nothing at all. It reports every interval now, with the values it
-  is holding against your own.
-* **Reuse Compiled Scripts Between Sessions switched itself off on the first real
-  client**, 26 seconds in, after 215 rebuilt scripts matched a fresh compile and
-  the 216th differed in one constant's addon ownership. Nothing wrong was ever
-  handed to the game - that is what the checking is for. The cause was reading
-  that ownership once per script instead of once per constant, which is what the
-  game does. Fixed, and the message now carries both values so the next report
-  settles it rather than describing it.
-* **The script cache turned away the files worth the most.** It refuses to keep
-  a copy of the source for anything over a megabyte, which is right for what it
-  holds in memory. The check sat in the wrong place, so those files were written
-  to the new disk store and could then never be read back from it. Those are
-  GlobalStrings.lua, ChatFrame and the rest of the large ones, where skipping a
-  compile is worth ten milliseconds rather than twenty microseconds.
 * **Shadows that did not refresh and flickered**, reported by prince [SANC] and
   Sicsoo. Setting a render target resets the viewport, and the render state cache
-  did not know, so it skipped the next `SetViewport` and the shadow pass drew into
-  the wrong rectangle. On by default, so this was everyone. Turning the two shadow
-  options was never going to help and they stay off.
+  skipped the `SetViewport` that put it back, so the shadow pass drew into the
+  wrong rectangle. On by default, so this was everyone.
 * **Wrong vertex layout after a vertex declaration.** Setting a declaration clears
   the FVF; the FVF cache kept skipping the call that put it back.
+* **The quality governor pulled your view distance down when you zoned**,
+  reported by the tester who turned every option on and said something was off
+  with the graphics while running around. It read the end of a loading screen as
+  slow gameplay, halved particle density and cut farclip, then put both back a
+  minute later. It ignores loading screens now and waits for real frames before
+  deciding anything. Off by default.
+* **The quality governor reports every interval**, with the values it is holding
+  against your own.
+* **Two threads could write into one log buffer.** A line would stop mid-message
+  with another thread's whole line inside it. A ring slot is claimed before it is
+  written now, and lines dropped to a full ring are counted in the report.
+* **Two worker threads started every session for a queue nothing writes to.**
+  Async Worker Pool checks whether an offload path is actually built in before
+  starting them. Each thread reserved a megabyte of stack in the low 2GB, which
+  is the half this client allocates from.
+* **The largest scripts reach the disk store.** The megabyte cap on the in-memory
+  copy of the source sat above the disk lookup, so GlobalStrings.lua, ChatFrame
+  and the rest were captured and could never be read back - and those are where
+  skipping a compile is worth ten milliseconds rather than twenty microseconds.
+* **Reuse Compiled Scripts Between Sessions understands addon ownership.** A
+  constant's ownership belongs to the compile that first created it and the
+  game's own dump format does not record it, so only scripts with no ownership on
+  any constant are kept, and they are served only into a context that has none.
+  The report counts what that leaves behind.
 * **The draw call census had never installed.** Its hooks came from a module
   compiled out months ago, so every session with that box ticked measured nothing.
 * **The animation census stood down whenever Animation LOD was on**, so neither of
-  the two numbers has ever arrived. It counts from inside the other one now.
+  the two numbers ever arrived. It counts from inside the other one now.
 * **Thirteen modules counted on hot paths and could not print the number**, seven
   of them counting crashes they had averted.
 * **Five launcher options turned on features this build does not contain**, and two
@@ -197,7 +145,6 @@ The current public build is focused on real frametime stability, long-session sm
 * **The primitive count in the log went down between reports** and ended at 0.8 per
   draw call, which cannot happen. It was a 32-bit counter holding a five billion
   total.
-
 ---
 
 ## Send me your log
@@ -234,50 +181,35 @@ If you would rather not share it publicly, that is fine — say so in an issue.
 
 ### If you want to measure something rather than report a bug
 
-Every optimization here is off by default because none of them had a measured
-gain, and until recently none could be measured: comparing two sessions compares
-two different evenings, not two settings. One session that alternates a feature
-on and off compares the same zone, the same addons and the same machine against
-itself.
+Comparing two sessions compares two different evenings. One session that
+alternates a feature on and off compares the same zone, the same addons and the
+same machine against itself.
 
-In the launcher, press **SET UP A MEASUREMENT RUN**. It ticks A/B Test a
-Feature and the sixteen features the harness can measure, changes nothing else
-you have set, and saves. Then play - somewhere the processor is busy. A raid, a
-battleground, a crowded city. Standing in a field the game waits on the
-graphics card, a saving inside the frame changes no frame time, and the report
-will tell you so instead of giving you numbers.
-
-That button exists because the harness can only measure features that are
-switched on - a feature registers with it at the moment it installs - and on a
-default install that is two of the sixteen, so the rest of the report would be
-empty. To pick them by hand instead, these are the ones it can measure:
+Tick **A/B Test a Feature** under General, and tick the features you want
+compared. The harness measures a feature that is switched on, because a feature
+registers with it at the moment it installs. These are the ones it can measure:
 
 > UI Layout Relink Shortcut, Model Draw Order Key Cache, Lua Pool Shortcuts,
 > Table Lookup Dispatch (SSE2), Bone Rotation Maths (SSE2), Bone Rotation
-> Unpack (SSE2), Bone Movement Track (SSE2), Visibility Box Test (SSE2), Box
-> Overlap Test (SSE2), Line-of-Sight Box Test (SSE2), SSE2 Frustum Cull and
-> Quaternion Normalize, Fast SSE2 Memory Clear, SSE2 String Compare, Lua VM:
-> stop the automatic GC, Bone Matrix Upload (SSE2), and Matrix-Vector SSE2.
+> Unpack (SSE2), Bone Movement Track (SSE2), Bone Matrix Upload (SSE2),
+> Visibility Box Test (SSE2), Box Overlap Test (SSE2), Line-of-Sight Box Test
+> (SSE2), M2 Matrix SSE2, M2 Matrix Slot Copy (SSE2), Model Animation Stride,
+> Fast SSE2 Memory Clear, SSE2 String Compare, Lua VM: stop the automatic GC,
+> and Matrix-Vector SSE2.
 
-Each is alternated on its own, so turning several on does not mix them up.
+Then play somewhere the processor is busy: a raid, a battleground, a crowded
+city. Standing in a field the game waits on the graphics card, a saving inside
+the frame changes no frame time, and the report says so instead of giving you
+numbers.
 
-There is a second button, **ANSWER THE OPEN QUESTIONS**, and it is a different
-session. It turns the A/B test off and the counters on: draw calls and how
-many of them could be merged, how much Lua the game compiles twice, how long
-the horizon scans are, how many tiny file writes there are, and where the main
-thread actually is. Those cost something to collect, which is why they do not
-go in the same session as a test comparing frame times. Twenty minutes of
-whatever you normally do is enough.
+Each subject is alternated on its own, four on/off pairs of twenty seconds, so
+it spends about two minutes and forty seconds on one before moving to the next.
+Play for longer than one pass over everything you ticked, and send the log. The
+report says, per feature, when there were too few turns for the number to mean
+anything.
 
-Each subject gets four on/off pairs of twenty seconds, so it spends about two
-minutes and forty seconds on one before moving to the next: all sixteen take
-about forty-three minutes. Play for at least that, longer if you can, and send
-the log. Every feature that was switched on will have been measured against
-the client doing the same work, and the report says per feature when there
-were too few turns for the number to mean anything.
-
-To spend the whole session on one feature instead, open `WTF\wow_opt.ini` and
-put its ini key under `[General]`:
+To spend the whole session on one feature, open `WTF\wow_opt.ini` and put its
+ini key under `[General]`:
 
 ```ini
 AbTestSubject=LayoutRelinkFast
@@ -287,10 +219,16 @@ and make sure that feature is switched on too. The switch decides whether it
 installs; this decides when it does its work. If the name is wrong the report
 lists the ones it would have accepted.
 
-One of them is there to check the instrument rather than the feature:
-`MatrixVectorSse2` is already known to be slower than the code it replaces, so
-if a report calls that one faster, the measurement is what is wrong.
+`MatrixVectorSse2` is in the list to check the instrument: it is known to be
+slower than the code it replaces, so if a report calls it faster, the
+measurement is what is wrong.
 
+For counters instead of a comparison - draw calls and how many of them could be
+merged, how much Lua the game compiles twice, how long the horizon scans are,
+how many tiny file writes there are, and where the main thread is during a
+loading screen - press **LOGGING: FULL** and leave A/B Test off. Those cost
+frames to collect, which is why they do not share a session with a test that
+compares frame times. Twenty minutes of whatever you normally do is enough.
 ---
 
 ## Reviews
@@ -503,7 +441,7 @@ Replacements for WoW's own statically-linked CRT routines at verified addresses:
 - SSE2 matrix-vector transforms — 3D point × 4x4 matrix (0x4C21B0), 4D vector × 4x4 matrix (0x4C2270), in-place point × 4x4 (0x4C2300)
 - SSE2 `C3Vector::Normalize` — 0x4C3420 + 0x4C3600 (full-precision `sqrtss`/`divss`, engine guards replicated)
 - SSE2 `CMatrix::Transpose` — 0x4C23D0 (`_MM_TRANSPOSE4_PS`, bit-identical)
-- **SSE2 collision box test** *(off by default, experimental)* — the AABB outcode classification in `sub_7C7230`, 3.8% of main-thread time in a corrected profile. Six x87 comparisons per vertex become six packed comparisons per four vertices. Bit-exact, not approximate: the bounds are plain floats with no arithmetic applied. `Graphics_Sound/CollisionOutcode`
+- **SSE2 collision box test** *(off by default, experimental)* — the AABB outcode classification in `sub_7C7230`, 3.8% of main-thread time in a corrected profile. Six x87 comparisons per vertex become six packed comparisons per four vertices. Bit-exact: the bounds are plain floats with no arithmetic applied. `Graphics_Sound/CollisionOutcode`
 - SSE2 frustum point culling — `CFrustum::IsPointVisible` (0x983D70)
 - SSE2 Möller-Trumbore ray-triangle intersection — 32-bit indices (0x9836B0), 16-bit indices (0x983490)
 - SSE2 frustum AABB-vs-4-planes cull
