@@ -31,3 +31,4 @@ src/disabled_features/
 scratch/
 wow_opt.ini
 *.ini
+RELEASE_*.md
