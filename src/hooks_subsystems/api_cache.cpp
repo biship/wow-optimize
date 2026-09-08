@@ -188,6 +188,14 @@ static ItemCacheEntry g_itemCache[CACHE_SIZE] = {};
 static long g_itemHits     = 0;
 static long g_itemMisses   = 0;
 static long g_itemBypassed = 0;   // key or result too large to store
+// Why a miss missed. A hit rate on its own says the cache is not working and
+// nothing about which of three different problems it has: a slot that was empty
+// (nothing to fix), a slot holding a different item (the table is too small or
+// the map too crude), or the client returning nothing because the item is not
+// in its own cache yet (nothing this can ever store).
+static long g_itemMissCold    = 0;
+static long g_itemMissEvicted = 0;
+static long g_itemMissNotReady = 0;
 static bool g_active       = false;
 
 static SRWLOCK g_itemCacheLock = SRWLOCK_INIT;
@@ -360,8 +368,10 @@ static int __cdecl Hooked_GetItemInfo(lua_State* L) {
 
     ItemCacheEntry localEntry;
     bool found = false;
+    bool slotHeldSomethingElse = false;
 
     AcquireSRWLockShared(&g_itemCacheLock);
+    slotHeldSomethingElse = e->valid;
     if (e->valid && e->keyHash == keyHash && e->keyType1 == keyType1) {
         bool match = (keyType1 == LUA_TNUMBER)
                        ? (e->keyNum1 == keyNum1)
@@ -369,6 +379,7 @@ static int __cdecl Hooked_GetItemInfo(lua_State* L) {
         if (match) {
             localEntry = *e;
             found = true;
+            slotHeldSomethingElse = false;
         }
     }
     ReleaseSRWLockShared(&g_itemCacheLock);
@@ -394,6 +405,13 @@ static int __cdecl Hooked_GetItemInfo(lua_State* L) {
     }
 
     InterlockedIncrement(&g_itemMisses);
+    if (ret <= 0) {
+        InterlockedIncrement(&g_itemMissNotReady);
+    } else if (slotHeldSomethingElse) {
+        InterlockedIncrement(&g_itemMissEvicted);
+    } else {
+        InterlockedIncrement(&g_itemMissCold);
+    }
     return ret;
 }
 
@@ -446,6 +464,15 @@ void LogStats() {
     if (total > 0) {
         Log("[ApiCache] GetItemInfo: %ld hits, %ld misses (%.1f%% hit rate), %ld bypassed",
             g_itemHits, g_itemMisses, (double)g_itemHits / total * 100.0, g_itemBypassed);
+        // A hit rate on its own does not say which of three problems this is,
+        // and they have different answers: nothing, a bigger table, or none of
+        // our business. A field session sat at 17.5% over 1.4 million calls and
+        // there was no way to tell.
+        Log("[ApiCache]   of those misses: %ld had nothing stored for that slot, "
+            "%ld found a different item in it, and %ld were the client itself "
+            "returning nothing because the item is not in its own cache yet. "
+            "Only the middle one is a cache that is too small.",
+            g_itemMissCold, g_itemMissEvicted, g_itemMissNotReady);
     } else if (g_active) {
         Log("[ApiCache] GetItemInfo: measured and zero, no call reached it");
     } else {
