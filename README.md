@@ -108,6 +108,11 @@ The current public build is focused on real frametime stability, long-session sm
 
 ### Fixed
 
+* **Three megabytes of address space came back.** The log ring reserved four
+  megabytes for lines that are measured at about a hundred and fifty characters.
+  It is sized to what is actually written now. That space sits in the low 2GB,
+  which is where the game allocates from, and where running out is what garbles
+  SavedVariables names.
 * **The matrix hook counter printed a negative number.** Fifteen counters were
   signed 32-bit and the matrix multiply takes about four thousand calls a frame,
   so one of them ran out inside the second hour and took the total with it. The
