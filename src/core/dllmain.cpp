@@ -1373,6 +1373,15 @@ static volatile LONG  g_problemCount = 0;
 static volatile LONG  g_problemDropped = 0;
 
 static bool ProblemWorthKeeping(const char* m) {
+    // The report prints each kept line back under [Wrong], and those lines
+    // carry the words that got them kept. Without this the list feeds on
+    // itself: a tester's first report held two entries, the second held six,
+    // and every one after that would have held more.
+    if (m[0] == '[' && m[1] == 'W' && m[2] == 'r' && m[3] == 'o' &&
+        m[4] == 'n' && m[5] == 'g' && m[6] == ']') {
+        return false;
+    }
+
     static const char* kNotAFault[] = {
         "via configuration", "switched off", "compiled out", "not in this build",
         "crash isolation", "for stability", "on purpose"

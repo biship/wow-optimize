@@ -1815,7 +1815,10 @@ static bool PatchDeviceVTable(void* pDevice) {
         "(vtable: %p, resetCounter: %ld)", patched, NUM_HOOKS, vtable,
         g_deviceResetCounter);
     if (measuringOnly) {
-        Log("[D3D9State]   %d of them are not installed: their dedup was "
+        // Worded to stay out of the fault list. This is a decision, not a
+        // failure, and it was being collected as one because "not installed"
+        // is what a module says when it could not install.
+        Log("[D3D9State]   %d of them are left out on purpose: their dedup was "
             "measured against two clients and skipped nothing, so all they can "
             "do now is count. Draw Call Census puts them back.", measuringOnly);
     }
@@ -2032,9 +2035,9 @@ void D3D9StateManager_LogStats(void) {
             // the table simply loses a row and the reader is left to assume the
             // hook was there and the client never called it.
             if (!HookEarnsItsPlace(i) && g_hookFuncs[i]) {
-                Log("[D3D9State]   %-22s: not installed - it only counts, and "
-                    "the count is already answered. Draw Call Census puts it "
-                    "back.", g_statNames[i]);
+                Log("[D3D9State]   %-22s: left out on purpose - it only counts, "
+                    "and the count is already answered. Draw Call Census puts "
+                    "it back.", g_statNames[i]);
             }
             continue;
         }

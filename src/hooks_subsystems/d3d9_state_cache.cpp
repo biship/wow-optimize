@@ -1138,6 +1138,21 @@ static bool g_drawHooksInstalled = false;
 
 void InstallDrawHooks(void* origDrawPrimitive, void* origDrawIndexed) {
     if (g_drawHooksInstalled) return;
+
+    // The switch first, because the state manager stopped patching the two draw
+    // slots when nothing is measuring and therefore has no original to hand
+    // over. Asking about the pointers first turned a switch the player left
+    // alone into "the draw entry points were not resolved", which is what a
+    // client with a moved address would say and reads as a fault on a machine
+    // that has nothing wrong with it.
+    //
+    // The merger needs the same trampoline and the same barriers, so it brings
+    // the census with it rather than duplicating either.
+    if (!Config::g_settings.OptDrawCensus && !Config::g_settings.OptDrawMerge) {
+        orig_DrawIndexedPrimitive = nullptr;   // marks the census as not counting
+        return;
+    }
+
     if (!origDrawPrimitive || !origDrawIndexed) {
         Log("[DrawCensus] not installed: the draw entry points were not "
             "resolved, so nothing counts draws this session.");
@@ -1147,13 +1162,6 @@ void InstallDrawHooks(void* origDrawPrimitive, void* origDrawIndexed) {
 
     orig_DrawPrimitive        = (DrawPrimitive_fn)origDrawPrimitive;
     orig_DrawIndexedPrimitive = (DrawIndexedPrimitive_fn)origDrawIndexed;
-
-    // The merger needs the same trampoline and the same barriers, so it brings
-    // the census with it rather than duplicating either.
-    if (!Config::g_settings.OptDrawCensus && !Config::g_settings.OptDrawMerge) {
-        orig_DrawIndexedPrimitive = nullptr;   // marks the census as not installed
-        return;
-    }
 
     if (MH_CreateHook(origDrawPrimitive, (void*)Hooked_DrawPrimitive,
                       (void**)&orig_DrawPrimitive) == MH_OK &&
