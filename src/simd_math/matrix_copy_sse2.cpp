@@ -23,8 +23,8 @@ extern "C" void Log(const char* fmt, ...);
 // "never installed".
 static bool g_matrixInstalled = false;
 
-static volatile long g_matcopy_calls = 0;
-static volatile long g_matident_calls = 0;
+static volatile unsigned long g_matcopy_calls = 0;
+static volatile unsigned long g_matident_calls = 0;
 
 // ================================================================
 // Original function pointers
@@ -40,25 +40,26 @@ typedef float* (__cdecl* MatMul_t)(float* result, float* a, float* b);
 static MatCopy_t     pOrigMatCopy     = nullptr;
 static MatIdentity_t pOrigMatIdentity = nullptr;
 static MatMul_t      pOrigMatMul      = nullptr;
-static volatile long g_matmul_calls   = 0;
+static volatile unsigned long g_matmul_calls   = 0;   // low word, wraps
+static volatile unsigned long g_matmul_wraps   = 0;   // how many times it has
 
 typedef float* (__cdecl* MatVec3Mul_t)(float* result, const float* vec3, const float* matrix44);
 typedef float* (__cdecl* MatVec4Mul_t)(float* result, const float* vec4, const float* matrix44);
 
 static MatVec3Mul_t  pOrigMatVec3Mul  = nullptr;
 static MatVec4Mul_t  pOrigMatVec4Mul  = nullptr;
-static volatile long g_matvec3_calls  = 0;
-static volatile long g_matvec4_calls  = 0;
+static volatile unsigned long g_matvec3_calls  = 0;
+static volatile unsigned long g_matvec4_calls  = 0;
 
 // sub_4C1C40: quaternion -> 3x3 rotation block, both operands on the stack.
 typedef float* (__cdecl* QuatToMatrix_t)(const float* quat, float* dest);
 static QuatToMatrix_t pOrigQuatToMatrix = nullptr;
-static volatile long  g_quat2mat_calls  = 0;
+static volatile unsigned long  g_quat2mat_calls  = 0;
 
 // sub_4C1DE0: __thiscall wrapper, ECX = destination matrix, quaternion on the stack.
 typedef float* (__fastcall* QuatToMatrixFull_t)(float* dest, void* edx, const float* quat);
 static QuatToMatrixFull_t pOrigQuatToMatrixFull = nullptr;
-static volatile long      g_quat2matfull_calls  = 0;
+static volatile unsigned long      g_quat2matfull_calls  = 0;
 
 // ================================================================
 // Precomputed identity matrix rows for the SSE2 store path
@@ -255,7 +256,17 @@ static bool SelfTestMatrixMultiply() {
 }
 
 static float* __cdecl HookMatrixMultiplyBody(float* result, float* a, float* b) {
-    ++g_matmul_calls;
+    // A field log printed "multiply -199339142". A negative call count is not a
+    // number, and the only reason it was readable at all is that the arithmetic
+    // that must hold - a count is not negative - was checked. Signed 32 bits
+    // ran out: this hook took just over four billion calls in three hours,
+    // about four thousand a frame.
+    //
+    // Unsigned buys one more bit and would still wrap inside a long evening, so
+    // the low word carries a wrap counter beside it, the same shape the draw
+    // census uses for primitives. The test is one compare that is never taken
+    // until it is.
+    if (++g_matmul_calls == 0) ++g_matmul_wraps;
 
     uintptr_t r = (uintptr_t)result, pa = (uintptr_t)a, pb = (uintptr_t)b;
     if (r > 0x10000 && r < 0xFFE00000 &&
@@ -608,7 +619,7 @@ static float* __cdecl Hooked_MatVec4Mul(float* result, const float* vec4, const 
 typedef void (__fastcall* Vec3Norm_t)(float* self, void* edx);
 static Vec3Norm_t pOrigVec3Norm     = nullptr;  // sub_4C3420 (unguarded)
 static Vec3Norm_t pOrigVec3NormSafe = nullptr;  // sub_4C3600 (mag^2 > 2^-22 guard)
-static volatile long g_vec3norm_calls = 0;
+static volatile unsigned long g_vec3norm_calls = 0;
 
 // 2^-22, the engine's near-zero magnitude cutoff in sub_4C3600 (flt_9EA27C, the
 // same constant the quaternion normalise uses). It is loaded with `fld dword`
@@ -779,7 +790,7 @@ static void __fastcall Hooked_Vec3NormSafe(float* self, void* edx) {
 #if !TEST_DISABLE_MATRIX_EXT_SSE2
 typedef float* (__fastcall* MatTranspose_t)(float* self, void* edx, float* out);
 static MatTranspose_t pOrigMatTranspose = nullptr;
-static volatile long g_mattranspose_calls = 0;
+static volatile unsigned long g_mattranspose_calls = 0;
 
 static float* __fastcall Hooked_MatTranspose(float* self, void* edx, float* out) {
     ++g_mattranspose_calls;
@@ -812,7 +823,7 @@ static float* __fastcall Hooked_MatTranspose(float* self, void* edx, float* out)
 #if !TEST_DISABLE_MATRIX_EXT_SSE2
 typedef void (__fastcall* Scale3x3_t)(float* self, void* edx, float scalar);
 static Scale3x3_t pOrigScale3x3 = nullptr;
-static volatile long g_scale3x3_calls = 0;
+static volatile unsigned long g_scale3x3_calls = 0;
 
 static void __fastcall Hooked_Scale3x3(float* self, void* edx, float scalar) {
     ++g_scale3x3_calls;
@@ -855,7 +866,7 @@ static void __fastcall Hooked_Scale3x3(float* self, void* edx, float scalar) {
 // and stores 4 rows of 4 floats with zero/one padding.
 typedef float* (__fastcall* MatFrom3x3_t)(float* self, void* edx, float* src3x3);
 static MatFrom3x3_t pOrigMatFrom3x3 = nullptr;
-static volatile long g_matfrom3x3_calls = 0;
+static volatile unsigned long g_matfrom3x3_calls = 0;
 
 static float* __fastcall Hooked_MatFrom3x3(float* self, void* edx, float* src) {
     ++g_matfrom3x3_calls;
@@ -879,7 +890,7 @@ static float* __fastcall Hooked_MatFrom3x3(float* self, void* edx, float* src) {
 
 typedef float* (__cdecl* PointXformIP_t)(float* a1, float* a2, float* a3);
 static PointXformIP_t pOrigPointXformIP = nullptr;
-static volatile long g_pointxformip_calls = 0;
+static volatile unsigned long g_pointxformip_calls = 0;
 
 static float* __cdecl Hooked_PointXformInPlace(float* a1, float* a2, float* a3) {
     ++g_pointxformip_calls;
@@ -969,7 +980,7 @@ static float* __cdecl Hooked_PointXformInPlace(float* a1, float* a2, float* a3) 
 #if !TEST_DISABLE_MATRIX_INVERT_SSE2
 typedef float* (__fastcall* MatInvRigid_t)(float* self, void* edx, float* out);
 static MatInvRigid_t pOrigMatInvRigid = nullptr;
-static volatile long g_matinvrigid_calls = 0;
+static volatile unsigned long g_matinvrigid_calls = 0;
 
 // The arithmetic alone, so the shadow check exercises the same code the hook
 // runs rather than a second copy of it that could drift.
@@ -1062,7 +1073,7 @@ static float* __fastcall Hooked_MatInvertRigid(float* self, void* edx, float* ou
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
 typedef float* (__cdecl* MatScalarMul_t)(float* out, float* src, float scalar);
 static MatScalarMul_t pOrigMatScalarMul = nullptr;
-static volatile long g_matscalarmul_calls = 0;
+static volatile unsigned long g_matscalarmul_calls = 0;
 
 typedef float* (__cdecl* RowAffinePoint_t)(float* out, float* mat, float* pt);
 static RowAffinePoint_t pOrigRowAffinePoint = nullptr;
@@ -1167,7 +1178,7 @@ static float* __cdecl Hooked_RowAffinePoint(float* out, float* mat, float* pt) {
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
 typedef float* (__fastcall* MatTranslate_t)(float* self, void* edx, float* vec3);
 static MatTranslate_t pOrigMatTranslate = nullptr;
-static volatile long g_mattranslate_calls = 0;
+static volatile unsigned long g_mattranslate_calls = 0;
 
 static float* __fastcall Hooked_MatTranslateLocal(float* self, void* edx, float* vec3) {
     ++g_mattranslate_calls;
@@ -1439,40 +1450,47 @@ void MatrixCopySSE2_LogStats(void) {
         Log("[MatrixSSE2] not measured: the hooks are not installed.");
         return;
     }
-    const long total =
-        g_matcopy_calls + g_matident_calls + g_matmul_calls + g_matvec3_calls +
-        g_matvec4_calls + g_quat2mat_calls + g_quat2matfull_calls +
-        g_vec3norm_calls + g_mattranspose_calls + g_scale3x3_calls +
-        g_matfrom3x3_calls + g_pointxformip_calls + g_matinvrigid_calls
+    // Summed as a double. Adding fifteen 32-bit counters into a sixteenth
+    // 32-bit word is how the total wrapped in the first place, and the fix for
+    // one term is not a fix for their sum.
+    const double mul = (double)g_matmul_wraps * 4294967296.0
+                     + (double)g_matmul_calls;
+    const double total =
+        (double)g_matcopy_calls + (double)g_matident_calls + mul +
+        (double)g_matvec3_calls + (double)g_matvec4_calls +
+        (double)g_quat2mat_calls + (double)g_quat2matfull_calls +
+        (double)g_vec3norm_calls + (double)g_mattranspose_calls +
+        (double)g_scale3x3_calls + (double)g_matfrom3x3_calls +
+        (double)g_pointxformip_calls + (double)g_matinvrigid_calls
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
-        + g_matscalarmul_calls
+        + (double)g_matscalarmul_calls
 #endif
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
-        + g_mattranslate_calls
+        + (double)g_mattranslate_calls
 #endif
         ;
-    if (total == 0) {
+    if (total == 0.0) {
         Log("[MatrixSSE2] measured and zero: the hooks are in and the client "
             "reached none of them.");
         return;
     }
-    Log("[MatrixSSE2] %ld call(s) through the SSE2 matrix hooks, lower bounds: "
-        "copy %ld, identity %ld, multiply %ld, matvec3 %ld, matvec4 %ld, "
-        "quat2mat %ld, quat2mat-fused %ld, vec3normalize %ld",
-        total, g_matcopy_calls, g_matident_calls, g_matmul_calls,
+    Log("[MatrixSSE2] %.0f call(s) through the SSE2 matrix hooks, lower bounds: "
+        "copy %lu, identity %lu, multiply %.0f, matvec3 %lu, matvec4 %lu, "
+        "quat2mat %lu, quat2mat-fused %lu, vec3normalize %lu",
+        total, g_matcopy_calls, g_matident_calls, mul,
         g_matvec3_calls, g_matvec4_calls, g_quat2mat_calls,
         g_quat2matfull_calls, g_vec3norm_calls);
-    Log("[MatrixSSE2]   transpose %ld, scale3x3 %ld, from3x3 %ld, "
-        "pointxform-in-place %ld, invert-rigid %ld",
+    Log("[MatrixSSE2]   transpose %lu, scale3x3 %lu, from3x3 %lu, "
+        "pointxform-in-place %lu, invert-rigid %lu",
         g_mattranspose_calls, g_scale3x3_calls, g_matfrom3x3_calls,
         g_pointxformip_calls, g_matinvrigid_calls);
     // These two are behind feature flags that are off, so the counters do not
     // exist in this build and neither does a line claiming they are zero.
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
-    Log("[MatrixSSE2]   scalar-mul %ld", g_matscalarmul_calls);
+    Log("[MatrixSSE2]   scalar-mul %lu", g_matscalarmul_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
-    Log("[MatrixSSE2]   translate-local %ld", g_mattranslate_calls);
+    Log("[MatrixSSE2]   translate-local %lu", g_mattranslate_calls);
 #endif
 }
 
