@@ -31,7 +31,7 @@ namespace WowOptimizeLauncher {
         public const string Trade = "[-]";   // more frames by changing how it looks
         public const string Log   = "[.]";   // records; negligible cost
         public const string Lost  = "[x]";   // measured and lost, or a known failure
-        public const string Unproven = "[!]";   // should help; nobody has proven it
+        public const string Unproven = "[!]";   // not proven yet
 
         // Badged apart from the rest because otherwise they read as speed
         // and the preset below silently disagrees with their own label.
@@ -75,7 +75,7 @@ namespace WowOptimizeLauncher {
         // as features are added.
         // `unproven` is the SettingItem's Experimental flag. It only changes
         // what a helping switch is called, so a census stays a census and a
-        // governor stays a governor whether or not anyone has proven it.
+        // governor stays a governor either way.
         public static string Of(string key, bool unproven) {
             if (In(LostKeys, key))  return Lost;
             if (In(DiagKeys, key))  return Diag;
@@ -117,14 +117,19 @@ namespace WowOptimizeLauncher {
             Perf, Unproven, Fix, Log, Diag, Trade, Lost
         };
 
+        // Short, and each one leads with the reason you would or would not
+        // want the run under it. The appearance group used to read MORE FRAMES,
+        // DIFFERENT LOOK, which made MAX PERFORMANCE look inconsistent for
+        // leaving it off - it reads as performance and it is not; it is a trade
+        // against how the game looks, and that is the player's to make.
         public static string Heading(string kind) {
-            if (kind == Perf)     return "MAKES THE GAME FASTER";
-            if (kind == Unproven) return "SHOULD, AND NOBODY HAS PROVEN IT";
-            if (kind == Fix)      return "PROTECTS OR REPAIRS";
-            if (kind == Log)      return "WRITES A LOG";
-            if (kind == Diag)     return "MEASURES THE GAME, AND COSTS FRAMES";
-            if (kind == Trade)    return "MORE FRAMES, DIFFERENT LOOK";
-            if (kind == Lost)     return "MEASURED AGAINST THE CLIENT AND LOST";
+            if (kind == Perf)     return "MAKES IT FASTER";
+            if (kind == Unproven) return "NOT PROVEN YET";
+            if (kind == Fix)      return "STABILITY AND FIXES";
+            if (kind == Log)      return "LOGGING";
+            if (kind == Diag)     return "DIAGNOSTICS - COSTS FRAMES";
+            if (kind == Trade)    return "CHANGES HOW IT LOOKS OR SOUNDS";
+            if (kind == Lost)     return "TRIED, DIDN'T HELP";
             return "";
         }
 
@@ -143,7 +148,7 @@ namespace WowOptimizeLauncher {
         public CheckBox Ctrl;
         public string Tooltip;
 
-        // Marks a switch nobody has proven yet. It used to decide which tab the
+        // Marks a switch that has not been proven. It used to decide which tab the
         // row appeared on, which put nearly half of them on one tab; now it only
         // decides whether the row is marked [+] or [!]. A tester was
         // asked to leave one of these off so we could tell whether it caused their
@@ -393,6 +398,7 @@ namespace WowOptimizeLauncher {
 
         // UI references
         private Label versionLabel;
+        private DarkButton btnLogging;
         private Label activeCountLabel;
         private DoubleBufferedPanel progressBarPanel;
         private DarkTabControl tabs;
@@ -595,7 +601,9 @@ namespace WowOptimizeLauncher {
 
             // Window Setup
             Text = "WoW-Optimize Launcher";
-            ClientSize = new Size(920, 650);
+            // The background is scaled to the client area and covered with a
+            // near-opaque wash, so the height is free to change.
+            ClientSize = new Size(920, 700);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None;
             BackColor = DarkBg;
@@ -823,7 +831,25 @@ namespace WowOptimizeLauncher {
                 + "This is the first thing to try when something is wrong. If the "
                 + "problem is still there with everything off, it is not us.");
             leftPanel.Controls.Add(btnVanilla);
-            y += 44;
+            y += 40;
+
+            y += AddSectionLabel(leftPanel, "WHEN SOMETHING IS WRONG", y);
+
+            btnLogging = new DarkButton(Color.FromArgb(160, 120, 220), false);
+            btnLogging.Size = new Size(btnWidth, 32);
+            btnLogging.Location = new Point(15, y);
+            btnLogging.Click += delegate { ToggleFullLogging(); };
+            toolTip.SetToolTip(btnLogging,
+                "Turn this on, play until the thing goes wrong, then send "
+                + "Logs\\wow_optimize.log.\r\n\r\n"
+                + "It switches on the sampling profiler and the counters that say "
+                + "what the game was doing: where the main thread was, what was "
+                + "drawn, what was compiled, what the shadow state looked like. "
+                + "They cost frames, and that is the trade for a log that can "
+                + "answer a question.\r\n\r\n"
+                + "MAX PERFORMANCE and DEFAULT turn them all back off.");
+            leftPanel.Controls.Add(btnLogging);
+            y += 40;
 
             y += AddSectionLabel(leftPanel, "MOVE A CONFIGURATION", y);
 
@@ -854,7 +880,7 @@ namespace WowOptimizeLauncher {
                 "Puts every switch on the clipboard as ini text. Paste it with a bug "
                 + "report and the log so the two can be read together.");
             leftPanel.Controls.Add(btnShareProfile);
-            y += 42;
+            y += 36;
 
             // ── Separator ───────────────────────────────────────
             DoubleBufferedPanel separator = new DoubleBufferedPanel();
@@ -918,7 +944,7 @@ namespace WowOptimizeLauncher {
             // Where the log is, because a bug report is worth nothing without it
             // and nobody should have to be told the path twice.
             Label logHint = new Label();
-            logHint.Text = "Bug? Send Logs\\wow_optimize.log - the report\r\ninside it starts with what did not work.";
+            logHint.Text = "The log is Logs\\wow_optimize.log, and its report\r\nstarts with a list of what did not work.";
             logHint.Font = new Font("Segoe UI", 7.5f, FontStyle.Regular);
             logHint.ForeColor = Color.FromArgb(130, 142, 158);
             logHint.AutoSize = false;
@@ -970,8 +996,8 @@ namespace WowOptimizeLauncher {
             // sentence, so it showed three of the marks and cut the third in half.
             // The headings inside a tab carry this. The marks come back
             // onto the rows only while a search has flattened the groups.
-            tipLabel.Text = "[+] faster   [!] unproven   [=] protects   [.] log\r\n"
-                          + "[?] measures   [-] changes the look   [x] lost";
+            tipLabel.Text = "[+] faster   [!] not proven   [=] fixes   [.] logging\r\n"
+                          + "[?] diagnostics   [-] changes the look   [x] didn't help";
             tipLabel.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
             tipLabel.ForeColor = CyanAccent;
             tipLabel.AutoSize = false;
@@ -979,7 +1005,7 @@ namespace WowOptimizeLauncher {
             tipLabel.Location = new Point(rightX, 8);
             toolTip.SetToolTip(tipLabel,
                 "[+] makes the game faster, and something measured it.\r\n"
-                + "[!] should make it faster and nobody has proven it. Turn one on, "
+                + "[!] should make it faster; not measured yet. Turn one on, "
                 + "play, and the log says what it did.\r\n"
                 + "[=] protects or repairs something; no speed claim.\r\n"
                 + "[?] measures the game, and costs frames to produce the number.\r\n"
@@ -1182,7 +1208,7 @@ namespace WowOptimizeLauncher {
         // the four real categories were half empty and nothing could be found
         // where its name said it would be. Maturity is a property of a switch,
         // not a place to keep it, so it is a mark on the row instead - [!] for
-        // what should help and nobody has proven.
+        // what should help and has not been proven.
         private FlowLayoutPanel FlowFor(SettingItem data) {
             switch (data.Section) {
                 case "General":        return generalFlow;
@@ -1205,6 +1231,43 @@ namespace WowOptimizeLauncher {
             l.BackColor = Color.Transparent;
             parent.Controls.Add(l);
             return l.PreferredHeight + 4;
+        }
+
+        // The switches that make a log able to answer a question, rather than
+        // only say that something happened. Every one of them records; none of
+        // them changes what the game does.
+        //
+        // Deliberately not in here: the A/B harness, which turns features on and
+        // off underneath you and would make a bug come and go, and No Client
+        // Patches, which removes the patches rather than describing them. Both
+        // are diagnostics and neither belongs in "I have a bug, record it".
+        private static readonly string[] FullLoggingKeys = new string[] {
+            "SessionLogs", "FlightRecorder", "NetDiag", "CpuTopology",
+            "SamplingProfiler", "AddonProfiler", "LuaCompileCensus",
+            "AnimCensus", "DrawCensus", "ShadowStateProbe"
+        };
+
+        // SamplingProfiler is the one that costs the most and the one nothing
+        // else turns on, so it is what the button reads its state from.
+        private bool FullLoggingOn() {
+            SettingItem anchor = FindByKey("SamplingProfiler");
+            return anchor != null && anchor.Ctrl != null && anchor.Ctrl.Checked;
+        }
+
+        private void ToggleFullLogging() {
+            bool turnOn = !FullLoggingOn();
+            for (int i = 0; i < FullLoggingKeys.Length; i++) {
+                SettingItem item = FindByKey(FullLoggingKeys[i]);
+                if (item != null && item.Ctrl != null) item.Ctrl.Checked = turnOn;
+            }
+            UpdateActiveModulesCount();
+            SaveSettings();
+            UpdateLoggingButton();
+        }
+
+        private void UpdateLoggingButton() {
+            if (btnLogging == null) return;
+            btnLogging.Text = FullLoggingOn() ? "LOGGING: FULL" : "LOGGING: NORMAL";
         }
 
         // Every switch off. The one direction that is always safe, and the first
@@ -1646,6 +1709,10 @@ namespace WowOptimizeLauncher {
         }
 
         private void UpdateActiveModulesCount() {
+            // The logging button reads its state from the switches, so it
+            // follows a preset and a hand-ticked box alike.
+            UpdateLoggingButton();
+
             if (settingsMap == null) return;
             int activeCount = 0;
             foreach (SettingItem item in settingsMap.Values) {
