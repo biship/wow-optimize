@@ -1321,8 +1321,22 @@ static void   DumpPeriodicStats(const char* why = "periodic",
 static FILE* g_log = nullptr;
 static FILE* g_sessionLog = nullptr;
 
-static constexpr int LOG_RING_SIZE = 2048;
+// The ring reserves LOG_RING_SIZE * LOG_LINE_MAX bytes of this DLL's image, and
+// that image is mapped into the low 2GB, which is the half the client allocates
+// from and the half that has run out on three tester machines - one of them
+// wrote a SavedVariables file under a garbage name because of it.
+//
+// It was 2048 slots of 2048 bytes: 4.01 MB reserved for lines that are measured
+// at 104 to 165 characters in the middle, 434 at the 99th percentile and 794 at
+// the longest over every log to hand. Both numbers were round rather than
+// chosen.
+//
+// 1024 by 1024 is 1.00 MB and still twice the longest line ever seen. A line
+// that does not fit is truncated by _vsnprintf and counted, so if this is ever
+// too small the log says how often rather than quietly losing the tail.
+static constexpr int LOG_RING_SIZE = 1024;
 static constexpr int LOG_RING_MASK = LOG_RING_SIZE - 1;
+static constexpr int LOG_LINE_MAX  = 1024;
 
 // ready: 0 = free (producer may fill), 1 = filled, 2 = claimed by a consumer.
 // The ring has two consumers - the background log thread and whichever thread calls
@@ -1343,7 +1357,7 @@ static constexpr LONG LOG_SLOT_CLAIMED = 2;
 static constexpr LONG LOG_SLOT_WRITING = 3;
 
 struct LogEntry {
-    char text[2048];
+    char text[LOG_LINE_MAX];
     volatile LONG ready;
 };
 
@@ -1427,6 +1441,9 @@ static volatile LONG g_logWritePos = 0;
 // shape this project keeps being caught by: a log with lines missing reads
 // exactly like a log of a session where nothing happened.
 static volatile LONG g_logDropped = 0;
+// Lines the formatter had to cut short. Zero on every log measured so far; if it
+// stops being zero, LOG_LINE_MAX is the thing to change.
+static volatile LONG g_logTruncated = 0;
 // For the per-reporter timing in the periodic dump.
 static LARGE_INTEGER g_statsFreq = {};
 static volatile LONG g_logReadPos = 0;
@@ -1682,9 +1699,13 @@ void LogFlushImmediate() {
 
     va_list args;
     va_start(args, fmt);
-    int msgLen = _vsnprintf(g_logRing[slot].text + offset, 2046 - offset, fmt, args);
+    int msgLen = _vsnprintf(g_logRing[slot].text + offset,
+                            LOG_LINE_MAX - 2 - offset, fmt, args);
     va_end(args);
-    if (msgLen < 0) msgLen = 2046 - offset;
+    if (msgLen < 0) {
+        msgLen = LOG_LINE_MAX - 2 - offset;
+        InterlockedIncrement(&g_logTruncated);
+    }
     offset += msgLen;
 
     g_logRing[slot].text[offset] = '\n';
@@ -5049,6 +5070,11 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
             Log("[Wrong] %ld log line(s) were dropped because the ring was full "
                 "when they were written, so this file is missing that many "
                 "entries.", (long)dropped);
+        }
+        LONG cut = g_logTruncated;
+        if (cut > 0) {
+            Log("[Wrong] %ld log line(s) were longer than a ring slot and lost "
+                "their tail.", (long)cut);
         }
         Log("========================================");
     }
