@@ -142,7 +142,18 @@ bool InstallRenderNullGuard()
 
 void RenderNullGuard_LogStats()
 {
-    if (!g_active || g_calls == 0) return;
+    // Two different silences used to look the same: a guard that is not in,
+    // and one that is in and has never been reached. This is a crash guard on
+    // by default, so both are worth a line.
+    if (!g_active) {
+        Log("[RenderGuard] not measured: the guard is not installed.");
+        return;
+    }
+    if (g_calls == 0) {
+        Log("[RenderGuard] measured and zero: the guard is in and no draw-path "
+            "call reached it.");
+        return;
+    }
 
     if (g_suppressed == 0) {
         Log("[RenderGuard] %ld draw-path calls, none suppressed", g_calls);

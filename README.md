@@ -3,6 +3,11 @@
 > memory optimization tools as illegal software regardless of intent, and the
 > result is a permanent ban on your account.
 
+> [!WARNING]
+> **On WoW Circle the DLL gets you disconnected** - Turning on **No Client Patches** in the launcher stops it, and
+> also turns every optimization off.   
+Or use the `!LuaBoost` addon without the DLL.
+
 # wow_optimize
 
 Performance optimization DLL for World of Warcraft 3.3.5a (WotLK)
@@ -19,8 +24,9 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
-* [What's New in v3.19.0](#whats-new-in-v3190)
+* [What's New in v3.19.2](#whats-new-in-v3192)
 * [Send me your log](#send-me-your-log)
+  * [Measuring rather than reporting](#if-you-want-to-measure-something-rather-than-report-a-bug)
 * [Reviews & Acknowledgments](#reviews)
 * [Current Feature Set](#current-feature-set)
 * [Installation](#installation)
@@ -33,107 +39,137 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
-## What's New in v3.19.0
+## What's New in v3.19.2
 
-Thanks to [txtsd](https://github.com/txtsd) for four long sessions, including the
-first one anyone has sent in with the frame rate uncapped. Every number below
-comes from those logs.
+### New
 
-### Four new features, all off by default
+* **The launcher is two presets and a switch for bug reports.** MAX PERFORMANCE,
+  DEFAULT and EVERYTHING OFF set every switch at once. Save, load and copy-for-
+  the-dev move a whole configuration between machines. LOGGING: NORMAL / FULL
+  turns on the recorders when something is wrong and off again when it is not.
 
-They sit in the **Experimental** tab and **Enable All skips them**. Tick them
-yourself.
+  Every switch carries a mark and sits under a heading that says what the run
+  below it is for: makes it faster, not proven yet, stability and fixes, logging,
+  diagnostics that cost frames, changes how it looks or sounds, tried and didn't
+  help. Hover any of them to read what was measured.
 
-**Reuse Compiled Scripts** — `UI_Lua/LuaProtoCache`
+  MAX PERFORMANCE turns on everything that makes the game faster and leaves off
+  everything that only measures it, buys frames by changing how the game looks,
+  or was measured against the client and lost. Those are still yours to tick.
+* **A bug report is legible from its first screen.** Every report opens with
+  `[Wrong]`: the modules that were asked to run and did not, each with the line
+  it printed. A switch you left off is not counted there.
+* **Loading screens say where they went.** A load report ends with the addresses
+  the main thread was actually in during that load, so the time that is neither
+  reading, writing nor compiling has a name on it. Needs LOGGING: FULL.
+* **Reuse Compiled Scripts Between Sessions.** A measured loading screen spends
+  2128 ms inside the game's Lua compiler. Only 260 ms of that is text the session
+  had already compiled, which is what Reuse Compiled Scripts removes. The rest is
+  text this session had never seen - and saw the last time the game ran. This
+  writes the compiled form to `Cache\wow_optimize_bytecode.bin` and reads it back
+  on the next launch. Off by default.
 
-Interface scripts written inside XML templates are recompiled every time a frame
-is built from that template. Measured: 68% of every chunk the client compiled in
-a session was source it had already compiled. This keeps the compiled form and
-hands it back, so the parse does not run. The client still builds the function
-object, its environment and its addon ownership, so nothing about permissions is
-shared between two uses.
+  The game can write that form and has no code to read it back, so the reading is
+  ours. Every script rebuilt from the file is compared against a real compile of
+  the same text, field by field, into every nested function, each constant by
+  type, value and addon ownership. That runs for the first 2000 of them and one
+  in every 256 after, and the whole store switches off for good the first time
+  two of them differ. The file is discarded whenever Wow.exe changes.
+* **Model Animation Stride** holds a distant model's skeleton for a frame instead
+  of re-solving every bone. Its materials, particles and attached items keep
+  animating, and nothing within 45 yards is ever held. The animation family is
+  about a fifth of the frame. Off by default.
+* **M2 Matrix Slot Copy (SSE2)** replaces three blocks in the model animation
+  update that move matrices one float at a time. No arithmetic, so the bytes
+  written are the bytes read. Off by default.
+* **Draw Call Merging** was built, measured and removed. 2.4% of 293 million draw
+  calls could be merged, merging exactly those worked, and the frame rate fell.
+  The census keeps its switch.
 
-Field: 806 and 704 reuses across two sessions, each compared against a fresh
-compile, none differing.
+### Faster
 
-**UI Method Object Lookup** — `UI_Lua/LuaThisFast`
+* **Fourteen of the twenty Direct3D hooks stay out of the vtable.** Two of them
+  skip redundant work and are kept, along with the four the shadow fix and the
+  device lifecycle need. The rest could only count, and what they counted has
+  been answered on two clients: 430 million render states, 601 million sampler
+  states and 1.2 billion texture binds, none of them redundant. That is about
+  five thousand fewer detours a frame. Draw Call Census puts them all back when
+  you want the numbers.
+* **string.match decides on the pattern before it reads the string.** A pattern
+  none of the fast paths handles goes straight to the game, so the subject is no
+  longer walked byte by byte, up to four kilobytes of it, to reach a comparison
+  that was never going to match.
+* **Batch the Game's File Writes** and **Reuse Compiled Scripts** are on by
+  default. One measured loading screen ran 1576 ms with 49 ms of it reading
+  files; another spent 2470 ms inside 593,557 nine-byte writes, and 2128 ms
+  inside the Lua compiler.
+* Loading screens report how much of themselves went into compiling Lua, split
+  into source seen for the first time and source compiled again.
 
-Every call an addon makes into a frame (`SetText`, `GetWidth`, and 672 others)
-starts by fetching the frame object out of a table slot through four script-engine
-calls. This reads it directly. The addon-ownership propagation those calls perform
-is reproduced, not skipped — it decides what may touch protected actions.
+### Fixed
 
-Field: 86.6M, 63.4M and 31.4M lookups across three sessions. None handed back,
-none disagreeing.
-
-**Spread Model Animation** — `Graphics_Sound/AnimLod`
-
-Posing model skeletons is the largest single block of frame time: 3.68 ms of a
-24.5 ms frame in a VoA raid, 114 models averaging 31 bones. No one function
-inside it is worth rewriting, so the only way to reach it is to do less.
-
-Below 96 models on screen nothing changes. Above that each model's pose refreshes
-every 2nd–4th frame, never slower than a quarter of your frame rate, and never
-before its first pose. It cannot make animations run slow: the client derives
-animation time from a clock, not by counting frames. In a packed city you may
-notice steppier movement on some characters.
-
-**Collision Box Test (SSE2)** — `Graphics_Sound/CollisionOutcode`
-
-Line-of-sight checks, world clicks and projectile paths sort a collision model's
-corners against a box — six comparisons per corner on the x87 stack, 3.8% of
-main-thread time. This does four corners per instruction.
-
-Unlike the other maths replacements here it is **exact, not approximate**: the
-bounds are plain floats with no arithmetic applied, so the vector comparison
-answers identically for every input including NaN. Before taking over it predicts
-which corners are outside and which triangles the game will queue, lets the game
-run, and compares — 3000 matches required.
-
-### The measurement tools were wrong
-
-**Every percentage the profiler printed was 5.6× too small** on a three-hour
-session: counts came from the last million ring entries, the divisor was the whole
-session. The top fifty summed to 12% of a profile, which no program can do. It
-produced a profile with no hot spot in it, and that reading was steering the work.
-Corrected: `AwesomeWotlkLib.dll` 9.7%, model animation 7.0%, `d3d9.dll` 6.3%, this
-DLL's own modules ~6%, particle vertex fill 2.5%, UI batch draw 2.3%. The
-executing/blocked split had the same defect and pinned every long session near
-99% executing whatever it was doing.
-
-**The animation counter claimed 72 ms of animation inside a 53 ms frame.** It
-closed its frame on the hooked `Sleep` tick, which a CPU-bound client stops
-running, so many frames were charged to one.
-
-**The feature summary listed two working default-on features as never having
-run**, forty lines below those features reporting their own work.
-
-**The vsync detector called an uncapped session capped** and told a tester to
-redo it. It tested the median frame time alone; a limiter has no tail, so the
-spread is what separates the two cases.
-
-### Removed and cheapened
-
-Six things that were never running: two event-name caches that logged themselves
-at startup and were never read, a CDataStore batch whose Install was called from
-nowhere, a frame-script throttle whose entry point nothing called, a sound guard
-that re-registered another module's hook, and a combat-text batch flushed every
-frame whose producer index nothing incremented. About 550 lines, and six log
-lines that claimed something was running.
-
-Nine counters on hot paths were atomic. On 32-bit x86 that is a locked
-instruction — and in the D3D9 state cache they sat on the skip branch, the fast
-one the whole feature exists to reach. The 64-bit ones in the script handler cache
-compiled to a locked retry loop. All are plain counters now; the numbers they
-report are a lower bound.
-
-The DBC row cache moved 1360 bytes per hit to deliver 680 — about 6.7 GB of spare
-`memcpy` in one session. The payload now goes straight to the caller.
-
-The quality governor could change settings the client only applies later, which
-queues a change the player never asked for and leaves the governor unable to
-measure what it did. It now reads each setting's flags and refuses those.
-
+* **Three megabytes of address space came back.** The log ring reserved four
+  megabytes for lines that are measured at about a hundred and fifty characters.
+  It is sized to what is actually written now. That space sits in the low 2GB,
+  which is where the game allocates from, and where running out is what garbles
+  SavedVariables names.
+* **The matrix hook counter printed a negative number.** Fifteen counters were
+  signed 32-bit and the matrix multiply takes about four thousand calls a frame,
+  so one of them ran out inside the second hour and took the total with it. The
+  count that overflows carries a wrap counter now and the total is summed
+  without one.
+* **The fault list at the top of each report counted its own output** and called
+  two deliberate decisions failures. It also reported an unresolved draw entry
+  point on machines where Draw Call Census was simply switched off.
+* **The periodic report says which part of it is slow.** It pauses the main
+  thread for a tenth of a second on some machines, and could only report that
+  the cost was itself. Each of its seventy-odd sections is timed and the slowest
+  are named.
+* **GetItemInfo caching says why a miss missed** - an empty slot, a different
+  item in the slot, or the game returning nothing because the item is not in its
+  own cache yet. Only the middle one is a cache that is too small.
+* **Shadows that did not refresh and flickered**, reported by prince [SANC] and
+  Sicsoo. Setting a render target resets the viewport, and the render state cache
+  skipped the `SetViewport` that put it back, so the shadow pass drew into the
+  wrong rectangle. On by default, so this was everyone.
+* **Wrong vertex layout after a vertex declaration.** Setting a declaration clears
+  the FVF; the FVF cache kept skipping the call that put it back.
+* **The quality governor pulled your view distance down when you zoned.** It
+  read the end of a loading screen as slow gameplay, halved particle density and
+  cut farclip, then put both back a minute later. It ignores loading screens now
+  and waits for real frames before deciding anything. Off by default.
+* **The quality governor reports every interval**, with the values it is holding
+  against your own.
+* **Two threads could write into one log buffer.** A line would stop mid-message
+  with another thread's whole line inside it. A ring slot is claimed before it is
+  written now, and lines dropped to a full ring are counted in the report.
+* **Two worker threads started every session for a queue nothing writes to.**
+  Async Worker Pool checks whether an offload path is actually built in before
+  starting them. Each thread reserved a megabyte of stack in the low 2GB, which
+  is the half this client allocates from.
+* **The largest scripts reach the disk store.** The megabyte cap on the in-memory
+  copy of the source sat above the disk lookup, so GlobalStrings.lua, ChatFrame
+  and the rest were captured and could never be read back - and those are where
+  skipping a compile is worth ten milliseconds rather than twenty microseconds.
+* **Reuse Compiled Scripts Between Sessions understands addon ownership.** A
+  constant's ownership belongs to the compile that first created it and the
+  game's own dump format does not record it, so only scripts with no ownership on
+  any constant are kept, and they are served only into a context that has none.
+  The report counts what that leaves behind.
+* **The draw call census had never installed.** Its hooks came from a module
+  compiled out months ago, so ticking that box measured nothing.
+* **The animation census stood down whenever Animation LOD was on**, so neither of
+  the two numbers ever arrived. It counts from inside the other one now.
+* **Thirteen modules counted on hot paths and could not print the number**, seven
+  of them counting crashes they had averted.
+* **Five launcher options turned on features this build does not contain**, and two
+  more gated an install that always fails. All gone.
+* **Four of the six render state filters skipped nothing at all** over 206
+  million measured calls. They only count now.
+* **A locked 64-bit instruction on every Lua allocation the game makes.**
+* **The primitive count in the log went down between reports** and ended at 0.8 per
+  draw call, which cannot happen. It was a 32-bit counter holding a five billion
+  total.
 ---
 
 ## Send me your log
@@ -168,6 +204,56 @@ together usually locate it.
 
 If you would rather not share it publicly, that is fine — say so in an issue.
 
+### If you want to measure something rather than report a bug
+
+Comparing two sessions compares two different evenings. One session that
+alternates a feature on and off compares the same zone, the same addons and the
+same machine against itself.
+
+Tick **A/B Test a Feature** under General, and tick the features you want
+compared. The harness measures a feature that is switched on, because a feature
+registers with it at the moment it installs. These are the ones it can measure:
+
+> UI Layout Relink Shortcut, Model Draw Order Key Cache, Lua Pool Shortcuts,
+> Table Lookup Dispatch (SSE2), Bone Rotation Maths (SSE2), Bone Rotation
+> Unpack (SSE2), Bone Movement Track (SSE2), Bone Matrix Upload (SSE2),
+> Visibility Box Test (SSE2), Box Overlap Test (SSE2), Line-of-Sight Box Test
+> (SSE2), M2 Matrix SSE2, M2 Matrix Slot Copy (SSE2), Model Animation Stride,
+> Fast SSE2 Memory Clear, SSE2 String Compare, Lua VM: stop the automatic GC,
+> and Matrix-Vector SSE2.
+
+Then play somewhere the processor is busy: a raid, a battleground, a crowded
+city. Standing in a field the game waits on the graphics card, a saving inside
+the frame changes no frame time, and the report says so instead of giving you
+numbers.
+
+Each subject is alternated on its own, four on/off pairs of twenty seconds, so
+it spends about two minutes and forty seconds on one before moving to the next.
+Play for longer than one pass over everything you ticked, and send the log. The
+report says, per feature, when there were too few turns for the number to mean
+anything.
+
+To spend the whole session on one feature, open `WTF\wow_opt.ini` and put its
+ini key under `[General]`:
+
+```ini
+AbTestSubject=LayoutRelinkFast
+```
+
+and make sure that feature is switched on too. The switch decides whether it
+installs; this decides when it does its work. If the name is wrong the report
+lists the ones it would have accepted.
+
+`MatrixVectorSse2` is in the list to check the instrument: it is known to be
+slower than the code it replaces, so if a report calls it faster, the
+measurement is what is wrong.
+
+For counters instead of a comparison - draw calls and how many of them could be
+merged, how much Lua the game compiles twice, how long the horizon scans are,
+how many tiny file writes there are, and where the main thread is during a
+loading screen - press **LOGGING: FULL** and leave A/B Test off. Those cost
+frames to collect, which is why they do not share a session with a test that
+compares frame times. Twenty minutes of whatever you normally do is enough.
 ---
 
 ## Reviews
@@ -380,7 +466,7 @@ Replacements for WoW's own statically-linked CRT routines at verified addresses:
 - SSE2 matrix-vector transforms — 3D point × 4x4 matrix (0x4C21B0), 4D vector × 4x4 matrix (0x4C2270), in-place point × 4x4 (0x4C2300)
 - SSE2 `C3Vector::Normalize` — 0x4C3420 + 0x4C3600 (full-precision `sqrtss`/`divss`, engine guards replicated)
 - SSE2 `CMatrix::Transpose` — 0x4C23D0 (`_MM_TRANSPOSE4_PS`, bit-identical)
-- **SSE2 collision box test** *(off by default, experimental)* — the AABB outcode classification in `sub_7C7230`, 3.8% of main-thread time in a corrected profile. Six x87 comparisons per vertex become six packed comparisons per four vertices. Bit-exact, not approximate: the bounds are plain floats with no arithmetic applied. `Graphics_Sound/CollisionOutcode`
+- **SSE2 collision box test** *(off by default, experimental)* — the AABB outcode classification in `sub_7C7230`, 3.8% of main-thread time in a corrected profile. Six x87 comparisons per vertex become six packed comparisons per four vertices. Bit-exact: the bounds are plain floats with no arithmetic applied. `Graphics_Sound/CollisionOutcode`
 - SSE2 frustum point culling — `CFrustum::IsPointVisible` (0x983D70)
 - SSE2 Möller-Trumbore ray-triangle intersection — 32-bit indices (0x9836B0), 16-bit indices (0x983490)
 - SSE2 frustum AABB-vs-4-planes cull
@@ -494,11 +580,14 @@ Then inject after WoW starts.
 The optimization suite is compatible with any standard or customized WotLK 3.3.5a client (build 12340), including private servers using custom executables:
 * **Warmane** (Icecrown, Lordaeron, Onyxia) — **STRICTLY PROHIBITED (WILL RESULT IN A PERMANENT BAN)**
 * **Project Ascension** (supporting custom `Ascension.exe` launches)
-* **WoW Circle** (supporting `WoWCircle.exe` launches)
+* **WoW Circle** - **On WoW Circle the DLL gets you disconnected** - Turning on **No Client Patches** in the launcher stops it, and
+also turns every optimization off.   
+Or use the `!LuaBoost` addon without the DLL.
 * **EZ WoW**
 * **WoW Sirus** (supporting `Sirus.exe` or custom `run.exe` launches)
 * **UWow** / **Firestorm** (supporting `run.exe` launches)
 * **ChromieCraft 3.3.5a**
+
 
 1. Install the `!LuaBoost` addon into `Interface\AddOns\`.
 2. **Disable conflicting addons:** Remove or disable any third-party GC optimizers (`GarbageProtector`, `GarbageCollector`, `SmartGC`, etc.) and combat log fixes (`CombatLogFix`, etc.). The DLL handles these natively; running both causes duplicate hooks, memory corruption, or crashes.
@@ -675,7 +764,7 @@ Recent events:
     -110351ms  TID=900   D3D9 device Reset (dev=0x0EB1AA90)
 ```
 
-The startup banner reports the exact build the log came from (`v3.19.0 (build abc1234)`), so please don't trim the first lines.
+The startup banner reports the exact build the log came from (`v3.19.1 (build abc1234)`), so please don't trim the first lines.
 
 If the complaint is stuttering rather than a crash, look for `slow frame` lines — each one names how far past your session's own median that frame ran, and what was happening during it:
 

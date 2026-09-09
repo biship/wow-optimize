@@ -49,8 +49,13 @@ void Invalidate(unsigned __int64 guid) {
 }
 
 bool Init() {
-    Log("[GuidLookupCache] Disabled for stability (prevents exit/logout ACCESS_VIOLATION at 0x5D9DD1).");
-    return true;
+    Log("[GuidLookupCache] Disabled for stability (prevents exit/logout "
+        "ACCESS_VIOLATION at 0x5D9DD1). Hooked_GetObject returns null and "
+        "nothing installs it, so no lookup has ever been cached.");
+    // Returns false: it did not install. Returning true put it in the
+    // feature summary as a working feature, which is the same lie the
+    // summary was fixed for telling in the other direction.
+    return false;
 }
 
 void Shutdown() {

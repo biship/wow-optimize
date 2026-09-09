@@ -13,6 +13,11 @@ namespace QualityGovernor {
 bool Init();
 void Shutdown();
 
+// From the periodic report. Shutdown does not run in this client, so the only
+// thing this module ever said about itself was the line for each change it
+// made - and nothing at all in a session where it made none.
+void LogStats();
+
 // Called once per frame boundary. Decides nothing most of the time: it is bounded
 // by a dwell period and only acts on a sustained condition.
 void OnFrame();

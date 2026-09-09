@@ -22,6 +22,10 @@ extern "C" void Log(const char* fmt, ...);
 // sub_85BC10: _DWORD *__cdecl(int a1, _DWORD *a2, int a3)
 // ----------------------------------------------------------------
 typedef void* (__cdecl* sub_85BC10_fn)(int a1, uint32_t* a2, int a3);
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static sub_85BC10_fn g_orig_sub_85BC10 = nullptr;
 
 // Nil object sentinel at 0xA46F78 (same as used by original function)
@@ -116,7 +120,26 @@ bool InstallLuaGetTableSafety()
     CrashDumper::FeatureSetActive("LuaGetTableSafety", true);
 
     Log("[GetTableSafety] ACTIVE: validating TValue type at sub_85BC10 (max_type=%u)", MAX_VALID_TYPE);
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void LuaGetTableSafety_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[GetTableSafety] not measured: the guard is not installed.");
+        return;
+    }
+    const LONG64 total = g_total_calls, blocked = g_blocked_calls;
+    if (total == 0) {
+        Log("[GetTableSafety] measured and zero: no lookup reached it.");
+        return;
+    }
+    Log("[GetTableSafety] %lld calls, %lld blocked (%.2f%%).",
+        (long long)total, (long long)blocked,
+        100.0 * (double)blocked / (double)total);
 }
 
 void UninstallLuaGetTableSafety()

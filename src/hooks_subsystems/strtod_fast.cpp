@@ -100,6 +100,25 @@ bool InstallStrtodFast() {
     return true;
 }
 
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void StrtodFast_LogStats(void) {
+    if (!orig_strtod_helper) {
+        Log("[StrtodFast] not measured: the hook is not installed.");
+        return;
+    }
+    const LONG64 total = g_strtodCalls, fast = g_strtodFast;
+    if (total == 0) {
+        Log("[StrtodFast] measured and zero: the client parsed no number "
+            "through it.");
+        return;
+    }
+    Log("[StrtodFast] %lld calls, %lld inline (%.1f%%).",
+        (long long)total, (long long)fast,
+        100.0 * (double)fast / (double)total);
+}
+
 void UninstallStrtodFast() {
     MH_DisableHook((void*)0x0084D480);
     MH_RemoveHook((void*)0x0084D480);

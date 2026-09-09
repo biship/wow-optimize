@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Diagnostics;
 using System.Collections.Generic;
@@ -11,6 +11,141 @@ using System.Reflection;
 
 namespace WowOptimizeLauncher {
 
+
+    // ───────────────────────────────────────────────────────────────
+    //  What a switch is for
+    // ───────────────────────────────────────────────────────────────
+    //
+    // A tester asked for the fastest possible configuration and could not tell
+    // which switches were making the game faster and which were only counting
+    // things. Nothing in the list said. The four kinds below are on every
+    // entry now, and MAX PERFORMANCE turns on the ones that help.
+    //
+    // Keyed by ini key rather than by the label, because labels get reworded
+    // and a mis-keyed classification would quietly put a profiler in a
+    // performance preset.
+    public static class Kinds {
+        public const string Perf  = "[+]";   // makes the game faster
+        public const string Fix   = "[=]";   // protects or repairs; no speed claim
+        public const string Diag  = "[?]";   // measures - costs frames, gives numbers
+        public const string Trade = "[-]";   // more frames by changing how it looks
+        public const string Log   = "[.]";   // records; negligible cost
+        public const string Lost  = "[x]";   // measured and lost, or a known failure
+        public const string Unproven = "[!]";   // not proven yet
+
+        // Badged apart from the rest because otherwise they read as speed
+        // and the preset below silently disagrees with their own label.
+        // Each was believed to help until something measured it.
+        private static readonly string[] LostKeys = new string[] {
+            "MatrixVectorSse2",    // 3.3 ns a call against the client's 2.5
+            "TextureUnloadDelay",  // 0.4% and 0.2% of held textures ever reused
+            "UIFrameBatch",        // switches nothing any more
+            "LuaGcCoalesce"        // the one tester crash with us truly in the stack
+        };
+
+        private static readonly string[] DiagKeys = new string[] {
+            "AbTest", "SamplingProfiler", "AddonProfiler", "LuaAddonProfile",
+            "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
+            "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
+        };
+        private static readonly string[] LogKeys = new string[] {
+            "SessionLogs", "FlightRecorder", "NetDiag", "CpuTopology",
+        };
+        private static readonly string[] FixKeys = new string[] {
+            "CompatMode", "MemoryPressure", "TimingCvarPin", "CvarNullGuard",
+            "PriorityGuard", "DeviceCbGuard", "OomGovernor", "HardwareCursor",
+            "MouseClipRelease", "SavedVarsBackup", "MimallocHighArena",
+            "RenderNullGuard", "CombatLogLeakFix", "ShadowCascadeHold",
+            "LuaGcStockPace", "UIFrameBatch",
+        };
+        private static readonly string[] TradeKeys = new string[] {
+            // Each of these buys frames by changing something the player can see
+            // or hear. Frame Rate Limiter Override was in here and does not
+            // belong: it replaces the client's own per-frame limiter with a
+            // waitable-timer and spin hybrid, which changes when a frame is
+            // handed over and nothing about what is in it.
+            "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
+            "AnimLod", "M2AnimStride", "SoundVolumeLimit",
+        };
+
+        private static bool In(string[] set, string key) {
+            for (int i = 0; i < set.Length; i++) {
+                if (set[i] == key) return true;
+            }
+            return false;
+        }
+
+        // Anything not named above speeds the game up. That is what most of
+        // this tool is, and listing the exceptions is shorter and stays right
+        // as features are added.
+        // `unproven` is the SettingItem's Experimental flag. It only changes
+        // what a helping switch is called, so a census stays a census and a
+        // governor stays a governor either way.
+        public static string Of(string key, bool unproven) {
+            if (In(LostKeys, key))  return Lost;
+            if (In(DiagKeys, key))  return Diag;
+            if (In(TradeKeys, key)) return Trade;
+            if (In(LogKeys, key))   return Log;
+            if (In(FixKeys, key))   return Fix;
+            return unproven ? Unproven : Perf;
+        }
+
+        // Left off by MAX PERFORMANCE, each for a reason recorded beside it.
+        public static readonly string[] NotForSpeed = new string[] {
+            // Measures the game. Every one of these costs frames to produce a
+            // number, and a player wants the frames.
+            "AbTest", "SamplingProfiler", "AddonProfiler", "LuaAddonProfile",
+            "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
+            "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
+
+            // Buys frames by making the game look or sound different. That is a
+            // real trade and it is the player's to make, not this button's. A
+            // tester turned all of these on, saw his view distance pulled from
+            // 350 to 262 and back seven times in four minutes, and could only
+            // say that something was wrong with the graphics.
+            "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
+            "AnimLod", "M2AnimStride", "SoundVolumeLimit",
+
+            // Left off because something measured them and the answer was no.
+            "CompatMode",          // slower on purpose; it repairs a broken connection
+            "MatrixVectorSse2",    // measured against the client: 3.3 ns to its 2.5
+            "TextureUnloadDelay",  // two testers: 0.4% and 0.2% of held textures reused
+            "UIFrameBatch",        // switches nothing; the two it named have their own
+            "LuaGcStockPace",      // turns the GC pacing below it off again
+            "LuaGcCoalesce",
+        };
+
+        // The order a tab lists them in, and what each run is called. Worst
+        // last: a person scrolling a tab meets the reasons to tick something
+        // before the reasons not to.
+        public static readonly string[] Order = new string[] {
+            Perf, Unproven, Fix, Log, Diag, Trade, Lost
+        };
+
+        // Short, and each one leads with the reason you would or would not
+        // want the run under it. The appearance group used to read MORE FRAMES,
+        // DIFFERENT LOOK, which made MAX PERFORMANCE look inconsistent for
+        // leaving it off - it reads as performance and it is not; it is a trade
+        // against how the game looks, and that is the player's to make.
+        public static string Heading(string kind) {
+            if (kind == Perf)     return "MAKES IT FASTER";
+            if (kind == Unproven) return "NOT PROVEN YET";
+            if (kind == Fix)      return "STABILITY AND FIXES";
+            if (kind == Log)      return "LOGGING";
+            if (kind == Diag)     return "DIAGNOSTICS - COSTS FRAMES";
+            if (kind == Trade)    return "CHANGES HOW IT LOOKS OR SOUNDS";
+            if (kind == Lost)     return "TRIED, DIDN'T HELP";
+            return "";
+        }
+
+        public static bool HelpsSpeed(string key) {
+            for (int i = 0; i < NotForSpeed.Length; i++) {
+                if (NotForSpeed[i] == key) return false;
+            }
+            return true;
+        }
+    }
+
     public class SettingItem {
         public string Section;
         public string Key;
@@ -18,7 +153,9 @@ namespace WowOptimizeLauncher {
         public CheckBox Ctrl;
         public string Tooltip;
 
-        // Experimental entries are skipped by "ENABLE ALL FEATURES". A tester was
+        // Marks a switch that has not been proven. It used to decide which tab the
+        // row appeared on, which put nearly half of them on one tab; now it only
+        // decides whether the row is marked [+] or [!]. A tester was
         // asked to leave one of these off so we could tell whether it caused their
         // addon errors; they pressed Enable All, it went on with everything else,
         // and the comparison measured nothing. A switch that exists to be left off
@@ -53,7 +190,9 @@ namespace WowOptimizeLauncher {
             ForeColor = Color.White;
             Font = new Font("Segoe UI", 9.75f, FontStyle.Regular);
             Cursor = Cursors.Hand;
-            Margin = new Padding(5, 5, 5, 12);
+            // Twelve pixels of gap under every row meant a forty-two entry
+            // tab showed twelve of them and the rest was scrolling.
+            Margin = new Padding(5, 3, 5, 5);
             AutoSize = true;
         }
 
@@ -204,7 +343,8 @@ namespace WowOptimizeLauncher {
                 Color textColor = selected ? CyanAccent : TabIdle;
                 using (Font tabFont = new Font("Segoe UI", 8f, FontStyle.Bold)) {
                     TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter;
-                    TextRenderer.DrawText(g, TabPages[i].Text, tabFont, tabRect, textColor, flags);
+                    TextRenderer.DrawText(g, TabPages[i].Text, tabFont, tabRect, textColor,
+                                          flags | TextFormatFlags.NoPrefix);
                 }
 
                 if (selected) {
@@ -256,29 +396,24 @@ namespace WowOptimizeLauncher {
         // remote version.txt to decide whether to show the update notification,
         // and shown in the version label. Keep in sync with version.txt and
         // src/core/version.h on every release.
-        private const string APP_VERSION = "3.19.0";
+        private const string APP_VERSION = "3.19.2";
 
         private string iniPath;
         private Dictionary<string, SettingItem> settingsMap;
 
         // UI references
         private Label versionLabel;
+        private DarkButton btnLogging;
         private Label activeCountLabel;
         private DoubleBufferedPanel progressBarPanel;
         private DarkTabControl tabs;
         private ToolTip toolTip;
 
-        private DarkButton btnEnableGeneral;
-        private DarkButton btnEnableUiLua;
-        private DarkButton btnEnableCombatNet;
-        private DarkButton btnEnableGfx;
 
         private FlowLayoutPanel generalFlow;
         private FlowLayoutPanel uiLuaFlow;
         private FlowLayoutPanel combatNetFlow;
         private FlowLayoutPanel graphicsSoundFlow;
-        private FlowLayoutPanel experimentalFlow;
-        private Label experimentalNote;
         private TextBox searchBox;
 
         // Background image
@@ -348,7 +483,7 @@ namespace WowOptimizeLauncher {
                 { "SSE2 String Compare", new SettingItem("Graphics_Sound", "StrncmpSse2", true, null, "Replaces the client's strncmp, which compares one character at a time, with one that compares sixteen at a time. Measured at 1.55% of the client's CPU time. 3.9x faster on a long comparison and still faster on a short one. It produces the same answer for every input - checked against the client's own routine at startup and against 400,000 cases offline - and it will not read past the end of a string into memory it should not touch, which is the mistake this kind of replacement usually makes.") },
                 { "Render Null Guard", new SettingItem("Graphics_Sound", "RenderNullGuard", true, null, "Stops the client crashing when it sets up a model's draw parameters before the render device is ready. It can only do that by skipping the call, and a skipped call draws that model with the previous model's parameters - which looks like a brief flicker. On by default. If you see the screen flicker occasionally, especially after changing a graphics setting, turn this off for one session and say whether it stops; your log now counts how often it fires either way.") },
                 { "Animation Census", new SettingItem("Graphics_Sound", "AnimCensus", false, null, "Counts what the model animation update does per frame: how many models, how many bones between them, and microseconds per model. A measurement, not a speed-up. The animation family is about a fifth of main-thread time and is the largest remaining target, but forty models at thirty bones and four hundred at three want completely different fixes and a profile cannot tell them apart. It also settles whether each model brings its own position to that call, which decides whether distance-based animation LOD is possible at all. Turn it on for one session, send the log, turn it off.", true) },
-                { "Draw Call Census", new SettingItem("Graphics_Sound", "DrawCensus", false, null, "Counts how many draw calls the client issues per frame and reports the distribution at the end of your log. This is a measurement, not a speed-up - it wraps the busiest call in the renderer, so turn it on for one session, send the log, and turn it back off. Nobody has ever counted this, and whether batching would help depends entirely on the answer.", true) },
+                { "Draw Call Census", new SettingItem("Graphics_Sound", "DrawCensus", false, null, "Counts how many draw calls the client issues per frame, how big they are, and how many of them could have been issued as one. Answered on 2026-09-05: 2.4% of 293 million, and a build that merged exactly those ran slower. Still useful for the per-frame count and the size distribution - same triangle list, same vertex base, next indices along, no state change in between. The last session showed 355 draws a frame with 35% of them carrying eight triangles or fewer, which is where the cost is a call rather than the triangles. Whether merging them is worth building depends on that share and nobody has ever counted it. A measurement, not a speed-up: it wraps the busiest call in the renderer, so run one session, send the log, and turn it back off.", true) },
                 { "SSE2 Matrix Multiply", new SettingItem("Graphics_Sound", "MatrixMultiplySse2", true, null, "Replaces the client's 4x4 matrix multiply, which is 199 x87 instructions and runs once per bone per frame on every animated model. Measured at 24.81 ns against 10.43 ns for this one, and the results are bit-identical - worst difference 0.000e+00 over 4096 random matrix pairs, because it accumulates at the same 53-bit width the client does. A single-precision version was 6.5x faster and drifted by 1e-04, which is the order that caused camera snapping once before, so it was not used. On startup the client's own version and this one are run on the same matrices and compared; any disagreement and it refuses to install and says so in the log.") },
                 { "Compatibility Mode (only if you need it - turns optimizations OFF)", new SettingItem("General", "CompatMode", false, null, "Leave this OFF unless the game will not connect with the DLL loaded, which usually means a VM or HyperV/virtual switches. It works by SWITCHING OFF optimizations - the CPU-priority, affinity and working-set tweaks that can starve the network in virtualized environments - so it makes the game slower on purpose. It is a repair for a broken connection, not an improvement, which is why Enable All leaves it alone.", true) },
                 { "SSE2 Quaternion Normalize", new SettingItem("Graphics_Sound", "QuatNormalizeSse2", true, null, "Replaces the client's quaternion normalize, measured at 3.13% of main-thread execution in a CPU-bound profile. Twice as fast, and it now produces exactly the same bits rather than being a ULP away, so it cannot change how anything looks. It was off by default while it was written in single precision; the client works in double, and that version disagreed with it on three quarters of the quaternions it touched. On startup it runs the client's own version and this one on the same inputs and refuses to install on a single differing bit.") },
@@ -357,10 +492,12 @@ namespace WowOptimizeLauncher {
                 { "Memory Pressure Governor", new SettingItem("General", "MemoryPressure", true, null, "Sheds caches and adjusts texture footprint dynamically under critical 32-bit virtual address (VA) space limits.") },
                 { "Heap Compactor", new SettingItem("General", "HeapCompactor", true, null, "Defragments the client heap every 5 seconds to prevent Out-Of-Memory (OOM) crashes during teleports.") },
                 { "Lock-Free Heap Defragmenter", new SettingItem("General", "DefragLf", false, null, "Experimental defragmentation on the main thread using lock-free structures. Bypasses standard heap serialization. Skipped by Enable All: experimental, and it bypasses heap serialization.", true) },
+                { "Async Worker Pool", new SettingItem("General", "AsyncWorkerPool", false, null, "Background worker threads used by the async subsystems. Also gated by the Lock-Free Heap Defragmenter until now, for no reason anyone recorded. Inherits that setting when its own key is absent. Forced off under Wine and Rosetta, where the workers blocked the main thread.") },
+                { "Thread Affinity", new SettingItem("General", "ThreadAffinity", false, null, "Pins client threads to cores chosen from the CPU topology. The third thing the Lock-Free Heap Defragmenter used to gate. Inherits that setting when absent, and Compatibility Mode still overrides it off.") },
                 { "D3D9Ex Vulkan DXVK Support", new SettingItem("General", "VulkanDXVK", false, null, "Optimizes DLL hook integration to work cleanly with DXVK (requires placing a d3d9.dll Vulkan wrapper in the game folder).") },
                 { "Windows API Caches", new SettingItem("General", "TimingFix", false, null, "Caches the answers to Windows calls the client repeats constantly and that never change during a session: GetProcAddress, the module file name, environment variables, registry reads, system metrics, the OS version, system info and INI reads. Pure lookups, no game code touched.\n\nThis switch used to be called \"High-Precision Timing Fix\" and its description said it redirected GetTickCount and timeGetTime to the performance counter. It does not, and has not for some time - those three timer hooks, and the QPC coalescing cache with them, are compiled out of the build entirely after they were found to cause random stutters under DXVK. What was left behind the switch was these eight caches, which have nothing to do with timing, so a player chasing a timing bug turned off eight caches instead and a player wanting smoothness turned eight caches on. Reported by biship in #50, who read the code and was right about all of it.") },
                 { "Timing CVar Pin", new SettingItem("General", "TimingCvarPin", true, null, "Pins timingMethod to 2 and timingTestError to 0 whatever the client asks for. This has been on for everyone for a long time with no switch, buried inside the CVar safeguard; it now has its own. Leave it on unless you want the client's own timer choice back.") },
-                { "Null Pointer CVar Safeguard", new SettingItem("General", "CvarNullGuard", true, null, "Declines CVar writes through an object that looks uninitialised, which prevents a class of client crash. The timing CVar pin that used to ride along inside this feature has moved to its own switch above.") },
+                { "Client Crash Guards", new SettingItem("General", "CvarNullGuard", true, null, "Six guards against known client crashes, not one. It declines CVar writes through an object that looks uninitialised - which is what the option used to be named after - and it also wraps the Lua table read at 0x84x, the GUID type check that crashes on battleground load, the object reaper's null write on unlink, and two more null and bounds checks. Turning it off turns off all six, which the old name did not say. On by default. The timing CVar pin that used to ride along inside this feature has its own switch above.") },
                 { "WoW.exe Hooks: Core (20)", new SettingItem("General", "WowOptHooks", true, null, "Twenty hooks into the client's own functions: memory copies, object destruction, file reads, error handling. These four groups were installed no matter what you set here - a log with every switch in this launcher turned off still showed about 150 detours in WoW.exe. That is fixed, and these switches are what \"Disable All (vanilla)\" now uses to actually mean vanilla. They default on because they have always been running for everyone, so leaving them alone changes nothing.") },
                 { "WoW.exe Hooks: Performance (20)", new SettingItem("General", "WowPerfHooks", true, null, "Twenty more hooks into the client, on the Lua C-API and packet paths. See the group above for why this switch exists. Default on.") },
                 { "WoW.exe Hooks: Extended (40)", new SettingItem("General", "WowExtendedHooks", true, null, "Forty further hooks into the client. Your log reports how many of them actually installed, as \"[EXTENDED] N/40\". Default on.") },
@@ -368,7 +505,6 @@ namespace WowOptimizeLauncher {
                 { "D3D9 Render State Dedup", new SettingItem("Graphics_Sound", "D3d9StateManager", true, null, "Patches sixteen entries of the Direct3D 9 device's function table so repeated render-state changes with the same value are dropped instead of going to the driver. Like the groups above it had no switch until 3.18.2 and patched the vtable on every install. Default on. Turn it off if you are testing whether this DLL interacts with an overlay, a capture tool or DXVK.") },
                 { "Critical Section Spin Tuning", new SettingItem("General", "LockTuning", true, null, "Gives fifteen of the client's own locks a spin count before they fall back to the kernel, and hooks InitializeCriticalSection so new ones get it too. Like the four groups above, this had no switch at all until 3.18.2 and ran on every install regardless of what you set. Default on.") },
                 { "Background MPQ I/O Worker", new SettingItem("General", "AsyncMpqIo", true, null, "Starts a background thread that reads MPQ data ahead of the main thread. This one is worth knowing about because it is a worker thread, and worker threads are where this project's freezes have come from. It also had no switch until 3.18.2. Default on.") },
-                { "Thread ID Cache", new SettingItem("General", "ThreadIdCache", true, null, "Caches GetCurrentThreadId per thread instead of calling into kernel32 each time. No switch until 3.18.2. Default on.") },
                 { "Process Priority Guard", new SettingItem("General", "PriorityGuard", true, null, "Hooks SetPriorityClass so nothing can quietly drop the game's process priority back down after it has been raised. No switch until 3.18.2. Default on.") },
                 { "Device Callback List Guard", new SettingItem("General", "DeviceCbGuard", true, null, "Fixes a crash where the game executes address 0 and dies instantly. Two people reported it independently - one swapping warrior stances, one alt-tabbing - and both logs land on the same instruction, a call through a callback pointer the client stores in a list and never checks for null. This looks at that list before the client walks it. On a healthy client that is one read-only pointer walk each time the graphics device is torn down, and nothing else happens; if it ever does find a bad entry it writes the whole entry to your log, which is the first time anyone will have seen one. Leave it on.") },
                 { "Frame Rate Limiter Override", new SettingItem("General", "FrameLimiter", false, null, "Overrides WoW's built-in frame limiter with a high-precision spin-wait sleep loop.") },
@@ -377,6 +513,9 @@ namespace WowOptimizeLauncher {
                 { "Mouse Clip Release on Alt-Tab", new SettingItem("General", "MouseClipRelease", false, null, "Frees the mouse cursor whenever WoW loses window focus, so it is never trapped inside the game window after alt-tab. Polls focus each frame and only ever RELEASES the clip (never applies one), so it cannot cause cursor/camera issues.") },
                 { "SavedVariables Backup on Startup", new SettingItem("General", "SavedVarsBackup", false, null, "At startup, copies each WTF\\Account SavedVariables .lua to a .lua.bak so you have the last-good config if a session corrupts it. Runs once on a background thread; only ever copies existing files, never modifies your live SavedVariables.") },
                 { "Sampling Profiler (diagnostic)", new SettingItem("General", "SamplingProfiler", false, null, "Developer tool: a background thread samples the main-thread instruction pointer ~1000x/sec and logs the top 50 hot functions on exit. Read-only, no gameplay effect. Leave off for normal play. Skipped by Enable All: it is a diagnostic and it costs frames. One reporter traced their long loading screens to leaving it on.", true) },
+                { "No Client Patches (diagnostic)", new SettingItem("General", "NoClientPatches", false, null, "Writes nothing into WoW.exe, which turns every optimization off. Fixes the WoWCircle disconnects: two players ran it and the drops stopped. It is a trade, not a fix - you keep your connection and lose the performance work.", true) },
+                { "Flight Recorder (mark a moment)", new SettingItem("General", "FlightRecorder", true, null, "Keeps the last 512 frames and writes 240 of them to the log when you press Scroll Lock. Press it the moment you see something wrong. Nothing is written until you do, and it also marks itself for a disconnect, a freeze and a bad SavedVariables filename. Change the key with FlightRecorderKey in wow_opt.ini.") },
+                { "A/B Test a Feature", new SettingItem("General", "AbTest", false, null, "Turns one feature on and off in stints while you play and compares the two halves. It can only measure features you have switched on. Tick the features you want compared as well, or it has nothing to measure. Play at least 45 minutes.", true) },
 
                 // UI & Lua
                 { "Fast UI Frame Accessors", new SettingItem("UI_Lua", "UIFrameAccessorFast", false, null, "Bypasses standard Lua stack queries to retrieve UI frame parameters (IsShown, GetAlpha) instantly.") },
@@ -390,20 +529,17 @@ namespace WowOptimizeLauncher {
                 { "Lua C-API Inline Cache Suite", new SettingItem("UI_Lua", "LuaOpcache", false, null, "Master switch for the Lua C-API fast paths. Off by default. It gates fifty-five separate hooks, which is why the four switches below exist: a tester reported that this suite corrupts ElvUI - addon names come out wrong in the addon list, the options panel reports itself missing, and a /reload drops you to the default Blizzard UI - and with everything behind one checkbox there was no way for them or for me to narrow it to one hook. Turn this on, then turn the groups below off one at a time until the corruption stops, and send the log. Leaving all four on is identical to how this switch behaved before. Skipped by Enable All: issue #37 reported it lengthening load times and producing Lua errors.", true) },
                 { "Lua Suite: table & index caches", new SettingItem("UI_Lua", "LuaOpcacheTables", true, null, "Part of the suite above, and the first group to suspect: the global, table, index and luaH_getstr caches, plus the VM table indexing path. These are the hooks that can hand back a value for the wrong key, which is what wrong addon names look like. Only has any effect when the suite above is on.", true) },
                 { "Lua Suite: string & buffer paths", new SettingItem("UI_Lua", "LuaOpcacheStrings", true, null, "Part of the suite above: pushstring, pushfstring, the string buffer helpers, tolstring, loadstring and the compiled pattern cache. Second group to suspect for wrong text. Only has any effect when the suite above is on.", true) },
-                { "Lua Suite: setters & object creation", new SettingItem("UI_Lua", "LuaOpcacheWrites", true, null, "Part of the suite above: rawset, settable, setfield, table creation, closure creation, the registry ref helpers and metamethod calls. Everything here writes into Lua state. Only has any effect when the suite above is on.", true) },
                 { "Lua Suite: accessors, arg checks & debug", new SettingItem("UI_Lua", "LuaOpcacheReads", true, null, "Part of the suite above, and the least likely group: type queries, length, toboolean, the luaL_check/opt argument helpers, and the debug and error helpers. Mostly read-only. Only has any effect when the suite above is on.", true) },
                 { "Adaptive Lua GC Governor", new SettingItem("UI_Lua", "LuaGcCoalesce", false, null, "Paces incremental garbage collection per frame from the live game state - relaxed while a loading screen is up, stopped in combat below 256MB, aggressive while idle.") },
                 { "Module Handle Cache", new SettingItem("UI_Lua", "ModuleHandleCache", false, null, "Caches GetModuleHandle results, which the client queries repeatedly for already-loaded modules.") },
                 
                 // Combat & Net
-                { "Combat Log Filter", new SettingItem("Combat_Net", "CombatLogFilter", false, null, "Drops every combat log event where neither the source nor the target is you, your party or your raid. That is a real reduction in work, but it is not free: arena and battleground opponents fighting each other, boss abilities aimed at other NPCs, and anything else happening outside your group stops reaching addons at all. Off by default, and only has any effect when Event Coalescing is on.") },
+                { "Combat Log Filter", new SettingItem("Combat_Net", "CombatLogFilter", false, null, "Drops every combat log event where neither the source nor the target is you, your party or your raid. That is a real reduction in work, but it is not free: arena and battleground opponents fighting each other, boss abilities aimed at other NPCs, and anything else happening outside your group stops reaching addons at all. A damage meter will under-report and an arena addon will not see an opponent's cooldowns. Off by default. It works on its own; until now it silently did nothing unless Event Coalescing was also on, and Event Coalescing was not even listed here.", true) },
                 { "Network Packet Reader Fast Paths", new SettingItem("Combat_Net", "SavedVarsPretoken", false, null, "Replaces the six CDataStore accessors the client uses to pull fields out of every network packet - GetDword, PutDword, GetByte, PutByte, PutQword and one more, together about 4,000 call sites.\n\nIt was called \"Saved Variables Pretokenize\" until 3.18.2, and the description admitted it also installed the whole Win32 file-hook suite, a stream cache and a packet batcher. Every one of those turned out to be dead: the pretokenizer's entire implementation was `return false` in each of its six entry points, the stream cache logged \"Disabled\" and returned, the batcher only initialised counters, and the stream-buffer fast path aimed at the same two addresses as the accessors above and always lost the race. What was left doing real work was the accessors, so that is what the switch is now named after and all it now installs.") },
                 { "Vertex Buffer Preallocation", new SettingItem("General", "VertexBufferPrealloc", false, null, "Pools vertex buffer allocations for the D3D9 state cache instead of allocating per use. Runs on every install; this switch is new.") },
                 { "M2 Matrix SSE2", new SettingItem("Graphics_Sound", "M2MatrixSimd", false, null, "SSE2 matrix copy for model transforms, plus the SIMD bone path. Runs on every install; this switch is new.") },
                 { "CRT Alloc Fast Path", new SettingItem("General", "CrtAllocMsize", true, null, "WoW's allocation wrapper calls _msize after every successful allocation and throws the result away, exactly as the free wrapper did - a heap lookup, sometimes a lock, for a number nobody reads. Same fix, applied to the other half. Separate switch from the free one so either can be turned off alone.") },
                 { "CRT Free Fast Path", new SettingItem("General", "CrtFreeMsize", true, null, "WoW's free wrapper calls _msize on every deallocation and throws the result away - a heap lookup, sometimes a lock, for a number nobody reads. Two tester profiles measured that call at 8-10% of main-thread execution time. This removes it and changes nothing else.") },
-                { "Object Manager Lookup Cache", new SettingItem("General", "ObjVisCache", true, null, "Caches the object-manager hash lookup for one frame at a time, keyed by GUID, and re-reads the object's own GUID before handing a cached pointer back. On unless you turn it off - this switch is new; until now it ran on every install with no way to disable it.") },
-                { "Object GUID Lookup Cache", new SettingItem("Combat_Net", "GuidLookupCache", true, null, "Lock-free cache for GUID to object lookups. On by default because it has always run - until this release it had no switch at all.") },
                 { "WoW API Result Cache", new SettingItem("Combat_Net", "ApiCache", true, null, "Caches GetItemInfo and GetSpellInfo results. This is the cache behind the WeakAuras icon that stays wrong after a talent switch: it used to be cleared only by a /reload. Entries now expire after a second. Until this release it had no switch at all and ran on every install - turn it off if you still see stale spell data.") },
                 { "Disconnect Diagnostics", new SettingItem("Combat_Net", "NetDiag", true, null, "Watches the receive path and writes a report if your connection ends: how it ended (a clean close, a reset, a timeout), how long since the last byte actually arrived, and whether the game was mid-loading or the main thread had stalled. It changes nothing about how the game talks to the server - it only records. Disconnects are the oldest complaint about this DLL and the only one never explained, because nothing was watching. On by default; if you get dropped, your log will now say something about it.") },
                 { "Combat Log Leak Fix (retention 1800s)", new SettingItem("Combat_Net", "CombatLogLeakFix", true, null, "Fixes the 16-year-old WoW combat log memory leak by extending event retention from 300s to 1800s (writes the retention CVar). Proven and stable - on by default.") },
@@ -413,21 +549,43 @@ namespace WowOptimizeLauncher {
 
                 // Graphics & Sound
                 { "SSE2 Boyer-Moore strstr", new SettingItem("Graphics_Sound", "StrStrSse2", false, null, "Optimizes string sub-searches (such as font names, textures) using vectorized SIMD algorithms.") },
+                { "SSE2 Frustum Cull and Quaternion Normalize", new SettingItem("Graphics_Sound", "SimdGeometry", false, null, "Replaces the frustum culling and quaternion normalize routines with SSE2 versions. These used to be switched on and off by the SSE2 string search option, which is named after something else entirely, so anyone who left that off - it is off by default - lost these too without being told. If you have never set this key it follows whatever the string search option is set to, so nothing changes for you by updating.") },
                 { "Vectorized String Concatenation", new SettingItem("Graphics_Sound", "StrCatFast", false, null, "Speeds up string appending (such as chat text building) using SSE2 assembly wrappers.") },
                 { "FMOD Sound Mixer Optimization", new SettingItem("Graphics_Sound", "SoundMixerOpt", false, null, "Adjusts audio thread schedules and buffer allocations to prevent sound stutters in raids.") },
                 { "Parallel Sound Wave Decoding", new SettingItem("Graphics_Sound", "AudioDecodeMt", false, null, "Decodes sound assets in background threads to eliminate latency when playing fresh audio clips.") },
                 { "DBC Data Lookup Cache", new SettingItem("Graphics_Sound", "DbcLookupCache", false, null, "Speeds up data reading from internal database files (.dbc) for models, items, and spells. Skipped by Enable All: issue #35 reported it crashing the client during a loading screen, and that has not been re-tested since the file hooks were split out of it, so it is not known which half was at fault.", true) },
                 { "File I/O Hooks", new SettingItem("General", "FileIoHooks", false, null, "Everything this tool does to Windows file calls: sequential-scan hints on open, the adaptive read cache for MPQ archives, handle cleanup, a skipped buffer flush, and caches for file attributes, seeks and sizes. These used to be switched by the DBC cache above, which meant clearing that one to test it also removed the whole file layer, silently. Turn this off if loading, streaming or disk behaviour looks wrong. Skipped by Enable All for the same reason as the DBC cache it was split from: the crash reported in issue #35 could have come from either half.", true) },
+                { "UI Frame Batch (parent switch)", new SettingItem("UI_Lua", "UIFrameBatch", false, null, "The setting the two below inherit from when they are absent from the file. It used to be read by the tool with no entry here at all, so it could only be changed by editing the ini by hand, and it has been off for everyone since issue #36 reported flickering. It no longer switches anything by itself: the two halves it really controlled have their own entries, and the other two things it appeared to control are compiled out of the build. Leave it off and use the two below.", true) },
+                { "Table Emptiness Census", new SettingItem("UI_Lua", "LuaTableCensus", false, null, "Diagnostic, not an optimization. The garbage collector walks every slot of every table it visits, including the empty ones, and a table that once held a thousand entries keeps a thousand slots for as long as nothing new is inserted into it. That function is the most expensive Lua thing in every profile taken so far. This samples one table in five hundred of the collector's walk and reports how many of the slots it stepped over were empty. It only counts and never changes anything. The answer decides whether a compactor is worth writing.", true) },
+                { "Leave Lua Garbage Collection Alone", new SettingItem("UI_Lua", "LuaGcStockPace", false, null, "The garbage collector governor normally makes Lua collect more eagerly than it would on its own, to keep memory down and avoid a large pause later. That eagerness has a price the tool has never measured: it is paid inside the game's own collector, and in profiled sessions those two functions are the two most expensive Lua things running, ahead of the script interpreter itself. Tick this to leave the collector exactly as the game sets it and step nothing by hand. Run one session each way and compare the two lines the log prints; that is the entire experiment.", true) },
+                { "Object Tick Prefetch", new SettingItem("Graphics_Sound", "TickListPrefetch", false, null, "Every frame the game walks a linked list of objects and pokes each one, and almost every poke does nothing but read two fields and return. Those two fields sit in different cache lines, so each object costs the processor two waits, and it cannot start the next object until it has finished the previous one. This tells the processor to start fetching the next object while the current one is still being handled. It was 1.39% of main-thread time in a measured session. It changes nothing about what the game computes - a prefetch is only a hint - and it refuses to install unless the function is byte-for-byte the one it was written against.", true) },
+                { "Terrain Read-Ahead", new SettingItem("General", "TerrainPrefetch", false, null, "Watches where the world is streaming from, projects that forward, and reads the terrain tiles ahead of you out of the MPQ archives on a background thread so they are in the OS cache before the game asks. It read its coordinate from an address the game never writes, so from the day it was added until 3.19.1 it queued nothing at all on any machine - which is also why nobody has ever tested what it does when it works. It does real background disk reads.", true) },
                 { "Lua Type Fast Path", new SettingItem("UI_Lua", "LuaTypeFast", false, null, "Resolves a Lua stack index inline in lua_type instead of calling the engine's index2adr. Also used to be switched by the DBC cache, which it has nothing to do with.") },
-                { "Win32 API Caches", new SettingItem("General", "Win32ApiCaches", false, null, "Caches Windows calls that return the same answer every time: system info, screen metrics, OS version, registry reads, GetProcAddress, module file names, environment variables and ini reads. These used to be switched by the timing fix, which should own the clock hooks and nothing else.") },
+                { "Win32 API Caches", new SettingItem("General", "Win32ApiCaches", false, null, "Caches Windows calls that return the same answer every time: system info, OS version, registry reads, GetProcAddress, module file names, environment variables and ini reads. Screen metrics used to be on that list and is not any more - it was measured at a zero percent hit rate and taken out. These used to be switched by the timing fix, which should own the clock hooks and nothing else.") },
                 { "Debug API Hooks", new SettingItem("General", "DebugApiHooks", true, null, "Answers IsBadReadPtr and IsBadWritePtr from a memory query instead of the slow path, turns OutputDebugString into a no-op, and reports no debugger attached. These used to be switched by the CVar safeguard, which is unrelated and defaults on, so this defaults on too and keeps doing what it already did.") },
                 { "Lock Spin Counts", new SettingItem("General", "LockSpinHooks", false, null, "Adds spin counts to CriticalSection and WaitForSingleObject so a short wait does not go straight to the kernel. These used to be switched by the heap defragmenter, a different subsystem.") },
-                { "Bone Rotation Maths (SSE2)", new SettingItem("Graphics_Sound", "QuatLerpSse2", false, null, "Every animated bone of every model gets its rotation blended between two keyframes, every frame. The game does the four numbers one at a time on the old floating-point stack; this does all four in one instruction. Not identical to the last bit: measured over 12 million values the largest difference is 0.0000003, which is under three of the smallest steps a float can take, and the result is renormalised straight afterwards. It checks itself against the game for the first 20000 blends and switches off if anything drifts further than rounding explains. EXPERIMENTAL.", true) },
-                { "Reuse Compiled Scripts", new SettingItem("UI_Lua", "LuaProtoCache", false, null, "Interface scripts written inside XML templates are recompiled from scratch every time a frame is built from that template. Counted on real sessions: 88 out of every 100 chunks the game compiled were text it had already compiled that same session, 332 MB of repeated work. This keeps the compiled form and reuses it when the text and the chunk name are both identical, checked byte for byte rather than by a hash. The game still builds the function itself, so its environment and its addon ownership are unchanged. It compares the first 2000 reuses against a fresh compile and switches off if any of them differ. EXPERIMENTAL.", true) },
-                { "Collision Box Test (SSE2)", new SettingItem("Graphics_Sound", "CollisionOutcode", false, null, "Every line-of-sight check, every mouse click on the world and every projectile path makes the game sort the corners of a collision model against a box, one corner at a time on the old floating-point stack - six comparisons per corner. A corrected profile puts that single function at 3.8% of main-thread time, the largest one left outside model animation. This does four corners per instruction. Unlike the other maths replacements in this tool it is exact rather than close: the box bounds are read as plain numbers with no arithmetic done to them, so the vector comparison gives the same answer as the game's for every possible input. Before it changes anything it works out what the game is about to produce - which corners are outside and which triangles get queued - lets the game run, and compares the two lists. Three thousand of those have to match before it takes over. EXPERIMENTAL.", true) },
-                { "Spread Model Animation (crowd throttle)", new SettingItem("Graphics_Sound", "AnimLod", false, null, "Posing the skeletons of everything on screen is the single largest block of frame time the game spends: measured on real sessions at 3.68 milliseconds out of a 24.5 millisecond frame in a raid, across 114 models averaging 31 bones each. No one function inside it is worth optimising - the cost is spread across dozens - so the only way to reach it is to do less of it. Below 96 models on screen this changes nothing at all. Above that, each model has its pose refreshed every second, third or fourth frame instead of every frame, never less often than a quarter of your frame rate, and a model is never skipped before its first pose. It cannot make animations run slow or drift: the game works out where an animation should be from the clock each time rather than by counting frames, so a skipped update only delays when a pose is refreshed. What you may notice in a packed city is slightly steppier movement on some characters. EXPERIMENTAL.", true) },
-                { "UI Method Object Lookup", new SettingItem("UI_Lua", "LuaThisFast", false, null, "Every call an addon makes into a frame - SetText, GetWidth, Show, all 674 of them - starts by fetching the frame object out of a table slot, and the game does that through four separate script-engine calls plus a push and a pop. This reads it directly instead. The one thing those calls do besides fetch is carry addon ownership between values, which decides what is allowed to touch protected actions, and that is reproduced exactly rather than skipped. Anything out of the ordinary is handed straight back to the game. It compares the first 20000 lookups against the game's own answer and switches off if any of them differ. EXPERIMENTAL.", true) },
-                { "Hash Lookup Chains", new SettingItem("General", "ObjMgrFindFast", false, null, "The game looks things up by id constantly - creatures, spells, items, database rows - through one search routine the compiler copied into the client eleven times. Every copy re-reads the table header and recomputes where the next link lives for each step of the search, although none of it can change during one lookup. This works it out once instead, on the three copies that are actually used heavily (one of them has 184 call sites). Each runs alongside the game's own routine at first and compares every answer; a single difference switches that one off for the session and says so in the log. EXPERIMENTAL.", true) },
+                { "Bone Rotation Maths (SSE2)", new SettingItem("Graphics_Sound", "QuatLerpSse2", false, null, "Every animated bone of every model gets its rotation blended between two keyframes, every frame. The game does the four numbers one at a time on the old floating-point stack; this does all four in one instruction. Not identical to the last bit: measured over 12 million values the largest difference is 0.0000003, which is under three of the smallest steps a float can take, and the result is renormalised straight afterwards. It checks itself against the game for the first 20000 blends and switches off if anything drifts further than rounding explains.", true) },
+                { "Reuse Compiled Scripts", new SettingItem("UI_Lua", "LuaProtoCache", true, null, "Interface scripts written inside XML templates are recompiled from scratch every time a frame is built from that template. Counted on real sessions: 88 out of every 100 chunks the game compiled were text it had already compiled that same session, 332 MB of repeated work. This keeps the compiled form and reuses it when the text and the chunk name are both identical, checked byte for byte rather than by a hash. The game still builds the function itself, so its environment and its addon ownership are unchanged. It compares the first 2000 reuses against a fresh compile and switches off if any of them differ.", true) },
+                { "Reuse Compiled Scripts Between Sessions", new SettingItem("UI_Lua", "LuaBytecodeStore", false, null, "Reuse Compiled Scripts only helps the second time the game compiles something in one sitting. On a measured loading screen that was 260 of the 2128 milliseconds spent compiling; the other 1868 were scripts the session had never seen, which nothing running inside the game can avoid. This writes the compiled form to Cache\\wow_optimize_bytecode.bin and reads it back on the next launch, so a script compiled yesterday is not compiled again today. The game can write that form but has no code to read it, so the reading is ours: every script rebuilt from the file is compared against a real compile of the same text, field by field and constant by constant, for the first 2000 of them and one in every 256 after that, and the whole store switches off for good the first time two of them differ. The file is discarded automatically if Wow.exe changes.", true) },
+                { "Collision Box Test (SSE2)", new SettingItem("Graphics_Sound", "CollisionOutcode", false, null, "Every line-of-sight check, every mouse click on the world and every projectile path makes the game sort the corners of a collision model against a box, one corner at a time on the old floating-point stack - six comparisons per corner. A corrected profile puts that single function at 3.8% of main-thread time, the largest one left outside model animation. This does four corners per instruction. Unlike the other maths replacements in this tool it is exact rather than close: the box bounds are read as plain numbers with no arithmetic done to them, so the vector comparison gives the same answer as the game's for every possible input. Before it changes anything it works out what the game is about to produce - which corners are outside and which triangles get queued - lets the game run, and compares the two lists. Three thousand of those have to match before it takes over.", true) },
+                { "Bone Matrix Upload (SSE2)", new SettingItem("Graphics_Sound", "BoneMatrixUpload", false, null, "Replaces the bone matrix transpose in the draw path with SSE2. 3.35% of main-thread time in the profile. Nothing is computed, only copied, so the result is identical bit for bit; it still checks the first 20000 bones against the client and backs out if they differ.", true) },
+                { "M2 Matrix Slot Copy (SSE2)", new SettingItem("Graphics_Sound", "M2MatrixSlotSse2", false, null, "Replaces the two places in the model animation update that copy a finished bone matrix into the model one float at a time - sixteen x87 moves each - with four SSE2 moves. There is no arithmetic in either, so the bytes written are the bytes read. The animation family is about a fifth of the frame. Experimental.", true) },
+                { "Model Animation Stride (experimental)", new SettingItem("Graphics_Sound", "M2AnimStride", false, null, "Holds a distant model's skeleton for a frame instead of re-solving every bone. Its materials, particles and attached items keep animating - only the bones pause. Nothing within 45 yards is ever held; past that a model updates every 2nd, 3rd or 4th frame by distance, and each one is on its own phase so they do not all update together. The animation family is about a fifth of the frame. Experimental.", true) },
+                { "Keep the Allocator Above 2GB", new SettingItem("General", "MimallocHighArena", false, null, "A 32-bit client can only allocate from the low 2GB, and this tool's allocator grows into the same half. Three sessions ran out of it, and one had a SavedVariables file written under a garbage name. This reserves address space above 2GB and hands it to the allocator, which uses memory it is given before asking the OS - and hands over more as it fills, so the allocator never has a reason to come back down. Needs a large-address-aware client. It releases any block Windows places below 2GB rather than use it. Sizes are MimallocHighArenaMB and MimallocHighArenaMaxMB in wow_opt.ini.", true) },
+                { "Batch the Game's File Writes", new SettingItem("General", "ClientWriteBatch", true, null, "The game writes SavedVariables about nine bytes at a time. One tester's loading screen spent 2470 ms of 16828 inside 593557 of those calls, for 5.6 MB. This gathers them into 64KB pieces, so the same work is about ninety system calls. It buffers one file at a time, flushes on every close, seek, read and flush, and checks each closed file's size against what the game handed over - if a byte ever goes missing it switches itself off and says so. Needs File I/O Hooks.", true) },
+                { "Box Overlap Test (SSE2)", new SettingItem("Graphics_Sound", "AabbOverlap", false, null, "Before drawing anything the game asks, for every object in the scene and for every visibility pass over it, whether that object's box overlaps the one being tested. Seventeen different parts of the engine ask it. The test itself is six number comparisons, but each one is moved off the old floating-point stack through the slowest instruction available for that, and each is followed by a branch the scene data decides - so a walk over a mixed set of objects guesses wrong on most of them. This answers all six at once. Nothing is added or multiplied anywhere in the test, only compared, so the vector version gives the identical answer for every possible input rather than a close one. It checks itself against the game's own answer twenty thousand times before it starts answering alone, and keeps rechecking one call in four thousand after that.", true) },
+                { "Lua Pool Shortcuts", new SettingItem("UI_Lua", "LuaPoolFast", false, null, "The game keeps its own pool of memory for the interface scripting language, carved into chunks. Every time it hands a block back, it has to work out which chunk that block came from, and it does that by checking every chunk in turn, following a pointer to each one before it can even compare. This remembers the last few chunks along with their boundaries, so the usual answer is a couple of comparisons instead of a walk through scattered memory. The block is always re-checked against the chunk's own record before anything is written, so a stale entry costs a little time and can never put memory in the wrong place. It also tells the separate 'Lua Pool Allocation Hint' feature which chunk just got a block back, which is the one thing that feature could not know on its own: a measurement of a tester's session showed three quarters of allocations finding room immediately but nearly a fifth still searching through thirty-three chunks or more, and that tail is exactly memory freed into a chunk the search had already passed. Two testers' freeze reports have pointed at this code.", true) },
+                { "Matrix-Vector SSE2 (slower - off)", new SettingItem("Graphics_Sound", "MatrixVectorSse2", false, null, "Replaces one small piece of the game's 3D maths with a modern instruction set. It is off, and it will stay off unless you have a reason: measured side by side against the game's own code it came out slower - 3.3 against 2.5 nanoseconds a call - while producing exactly the same numbers, and it runs about five thousand times per frame. It was switched on for everyone by accident, tied to an unrelated text-search option, so nobody could turn it off. Left here only so the measurement can be repeated.", true) },
+                { "Steadier Shadows (flicker fix)", new SettingItem("Graphics_Sound", "ShadowCascadeHold", false, null, "Below the highest shadow setting the game does not redraw shadows every frame. It builds a new shadow map over nine frames around the point you were standing on when those frames began, then shows the whole thing at once - so the shadows do not fade in, they jump. The nearest map does that every two yards, which while running is about three times a second, and that jump is the flicker people see on buildings as they run past. This halves the distance, so the jumps are half the size and twice as often: many small corrections read as movement where a few large ones read as popping. It costs some frames the game would have skipped the shadow work on entirely. An earlier version went the other way and doubled the distance, which removed the flicker for one tester and gave another visibly lagging shadows. EXPERIMENTAL - this is a judgement about how a jump looks, not a measurement, so try it against having it off.", true) },
+                { "Table Lookup Dispatch (SSE2)", new SettingItem("UI_Lua", "LuaHGetDispatch", false, null, "Every time an addon reads a value out of a table, the scripting engine first has to work out what kind of key it was given. Deciding whether a number is a whole number - which is how any list is indexed - costs it three trips through memory and a stall waiting for the floating-point unit to report a comparison, and the first of those trips writes the number to memory and reads it straight back unchanged. The processor can do all of it in registers. Only that decision is replaced; unusual key types are still handed to the game's own code. The lookup only reads and returns a location, so it is checked against the game's own answer thirty thousand times and regularly afterwards.", true) },
+                { "Line-of-Sight Box Test (SSE2)", new SettingItem("Graphics_Sound", "SegmentAabb", false, null, "Checking whether a line passes through a box. Almost all the time here goes on something other than the maths: to act on a comparison of two numbers, the old floating-point unit has to copy its status into a general register first, and the next instruction sits waiting for it. This function does that ten times per call, and the profiler's samples land exactly on the waiting instruction. Modern instructions produce the answer directly. Every one of those ten decisions was transcribed rather than guessed, including two that the game makes by inspecting raw bits rather than comparing values, so the answer is identical in every case. The test only reports a yes or no and changes nothing, so it is checked against the game's own answer twenty thousand times and regularly afterwards.", true) },
+                { "Visibility Box Test (SSE2)", new SettingItem("Graphics_Sound", "FrustumAabb", false, null, "Deciding whether something is on screen means testing its bounding box against the six sides of the view. Most of what the game spends there is not the maths: for each side it checks the sign of a number, uses that to look up which corner of the box to use, and then fetches the corner through that lookup - eighteen times per test. The processor can pick the corner directly from those signs with no lookup at all. The maths is done at the same width the game uses and in the same order, so the answer is identical. The test only reports a yes or no and changes nothing, so it is simply checked against the game's own answer, twenty thousand times at first and regularly afterwards.", true) },
+                { "Model Draw Order Key Cache", new SettingItem("Graphics_Sound", "M2SortKey", false, null, "Before drawing a model the game sorts its pieces into the right order, and the routine that decides which of two pieces comes first spends almost all its time chasing pointers through memory to look up a single number - five hops, each waiting on the one before it. In a profile of a tester's session this one routine was 2.44 percent of all the time the game spent working, ahead of every scripting entry. This remembers that number for the length of a single frame, which removes three of the five hops. The comparison itself is unchanged and does not alter anything, so the result is simply checked against the game's own answer, twenty thousand times at first and regularly afterwards.", true) },
+                { "Bone Movement Track (SSE2)", new SettingItem("Graphics_Sound", "AnimVec3Track", false, null, "Alongside a rotation, every animated bone carries a position, and the game works out where it should be by interpolating between two keyframes one number at a time. This does all three at once. It runs more often than the rotation work does - the same routine handles every three-number track in a model, and the animation code calls it eight times over against once for rotations. The tricky part is that the game rounds the result to lower precision in one place and deliberately does not in another, so both are reproduced exactly where they happen and the position that comes out is identical bit for bit, not merely close. It checks itself against the game's own answer for the first thirty thousand bones and keeps rechecking afterwards.", true) },
+                { "Bone Rotation Unpack (SSE2)", new SettingItem("Graphics_Sound", "AnimQuatUnpack", false, null, "Posing a skeleton means reading a rotation for every bone of every animated thing on screen, every frame - and each rotation is stored packed into four small integers that have to be expanded back into real numbers. A 32-bit processor has no direct route from an integer to the old floating-point unit, so the game writes each number to memory and immediately reads it back again, four times per rotation and up to sixteen times per bone. This converts two at a time inside the processor with no memory in the way. The maths is done at the same width the game uses and rounded at the same points, so the pose that comes out is identical bit for bit, not merely close. It compares all its output against the game's own for the first thirty thousand bones and keeps rechecking afterwards.", true) },
+                { "Spread Model Animation (crowd throttle)", new SettingItem("Graphics_Sound", "AnimLod", false, null, "Posing the skeletons of everything on screen is the single largest block of frame time the game spends: measured on real sessions at 3.68 milliseconds out of a 24.5 millisecond frame in a raid, across 114 models averaging 31 bones each. No one function inside it is worth optimising - the cost is spread across dozens - so the only way to reach it is to do less of it. Below 96 models on screen this changes nothing at all. Above that, each model has its pose refreshed every second, third or fourth frame instead of every frame, never less often than a quarter of your frame rate, and a model is never skipped before its first pose. It cannot make animations run slow or drift: the game works out where an animation should be from the clock each time rather than by counting frames, so a skipped update only delays when a pose is refreshed. What you may notice in a packed city is slightly steppier movement on some characters.", true) },
+                { "UI Method Object Lookup", new SettingItem("UI_Lua", "LuaThisFast", false, null, "Every call an addon makes into a frame - SetText, GetWidth, Show, all 674 of them - starts by fetching the frame object out of a table slot, and the game does that through four separate script-engine calls plus a push and a pop. This reads it directly instead. The one thing those calls do besides fetch is carry addon ownership between values, which decides what is allowed to touch protected actions, and that is reproduced exactly rather than skipped. Anything out of the ordinary is handed straight back to the game. It compares the first 20000 lookups against the game's own answer and switches off if any of them differ.", true) },
+                { "Hash Lookup Chains", new SettingItem("General", "ObjMgrFindFast", false, null, "The game looks things up by id constantly - creatures, spells, items, database rows - through one search routine the compiler copied into the client eleven times. Every copy re-reads the table header and recomputes where the next link lives for each step of the search, although none of it can change during one lookup. This works it out once instead, on the three copies that are actually used heavily (one of them has 184 call sites). Each runs alongside the game's own routine at first and compares every answer; a single difference switches that one off for the session and says so in the log.", true) },
                 { "Vertex Colour Format Inline", new SettingItem("Graphics_Sound", "VertexFmtInline", false, null, "The game asks \"does this colour need its bytes swapped for my graphics card\" once for every single vertex it builds, in both the interface batcher and the particle system. The answer is a property of your graphics device and cannot change between two vertices. Those two functions were 5% of CPU time in a profile. This computes the answer in place instead of calling out for it, using the same fourteen bytes of machine code, so nothing else shifts. It checks the client byte for byte first and does nothing if it does not match. EXPERIMENTAL: it patches game code.", true) },
                 { "Lua Memory Pool Search", new SettingItem("UI_Lua", "LuaMemPoolFast", false, null, "The Lua allocator keeps memory in chunks and searches them from the beginning every single time it needs a block. Chunks that filled up early stay full, so once the pool has grown, every allocation walks past all of them first. A profile counted 2.3 million allocations in six minutes and put this function second overall. This starts the search where the last one succeeded. It cannot miss a free block: if the shorter search finds nothing, the original runs unchanged. Also counts how far the search really goes, so the log says whether it was ever the problem.", true) },
                 { "CPU Core Class Report", new SettingItem("General", "CpuTopology", true, null, "Reads whether your CPU has both performance and efficiency cores, and records which kind the game's frame loop actually runs on. Measurement only, one call per frame. On hybrid CPUs (Intel 12th gen and newer) Windows decides where to put a thread, and a game that sleeps every frame looks like a light load, which is what gets moved onto a slow core. This tells you whether that is happening to you.") },
@@ -448,7 +606,9 @@ namespace WowOptimizeLauncher {
 
             // Window Setup
             Text = "WoW-Optimize Launcher";
-            ClientSize = new Size(920, 650);
+            // The background is scaled to the client area and covered with a
+            // near-opaque wash, so the height is free to change.
+            ClientSize = new Size(920, 700);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None;
             BackColor = DarkBg;
@@ -611,6 +771,10 @@ namespace WowOptimizeLauncher {
             // Subheader
             Label subHeaderLabel = new Label();
             subHeaderLabel.Text = "MOD CONFIGURATOR & LAUNCHER";
+            // Same reason the tab strip needed NoPrefix: a Label eats & as a
+            // mnemonic and underlines what follows, so this read CONFIGURATOR
+            // with a gap where the ampersand should be.
+            subHeaderLabel.UseMnemonic = false;
             subHeaderLabel.Font = new Font("Segoe UI", 7.5f, FontStyle.Regular);
             subHeaderLabel.ForeColor = SubHeaderColor;
             subHeaderLabel.AutoSize = true;
@@ -619,64 +783,117 @@ namespace WowOptimizeLauncher {
             leftPanel.Controls.Add(subHeaderLabel);
             y += subHeaderLabel.PreferredHeight + 18;
 
-            // ── Master Buttons ──────────────────────────────────
+            // ── Actions ────────────────────────────────────────
+            //
+            // Three that set every switch at once, three that move a whole
+            // configuration around, and Launch pinned to the bottom of the
+            // column so it is in the same place whatever else is above it.
+            //
+            // What is not here: the two buttons that set up a measuring
+            // session. They put a profiler on the main thread and an A/B
+            // harness that flips eighteen features every twenty seconds, and
+            // sitting in the same column as MAX PERFORMANCE they read like
+            // something a player should press. Every switch they touched is
+            // still a checkbox on the right.
             int btnWidth = 248;
 
-            DarkButton btnEnableAll = new DarkButton(CyanAccent, false);
-            btnEnableAll.Text = "ENABLE ALL FEATURES";
-            btnEnableAll.Size = new Size(btnWidth, 30);
-            btnEnableAll.Location = new Point(15, y);
-            btnEnableAll.Click += delegate { ToggleAll(true); };
-            leftPanel.Controls.Add(btnEnableAll);
-            y += 36;
+            y += AddSectionLabel(leftPanel, "SET EVERYTHING AT ONCE", y);
 
-            DarkButton btnDisableAll = new DarkButton(Color.FromArgb(255, 23, 68), false);
-            btnDisableAll.Text = "DISABLE ALL (VANILLA)";
-            btnDisableAll.Size = new Size(btnWidth, 30);
-            btnDisableAll.Location = new Point(15, y);
-            btnDisableAll.Click += delegate { ToggleAll(false); };
-            leftPanel.Controls.Add(btnDisableAll);
-            y += 36;
+            DarkButton btnMaxPerf = new DarkButton(Color.FromArgb(255, 170, 0), false);
+            btnMaxPerf.Text = "MAX PERFORMANCE";
+            btnMaxPerf.Size = new Size(btnWidth, 32);
+            btnMaxPerf.Location = new Point(15, y);
+            btnMaxPerf.Click += delegate { SetUpMaxPerformance(); };
+            toolTip.SetToolTip(btnMaxPerf,
+                "Everything that makes the game faster, on. Everything that only "
+                + "measures it, off - a census or a profiler costs frames to produce "
+                + "a number.\r\n\r\n"
+                + "Also left off: the ones that buy frames by changing how the game "
+                + "looks or sounds, and the handful that were measured and lost. "
+                + "Each of those is still yours to tick; hover it to read what was "
+                + "measured.");
+            leftPanel.Controls.Add(btnMaxPerf);
+            y += 38;
 
-            DarkButton btnDefaults = new DarkButton(Color.FromArgb(100, 110, 140), false);
-            btnDefaults.Text = "RESTORE SAFE DEFAULTS";
-            btnDefaults.Size = new Size(btnWidth, 30);
+            DarkButton btnDefaults = new DarkButton(Color.FromArgb(120, 132, 160), false);
+            btnDefaults.Text = "DEFAULT";
+            btnDefaults.Size = new Size(btnWidth, 32);
             btnDefaults.Location = new Point(15, y);
             btnDefaults.Click += delegate { RestoreDefaults(); };
+            toolTip.SetToolTip(btnDefaults,
+                "Back to what a fresh install runs: the features that are on for "
+                + "everyone, and nothing else.");
             leftPanel.Controls.Add(btnDefaults);
-            y += 36;
+            y += 38;
+
+            DarkButton btnVanilla = new DarkButton(Color.FromArgb(255, 23, 68), false);
+            btnVanilla.Text = "EVERYTHING OFF";
+            btnVanilla.Size = new Size(btnWidth, 32);
+            btnVanilla.Location = new Point(15, y);
+            btnVanilla.Click += delegate { TurnEverythingOff(); };
+            toolTip.SetToolTip(btnVanilla,
+                "The game as it ships, with the DLL loaded and doing nothing.\r\n\r\n"
+                + "This is the first thing to try when something is wrong. If the "
+                + "problem is still there with everything off, it is not us.");
+            leftPanel.Controls.Add(btnVanilla);
+            y += 40;
+
+            y += AddSectionLabel(leftPanel, "WHEN SOMETHING IS WRONG", y);
+
+            btnLogging = new DarkButton(Color.FromArgb(160, 120, 220), false);
+            btnLogging.Size = new Size(btnWidth, 32);
+            btnLogging.Location = new Point(15, y);
+            btnLogging.Click += delegate { ToggleFullLogging(); };
+            toolTip.SetToolTip(btnLogging,
+                "Turn this on, play until the thing goes wrong, then send "
+                + "Logs\\wow_optimize.log.\r\n\r\n"
+                + "It switches on the sampling profiler and the counters that say "
+                + "what the game was doing: where the main thread was, what was "
+                + "drawn, what was compiled, what the shadow state looked like. "
+                + "They cost frames, and that is the trade for a log that can "
+                + "answer a question.\r\n\r\n"
+                + "MAX PERFORMANCE and DEFAULT turn them all back off.");
+            leftPanel.Controls.Add(btnLogging);
+            y += 40;
+
+            y += AddSectionLabel(leftPanel, "MOVE A CONFIGURATION", y);
 
             DarkButton btnSaveProfile = new DarkButton(CyanAccent, false);
-            btnSaveProfile.Text = "SAVE PROFILE...";
+            btnSaveProfile.Text = "SAVE TO FILE...";
             btnSaveProfile.Size = new Size(btnWidth, 30);
             btnSaveProfile.Location = new Point(15, y);
             btnSaveProfile.Click += delegate { SaveProfile(); };
+            toolTip.SetToolTip(btnSaveProfile, "Write every switch to an ini you can keep or send.");
             leftPanel.Controls.Add(btnSaveProfile);
             y += 36;
 
             DarkButton btnLoadProfile = new DarkButton(CyanAccent, false);
-            btnLoadProfile.Text = "LOAD PROFILE...";
+            btnLoadProfile.Text = "LOAD FROM FILE...";
             btnLoadProfile.Size = new Size(btnWidth, 30);
             btnLoadProfile.Location = new Point(15, y);
             btnLoadProfile.Click += delegate { LoadProfile(); };
+            toolTip.SetToolTip(btnLoadProfile, "Read a saved ini back in. Nothing is written until you launch.");
             leftPanel.Controls.Add(btnLoadProfile);
             y += 36;
 
             DarkButton btnShareProfile = new DarkButton(Color.FromArgb(255, 179, 0), false);
-            btnShareProfile.Text = "SHARE WITH DEVELOPER";
+            btnShareProfile.Text = "COPY FOR THE DEV";
             btnShareProfile.Size = new Size(btnWidth, 30);
             btnShareProfile.Location = new Point(15, y);
             btnShareProfile.Click += delegate { ShareProfileWithDev(); };
+            toolTip.SetToolTip(btnShareProfile,
+                "Puts every switch on the clipboard as ini text. Paste it with a bug "
+                + "report and the log so the two can be read together.");
             leftPanel.Controls.Add(btnShareProfile);
             y += 36;
 
             // ── Separator ───────────────────────────────────────
             DoubleBufferedPanel separator = new DoubleBufferedPanel();
             separator.Size = new Size(btnWidth, 1);
-            separator.Location = new Point(15, y + 4);
+            separator.Location = new Point(15, y);
             separator.BackColor = SeparatorColor;
             leftPanel.Controls.Add(separator);
-            y += 18;
+            y += 14;
 
             // ── DLL Status Card ─────────────────────────────────
             DoubleBufferedPanel statusCard = new DoubleBufferedPanel();
@@ -699,26 +916,21 @@ namespace WowOptimizeLauncher {
             statusTitle.BackColor = Color.Transparent;
             statusCard.Controls.Add(statusTitle);
 
-            string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-            bool dllActive = File.Exists(Path.Combine(exeDir, "version.dll")) &&
-                             File.Exists(Path.Combine(exeDir, "wow_optimize.dll"));
-
+            bool dllActive = File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "version.dll"));
             Label statusVal = new Label();
             statusVal.Text = dllActive ? "OPTIMIZER ACTIVE (version.dll)" : "NOT LOADED / MISSING DLLs";
-            statusVal.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            statusVal.ForeColor = dllActive ? Color.FromArgb(0, 230, 118) : Color.FromArgb(255, 145, 0);
+            statusVal.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+            statusVal.ForeColor = dllActive ? Color.FromArgb(0, 230, 118) : Color.FromArgb(255, 82, 82);
             statusVal.AutoSize = true;
             statusVal.Location = new Point(10, 26);
             statusVal.BackColor = Color.Transparent;
             statusCard.Controls.Add(statusVal);
-
             leftPanel.Controls.Add(statusCard);
-            y += 64;
+            y += 62;
 
-            // ── Active Modules Counter ──────────────────────────
             activeCountLabel = new Label();
-            activeCountLabel.Font = new Font("Segoe UI", 8.5f, FontStyle.Regular);
-            activeCountLabel.ForeColor = SubtextColor;
+            activeCountLabel.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
+            activeCountLabel.ForeColor = Color.FromArgb(150, 163, 178);
             activeCountLabel.AutoSize = true;
             activeCountLabel.Location = new Point(17, y);
             activeCountLabel.BackColor = Color.Transparent;
@@ -726,35 +938,48 @@ namespace WowOptimizeLauncher {
             leftPanel.Controls.Add(activeCountLabel);
             y += 20;
 
-            // ── Progress Bar ────────────────────────────────────
             progressBarPanel = new DoubleBufferedPanel();
             progressBarPanel.Size = new Size(btnWidth, 4);
             progressBarPanel.Location = new Point(17, y);
-            progressBarPanel.BackColor = SeparatorColor;
+            progressBarPanel.BackColor = Color.FromArgb(30, 30, 45);
             progressBarPanel.Paint += ProgressBar_Paint;
             leftPanel.Controls.Add(progressBarPanel);
-            y += 16;
+            y += 18;
 
-            // ── LAUNCH WOW Button ───────────────────────────────
-            DarkButton btnLaunch = new DarkButton(CyanAccent, true);
-            btnLaunch.Text = "LAUNCH WOW";
-            btnLaunch.Size = new Size(btnWidth, 45);
-            btnLaunch.Font = new Font("Segoe UI", 11f, FontStyle.Bold);
-            btnLaunch.Location = new Point(15, y);
-            btnLaunch.Click += delegate { LaunchWow(); };
-            leftPanel.Controls.Add(btnLaunch);
-            y += 51;
+            // Where the log is, because a bug report is worth nothing without it
+            // and nobody should have to be told the path twice.
+            Label logHint = new Label();
+            logHint.Text = "The log is Logs\\wow_optimize.log, and its report\r\nstarts with a list of what did not work.";
+            logHint.Font = new Font("Segoe UI", 7.5f, FontStyle.Regular);
+            logHint.ForeColor = Color.FromArgb(130, 142, 158);
+            logHint.AutoSize = false;
+            logHint.Size = new Size(btnWidth, 30);
+            logHint.Location = new Point(17, y);
+            logHint.BackColor = Color.Transparent;
+            leftPanel.Controls.Add(logHint);
 
-            // ── EXIT Button ─────────────────────────────────────
-            DarkButton btnExit = new DarkButton(Color.FromArgb(60, 60, 70), false);
+            // ── Launch, pinned to the bottom ────────────────────
+            //
+            // Anchored rather than flowed, so the column can gain or lose a
+            // button above without Launch moving. It used to follow the flow
+            // and ended up halfway up the panel with a void underneath.
+            int bottom = leftPanel.Height - 10;
+
+            DarkButton btnExit = new DarkButton(Color.FromArgb(80, 88, 110), false);
             btnExit.Text = "EXIT LAUNCHER";
             btnExit.Size = new Size(btnWidth, 30);
-            btnExit.Location = new Point(15, y);
-            btnExit.Click += delegate { Close(); };
+            btnExit.Location = new Point(15, bottom - 30);
+            btnExit.Click += delegate { Application.Exit(); };
             leftPanel.Controls.Add(btnExit);
-            y += 36;
 
-            // ── Version Label ───────────────────────────────────
+            DarkButton btnLaunch = new DarkButton(CyanAccent, true);
+            btnLaunch.Text = "LAUNCH WOW";
+            btnLaunch.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
+            btnLaunch.Size = new Size(btnWidth, 46);
+            btnLaunch.Location = new Point(15, bottom - 30 - 8 - 46);
+            btnLaunch.Click += delegate { LaunchWow(); };
+            leftPanel.Controls.Add(btnLaunch);
+
             versionLabel = new Label();
             versionLabel.Text = "v" + APP_VERSION + "-Release";
             versionLabel.Font = new Font("Segoe UI", 7f, FontStyle.Regular);
@@ -772,12 +997,27 @@ namespace WowOptimizeLauncher {
 
             // Tip label
             Label tipLabel = new Label();
-            tipLabel.Text = "Tip: Hover over any optimization feature to view a detailed description of its behavior.";
-            tipLabel.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            // Two lines. It was one line 20 pixels tall holding six marks and a
+            // sentence, so it showed three of the marks and cut the third in half.
+            // The headings inside a tab carry this. The marks come back
+            // onto the rows only while a search has flattened the groups.
+            tipLabel.Text = "[+] faster   [!] not proven   [=] fixes   [.] logging\r\n"
+                          + "[?] diagnostics   [-] changes the look   [x] didn't help";
+            tipLabel.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
             tipLabel.ForeColor = CyanAccent;
             tipLabel.AutoSize = false;
-            tipLabel.Size = new Size(rightW - 270, 20);
-            tipLabel.Location = new Point(rightX, 15);
+            tipLabel.Size = new Size(rightW - 270, 30);
+            tipLabel.Location = new Point(rightX, 8);
+            toolTip.SetToolTip(tipLabel,
+                "[+] makes the game faster, and something measured it.\r\n"
+                + "[!] should make it faster; not measured yet. Turn one on, "
+                + "play, and the log says what it did.\r\n"
+                + "[=] protects or repairs something; no speed claim.\r\n"
+                + "[?] measures the game, and costs frames to produce the number.\r\n"
+                + "[-] buys frames by changing how the game looks or sounds.\r\n"
+                + "[x] was measured against the client and lost; hover it to read what.\r\n"
+                + "[.] writes a log; negligible cost.\r\n\r\n"
+                + "Hover any feature for what it does.");
             tipLabel.BackColor = Color.Transparent;
             Controls.Add(tipLabel);
 
@@ -804,8 +1044,8 @@ namespace WowOptimizeLauncher {
 
             // TabControl
             tabs = new DarkTabControl();
-            tabs.Location = new Point(rightX, 40);
-            tabs.Size = new Size(rightW, ClientSize.Height - 55);
+            tabs.Location = new Point(rightX, 44);
+            tabs.Size = new Size(rightW, ClientSize.Height - 59);
             tabs.SelectedIndexChanged += delegate {
                 if (searchBox != null) {
                     FilterFeatures(searchBox.Text);
@@ -817,168 +1057,114 @@ namespace WowOptimizeLauncher {
             TabPage tpUiLua = CreateTabPage("UI & LUA");
             TabPage tpCombatNet = CreateTabPage("COMBAT & NET");
             TabPage tpGraphicsSound = CreateTabPage("GRAPHICS & SOUND");
-            TabPage tpExperimental = CreateTabPage("EXPERIMENTAL");
 
             tabs.TabPages.Add(tpGeneral);
             tabs.TabPages.Add(tpUiLua);
             tabs.TabPages.Add(tpCombatNet);
             tabs.TabPages.Add(tpGraphicsSound);
-            tabs.TabPages.Add(tpExperimental);
 
             // Get the scroll panels from each tab page
             generalFlow = (FlowLayoutPanel)((Panel)tpGeneral.Controls[0]).Controls[0];
             uiLuaFlow = (FlowLayoutPanel)((Panel)tpUiLua.Controls[0]).Controls[0];
             combatNetFlow = (FlowLayoutPanel)((Panel)tpCombatNet.Controls[0]).Controls[0];
             graphicsSoundFlow = (FlowLayoutPanel)((Panel)tpGraphicsSound.Controls[0]).Controls[0];
-            experimentalFlow = (FlowLayoutPanel)((Panel)tpExperimental.Controls[0]).Controls[0];
 
-            // Add "ENABLE ALL IN ..." buttons at top of each flow
-            btnEnableGeneral = CreateCategoryButton("ENABLE ALL IN GENERAL");
-            btnEnableGeneral.Click += delegate { ToggleCategoryAction("General", btnEnableGeneral, "GENERAL"); };
-            generalFlow.Controls.Add(btnEnableGeneral);
 
-            btnEnableUiLua = CreateCategoryButton("ENABLE ALL IN UI & LUA");
-            btnEnableUiLua.Click += delegate { ToggleCategoryAction("UI_Lua", btnEnableUiLua, "UI & LUA"); };
-            uiLuaFlow.Controls.Add(btnEnableUiLua);
 
-            btnEnableCombatNet = CreateCategoryButton("ENABLE ALL IN COMBAT & NET");
-            btnEnableCombatNet.Click += delegate { ToggleCategoryAction("Combat_Net", btnEnableCombatNet, "COMBAT & NET"); };
-            combatNetFlow.Controls.Add(btnEnableCombatNet);
-
-            btnEnableGfx = CreateCategoryButton("ENABLE ALL IN GRAPHICS & SOUND");
-            btnEnableGfx.Click += delegate { ToggleCategoryAction("Graphics_Sound", btnEnableGfx, "GRAPHICS & SOUND"); };
-            graphicsSoundFlow.Controls.Add(btnEnableGfx);
-
-            // No "enable all" button here on purpose. These are the switches that
-            // are meant to be turned on one at a time, by someone who wants to
-            // find out what one of them does.
-            Label expNote = new Label();
-            experimentalNote = expNote;
-            expNote.Text = "Under investigation, or new enough that nobody has proven them yet.\r\n"
-                         + "Turn on ONE at a time, play, and send the log - that is what makes them\r\n"
-                         + "either real features or deleted ones. Left off by Enable All.";
-            expNote.AutoSize = false;
-            expNote.Size = new Size(tabs.Width - 60, 58);
-            expNote.ForeColor = Color.FromArgb(150, 163, 178);
-            expNote.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
-            expNote.Margin = new Padding(10, 6, 10, 10);
-            experimentalFlow.Controls.Add(expNote);
-
-            // Populate checkboxes
+            // One control per switch, made once. Where it goes and what it is
+            // called are decided by Rebuild, which runs again on every search.
             foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
-                string name = pair.Key;
                 SettingItem data = pair.Value;
-                DarkCheckBox chk = CreateStyledCheckBox(name, data.Tooltip);
-
+                DarkCheckBox chk = CreateStyledCheckBox(pair.Key, data.Tooltip);
                 data.Ctrl = chk;
-
                 chk.CheckedChanged += delegate { UpdateActiveModulesCount(); };
-
-                // The ini section still decides where the value is written; this
-                // flag only decides which tab the switch is shown on.
-                if (data.Experimental) {
-                    experimentalFlow.Controls.Add(chk);
-                    continue;
-                }
-
-                switch (data.Section) {
-                    case "General":
-                        generalFlow.Controls.Add(chk);
-                        break;
-                    case "UI_Lua":
-                        uiLuaFlow.Controls.Add(chk);
-                        break;
-                    case "Combat_Net":
-                        combatNetFlow.Controls.Add(chk);
-                        break;
-                    case "Graphics_Sound":
-                        graphicsSoundFlow.Controls.Add(chk);
-                        break;
-                }
             }
+            Rebuild("");
 
             Controls.Add(tabs);
             ResumeLayout(false);
         }
 
         private void FilterFeatures(string query) {
-            query = (query ?? "").Trim().ToLower();
-            bool hasSearch = !string.IsNullOrEmpty(query);
+            Rebuild(query);
+        }
 
-            TabPage activeTab = (tabs != null) ? tabs.SelectedTab : null;
-            FlowLayoutPanel activeFlow = null;
-            if (activeTab != null && activeTab.Controls.Count > 0) {
-                Control scrollPanel = activeTab.Controls[0];
-                if (scrollPanel.Controls.Count > 0) {
-                    activeFlow = scrollPanel.Controls[0] as FlowLayoutPanel;
-                }
-            }
-
-            if (generalFlow == null || uiLuaFlow == null || combatNetFlow == null ||
-                graphicsSoundFlow == null || experimentalFlow == null) {
+        // Fills the four tabs. Called once at start-up and again on every
+        // keystroke in the search box.
+        //
+        // Without a search the rows are grouped by what the switch is for, with
+        // a heading over each run. A hundred and twenty-three checkboxes in one
+        // column is a wall, and reading it told you nothing about which of them
+        // you would want. Grouped, a tab opens on the ones that make the game
+        // faster and the profilers are at the bottom under a heading that says
+        // they cost frames.
+        //
+        // The mark is on the row only while searching. A search flattens the
+        // groups, so the row has to carry its own label again; under a heading
+        // that already says MAKES THE GAME FASTER, a [+] in front of every line
+        // is the same word twice.
+        private void Rebuild(string query) {
+            if (generalFlow == null || uiLuaFlow == null ||
+                combatNetFlow == null || graphicsSoundFlow == null) {
                 return;
             }
 
-            // Temporarily clear all flow panels
-            generalFlow.Controls.Clear();
-            uiLuaFlow.Controls.Clear();
-            combatNetFlow.Controls.Clear();
-            graphicsSoundFlow.Controls.Clear();
-            experimentalFlow.Controls.Clear();
-            if (!hasSearch && experimentalNote != null) {
-                experimentalFlow.Controls.Add(experimentalNote);
-            }
+            query = (query ?? "").Trim().ToLower();
+            bool hasSearch = !string.IsNullOrEmpty(query);
 
-            // Category buttons visibility
-            if (btnEnableGeneral != null) btnEnableGeneral.Visible = !hasSearch;
-            if (btnEnableUiLua != null) btnEnableUiLua.Visible = !hasSearch;
-            if (btnEnableCombatNet != null) btnEnableCombatNet.Visible = !hasSearch;
-            if (btnEnableGfx != null) btnEnableGfx.Visible = !hasSearch;
-
-            // Put category buttons back if not searching
-            if (!hasSearch) {
-                generalFlow.Controls.Add(btnEnableGeneral);
-                uiLuaFlow.Controls.Add(btnEnableUiLua);
-                combatNetFlow.Controls.Add(btnEnableCombatNet);
-                graphicsSoundFlow.Controls.Add(btnEnableGfx);
+            FlowLayoutPanel[] flows = new FlowLayoutPanel[] {
+                generalFlow, uiLuaFlow, combatNetFlow, graphicsSoundFlow
+            };
+            // The checkboxes are made once and reused, so they are only removed.
+            // The group headings are made fresh every time this runs, which is
+            // every keystroke in the search box, so they have to be disposed or
+            // they pile up for the life of the window.
+            for (int i = 0; i < flows.Length; i++) {
+                List<Control> headings = new List<Control>();
+                foreach (Control c in flows[i].Controls) {
+                    if (c is Label) headings.Add(c);
+                }
+                flows[i].Controls.Clear();
+                for (int h = 0; h < headings.Count; h++) headings[h].Dispose();
             }
 
             foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
-                string name = pair.Key;
-                SettingItem data = pair.Value;
+                if (pair.Value.Ctrl == null) continue;
+                pair.Value.Ctrl.Visible =
+                    !hasSearch || pair.Key.ToLower().Contains(query);
+            }
 
-                // Match only by name (case-insensitive)
-                bool isMatch = !hasSearch || name.ToLower().Contains(query);
+            for (int f = 0; f < flows.Length; f++) {
+                for (int k = 0; k < Kinds.Order.Length; k++) {
+                    string kind = Kinds.Order[k];
+                    bool headed = false;
 
-                if (hasSearch) {
-                    if (isMatch && data.Ctrl != null && activeFlow != null) {
-                        data.Ctrl.Visible = true;
-                        activeFlow.Controls.Add(data.Ctrl);
-                    } else if (data.Ctrl != null) {
-                        data.Ctrl.Visible = false;
-                    }
-                } else {
-                    // Restore to original tab flows
-                    if (data.Ctrl != null) {
-                        data.Ctrl.Visible = true;
-                        // Experimental wins over the ini section, exactly as it does
-                        // when the tabs are first built. Routing on Section alone
-                        // here is what emptied the Experimental tab: the first tab
-                        // switch moved both switches onto Graphics & Sound and
-                        // UI & Lua and left the tab with nothing but its note.
-                        if (data.Experimental) {
-                            experimentalFlow.Controls.Add(data.Ctrl);
-                        } else {
-                            switch (data.Section) {
-                                case "General": generalFlow.Controls.Add(data.Ctrl); break;
-                                case "UI_Lua": uiLuaFlow.Controls.Add(data.Ctrl); break;
-                                case "Combat_Net": combatNetFlow.Controls.Add(data.Ctrl); break;
-                                case "Graphics_Sound": graphicsSoundFlow.Controls.Add(data.Ctrl); break;
-                            }
+                    foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
+                        SettingItem data = pair.Value;
+                        if (data.Ctrl == null || !data.Ctrl.Visible) continue;
+                        if (FlowFor(data) != flows[f]) continue;
+                        if (Kinds.Of(data.Key, data.Experimental) != kind) continue;
+
+                        if (!headed && !hasSearch) {
+                            flows[f].Controls.Add(MakeGroupHeader(Kinds.Heading(kind)));
+                            headed = true;
                         }
+                        data.Ctrl.Text = hasSearch ? (kind + " " + pair.Key) : pair.Key;
+                        flows[f].Controls.Add(data.Ctrl);
                     }
                 }
             }
+        }
+
+        private Label MakeGroupHeader(string text) {
+            Label l = new Label();
+            l.Text = text;
+            l.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+            l.ForeColor = Color.FromArgb(110, 122, 140);
+            l.AutoSize = true;
+            l.Margin = new Padding(6, 14, 5, 4);
+            l.BackColor = Color.Transparent;
+            return l;
         }
 
         private TabPage CreateTabPage(string title) {
@@ -1017,13 +1203,141 @@ namespace WowOptimizeLauncher {
             return tp;
         }
 
-        private DarkButton CreateCategoryButton(string text) {
-            DarkButton btn = new DarkButton(CyanAccent, false);
-            btn.Text = text;
-            btn.Size = new Size(tabs.Width - 60, 28);
-            btn.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
-            btn.Margin = new Padding(5, 5, 5, 12);
-            return btn;
+        
+        // Which tab a switch belongs on. Both the initial build and the search
+        // filter route through here, because they are the two places that have
+        // already drifted apart once and emptied a tab between them.
+        //
+        // There is no Experimental tab any more. It was a maturity axis wearing
+        // a category tab's clothes, and it held nearly half the switches, so
+        // the four real categories were half empty and nothing could be found
+        // where its name said it would be. Maturity is a property of a switch,
+        // not a place to keep it, so it is a mark on the row instead - [!] for
+        // what should help and has not been proven.
+        private FlowLayoutPanel FlowFor(SettingItem data) {
+            switch (data.Section) {
+                case "General":        return generalFlow;
+                case "UI_Lua":         return uiLuaFlow;
+                case "Combat_Net":     return combatNetFlow;
+                case "Graphics_Sound": return graphicsSoundFlow;
+            }
+            return generalFlow;
+        }
+
+        // A quiet heading over a run of buttons. Returns the height it used so
+        // the caller's running y stays the only place that knows the layout.
+        private int AddSectionLabel(Control parent, string text, int y) {
+            Label l = new Label();
+            l.Text = text;
+            l.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+            l.ForeColor = Color.FromArgb(110, 122, 140);
+            l.AutoSize = true;
+            l.Location = new Point(17, y);
+            l.BackColor = Color.Transparent;
+            parent.Controls.Add(l);
+            return l.PreferredHeight + 4;
+        }
+
+        // The switches that make a log able to answer a question, rather than
+        // only say that something happened. Every one of them records; none of
+        // them changes what the game does.
+        //
+        // Deliberately not in here: the A/B harness, which turns features on and
+        // off underneath you and would make a bug come and go, and No Client
+        // Patches, which removes the patches rather than describing them. Both
+        // are diagnostics and neither belongs in "I have a bug, record it".
+        private static readonly string[] FullLoggingKeys = new string[] {
+            "SessionLogs", "FlightRecorder", "NetDiag", "CpuTopology",
+            "SamplingProfiler", "AddonProfiler", "LuaCompileCensus",
+            "AnimCensus", "DrawCensus", "ShadowStateProbe"
+        };
+
+        // SamplingProfiler is the one that costs the most and the one nothing
+        // else turns on, so it is what the button reads its state from.
+        private bool FullLoggingOn() {
+            SettingItem anchor = FindByKey("SamplingProfiler");
+            return anchor != null && anchor.Ctrl != null && anchor.Ctrl.Checked;
+        }
+
+        private void ToggleFullLogging() {
+            bool turnOn = !FullLoggingOn();
+            for (int i = 0; i < FullLoggingKeys.Length; i++) {
+                SettingItem item = FindByKey(FullLoggingKeys[i]);
+                if (item != null && item.Ctrl != null) item.Ctrl.Checked = turnOn;
+            }
+            UpdateActiveModulesCount();
+            SaveSettings();
+            UpdateLoggingButton();
+        }
+
+        private void UpdateLoggingButton() {
+            if (btnLogging == null) return;
+            btnLogging.Text = FullLoggingOn() ? "LOGGING: FULL" : "LOGGING: NORMAL";
+        }
+
+        // Every switch off. The one direction that is always safe, and the first
+        // thing to try when something is wrong.
+        private void TurnEverythingOff() {
+            foreach (SettingItem item in settingsMap.Values) {
+                if (item.Ctrl != null) item.Ctrl.Checked = false;
+            }
+            UpdateActiveModulesCount();
+            SaveSettings();
+        }
+
+        private void SaveProfile() {
+            SaveFileDialog sfd = new SaveFileDialog();
+            sfd.Filter = "Configuration Profiles (*.ini)|*.ini";
+            sfd.FileName = "wow_opt_profile.ini";
+            sfd.Title = "Save Configuration Profile";
+            if (sfd.ShowDialog() == DialogResult.OK) {
+                SaveSettingsToPath(sfd.FileName);
+                MessageBox.Show("Saved to:\n" + sfd.FileName, "Profile saved",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private void LoadProfile() {
+            OpenFileDialog ofd = new OpenFileDialog();
+            ofd.Filter = "Configuration Profiles (*.ini)|*.ini";
+            ofd.Title = "Load Configuration Profile";
+            if (ofd.ShowDialog() == DialogResult.OK) {
+                LoadSettingsFromPath(ofd.FileName);
+                MessageBox.Show("Loaded from:\n" + ofd.FileName, "Profile loaded",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        // Straight to the clipboard as ini text, because a bug report needs the
+        // configuration beside the log and retyping 123 switches is how the two
+        // stop matching.
+        private void ShareProfileWithDev() {
+            try {
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("; wow_optimize " + APP_VERSION + " - switches at the time of the report");
+                sb.AppendLine();
+
+                string[] order = new string[] { "General", "UI_Lua", "Combat_Net", "Graphics_Sound" };
+                for (int s = 0; s < order.Length; s++) {
+                    sb.AppendLine("[" + order[s] + "]");
+                    foreach (SettingItem item in settingsMap.Values) {
+                        if (item.Section != order[s]) continue;
+                        sb.AppendLine(item.Key + "=" +
+                                      ((item.Ctrl != null && item.Ctrl.Checked) ? "1" : "0"));
+                    }
+                    sb.AppendLine();
+                }
+
+                Clipboard.SetText(sb.ToString());
+                MessageBox.Show(
+                    "On the clipboard. Paste it with the log file - Logs" + "\\" +
+                    "wow_optimize.log - so the switches and what happened can be read "
+                    + "together.",
+                    "Copied", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            } catch (Exception ex) {
+                MessageBox.Show("Could not copy: " + ex.Message, "Error",
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private DarkCheckBox CreateStyledCheckBox(string name, string tooltipText) {
@@ -1052,86 +1366,68 @@ namespace WowOptimizeLauncher {
 
         // ── Settings Logic ───────────────────────────────────────
 
-        private void ToggleAll(bool enabled) {
+        
+        // The features the A/B harness can measure, by ini key.
+        //
+        // It can only alternate a feature that installed, and a feature installs
+        // only if its own switch is on. On a default install that is two of the
+        // sixteen below, so a tester who ticks A/B and plays for an hour gets a
+        // report about two things. A tester gives this project about one session a
+        // week; that is what this button is for.
+        //
+        // MatrixVectorSse2 belongs in the list precisely because it is known to be
+        // slower than the code it replaces. If a run reports it as faster, the
+        // measurement is what is wrong, and the DLL says so in the log itself.
+        // Every name here must be one a module passes to AbTest::IsSubject,
+        // or the run turns the feature on and the harness never alternates it.
+        // SimdGeometry was in this list and registers no subject; M2MatrixSimd
+        // registers one and was missing. The A/B report prints the names that
+        // did register, so a log says which side drifted.
+        
+        // The counting questions, which are not the same session as the A/B run.
+        //
+        // Counters only. Draw Call Merging is deliberately not here even though
+        // it prints a count: it changes what the renderer sends, and a build of
+        // it put a tester's world on screen as smeared triangles. A button that
+        // says it turns on counters does not turn that on.
+        //
+        // These answer "how much of X is there", not "is X faster". Several of
+        // them cost something to measure - the draw census wraps the busiest call
+        // in the renderer - so running them during an A/B test would move the very
+        // frame times that test is comparing. Two buttons, two sessions.
+        
+        // Every switch that speeds the game up, on. Everything that measures it,
+        // off. See Kinds.NotForSpeed for what else is left off and why.
+        //
+        // This exists because the button that turned everything on read exactly
+        // like the answer to "make it as fast as possible" and was not. A tester
+        // pressed it and got twelve profilers, a census on every draw call, and
+        // an A/B harness rotating eighteen features every twenty seconds. That
+        // button is gone; this one is what it was being mistaken for.
+        private void SetUpMaxPerformance() {
+            int on = 0, off = 0;
             foreach (SettingItem item in settingsMap.Values) {
                 if (item.Ctrl == null) continue;
-                // Turning everything off is always safe and always honoured.
-                // Turning everything on skips the experimental ones on purpose.
-                if (enabled && item.Experimental) continue;
-                item.Ctrl.Checked = enabled;
+                bool want = Kinds.HelpsSpeed(item.Key);
+                item.Ctrl.Checked = want;
+                if (want) on++; else off++;
             }
+            UpdateActiveModulesCount();
+            SaveSettings();
+            MessageBox.Show(
+                on.ToString() + " features on, " + off.ToString() + " left off.\r\n\r\n"
+                + "Off: everything that measures the game, everything that buys "
+                + "frames by changing how it looks or sounds, and the few that "
+                + "were measured against the client and lost.\r\n\r\n"
+                + "Saved. Launch when ready.",
+                "Max Performance", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
-        private void ToggleTabFeatures(string section, bool enabled) {
-            foreach (SettingItem item in settingsMap.Values) {
-                if (item.Section != section || item.Ctrl == null) continue;
-                if (enabled && item.Experimental) continue;
-                item.Ctrl.Checked = enabled;
-            }
-        }
-
-        private void ToggleCategoryAction(string section, DarkButton btn, string labelName) {
-            bool allChecked = true;
-            foreach (SettingItem item in settingsMap.Values) {
-                if (item.Section == section && item.Ctrl != null && !item.Ctrl.Checked) {
-                    allChecked = false;
-                    break;
-                }
-            }
-
-            bool nextState = !allChecked;
-            ToggleTabFeatures(section, nextState);
-            UpdateCategoryButtonTexts();
-        }
-
-        private void UpdateCategoryButtonTexts() {
-            if (settingsMap == null) return;
-
-            if (btnEnableGeneral != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.Section == "General" && item.Ctrl != null && !item.Ctrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableGeneral.Text = all ? "DISABLE ALL IN GENERAL" : "ENABLE ALL IN GENERAL";
-            }
-
-            if (btnEnableUiLua != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.Section == "UI_Lua" && item.Ctrl != null && !item.Ctrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableUiLua.Text = all ? "DISABLE ALL IN UI & LUA" : "ENABLE ALL IN UI & LUA";
-            }
-
-            if (btnEnableCombatNet != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.Section == "Combat_Net" && item.Ctrl != null && !item.Ctrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableCombatNet.Text = all ? "DISABLE ALL IN COMBAT & NET" : "ENABLE ALL IN COMBAT & NET";
-            }
-
-            if (btnEnableGfx != null) {
-                bool all = true;
-                foreach (SettingItem item in settingsMap.Values) {
-                    if (item.Section == "Graphics_Sound" && item.Ctrl != null && !item.Ctrl.Checked) {
-                        all = false;
-                        break;
-                    }
-                }
-                btnEnableGfx.Text = all ? "DISABLE ALL IN GRAPHICS & SOUND" : "ENABLE ALL IN GRAPHICS & SOUND";
-            }
-        }
-
+        
+        
+        
+        
+        
         private void RestoreDefaults() {
             foreach (SettingItem item in settingsMap.Values) {
                 if (item.Ctrl != null) {
@@ -1217,7 +1513,16 @@ namespace WowOptimizeLauncher {
             InheritIfAbsent(present, "Win32ApiCaches", "TimingFix");
             InheritIfAbsent(present, "DebugApiHooks", "CvarNullGuard");
             InheritIfAbsent(present, "LockSpinHooks", "DefragLf");
+            InheritIfAbsent(present, "AsyncWorkerPool", "DefragLf");
+            InheritIfAbsent(present, "ThreadAffinity", "DefragLf");
+            InheritIfAbsent(present, "SimdGeometry", "StrStrSse2");
             InheritIfAbsent(present, "LuaAddonProfile", "SamplingProfiler");
+            // UiScriptHandlerCache and UnitApiFastPath used to inherit UIFrameBatch
+            // here. Their checkboxes are gone because both gate an install that
+            // can only return false, so there is nothing left to inherit and
+            // InheritIfAbsent would find no control anyway. The DLL still reads
+            // both keys and still inherits UIFrameBatch for them; that costs a
+            // branch and turns on nothing.
         }
 
         private void SaveSettingsToPath(string path) {
@@ -1239,6 +1544,44 @@ namespace WowOptimizeLauncher {
                     sections[item.Section].Add(item.Key + "=" + val);
                 }
 
+                // Keys this launcher does not own, carried across.
+                //
+                // The writer below truncates the file and rebuilds it from the
+                // table above, so every key without a tickbox here used to be
+                // destroyed by pressing Save: thirteen boolean settings the DLL
+                // reads, every numeric one - SleepPrecisionValue, SessionLogsToKeep,
+                // FlightRecorderKey, AbTestPeriodMs - and AbTestSubject, which names
+                // the feature an A/B run measures and whose own tooltip tells you to
+                // set it by hand.
+                //
+                // A tester who edited one of those, opened this launcher and saved,
+                // lost it without being told. Anything already in the file whose key
+                // the launcher does not own is kept now, in the section it was found
+                // in.
+                try {
+                    if (File.Exists(path)) {
+                        string current = "General";
+                        foreach (string raw in File.ReadAllLines(path)) {
+                            string line = raw.Trim();
+                            if (line.Length == 0 || line[0] == ';') continue;
+                            if (line[0] == '[' && line[line.Length - 1] == ']') {
+                                current = line.Substring(1, line.Length - 2);
+                                continue;
+                            }
+                            int eq = line.IndexOf('=');
+                            if (eq <= 0) continue;
+                            string key = line.Substring(0, eq).Trim();
+                            if (FindByKey(key) != null) continue;
+                            if (!sections.ContainsKey(current)) continue;
+                            sections[current].Add(key + "=" + line.Substring(eq + 1).Trim());
+                        }
+                    }
+                } catch {
+                    // An unreadable existing file must not stop the save. The owned
+                    // keys are still written; only the carry-over is lost, which is
+                    // what every save did before this.
+                }
+
                 using (StreamWriter sw = new StreamWriter(path, false, Encoding.UTF8)) {
                     sw.WriteLine("; WoW-Optimize Mod Configuration Profile");
                     sw.WriteLine("; Generated by Launcher");
@@ -1257,69 +1600,9 @@ namespace WowOptimizeLauncher {
             }
         }
 
-        private void SaveProfile() {
-            SaveFileDialog sfd = new SaveFileDialog();
-            sfd.Filter = "Configuration Profiles (*.ini)|*.ini";
-            sfd.FileName = "wow_opt_profile.ini";
-            sfd.Title = "Save Configuration Profile";
-            if (sfd.ShowDialog() == DialogResult.OK) {
-                SaveSettingsToPath(sfd.FileName);
-                MessageBox.Show("Profile successfully saved to:\n" + sfd.FileName, "Profile Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-        }
-
-        private void LoadProfile() {
-            OpenFileDialog ofd = new OpenFileDialog();
-            ofd.Filter = "Configuration Profiles (*.ini)|*.ini";
-            ofd.Title = "Load Configuration Profile";
-            if (ofd.ShowDialog() == DialogResult.OK) {
-                LoadSettingsFromPath(ofd.FileName);
-                MessageBox.Show("Profile successfully loaded from:\n" + ofd.FileName, "Profile Loaded", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-        }
-
-        private void ShareProfileWithDev() {
-            try {
-                StringBuilder sb = new StringBuilder();
-                sb.AppendLine("; SUGGESTED SAFE PROFILE PRESET");
-                sb.AppendLine("; Submit to Suprematist");
-                sb.AppendLine();
-
-                Dictionary<string, List<string>> sections = new Dictionary<string, List<string>>() {
-                    { "General", new List<string>() },
-                    { "UI_Lua", new List<string>() },
-                    { "Combat_Net", new List<string>() },
-                    { "Graphics_Sound", new List<string>() }
-                };
-
-                foreach (SettingItem item in settingsMap.Values) {
-                    string val = (item.Ctrl != null && item.Ctrl.Checked) ? "1" : "0";
-                    sections[item.Section].Add(item.Key + "=" + val);
-                }
-
-                foreach (KeyValuePair<string, List<string>> section in sections) {
-                    sb.AppendLine("[" + section.Key + "]");
-                    foreach (string line in section.Value) {
-                        sb.AppendLine(line);
-                    }
-                    sb.AppendLine();
-                }
-
-                Clipboard.SetText(sb.ToString());
-
-                MessageBox.Show(
-                    "Your current profile settings have been copied to the clipboard!\n\n" +
-                    "Please paste and share them with the developer (Suprematist) via Discord or GitHub Issues " +
-                    "to suggest making this profile safe by default in future updates.",
-                    "Profile Copied to Clipboard",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information
-                );
-            } catch (Exception ex) {
-                MessageBox.Show("Failed to copy profile to clipboard: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
+        
+        
+        
         private void CheckForUpdatesAsync() {
             System.Threading.ThreadPool.QueueUserWorkItem(delegate {
                 try {
@@ -1431,6 +1714,10 @@ namespace WowOptimizeLauncher {
         }
 
         private void UpdateActiveModulesCount() {
+            // The logging button reads its state from the switches, so it
+            // follows a preset and a hand-ticked box alike.
+            UpdateLoggingButton();
+
             if (settingsMap == null) return;
             int activeCount = 0;
             foreach (SettingItem item in settingsMap.Values) {
@@ -1444,7 +1731,6 @@ namespace WowOptimizeLauncher {
             if (progressBarPanel != null) {
                 progressBarPanel.Invalidate();
             }
-            UpdateCategoryButtonTexts();
         }
     }
 

@@ -67,9 +67,13 @@
 
 #include <windows.h>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 
 #include "anim_census.h"
+#include "session_verdict.h"
+#include "frame_bench.h"
+#include "../core/world_position.h"
 #include "crash_dumper.h"
 #include "config.h"
 #include "MinHook.h"
@@ -140,6 +144,87 @@ static bool  g_distinctOverflow = false;
 static int  g_peakDistinct   = 0;
 static bool g_everOverflowed = false;
 
+// ---- Would caching the animation result have helped? -----------------------
+//
+// The M2 cluster is about 15% of executing time in the one CPU-bound profile
+// this project has, and bone matrices are a function of the model's animation
+// state. If that state is unchanged from the previous frame the matrices are
+// unchanged too, so a cache could skip the work. Whether there is anything to
+// skip is a measurement, and this is it - the same discipline that killed
+// AnimLod, which declined 94.2% of models and skipped 0.0%.
+//
+// Two things have to be counted apart, because the client already does some of
+// this itself. sub_82F0F0 opens with
+//
+//     mov eax, [esi+10h]  / test al, 1  / jz  out      ; an instance flag
+//     mov ecx, [esi+28h]  / mov edx, [esi+3Ch]
+//     cmp edx, [ecx+14h]  / jz  out                    ; a per-tick stamp
+//
+// so a share of the calls counted here return without doing anything. Those are
+// not work a cache could remove - they are work already removed. Counting them
+// separately is the difference between "models animated" and "models that
+// actually rebuilt their bones".
+//
+// For the rest, the ceiling on what a cache could skip is how often a model is
+// asked for the same animation state two frames running. That is what repeats
+// below counts. It is a ceiling and not a promise: a matching tuple is strong
+// evidence the output matches, not proof, and proving it needs the bone array
+// compared rather than the arguments. If the ceiling turns out to be small the
+// idea is dead and one log says so, which is the cheap half of the work.
+static constexpr int  ANIM_SLOTS = 512;
+struct AnimKey {
+    void*    model;
+    int      a2, a3;
+    uint32_t a4, a5, a6;      // the floats, by bit pattern
+    uint64_t frame;
+};
+static AnimKey g_animKey[ANIM_SLOTS];
+
+static uint64_t g_workCalls   = 0;   // reached past both early exits
+static uint64_t g_skipFlag    = 0;   // the instance flag was clear
+static uint64_t g_skipStamp   = 0;   // the per-tick stamp already matched
+static uint64_t g_repeats     = 0;   // same model, same tuple, previous frame
+static uint64_t g_evictions   = 0;   // a slot held a different model
+
+// Read the two conditions the client tests before doing anything, without
+// repeating its work. Guarded: this runs on every animated model.
+static bool ClassifyEntry(void* This, bool* outFlagClear, bool* outStampMatch) {
+    __try {
+        const uint8_t* m = (const uint8_t*)This;
+        uint32_t flags = *(const uint32_t*)(m + 0x10);
+        *outFlagClear = (flags & 1u) == 0u;
+        if (*outFlagClear) { *outStampMatch = false; return true; }
+        uint32_t owner = *(const uint32_t*)(m + 0x28);
+        if (!owner) return false;
+        *outStampMatch = *(const uint32_t*)(m + 0x3C) == *(const uint32_t*)(owner + 0x14);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void NoteAnimRepeat(void* This, int a2, int a3, float a4, float a5, float a6) {
+    unsigned slot = (unsigned)(((uintptr_t)This >> 4) & (ANIM_SLOTS - 1));
+    AnimKey& k = g_animKey[slot];
+    uint32_t b4, b5, b6;
+    memcpy(&b4, &a4, 4); memcpy(&b5, &a5, 4); memcpy(&b6, &a6, 4);
+
+    if (k.model == This) {
+        // A later frame asking for the same state. Same-frame duplicates are not
+        // counted - the client's own stamp already removes those, and counting
+        // them would inflate the ceiling with work nobody would have done.
+        if (k.frame != g_frames &&
+            k.a2 == a2 && k.a3 == a3 &&
+            k.a4 == b4 && k.a5 == b5 && k.a6 == b6) {
+            g_repeats++;
+        }
+    } else if (k.model) {
+        g_evictions++;
+    }
+    k.model = This; k.a2 = a2; k.a3 = a3;
+    k.a4 = b4; k.a5 = b5; k.a6 = b6; k.frame = g_frames;
+}
+
 // Spread of the candidate per-model position across one frame. If every model
 // reports the same point this stays at zero and there is nothing to drive a
 // distance from.
@@ -152,21 +237,19 @@ static double g_worstSpread = 0.0;
 static int g_samplesLogged = 0;
 static constexpr int MAX_SAMPLES = 16;
 
-// The player's world position, already relied on by perf_diagnostics and
-// predictive_prefetch. Without it the sampled translations are just numbers;
-// with it they can be read as distances, which is the form the answer is
-// actually needed in.
-static float* const g_playerX = (float*)0x00BE1F30;
-static float* const g_playerY = (float*)0x00BE1F34;
-
+// The client's terrain streaming centre. Without a world position the sampled
+// translations are just numbers; with one they can be read as distances, which
+// is the form the answer is actually needed in - this census exists to find out
+// whether a distance is reachable at the animation call site at all.
+//
+// It used to read 0x00BE1F30, which no instruction in wow.exe touches, so every
+// distance printed here before 2026-08-22 is a distance from the map origin.
 static bool ReadPlayerXY(float& px, float& py) {
-    __try {
-        px = *g_playerX;
-        py = *g_playerY;
-        return (px > -64000.0f && px < 64000.0f && py > -64000.0f && py < 64000.0f);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+    float pos[3];
+    if (!WowWorld::StreamCentre(pos)) return false;
+    px = pos[0];
+    py = pos[1];
+    return true;
 }
 
 static void NoteDistinct(void* m) {
@@ -227,12 +310,24 @@ static uint32_t BoneCountOf(void* This) {
     }
 }
 
-static int __fastcall Hooked_AnimateModel(void* This, void* edx,
-                                          int a2, int a3, float a4, float a5, float a6) {
-    if (!g_active || GetCurrentThreadId() != g_mainThreadId)
-        return orig_AnimateModel(This, edx, a2, a3, a4, a5, a6);
-
+// The accounting, split out of the hook so AnimLod can hand it the calls when
+// that module owns the address instead. Everything in here reads the arguments
+// and the model and writes nothing the client can see.
+static void NoteCallInner(void* This, int a2, int a3, float a4, float a5, float a6) {
     InterlockedIncrement(&g_callsThisFrame);
+
+    // Before anything else: which of the client's two early exits this call
+    // would take, and whether its animation state repeats a previous frame's.
+    bool flagClear = false, stampMatch = false;
+    if (ClassifyEntry(This, &flagClear, &stampMatch)) {
+        if (flagClear)       g_skipFlag++;
+        else if (stampMatch) g_skipStamp++;
+        else {
+            g_workCalls++;
+            NoteAnimRepeat(This, a2, a3, a4, a5, a6);
+        }
+    }
+
     uint32_t bones = BoneCountOf(This);
     if (bones) InterlockedExchangeAdd(&g_bonesThisFrame, (LONG)bones);
 
@@ -268,10 +363,14 @@ static int __fastcall Hooked_AnimateModel(void* This, void* edx,
             // one of these two distances will look like a plausible yardage and
             // will differ between models.
             float px, py;
-            if (ReadPlayerXY(px, py)) {
+            if (!ReadPlayerXY(px, py)) {
+                Log("[AnimCensus]            no world position available for "
+                    "this sample, so neither translation can be read as a "
+                    "distance");
+            } else {
                 double dl = sqrt((double)(loc[0] - px) * (loc[0] - px) +
                                  (double)(loc[1] - py) * (loc[1] - py));
-                Log("[AnimCensus]            player at %.1f %.1f -> %.1f yd from "
+                Log("[AnimCensus]            camera at %.1f %.1f -> %.1f yd from "
                     "the this+180 translation", px, py, dl);
                 if (haveArg) {
                     double da = sqrt((double)(arg[0] - px) * (arg[0] - px) +
@@ -281,6 +380,15 @@ static int __fastcall Hooked_AnimateModel(void* This, void* edx,
             }
         }
     }
+
+}
+
+static int __fastcall Hooked_AnimateModel(void* This, void* edx,
+                                          int a2, int a3, float a4, float a5, float a6) {
+    if (!g_active || GetCurrentThreadId() != g_mainThreadId)
+        return orig_AnimateModel(This, edx, a2, a3, a4, a5, a6);
+
+    NoteCallInner(This, a2, a3, a4, a5, a6);
 
     // Sampled timing. Note this measures the call including everything it
     // recurses into, which is what a level-of-detail decision would actually
@@ -327,8 +435,50 @@ void OnFrame() {
     }
 }
 
+// Read from AnimLod's naked thunk, so a byte rather than a bool through a
+// function call.
+extern "C" unsigned char g_animCensusPiggyback = 0;
+
+// Called from AnimLod's hook when that module owns sub_82F0F0. Same accounting,
+// no hook of our own, and no timing: the timing wraps the original call and
+// AnimLod's thunk makes that call in assembly, sometimes not at all.
+extern "C" void __cdecl AnimCensus_NoteCall(void* This, int a2, int a3,
+                                            float a4, float a5, float a6) {
+    if (!g_active || !g_animCensusPiggyback) return;
+    if (GetCurrentThreadId() != g_mainThreadId) return;
+    NoteCallInner(This, a2, a3, a4, a5, a6);
+}
+
 bool Init() {
     if (!Config::g_settings.OptAnimCensus) return true;
+
+    // AnimLod hooks this same function. Two of our modules on one address means
+    // whichever installs first wins and the other logs what reads as a failure
+    // of the target - the collision this project has a guard for. Both have real
+    // switches, so a tester can tick both and get a silent race.
+    //
+    // The census yields, because it only measures and the other one is a feature
+    // a player asked for. Saying so is the point: an absent census with AnimLod
+    // on is a decision, and an absent census with AnimLod off would be a defect.
+    if (Config::g_settings.OptAnimLod) {
+        // Both switched on used to mean the census silently stood down, and a
+        // tester wanting both numbers had to run two sessions - which is why
+        // neither number has ever arrived. The two are wanted together: this
+        // says what the animation work is made of, and AnimLod's own report
+        // says how much of it a distance rule would have been allowed to skip.
+        //
+        // So the census rides along instead. AnimLod hands it every call from
+        // inside its own hook and nothing is hooked twice.
+        g_animCensusPiggyback = 1;
+        g_active = true;
+        CrashDumper::RegisterFeature("AnimCensus");
+        Log("[AnimCensus] riding along inside AnimLod's hook on sub_%08X, "
+            "because both are switched on and one address takes one hook. "
+            "Everything is counted except the sampled timing, which wraps the "
+            "call AnimLod makes in assembly and sometimes does not make.",
+            (unsigned)ADDR_AnimateModel);
+        return true;
+    }
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
@@ -362,6 +512,18 @@ void LogStats() {
     double avgBones = g_sumBones / (double)g_frames;
     double avgNs    = (g_sampledCount > 0) ? (g_sampledNs / (double)g_sampledCount) : 0.0;
 
+    if (g_animCensusPiggyback) {
+        Log("[AnimCensus] counted from inside AnimLod's hook this session, so "
+            "there is no per-model timing below. Everything else is here, and "
+            "AnimLod's own report carries the share a distance rule would have "
+            "been allowed to skip.");
+    } else {
+        Log("[AnimCensus] AnimLod was off, so this says what the animation work "
+            "is made of and nothing says how much of it a distance rule could "
+            "have skipped. Switching both on gives both numbers in one session: "
+            "the census rides inside AnimLod's hook rather than standing down.");
+    }
+
     Log("[AnimCensus] %.1f models/frame (peak %ld), %.0f bones/frame (peak %ld), "
         "%.0f bones per model, over %llu presented frames that animated something "
         "(%llu presented with nothing to animate)",
@@ -370,10 +532,55 @@ void LogStats() {
         (unsigned long long)g_frames, (unsigned long long)g_idleFrames);
 
     if (g_sampledCount > 0) {
+        double msPerFrame = avgNs * avgCalls / 1e6;
         Log("[AnimCensus] %.2f us per model measured over %llu sampled calls, so "
             "about %.2f ms/frame at the average model count",
-            avgNs / 1000.0, (unsigned long long)g_sampledCount,
-            avgNs * avgCalls / 1e6);
+            avgNs / 1000.0, (unsigned long long)g_sampledCount, msPerFrame);
+
+        // The arithmetic that has to hold: one part of a frame cannot take longer
+        // than the frame. This instrument once reported 72 ms of animation inside
+        // a 53 ms frame, because it closed its frame on a tick that a busy client
+        // stops running - so its frame count fell while the per-frame work it
+        // divided by that count did not, and every figure above inflated together.
+        //
+        // FrameBench counts presented frames from D3D9 Present and is the honest
+        // denominator to check against. A zero median means it has not measured
+        // anything yet, which is not the same as a fast frame, so nothing is said.
+        double frameMs = FrameBench::MedianMs();
+        if (frameMs > 0.0 && msPerFrame > frameMs) {
+            Verdict::Add(Verdict::Warn,
+                         "the animation census claims %.1f ms per frame inside a "
+                         "%.1f ms frame - suspect its frame count",
+                         msPerFrame, frameMs);
+            Log("[AnimCensus] that is more than the whole frame: FrameBench has "
+                "the median at %.2f ms. One part of a frame cannot outlast it, so "
+                "the frame count here is wrong rather than the timing - the last "
+                "time this happened the census was closing its frame on a tick a "
+                "busy client stops running.", frameMs);
+        }
+    }
+
+    uint64_t entries = g_workCalls + g_skipFlag + g_skipStamp;
+    if (entries) {
+        Log("[AnimCensus] of %llu calls: %llu rebuilt bones, %llu returned on the "
+            "instance flag, %llu returned because the per-tick stamp already "
+            "matched. Only the first group is work a cache could remove.",
+            (unsigned long long)entries, (unsigned long long)g_workCalls,
+            (unsigned long long)g_skipFlag, (unsigned long long)g_skipStamp);
+    }
+    if (g_workCalls) {
+        Log("[AnimCensus] %llu of those %llu (%.1f%%) were the same model asked "
+            "for the same animation state as in an earlier frame. That is the "
+            "CEILING on what caching the result could skip, not a promise - a "
+            "matching argument tuple is evidence the bones match, and proving it "
+            "needs the bone array compared. %llu lookups hit a slot held by a "
+            "different model and could not be judged.",
+            (unsigned long long)g_repeats, (unsigned long long)g_workCalls,
+            100.0 * (double)g_repeats / (double)g_workCalls,
+            (unsigned long long)g_evictions);
+        if (g_repeats * 20 < g_workCalls)
+            Log("[AnimCensus]   under five percent - caching the animation result "
+                "is not worth building, and this is the log that says so.");
     }
 
     // The two numbers that decide whether level of detail is possible here.

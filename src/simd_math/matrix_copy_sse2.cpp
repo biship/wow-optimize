@@ -10,6 +10,7 @@
 #include <cmath>
 #include "version.h"
 #include "matrix_copy_sse2.h"
+#include "ab_test.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -18,8 +19,12 @@ extern "C" void Log(const char* fmt, ...);
 // Both hooked functions run on the main WoW thread only;
 // atomic overhead would dwarf the work itself.
 // ================================================================
-static volatile long g_matcopy_calls = 0;
-static volatile long g_matident_calls = 0;
+// Whether the hooks went in, so the report can tell "never reached" from
+// "never installed".
+static bool g_matrixInstalled = false;
+
+static volatile unsigned long g_matcopy_calls = 0;
+static volatile unsigned long g_matident_calls = 0;
 
 // ================================================================
 // Original function pointers
@@ -35,25 +40,26 @@ typedef float* (__cdecl* MatMul_t)(float* result, float* a, float* b);
 static MatCopy_t     pOrigMatCopy     = nullptr;
 static MatIdentity_t pOrigMatIdentity = nullptr;
 static MatMul_t      pOrigMatMul      = nullptr;
-static volatile long g_matmul_calls   = 0;
+static volatile unsigned long g_matmul_calls   = 0;   // low word, wraps
+static volatile unsigned long g_matmul_wraps   = 0;   // how many times it has
 
 typedef float* (__cdecl* MatVec3Mul_t)(float* result, const float* vec3, const float* matrix44);
 typedef float* (__cdecl* MatVec4Mul_t)(float* result, const float* vec4, const float* matrix44);
 
 static MatVec3Mul_t  pOrigMatVec3Mul  = nullptr;
 static MatVec4Mul_t  pOrigMatVec4Mul  = nullptr;
-static volatile long g_matvec3_calls  = 0;
-static volatile long g_matvec4_calls  = 0;
+static volatile unsigned long g_matvec3_calls  = 0;
+static volatile unsigned long g_matvec4_calls  = 0;
 
 // sub_4C1C40: quaternion -> 3x3 rotation block, both operands on the stack.
 typedef float* (__cdecl* QuatToMatrix_t)(const float* quat, float* dest);
 static QuatToMatrix_t pOrigQuatToMatrix = nullptr;
-static volatile long  g_quat2mat_calls  = 0;
+static volatile unsigned long  g_quat2mat_calls  = 0;
 
 // sub_4C1DE0: __thiscall wrapper, ECX = destination matrix, quaternion on the stack.
 typedef float* (__fastcall* QuatToMatrixFull_t)(float* dest, void* edx, const float* quat);
 static QuatToMatrixFull_t pOrigQuatToMatrixFull = nullptr;
-static volatile long      g_quat2matfull_calls  = 0;
+static volatile unsigned long      g_quat2matfull_calls  = 0;
 
 // ================================================================
 // Precomputed identity matrix rows for the SSE2 store path
@@ -68,7 +74,16 @@ static const __m128 kIdentityRow3 = { 0.0f, 0.0f, 0.0f, 1.0f };
 // Original does 16 scalar FPU load/store pairs.
 // 4x SSE2 unaligned 128-bit moves cover all 64 bytes.
 // ================================================================
-static float* __fastcall HookMatrixCopy(float* self, void* /*edx*/, float* src) {
+// Set at init when the A/B harness names this module.
+//
+// These three hooks sit on the busiest maths in the client - 247 call sites for
+// the copy, 66 for the multiply, 53 for the identity - and none has ever been
+// measured against the client doing the same work. Each stands aside on an OFF
+// stint and is timed on both, because none is a large enough share of a frame
+// for frame time on its own to separate.
+static bool g_abSubject = false;
+
+static float* __fastcall HookMatrixCopyBody(float* self, void* /*edx*/, float* src) {
     ++g_matcopy_calls;
 
     uintptr_t s = (uintptr_t)self;
@@ -89,12 +104,24 @@ static float* __fastcall HookMatrixCopy(float* self, void* /*edx*/, float* src) 
     return pOrigMatCopy(self, nullptr, src);
 }
 
+// The detour proper. Split from the body so the A/B harness can time the
+// call: a scope guard closing that sample on every return path cannot live in
+// a function containing __try, which the body does.
+static float* __fastcall HookMatrixCopy(float* self, void* edx, float* src) {
+    if (!g_abSubject) return HookMatrixCopyBody(self, edx, src);
+    unsigned long long abTick = AbTest::TickIn();
+    float* r = AbTest::StandAside() ? pOrigMatCopy(self, edx, src)
+                                    : HookMatrixCopyBody(self, edx, src);
+    AbTest::TickOut(abTick);
+    return r;
+}
+
 // ================================================================
 // sub_407F40: 4x4 matrix identity (53 xrefs)
 // Original writes 16 immediate floats through the FPU.
 // 4x SSE2 stores from compile-time constants.
 // ================================================================
-static float* __fastcall HookMatrixIdentity(float* self, void* /*edx*/) {
+static float* __fastcall HookMatrixIdentityBody(float* self, void* /*edx*/) {
     ++g_matident_calls;
 
     uintptr_t s = (uintptr_t)self;
@@ -111,6 +138,18 @@ static float* __fastcall HookMatrixIdentity(float* self, void* /*edx*/) {
     }
 
     return pOrigMatIdentity(self, nullptr);
+}
+
+// The detour proper. Split from the body so the A/B harness can time the
+// call: a scope guard closing that sample on every return path cannot live in
+// a function containing __try, which the body does.
+static float* __fastcall HookMatrixIdentity(float* self, void* edx) {
+    if (!g_abSubject) return HookMatrixIdentityBody(self, edx);
+    unsigned long long abTick = AbTest::TickIn();
+    float* r = AbTest::StandAside() ? pOrigMatIdentity(self, edx)
+                                    : HookMatrixIdentityBody(self, edx);
+    AbTest::TickOut(abTick);
+    return r;
 }
 
 // ================================================================
@@ -216,8 +255,18 @@ static bool SelfTestMatrixMultiply() {
     return true;
 }
 
-static float* __cdecl HookMatrixMultiply(float* result, float* a, float* b) {
-    ++g_matmul_calls;
+static float* __cdecl HookMatrixMultiplyBody(float* result, float* a, float* b) {
+    // A field log printed "multiply -199339142". A negative call count is not a
+    // number, and the only reason it was readable at all is that the arithmetic
+    // that must hold - a count is not negative - was checked. Signed 32 bits
+    // ran out: this hook took just over four billion calls in three hours,
+    // about four thousand a frame.
+    //
+    // Unsigned buys one more bit and would still wrap inside a long evening, so
+    // the low word carries a wrap counter beside it, the same shape the draw
+    // census uses for primitives. The test is one compare that is never taken
+    // until it is.
+    if (++g_matmul_calls == 0) ++g_matmul_wraps;
 
     uintptr_t r = (uintptr_t)result, pa = (uintptr_t)a, pb = (uintptr_t)b;
     if (r > 0x10000 && r < 0xFFE00000 &&
@@ -234,6 +283,18 @@ static float* __cdecl HookMatrixMultiply(float* result, float* a, float* b) {
         }
     }
     return pOrigMatMul(result, a, b);
+}
+
+// The detour proper. Split from the body so the A/B harness can time the
+// call: a scope guard closing that sample on every return path cannot live in
+// a function containing __try, which the body does.
+static float* __cdecl HookMatrixMultiply(float* result, float* a, float* b) {
+    if (!g_abSubject) return HookMatrixMultiplyBody(result, a, b);
+    unsigned long long abTick = AbTest::TickIn();
+    float* r = AbTest::StandAside() ? pOrigMatMul(result, a, b)
+                                    : HookMatrixMultiplyBody(result, a, b);
+    AbTest::TickOut(abTick);
+    return r;
 }
 
 #if !TEST_DISABLE_QUAT_MATRIX_SSE2
@@ -558,7 +619,7 @@ static float* __cdecl Hooked_MatVec4Mul(float* result, const float* vec4, const 
 typedef void (__fastcall* Vec3Norm_t)(float* self, void* edx);
 static Vec3Norm_t pOrigVec3Norm     = nullptr;  // sub_4C3420 (unguarded)
 static Vec3Norm_t pOrigVec3NormSafe = nullptr;  // sub_4C3600 (mag^2 > 2^-22 guard)
-static volatile long g_vec3norm_calls = 0;
+static volatile unsigned long g_vec3norm_calls = 0;
 
 // 2^-22, the engine's near-zero magnitude cutoff in sub_4C3600 (flt_9EA27C, the
 // same constant the quaternion normalise uses). It is loaded with `fld dword`
@@ -729,7 +790,7 @@ static void __fastcall Hooked_Vec3NormSafe(float* self, void* edx) {
 #if !TEST_DISABLE_MATRIX_EXT_SSE2
 typedef float* (__fastcall* MatTranspose_t)(float* self, void* edx, float* out);
 static MatTranspose_t pOrigMatTranspose = nullptr;
-static volatile long g_mattranspose_calls = 0;
+static volatile unsigned long g_mattranspose_calls = 0;
 
 static float* __fastcall Hooked_MatTranspose(float* self, void* edx, float* out) {
     ++g_mattranspose_calls;
@@ -762,7 +823,7 @@ static float* __fastcall Hooked_MatTranspose(float* self, void* edx, float* out)
 #if !TEST_DISABLE_MATRIX_EXT_SSE2
 typedef void (__fastcall* Scale3x3_t)(float* self, void* edx, float scalar);
 static Scale3x3_t pOrigScale3x3 = nullptr;
-static volatile long g_scale3x3_calls = 0;
+static volatile unsigned long g_scale3x3_calls = 0;
 
 static void __fastcall Hooked_Scale3x3(float* self, void* edx, float scalar) {
     ++g_scale3x3_calls;
@@ -805,7 +866,7 @@ static void __fastcall Hooked_Scale3x3(float* self, void* edx, float scalar) {
 // and stores 4 rows of 4 floats with zero/one padding.
 typedef float* (__fastcall* MatFrom3x3_t)(float* self, void* edx, float* src3x3);
 static MatFrom3x3_t pOrigMatFrom3x3 = nullptr;
-static volatile long g_matfrom3x3_calls = 0;
+static volatile unsigned long g_matfrom3x3_calls = 0;
 
 static float* __fastcall Hooked_MatFrom3x3(float* self, void* edx, float* src) {
     ++g_matfrom3x3_calls;
@@ -829,7 +890,7 @@ static float* __fastcall Hooked_MatFrom3x3(float* self, void* edx, float* src) {
 
 typedef float* (__cdecl* PointXformIP_t)(float* a1, float* a2, float* a3);
 static PointXformIP_t pOrigPointXformIP = nullptr;
-static volatile long g_pointxformip_calls = 0;
+static volatile unsigned long g_pointxformip_calls = 0;
 
 static float* __cdecl Hooked_PointXformInPlace(float* a1, float* a2, float* a3) {
     ++g_pointxformip_calls;
@@ -919,7 +980,7 @@ static float* __cdecl Hooked_PointXformInPlace(float* a1, float* a2, float* a3) 
 #if !TEST_DISABLE_MATRIX_INVERT_SSE2
 typedef float* (__fastcall* MatInvRigid_t)(float* self, void* edx, float* out);
 static MatInvRigid_t pOrigMatInvRigid = nullptr;
-static volatile long g_matinvrigid_calls = 0;
+static volatile unsigned long g_matinvrigid_calls = 0;
 
 // The arithmetic alone, so the shadow check exercises the same code the hook
 // runs rather than a second copy of it that could drift.
@@ -1012,7 +1073,7 @@ static float* __fastcall Hooked_MatInvertRigid(float* self, void* edx, float* ou
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
 typedef float* (__cdecl* MatScalarMul_t)(float* out, float* src, float scalar);
 static MatScalarMul_t pOrigMatScalarMul = nullptr;
-static volatile long g_matscalarmul_calls = 0;
+static volatile unsigned long g_matscalarmul_calls = 0;
 
 typedef float* (__cdecl* RowAffinePoint_t)(float* out, float* mat, float* pt);
 static RowAffinePoint_t pOrigRowAffinePoint = nullptr;
@@ -1043,32 +1104,58 @@ static float* __cdecl Hooked_MatScalarMul(float* out, float* src, float scalar) 
 // sub_4C2210: row-major affine 3D point transform  __cdecl(out3, mat16, pt3)  (6 xrefs)
 // ================================================================
 // out_i = mat[4i]*p.x + mat[4i+1]*p.y + mat[4i+2]*p.z + mat[4i+3], i=0..2.
-// (Row-vector form: each output row dotted with the homogeneous point (p,1).)
-// Transposing the three matrix rows with a zeroed 4th yields column vectors whose
-// linear combination px*c0 + py*c1 + pz*c2 + c3 reproduces exactly those products;
-// lane3 stays 0 and is never stored. Reads only mat[0..11] + pt[0..2]; writes 3
-// floats. Same four products as the FPU original (summation order sub-ULP).
+//
+// This used to say "same four products as the FPU original (summation order
+// sub-ULP)". That was asserted and it was false, which is what CLAUDE.md records
+// about every "sub-ULP" comment written here. Measured over 2000000 random
+// transforms with the translation at map scale, against a reference in Python
+// doubles rounding to single only where the client stores:
+//
+//     packed single, one association for all three lanes
+//         73.272% of components exact, 26.084% off by one ULP,
+//         0.53% off by two or more, worst absolute 1.953e-03
+//     scalar double, the client's own per-row association
+//         100.0000% exact, worst 0.000e+00
+//
+// Two millimetres in world units at the extreme, and the ULP tail runs to five
+// figures where the result lands near zero and cancellation makes an ULP tiny.
+//
+// The association is not one association. Read off sub_4C2210: row 0 computes
+// ((M0*px) + ((M1*py) + (M2*pz))) + M3, and rows 1 and 2 compute
+// ((M5*py) + ((M4*px) + (M6*pz))) + M7 - the row-0 lane leads with px and the
+// other two lead with py. A packed form has to give all three lanes the same
+// order, so it cannot match, and the transpose that made the vector version
+// possible is what made it wrong.
+//
+// Scalar double per row instead. x87 under MSVC carries 53 bits and so does a
+// double, so each row reproduces the client operation for operation and the
+// single rounding on store lands where the client's fstp does. No speed gain is
+// claimed: this is 18 scalar SSE2 operations against about 15 x87 ones with
+// stack shuffling between them, and sub_4C2210 has four callers. What changes
+// is that the answer is the client's answer.
 static float* __cdecl Hooked_RowAffinePoint(float* out, float* mat, float* pt) {
     ++g_matscalarmul_calls;  // shared misc-ops counter
     uintptr_t o = (uintptr_t)out, m = (uintptr_t)mat, p = (uintptr_t)pt;
     if (o > 0x10000 && o < 0xFFE00000 && m > 0x10000 && m < 0xFFE00000 &&
         p > 0x10000 && p < 0xFFE00000) {
         __try {
-            __m128 r0 = _mm_loadu_ps(mat);       // M0..M3
-            __m128 r1 = _mm_loadu_ps(mat + 4);   // M4..M7
-            __m128 r2 = _mm_loadu_ps(mat + 8);   // M8..M11
-            __m128 r3 = _mm_setzero_ps();
-            float px = pt[0], py = pt[1], pz = pt[2];
-            // r0=(M0,M4,M8,0)=col0  r1=(M1,M5,M9,0)=col1  r2=(M2,M6,M10,0)=col2
-            //                                              r3=(M3,M7,M11,0)=col3
-            _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
-            __m128 res = _mm_add_ps(
-                _mm_add_ps(_mm_mul_ps(_mm_set1_ps(px), r0),
-                           _mm_mul_ps(_mm_set1_ps(py), r1)),
-                _mm_add_ps(_mm_mul_ps(_mm_set1_ps(pz), r2), r3));  // (out0,out1,out2,0)
-            _mm_store_ss(out,     res);
-            _mm_store_ss(out + 1, _mm_shuffle_ps(res, res, _MM_SHUFFLE(1, 1, 1, 1)));
-            _mm_store_ss(out + 2, _mm_shuffle_ps(res, res, _MM_SHUFFLE(2, 2, 2, 2)));
+            const double px = (double)pt[0];
+            const double py = (double)pt[1];
+            const double pz = (double)pt[2];
+            const double m0 = (double)mat[0],  m1 = (double)mat[1];
+            const double m2 = (double)mat[2],  m3 = (double)mat[3];
+            const double m4 = (double)mat[4],  m5 = (double)mat[5];
+            const double m6 = (double)mat[6],  m7 = (double)mat[7];
+            const double m8 = (double)mat[8],  m9 = (double)mat[9];
+            const double mA = (double)mat[10], mB = (double)mat[11];
+
+            // Row 0 leads with px; rows 1 and 2 lead with py. That is what the
+            // x87 stack does at 0x4C2219, 0x4C2235 and 0x4C2250 respectively,
+            // and the difference between the two shapes is why one packed
+            // expression cannot serve all three.
+            out[0] = (float)(((m0 * px) + ((m1 * py) + (m2 * pz))) + m3);
+            out[1] = (float)(((m5 * py) + ((m4 * px) + (m6 * pz))) + m7);
+            out[2] = (float)(((m9 * py) + ((m8 * px) + (mA * pz))) + mB);
             return out;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
@@ -1091,7 +1178,7 @@ static float* __cdecl Hooked_RowAffinePoint(float* out, float* mat, float* pt) {
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
 typedef float* (__fastcall* MatTranslate_t)(float* self, void* edx, float* vec3);
 static MatTranslate_t pOrigMatTranslate = nullptr;
-static volatile long g_mattranslate_calls = 0;
+static volatile unsigned long g_mattranslate_calls = 0;
 
 static float* __fastcall Hooked_MatTranslateLocal(float* self, void* edx, float* vec3) {
     ++g_mattranslate_calls;
@@ -1129,6 +1216,14 @@ static float* __fastcall Hooked_MatTranslateLocal(float* self, void* edx, float*
 // Install hooks
 // ================================================================
 bool InstallMatrixCopySSE2() {
+    g_abSubject = AbTest::IsSubject("M2MatrixSimd", &g_abSubject);
+    if (g_abSubject) {
+        Log("[MatrixSSE2] under A/B test: the copy, the identity and the "
+            "multiply alternate on and off in stints, and AbTest reports both "
+            "the frame times and the cost of each call either way. The "
+            "correctness checks are unaffected.");
+    }
+
 #if !TEST_DISABLE_MATRIX_COPY
     struct HookDef {
         void*       addr;
@@ -1329,10 +1424,73 @@ bool InstallMatrixCopySSE2() {
     Log("[MatrixSSE2] CMatrix::TranslateLocal DISABLED via feature flag");
 #endif
 
+    g_matrixInstalled = true;
 #if !TEST_DISABLE_MATRIX_COPY
     return installed == (int)(sizeof(hooks) / sizeof(hooks[0]));
 #else
     return true;
+#endif
+}
+
+// ================================================================
+// Statistics
+// ================================================================
+//
+// Fifteen counters, printed only from ShutdownMatrixCopySSE2 until now, which
+// nothing calls - the DLL leaves through TerminateProcess and the linker had
+// dropped the whole function. M2MatrixSimd is an A/B subject, and a subject
+// whose call counts cannot be read cannot answer "was its hot path reached
+// during the OFF stint", which is the question that decides whether a null
+// result means anything.
+//
+// One line, because fifteen lines of two-digit numbers is not a report. The
+// counts are plain increments on hot paths and are lower bounds.
+void MatrixCopySSE2_LogStats(void) {
+    if (!g_matrixInstalled) {
+        Log("[MatrixSSE2] not measured: the hooks are not installed.");
+        return;
+    }
+    // Summed as a double. Adding fifteen 32-bit counters into a sixteenth
+    // 32-bit word is how the total wrapped in the first place, and the fix for
+    // one term is not a fix for their sum.
+    const double mul = (double)g_matmul_wraps * 4294967296.0
+                     + (double)g_matmul_calls;
+    const double total =
+        (double)g_matcopy_calls + (double)g_matident_calls + mul +
+        (double)g_matvec3_calls + (double)g_matvec4_calls +
+        (double)g_quat2mat_calls + (double)g_quat2matfull_calls +
+        (double)g_vec3norm_calls + (double)g_mattranspose_calls +
+        (double)g_scale3x3_calls + (double)g_matfrom3x3_calls +
+        (double)g_pointxformip_calls + (double)g_matinvrigid_calls
+#if !TEST_DISABLE_MATRIX_MISC_SSE2
+        + (double)g_matscalarmul_calls
+#endif
+#if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
+        + (double)g_mattranslate_calls
+#endif
+        ;
+    if (total == 0.0) {
+        Log("[MatrixSSE2] measured and zero: the hooks are in and the client "
+            "reached none of them.");
+        return;
+    }
+    Log("[MatrixSSE2] %.0f call(s) through the SSE2 matrix hooks, lower bounds: "
+        "copy %lu, identity %lu, multiply %.0f, matvec3 %lu, matvec4 %lu, "
+        "quat2mat %lu, quat2mat-fused %lu, vec3normalize %lu",
+        total, g_matcopy_calls, g_matident_calls, mul,
+        g_matvec3_calls, g_matvec4_calls, g_quat2mat_calls,
+        g_quat2matfull_calls, g_vec3norm_calls);
+    Log("[MatrixSSE2]   transpose %lu, scale3x3 %lu, from3x3 %lu, "
+        "pointxform-in-place %lu, invert-rigid %lu",
+        g_mattranspose_calls, g_scale3x3_calls, g_matfrom3x3_calls,
+        g_pointxformip_calls, g_matinvrigid_calls);
+    // These two are behind feature flags that are off, so the counters do not
+    // exist in this build and neither does a line claiming they are zero.
+#if !TEST_DISABLE_MATRIX_MISC_SSE2
+    Log("[MatrixSSE2]   scalar-mul %lu", g_matscalarmul_calls);
+#endif
+#if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
+    Log("[MatrixSSE2]   translate-local %lu", g_mattranslate_calls);
 #endif
 }
 
@@ -1348,7 +1506,7 @@ void ShutdownMatrixCopySSE2() {
 #if !TEST_DISABLE_QUAT_MATRIX_SSE2
     MH_DisableHook((void*)0x004C1C40);
     MH_DisableHook((void*)0x004C1DE0);
-    Log("[MatrixSSE2] Stats: QuatToMatrix core=%ld  fused wrapper=%ld",
+    Log("[MatrixSSE2] Stats: QuatToMatrix core=%lu  fused wrapper=%lu",
         g_quat2mat_calls, g_quat2matfull_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_VECTOR_SSE2
@@ -1358,30 +1516,30 @@ void ShutdownMatrixCopySSE2() {
 #if !TEST_DISABLE_VEC_NORMALIZE_SSE2
     MH_DisableHook((void*)0x004C3420);
     MH_DisableHook((void*)0x004C3600);
-    Log("[MatrixSSE2] Stats: Vec3Normalize=%ld", g_vec3norm_calls);
+    Log("[MatrixSSE2] Stats: Vec3Normalize=%lu", g_vec3norm_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_EXT_SSE2
     MH_DisableHook((void*)0x004C23D0);
     MH_DisableHook((void*)0x004C2300);
     MH_DisableHook((void*)0x004C1BF0);
     MH_DisableHook((void*)0x004C3680);
-    Log("[MatrixSSE2] Stats: Transpose=%ld  PointXformIP=%ld  Scale3x3=%ld  From3x3=%ld",
+    Log("[MatrixSSE2] Stats: Transpose=%lu  PointXformIP=%lu  Scale3x3=%lu  From3x3=%lu",
         g_mattranspose_calls, g_pointxformip_calls, g_scale3x3_calls, g_matfrom3x3_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_INVERT_SSE2
     MH_DisableHook((void*)0x004C2FC0);
-    Log("[MatrixSSE2] Stats: InvertRigid=%ld", g_matinvrigid_calls);
+    Log("[MatrixSSE2] Stats: InvertRigid=%lu", g_matinvrigid_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
     MH_DisableHook((void*)0x004C2120);
     MH_DisableHook((void*)0x004C2210);
-    Log("[MatrixSSE2] Stats: MatrixMisc(ScalarMul+RowAffine)=%ld", g_matscalarmul_calls);
+    Log("[MatrixSSE2] Stats: MatrixMisc(ScalarMul+RowAffine)=%lu", g_matscalarmul_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
     MH_DisableHook((void*)0x004C1B30);
-    Log("[MatrixSSE2] Stats: TranslateLocal=%ld", g_mattranslate_calls);
+    Log("[MatrixSSE2] Stats: TranslateLocal=%lu", g_mattranslate_calls);
 #endif
 
-    Log("[MatrixSSE2] Stats: MatrixCopy=%ld  MatrixIdentity=%ld  MatrixMul=%ld  MatVec3=%ld  MatVec4=%ld",
+    Log("[MatrixSSE2] Stats: MatrixCopy=%lu  MatrixIdentity=%lu  MatrixMul=%lu  MatVec3=%lu  MatVec4=%lu",
         g_matcopy_calls, g_matident_calls, g_matmul_calls, g_matvec3_calls, g_matvec4_calls);
 }

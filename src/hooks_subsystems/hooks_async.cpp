@@ -14,6 +14,7 @@
 #include "MinHook.h"
 #include "version.h"
 #include "hooks_async.h"
+#include "config.h"
 
 typedef unsigned char _BYTE;
 typedef unsigned short _WORD;
@@ -373,7 +374,15 @@ extern "C" char __cdecl Hooked_ParticleEmitterUpdate(int a1, int a2, int a3, int
 #define ADDR_ADT_CHUNK_LOAD 0x007D9A20
 #endif
 
-#define TEST_DISABLE_ADT_PREFETCH 1  // Enabled!
+// 1 is DISABLED under this project's flag convention, so the ADT prefetcher in
+// this module does not run and has not for as long as this line has read "1".
+// The comment beside it said "Enabled!", which is the reverse, and a bisection
+// flag whose comment contradicts its value answers the question it exists for
+// falsely - the same defect that had fifteen of these removed in 3.18.2.
+//
+// Left at 1. The dedicated terrain module owns this function and is the thing to
+// switch on; the guard below keeps that true if anyone flips this back.
+#define TEST_DISABLE_ADT_PREFETCH 1
 
 // LRU cache for prefetched terrain data
 static constexpr int ADT_CACHE_SLOTS = 64;
@@ -606,17 +615,32 @@ bool InstallAsyncHooks(void) {
     g_tasksQueued = g_tasksProcessed = g_tasksDropped = 0;
     ::memset((void*)g_tasksByType, 0, sizeof(g_tasksByType));
 
-    // The async task pool only has producers if at least one of the offload
-    // hooks below is wired to a real address. They are all still 0x0 placeholders,
-    // so EnqueueTask is never called -- spawning the worker pool would just leave
-    // idle threads spinning on the event wait. Skip it until a hook is filled in.
-    const bool anyAsyncHook =
-        (ADDR_PARTICLE_EMITTER_UPDATE | ADDR_ADT_CHUNK_LOAD |
-         ADDR_DBC_LOAD_DISPATCH | ADDR_CDATASTORE_PROCESS) != 0;
-    if (!anyAsyncHook) {
+    // The pool is worth starting only if something can put work in it.
+    //
+    // This used to ask whether any of the four offload addresses was non-zero,
+    // and it stopped protecting anything the day they were filled in. The
+    // addresses are real now - 0x007C2700, 0x007D9A20, 0x006337D0 - while all
+    // four offload paths are still compiled out behind their own flags, so the
+    // guard read "wired" and the branch below became unreachable. Two threads
+    // were created every session to block on an event nothing ever sets: the
+    // only EnqueueTask call site in this file is inside the ADT prefetch, which
+    // is one of the paths that is off.
+    //
+    // Idle threads are not free here. Each reserves a megabyte of stack in the
+    // low 2GB, which is the half this client allocates from and the half that
+    // has run out on three tester machines. Ask about producers instead.
+    const bool anyProducer =
+        (!TEST_DISABLE_PARTICLE_ASYNC && ADDR_PARTICLE_EMITTER_UPDATE) ||
+        (!TEST_DISABLE_ADT_PREFETCH   && ADDR_ADT_CHUNK_LOAD)          ||
+        (!TEST_DISABLE_DBC_PARALLEL   && ADDR_DBC_LOAD_DISPATCH)       ||
+        (!TEST_DISABLE_CDATA_ASYNC    && ADDR_CDATASTORE_PROCESS);
+    if (!anyProducer) {
         g_asyncInit = true;          // allow Shutdown()/stats to run as no-ops
         memset(g_adtCache, 0, sizeof(g_adtCache));
-        Log("[AsyncHooks] Worker pool: not started (no offload hooks wired)");
+        Log("[AsyncHooks] Worker pool: not started. Every offload path is "
+            "compiled out, so nothing would queue a task and the threads would "
+            "wait for the life of the session. The switch is on and this is "
+            "what it does today.");
         return true;
     }
 
@@ -688,8 +712,16 @@ bool InstallAsyncHooks(void) {
 
     Log("[AsyncHooks] Worker pool: %d threads, %d task slots", ASYNC_POOL_WORKERS, TASK_QUEUE_SIZE);
 
+    // 0x007D9A20 is claimed by async_terrain_loader.cpp as well, which is a whole
+    // terrain feature built around it rather than the single prefetch hook here.
+    // Whichever initialised first used to win and the other logged a duplicate, so
+    // which of the two a player got depended on link order. The dedicated module
+    // wins by name now.
     #if !TEST_DISABLE_ADT_PREFETCH
-    if (ADDR_ADT_CHUNK_LOAD) {
+    if (ADDR_ADT_CHUNK_LOAD && Config::g_settings.OptAsyncTerrainLoader) {
+        Log("[AsyncHooks] ADT prefetcher: leaving 0x%08X to AsyncTerrainLoader, "
+            "which owns this function", ADDR_ADT_CHUNK_LOAD);
+    } else if (ADDR_ADT_CHUNK_LOAD) {
         if (WineSafe_CreateHook((void*)ADDR_ADT_CHUNK_LOAD, (void*)Hooked_sub_7D9A20, (void**)&orig_AdtChunkLoad) == MH_OK) {
             if (WO_EnableHook((void*)ADDR_ADT_CHUNK_LOAD) == MH_OK) {
                 Log("[AsyncHooks] Hook installed: ADT prefetcher (0x%08X)", ADDR_ADT_CHUNK_LOAD);

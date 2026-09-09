@@ -241,8 +241,11 @@ static BOOL WINAPI Hooked_WriteFile_SV(HANDLE hFile, LPCVOID lpBuffer, DWORD nBy
 }
 
 bool InstallSavedVarsAsync() {
-    Log("[SavedVarsAsync] Bypassed for stability (standard OS buffered writing enabled).");
-    return true;
+    Log("[SavedVarsAsync] Bypassed for stability (standard OS buffered writing "
+        "enabled).");
+    // False, because it did not install. True put it in the feature summary as
+    // a working feature.
+    return false;
 }
 
 void ShutdownSavedVarsAsync() {

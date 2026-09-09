@@ -35,9 +35,16 @@
 #include <cstdio>
 
 #include "lua_compile_census.h"
+// For handing compile time to the loading screen it fell inside.
+namespace LoadingState {
+    bool IsLoading();
+    void NoteCompile(double ms, bool repeat);
+}
 #include "MinHook.h"
 #include "version.h"
 #include "config.h"
+#include "flight_recorder.h"
+#include "session_verdict.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -85,6 +92,10 @@ static uint64_t g_totalBytes = 0;
 static uint32_t g_overflow = 0;
 static int      g_reports  = 0;
 
+// A column in the flight recorder. A UI reload compiles thousands of chunks
+// in a handful of frames, and a per-window count cannot show that shape.
+static int      g_frSlot   = -1;
+
 // Whether the same *source* keeps being compiled, which is the question a cache
 // turns on and which counting by name cannot answer.
 //
@@ -104,6 +115,27 @@ static int      g_seenUsed  = 0;
 static uint64_t g_dupCount  = 0;
 static uint64_t g_dupBytes  = 0;
 static bool     g_seenFull  = false;
+
+// How long the compiling actually takes, split the same way.
+//
+// The census has been reporting that most compiles are of source already
+// compiled, in chunks and in kilobytes, and neither of those is a saving. A
+// cache that removed every repeat would save the time those repeats spent, and
+// nothing measured that - so "69% of compiles are removable" has been sitting
+// there for weeks with no way to decide whether it is worth removing.
+//
+// Only the outermost call is timed. luaL_loadbuffer calls lua_load and both are
+// hooked here, so timing each would count the inner one twice; the depth counter
+// is checked before the original runs and the clock is only read on the way in
+// and out of the outer one. Main thread only, so a plain int is right.
+static LARGE_INTEGER g_qpcFreq   = {};
+static int      g_depth      = 0;
+static double   g_msFirst    = 0.0;
+static double   g_msRepeat   = 0.0;
+static uint64_t g_timedFirst = 0;
+static uint64_t g_timedRepeat= 0;
+static double   g_msWorst    = 0.0;
+static char     g_worstName[72] = {};
 
 // Returns true when this exact source has been compiled before.
 static bool SeenBefore(uint64_t h) {
@@ -163,16 +195,22 @@ static void DescribeChunk(const char* name, const char* buf, size_t sz,
     out[w] = '\0';
 }
 
-static void Record(const char* name, const char* buf, size_t sz) {
+// Returns true when this exact source had been compiled before, so the caller
+// can put the time it took into the right bucket.
+static bool Record(const char* name, const char* buf, size_t sz, char* labelOut,
+                   size_t labelOutSize) {
     char label[72];
     __try {
         DescribeChunk(name, buf, sz, label, sizeof(label));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return;
+        return false;
     }
+    if (labelOut && labelOutSize) lstrcpynA(labelOut, label, (int)labelOutSize);
+    bool repeat = false;
 
     ++g_total;
     g_totalBytes += (uint64_t)sz;
+    FlightRecorder::Bump(g_frSlot);
 
     // Hash the source itself, capped so a pathologically large chunk cannot make
     // this the expensive part of a compile.
@@ -180,7 +218,7 @@ static void Record(const char* name, const char* buf, size_t sz) {
         __try {
             size_t hn = sz < 4096 ? sz : 4096;
             uint64_t ch = Fnv1a(buf, hn) ^ ((uint64_t)sz * 0x9E3779B97F4A7C15ULL);
-            if (SeenBefore(ch)) { ++g_dupCount; g_dupBytes += (uint64_t)sz; }
+            if (SeenBefore(ch)) { repeat = true; ++g_dupCount; g_dupBytes += (uint64_t)sz; }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
@@ -190,67 +228,130 @@ static void Record(const char* name, const char* buf, size_t sz) {
     int idx = (int)(k % SLOTS);
     for (int probe = 0; probe < SLOTS; ++probe) {
         Entry& e = g_tab[idx];
-        if (e.key == k) { ++e.count; e.bytes += sz; return; }
+        if (e.key == k) { ++e.count; e.bytes += sz; return repeat; }
         if (e.key == 0) {
             e.key = k; e.count = 1; e.bytes = sz;
             lstrcpynA(e.name, label, sizeof(e.name));
             ++g_used;
-            return;
+            return repeat;
         }
         idx = (idx + 1) % SLOTS;
     }
     ++g_overflow;
+    return repeat;
+}
+
+// The clock around the client's own compile. Reads QPC twice per outermost
+// compile and nothing at all for a nested one.
+static void NoteCompileTime(const LARGE_INTEGER& a, bool repeat, const char* label) {
+    if (!g_qpcFreq.QuadPart) return;
+    LARGE_INTEGER bnow;
+    QueryPerformanceCounter(&bnow);
+    double ms = (double)(bnow.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+    if (repeat) { g_msRepeat += ms; ++g_timedRepeat; }
+    else        { g_msFirst  += ms; ++g_timedFirst;  }
+    // A loading screen is 97% something other than file I/O and this is the
+    // largest known candidate, so hand it over while one is up.
+    if (LoadingState::IsLoading()) LoadingState::NoteCompile(ms, repeat);
+    if (ms > g_msWorst) {
+        g_msWorst = ms;
+        lstrcpynA(g_worstName, label && *label ? label : "(unnamed)",
+                  (int)sizeof(g_worstName));
+    }
 }
 
 static int __cdecl Hooked_luaL_loadbuffer(lua_State* L, const char* buf, size_t sz,
                                           const char* name) {
-    if (g_active) Record(name, buf, sz);
-    return orig_luaL_loadbuffer(L, buf, sz, name);
+    if (!g_active) return orig_luaL_loadbuffer(L, buf, sz, name);
+
+    char label[72] = {};
+    bool repeat = Record(name, buf, sz, label, sizeof(label));
+
+    const bool outer = (g_depth == 0);
+    LARGE_INTEGER a = {};
+    if (outer) QueryPerformanceCounter(&a);
+    ++g_depth;
+    int r = orig_luaL_loadbuffer(L, buf, sz, name);
+    --g_depth;
+    if (outer) NoteCompileTime(a, repeat, label);
+    return r;
 }
 
 static int __cdecl Hooked_lua_load(lua_State* L, lua_Reader reader, void* data,
                                    const char* name) {
     // Only a load streaming from a plain buffer has something to describe; the
     // reader identifies it, and its user data is the {s, size} pair.
-    if (g_active) {
-        if ((uintptr_t)reader == ADDR_getS && data) {
-            __try {
-                LoadS* ls = (LoadS*)data;
-                Record(name, ls->s, ls->size);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-            }
-        } else {
-            Record(name, nullptr, 0);
+    if (!g_active) return orig_lua_load(L, reader, data, name);
+
+    char label[72] = {};
+    bool repeat = false;
+    if ((uintptr_t)reader == ADDR_getS && data) {
+        __try {
+            LoadS* ls = (LoadS*)data;
+            repeat = Record(name, ls->s, ls->size, label, sizeof(label));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
+    } else {
+        repeat = Record(name, nullptr, 0, label, sizeof(label));
     }
-    return orig_lua_load(L, reader, data, name);
+
+    const bool outer = (g_depth == 0);
+    LARGE_INTEGER a = {};
+    if (outer) QueryPerformanceCounter(&a);
+    ++g_depth;
+    int r = orig_lua_load(L, reader, data, name);
+    --g_depth;
+    if (outer) NoteCompileTime(a, repeat, label);
+    return r;
 }
 
 bool Init() {
     if (!Config::g_settings.OptLuaCompileCensus) return true;
+
+    QueryPerformanceFrequency(&g_qpcFreq);
+    g_frSlot = FlightRecorder::RegisterSlot("luacomp");
+
+    // lua_load first, and luaL_loadbuffer only if that fails.
+    //
+    // This used to be the other way round, and it put an observer in a fight with
+    // the optimisation it exists to justify. Reuse Compiled Scripts hooks
+    // luaL_loadbuffer too - it needs that call to anchor the Proto it kept, or the
+    // collector frees it - and whichever of the two initialised first won the
+    // address. With this census first, that feature logged "luaL_loadbuffer hook
+    // NOT created" and installed nothing, so the one session that could have
+    // measured whether the cache is worth shipping was the one session where the
+    // cache could not run.
+    //
+    // Nothing is lost by yielding. luaL_loadbuffer calls lua_load
+    // unconditionally, passing the getS reader with the same buffer and size, so
+    // every compile still arrives here with its source intact. Only
+    // luaL_loadbuffer's own few instructions fall outside the timing, which at
+    // hundreds of microseconds a compile is not a figure anyone will read.
+    void* inner = (void*)ADDR_lua_load;
+    MH_STATUS st2 = WineSafe_CreateHook(inner, (void*)Hooked_lua_load,
+                                        (void**)&orig_lua_load);
+    if (st2 == MH_OK && WO_EnableHook(inner) == MH_OK) {
+        g_active = true;
+        Log("[LuaCompile] Counting what gets compiled at runtime (lua_load), which "
+            "leaves luaL_loadbuffer free for Reuse Compiled Scripts");
+        return true;
+    }
+    if (st2 == MH_OK) MH_RemoveHook(inner);
+    orig_lua_load = nullptr;
 
     void* outer = (void*)ADDR_luaL_loadbuffer;
     MH_STATUS st = WineSafe_CreateHook(outer, (void*)Hooked_luaL_loadbuffer,
                                        (void**)&orig_luaL_loadbuffer);
     if (st == MH_OK && WO_EnableHook(outer) == MH_OK) {
         g_active = true;
-        Log("[LuaCompile] Counting what gets compiled at runtime (luaL_loadbuffer)");
+        Log("[LuaCompile] Counting what gets compiled at runtime (luaL_loadbuffer "
+            "- lua_load was already detoured by something else). Reuse Compiled "
+            "Scripts cannot install alongside this; run them in separate "
+            "sessions.");
         return true;
     }
     if (st == MH_OK) MH_RemoveHook(outer);
     orig_luaL_loadbuffer = nullptr;
-
-    void* inner = (void*)ADDR_lua_load;
-    MH_STATUS st2 = WineSafe_CreateHook(inner, (void*)Hooked_lua_load,
-                                        (void**)&orig_lua_load);
-    if (st2 == MH_OK && WO_EnableHook(inner) == MH_OK) {
-        g_active = true;
-        Log("[LuaCompile] Counting what gets compiled at runtime (lua_load - "
-            "luaL_loadbuffer was already detoured by something else)");
-        return true;
-    }
-    if (st2 == MH_OK) MH_RemoveHook(inner);
-    orig_lua_load = nullptr;
 
     Log("[LuaCompile] NOT active: neither luaL_loadbuffer (0x%X, status %d) nor "
         "lua_load (0x%X, status %d) could be hooked",
@@ -264,7 +365,17 @@ bool Init() {
 static constexpr uint64_t QUIET_BELOW = 2000;
 
 void LogStats() {
-    if (!g_active || g_total == 0) return;
+    // In the diagnostic run and on by default, so a session with no [LuaCompile]
+    // line in it has to mean something other than "we did not look".
+    if (!g_active) {
+        Log("[LuaCompile] not measured: the census is not installed.");
+        return;
+    }
+    if (g_total == 0) {
+        Log("[LuaCompile] measured and zero: the client compiled no Lua through "
+            "the hooked entry point.");
+        return;
+    }
     if (g_total < QUIET_BELOW && g_reports > 0) return;
 
     ++g_reports;
@@ -339,6 +450,33 @@ void LogStats() {
             g_seenFull ? " (and the seen-set filled, so the real figure is higher)"
                        : "");
     }
+    // The number the share was always standing in for. Kilobytes of repeated
+    // source is not a saving; the time those repeats spent inside the client's
+    // compiler is, and it is the only figure that decides whether a cache is
+    // worth its risk.
+    double msTotal = g_msFirst + g_msRepeat;
+    if (g_msRepeat > 250.0) {
+        Verdict::Add(Verdict::Note,
+                     "%.0f ms of this session went into recompiling Lua the client "
+                     "had already compiled", g_msRepeat);
+    }
+
+    if (g_timedFirst + g_timedRepeat == 0) {
+        Log("[LuaCompile] no compile was timed - the outer entry point was never "
+            "reached, so there is no time figure here, not a zero one");
+    } else {
+        Log("[LuaCompile] %.0f ms inside the client's compiler this session: "
+            "%.0f ms on %llu first compiles, %.0f ms on %llu repeats. The repeat "
+            "half is what a cache could remove; the first half is work that has "
+            "to happen once whatever we do.",
+            msTotal, g_msFirst, (unsigned long long)g_timedFirst,
+            g_msRepeat, (unsigned long long)g_timedRepeat);
+        if (g_timedRepeat)
+            Log("[LuaCompile]   that is %.3f ms per repeat on average, and the "
+                "slowest single compile was %.1f ms (%s)",
+                g_msRepeat / (double)g_timedRepeat, g_msWorst, g_worstName);
+    }
+
     Log("[LuaCompile] A high repeat share means this is removable and worth "
         "caching; a low one means the client really is compiling that much new "
         "source, and a five-figure count on one name is an addon calling "

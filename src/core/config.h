@@ -41,6 +41,13 @@ namespace Config {
         bool OptDefragLf = false;
         bool OptVulkanDXVK = false;
         bool OptTimingFix = false;
+        // Six crash guards, not one, and the key is named after the first of
+        // them: the CVar null write. It also gates the Lua table read guard, the
+        // GUID type check that crashes on battleground load, the object reaper's
+        // null write on unlink, and two more null and bounds checks. The launcher
+        // entry says so now - it used to read "Null Pointer CVar Safeguard", and a
+        // tester turning that off to isolate something would have lost five
+        // unrelated crash fixes without being told.
         bool OptCvarNullGuard = true; // Safe default: enabled
         // Null-callback crash in the client's device callback list. On by
         // default: on a healthy client it is one read-only pointer walk per
@@ -104,6 +111,46 @@ namespace Config {
         bool OptMimallocLarge = false;
         bool OptVaArena = false;   // EXPERIMENTAL opt-in: segregated VirtualAlloc arena (anti-fragmentation)
         bool OptCompatMode = false; // Compatibility: skip aggressive CPU-priority/affinity/working-set tweaks (for VMs/HyperV where they break the connection)
+        // Diagnostic: write nothing into the wow.exe image. Every optimisation
+        // is a patch, so this turns them all off and leaves only the observers
+        // that live outside the client - the socket watch, the crash reporter,
+        // the frame timing. It exists to answer whether a disconnect follows
+        // the patches or happens regardless of them.
+        bool OptNoClientPatches = false;
+        // Per-frame ring the player dumps with a key when something looks
+        // wrong, so a report carries the frames around the moment instead of
+        // the ten-second average that has cost every investigation so far.
+        //
+        // On by default, which is unusual here and deliberate. It writes nothing
+        // at all until a mark, and the three events it marks by itself - a
+        // disconnect, a freeze, a SavedVariables file written under a name
+        // matching no addon - are exactly the ones nobody can press a key for.
+        // Left off, the most useful thing built for these reports would only ever
+        // reach the handful of people who read a changelog and went looking for
+        // the tickbox. The cost when nothing marks it is a 96-byte copy and one
+        // clock read a frame.
+        bool OptFlightRecorder = true;
+        int  FlightRecorderKey = 0x91;   // VK_SCROLL
+        // Frustum culling and quaternion normalise, in SSE2. These used to hang
+        // off OptStrStrSse2 - a switch named after a string search - so anyone who
+        // left "SSE2 Boyer-Moore strstr" off, which is its default, silently lost
+        // both. Inherits that switch when its own key is absent.
+        bool OptSimdGeometry = false;
+        // Two things the Lock-Free Heap Defragmenter switch used to gate that have
+        // nothing to do with defragmenting a heap. Each inherits DefragLf when its
+        // own key is absent, so nobody loses a feature they were already running by
+        // updating. A third, RenderHooks, was split out with them and then removed:
+        // the function it gated installs nothing, so the key decided only whether a
+        // log line appeared.
+        bool OptAsyncWorkerPool = false;
+        bool OptThreadAffinity = false;
+        // Alternates one feature on and off inside a session, so its frame times can
+        // be compared against a control that saw the same zone, the same addons and
+        // the same play. Between two sessions nothing is held still, which is why no
+        // optimization here has a measured gain.
+        bool OptAbTest = false;
+        int  AbTestPeriodMs = 20000;
+        char AbTestSubject[32] = {};
 
         // UI & Lua
         bool OptUIFrameBatch = false;
@@ -139,6 +186,16 @@ namespace Config {
         // two, because neither has run in either version. A tester's log said so
         // plainly and I had not checked.
         bool OptSavedVarsAsync = false;
+        // The key is misnamed and stays misnamed. It gates one thing -
+        // InitDataStoreFastPath, the six CDataStore accessors the client uses to
+        // read fields out of every network packet - and has nothing to do with
+        // SavedVariables or tokenising. The launcher entry says "Network Packet
+        // Reader Fast Paths", which is accurate.
+        //
+        // Renaming the ini key would silently turn the feature off for everyone
+        // who had written the old one, which is the 3.18.1 regression, and it is
+        // not worth that to fix a name only this file sees. It once gated a dozen
+        // unrelated installs; that part is already undone.
         bool OptSavedVarsPretoken = false;
         bool OptUnitAuraFast = false;
         bool OptNetworkGuidSse2 = false;
@@ -190,6 +247,38 @@ namespace Config {
         // asked for. Defaults to whatever DbcLookupCache resolved to, so no
         // install changes behaviour until its owner sets it deliberately.
         bool OptFileIoHooks = false;
+        // The terrain read-ahead. It hung off FileIoHooks, which names the
+        // Win32 file layer and not a prefetcher, and it never ran: its player
+        // coordinate came from an address no instruction in wow.exe writes, so
+        // it took its own zero-coordinate early return on every frame ever.
+        // Now that it has a working coordinate it does real background I/O, and
+        // that has never been tested by anyone. Off by default is not the 3.18.1
+        // mistake of removing a running feature - there is nothing running to
+        // remove.
+        bool OptTerrainPrefetch = false;
+        // Prefetches the next node of the per-frame object tick walk. New, and
+        // it is a cache hint on a hot list, so off until someone has run it.
+        bool OptTickListPrefetch = false;
+        // Makes the GC governor leave Lua's collector at its stock 200/200 and
+        // stop stepping it by hand, so the pace it normally sets can be
+        // measured against doing nothing. Off, because on is what ships today.
+        bool OptLuaGcStockPace = false;
+        // Diagnostic. Samples the tables the collector walks and reports how
+        // many of their slots are empty, which is the number a table compactor
+        // would have to justify itself against.
+        bool OptLuaTableCensus = false;
+        // UIFrameBatch reads as gating four things. Two of them, the message
+        // pump hook and the deferred field updates, are compiled out by
+        // CRASH_TEST_DISABLE_MSGPUMP_RC1 and TEST_DISABLE_DEFERRED_FIELD_UPDATES
+        // and have never run. What it really controls is these two. Issue #36,
+        // the artifacting that made it default off for everyone, can therefore
+        // only have come from one of them, and splitting makes that answerable
+        // in two runs instead of never.
+        //
+        // Both inherit UIFrameBatch, so no install changes behaviour until its
+        // owner sets one of them deliberately.
+        bool OptUiScriptHandlerCache = false;
+        bool OptUnitApiFastPath      = false;
         // The lua_type fast path in hot_patch.cpp, which resolves a positive
         // stack index inline instead of calling the engine's index2adr. It was
         // gated on OptDbcLookupCache as well and has nothing to do with .dbc
@@ -258,7 +347,19 @@ namespace Config {
         // the compiled Proto; the client still builds the closure, environment
         // and taint, so nothing about ownership is shared. Opt-in, and it checks
         // reuses against a fresh compile before trusting itself.
-        bool OptLuaProtoCache = false;
+        // On by default since 3.19.2. A measured session spent 2128 ms inside
+        // the client's Lua compiler and nothing in a default install touched
+        // any of it. A stale Proto is refused by its own fingerprint rather
+        // than handed back, and a state swap drops everything.
+        bool OptLuaProtoCache = true;
+        // The other 1868 ms of that same loading screen: source the session had
+        // never seen, which no cache inside the process can help with. This one
+        // keeps the compiled form on disk between sessions. Off by default -
+        // it writes a file into the game folder and it reconstructs Proto
+        // objects the client itself has no code to read back, so it wants field
+        // evidence before it is anyone's default. Every chunk it rebuilds is
+        // compared against a real parse until a few thousand have matched.
+        bool OptLuaBytecodeStore = false;
         // The object lookup every Lua call into a UI method starts with
         // (sub_4A81B0, 674 call sites). Four Lua API calls replaced by direct
         // reads, including the taint move lua_rawgeti performs. Opt-in, and it
@@ -276,6 +377,93 @@ namespace Config {
         // applied, so this is bit-exact rather than close. Opt-in, and it
         // predicts the client's whole output and compares before trusting itself.
         bool OptCollisionOutcode = false;
+        // The bone matrix upload loop inside sub_829BA0, 3.35% of executing
+        // time and the largest entry in the corrected profile with nothing
+        // shipped against it. Twelve x87 load/store pairs a bone transpose a
+        // 4x4 into three vec4s; four loads, seven shuffles and three stores do
+        // the same. No arithmetic anywhere in it, so bit-exact by construction.
+        // Opt-in, and it does the first bones both ways and compares.
+        bool OptBoneMatrixUpload = false;
+        // Hands mimalloc a block of address space above 2GB so it grows there
+        // instead of into the half a 32-bit client allocates from. Two tester
+        // sessions ended with the low half down to a megabyte while the working
+        // set was under a gigabyte, and one of them wrote a SavedVariables file
+        // under a garbage name. Opt-in, and it refuses to run if the block it
+        // gets back is below 2GB.
+        // Gathers the client's nine-byte file writes into 64KB pieces. A
+        // tester's loading screen spent 2470 ms of 16828 inside 593557 of
+        // them. Opt-in, needs the CloseHandle hook, and checks every closed
+        // file's size against what the client handed over.
+        // On by default since 3.19.2. A tester loading screen spent 2470 ms of
+        // 16828 inside 593557 nine-byte writes, and the module retires itself
+        // for the session the moment a file comes out the wrong size.
+        bool OptClientWriteBatch = true;
+        bool OptMimallocHighArena = false;
+        // The size of each block handed over, and the most that will ever be
+        // handed over in total. One block only postpones the problem: when the
+        // allocator has used it, it reserves from the OS again and the low half
+        // starts filling as before.
+        int  MimallocHighArenaMB = 256;
+        int  MimallocHighArenaMaxMB = 1024;
+        // The box-overlap predicate (sub_78F370) that seventeen culling and
+        // pick functions call once per scene node per pass. Six x87 compares,
+        // each leaving the FPU through fnstsw and a data-dependent branch,
+        // become two packed compares and one movemask. No arithmetic in it at
+        // all, so bit-exact rather than close. Opt-in, and it checks itself
+        // against the client before it stops calling it.
+        bool OptAabbOverlap = false;
+        // The bone rotation track (sub_828680), run once per animated bone per
+        // frame from the largest entry in the main-thread profile. Keyframes are
+        // four uint16 expanded as v * K - 1.0, and x86 has no register path from
+        // an integer to the x87 stack, so the client spills and reloads every
+        // component - up to sixteen times a call. Packed double rounds where the
+        // client rounds, so this is bit-exact. Opt-in, and it compares all
+        // twenty-four output bytes against the client before trusting itself.
+        bool OptAnimQuatUnpack = false;
+        // The Lua pool free (sub_855670). Every block returned to the client's
+        // own Lua pool makes it walk that pool's chunks, two dependent loads
+        // each, until one contains the pointer. Two tester freeze samples landed
+        // on the compare inside that loop. Opt-in, and it predicts against the
+        // client before it skips anything.
+        bool OptLuaPoolFast = false;
+        // The vector animation track (sub_82B0A0). Eight call sites, six of
+        // them inside the largest entry in the main-thread profile, against one
+        // for the quaternion track. Opt-in, and it compares all twenty output
+        // bytes against the client before trusting itself.
+        bool OptAnimVec3Track = false;
+        // The render batch comparator (sub_824B70), 2.44% of executing time in
+        // an uncapped tester profile. It derives one 16-bit key through five
+        // dependent loads on every comparison inside a sort. Opt-in; the
+        // comparator is pure, so both answers are simply compared.
+        bool OptM2SortKey = false;
+        // CFrustum::IsAABBVisible (sub_9839E0), 0.82% of executing time. Most
+        // of it is eighteen sign tests and eighteen dependent loads to pick box
+        // corners, which SSE2 does as a blend. Opt-in; the function is pure so
+        // both answers are simply compared.
+        bool OptFrustumAabb = false;
+        // The segment/box test (sub_7F9480), 0.88% of executing time. The
+        // profile's weight is on a `test ah` waiting for an `fnstsw ax` - the
+        // x87 way of branching on a float compare, ten times over. Opt-in.
+        bool OptSegmentAabb = false;
+        // luaH_get (sub_85C470), 0.67% of executing time, almost all of it
+        // deciding where to hand off. Answering "is this key an integer" costs
+        // three memory round-trips and an fnstsw there. Opt-in; read-only, so
+        // both answers are simply compared.
+        bool OptLuaHGetDispatch = false;
+        // Holds the shadow cascade centre still for longer. Measured cause of
+        // the flicker two testers report below extShadowQuality 5: cascade 0
+        // recentres every two yards and each recentre leaves two thirds of the
+        // map stale. Self-limiting - never drifts past a quarter of the
+        // cascade's own extent. Rides on the shadow probe's hook.
+        bool OptShadowCascadeHold = false;
+        // The SSE2 matrix-vector multiply on sub_4C21B0. Default OFF, and the
+        // reason is in the module's own harness numbers: 3.333 ns against 2.497
+        // ns for the code it replaces, with output bit-identical - worst
+        // relative difference 0.000e+00. A replacement that is slower and
+        // returns the same answer is negative value, and this one runs 5257
+        // times a frame. It also used to be gated on OptStrStrSse2, a string
+        // search switch, so nobody could turn it off on purpose either.
+        bool OptMatrixVectorSse2 = false;
         bool OptWorldStateCoalesce = false;
         bool OptD3d9RenderThread = false;
 
@@ -335,6 +523,19 @@ namespace Config {
         // wraps the hottest call in the renderer, so it is meant to answer the
         // question in one session and be switched off again.
         bool OptDrawCensus = false;
+        // Issues consecutive triangle-list draws that continue each other
+        // in the index buffer, with no state change between them, as one
+        // call. A renderer change: it holds a draw so the next one can join
+        // it. Experimental, off by default.
+        bool OptDrawMerge = false;
+        // Replaces the two sixteen-float matrix slot copies in sub_82F0F0
+        // with four SSE2 moves each. No arithmetic, so the bytes written are
+        // the bytes read.
+        bool OptM2MatrixSlotSse2 = false;
+        // Holds a distant model's skeleton for a frame by taking the
+        // client's own no-bones branch out of the bone loop. The tail still
+        // runs, so materials and attachments keep animating.
+        bool OptM2AnimStride = false;
         // Counts Lua VM allocations by size through G->frealloc. A measurement,
         // like the draw census - it decides whether a dedicated Lua arena is
         // worth building.

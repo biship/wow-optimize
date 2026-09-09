@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include "frame_bench.h"
+#include "flight_recorder.h"
 #include "core/config.h"
 #include "crash_dumper.h"
 #include "version.h"
@@ -103,6 +104,19 @@ static bool          g_ready  = false;
 static constexpr double SLOW_FRAME_FACTOR   = 5.0;    // times the running median
 static constexpr double SLOW_FRAME_FLOOR_MS = 8.0;    // never report below this
 static constexpr DWORD  SLOW_FRAME_QUIET_MS = 2000;   // spacing between reports
+// A spike gets the flight recorder dumped around it when it is both far above
+// the median and long enough to see.
+//
+// A flat 100 ms was the first shape of this and it was wrong at both ends. A
+// session running at 3 ms a frame reported hitches of 42.7 ms - fourteen times
+// the median, a visible stutter - and none of them reached the threshold. A
+// session running at 30 ms a frame would have had every ordinary frame during a
+// zone load qualify.
+//
+// A multiple catches the first and refuses the second. The floor is there
+// because a 25x spike on a 0.5 ms frame is 12 ms, which nobody feels.
+static constexpr double AUTO_MARK_FACTOR    = 10.0;
+static constexpr double AUTO_MARK_FLOOR_MS  = 25.0;
 
 static double g_medianMs      = 0.0;   // refreshed periodically from the histogram
 static double g_p95Ms         = 0.0;   // same walk, so the two are always comparable
@@ -194,6 +208,13 @@ static void NoteRecent(double ms) {
     if (g_recentCount < RECENT_SIZE) g_recentCount++;
 }
 
+void ResetRecent() {
+    g_recentCount = 0;
+    g_recentPos   = 0;
+}
+
+bool RecentWindowFull() { return g_recentCount >= RECENT_SIZE; }
+
 double RecentP95Ms() {
     int n = g_recentCount;
     if (n < 64) return 0.0;          // too early to have an opinion
@@ -252,6 +273,28 @@ static void Accumulate(double ms) {
     Log("[FrameBench] slow frame: %.1f ms (%.1fx the %.2f ms median) - events within it:",
         ms, ms / (g_medianMs > 0.0 ? g_medianMs : 1.0), g_medianMs);
     CrashDumper::DumpTrace(8, window);
+
+    // A 43x spike with "(nothing traced in this window)" under it is the shape
+    // most of these reports take, and it is not the tracer being empty - it is
+    // the tracer only knowing about events something chose to trace. The flight
+    // recorder holds the last 512 frames with a counter column per subsystem,
+    // so the frames around the spike are already sitting in memory; they just
+    // needed someone to ask.
+    //
+    // Only for a spike large enough that nobody would argue about it. A slow
+    // frame at three times the median happens while a zone loads and dumping
+    // 240 frames for each of those would bury the log. The recorder rate limits
+    // nothing itself, so the gate is here.
+    const double autoMarkAt =
+        (g_medianMs > 0.0 && g_medianMs * AUTO_MARK_FACTOR > AUTO_MARK_FLOOR_MS)
+            ? g_medianMs * AUTO_MARK_FACTOR : AUTO_MARK_FLOOR_MS;
+    if (ms >= autoMarkAt && FlightRecorder::IsRecording()) {
+        char why[96];
+        _snprintf(why, sizeof(why) - 1, "frame of %.0f ms, %.0fx the median",
+                  ms, ms / (g_medianMs > 0.0 ? g_medianMs : 1.0));
+        why[sizeof(why) - 1] = 0;
+        FlightRecorder::Mark(why);
+    }
 }
 
 void OnPresent(Source src) {

@@ -5,6 +5,7 @@
 // ============================================================================
 
 #include "lua_optimize.h"
+#include "lua_proto_cache.h"
 // config.h is deliberately NOT included here: this file declares a file-scope
 // object called Config, and a variable cannot share a name with a namespace in
 // the same scope. These two accessors are defined in config.cpp instead.
@@ -38,10 +39,11 @@ extern "C" void ReleaseLoadingArena();
 
 #include "version.h"
 #include "version_checker.h"
+#include "heap_compactor.h"
 
 extern bool g_isMultiClient;
 extern "C" void Log(const char* fmt, ...);
-extern "C" SIZE_T HeapCompactor_GetCachedLargestBlock();
+extern "C" SIZE_T HeapCompactor_GetCachedLowHalf();
 
 // ================================================================
 // Lua 5.1 types and GC constants.
@@ -312,15 +314,35 @@ static long g_luaAllocStats_reallocMigrate = 0;
 // Adaptive GC: track net allocation bytes between frames.
 // This lets StepGC scale collection to match actual allocation pressure,
 // so heavy-addon users (300MB) and light users (100MB) both stay stable.
-static volatile LONG64 g_netAllocBytes = 0;   // net bytes allocated since last reset
-static volatile LONG64 g_frameAllocBytes = 0; // bytes allocated this frame (for smoothing)
+// Plain 32-bit, added to without a lock prefix.
+//
+// This sits in WoW's lua_Alloc, so every Lua object the client or an addon
+// allocates passes through one of the four sites below. It was LONG64 with
+// InterlockedAdd64, which on 32-bit x86 is a lock cmpxchg8b retry loop with a
+// bus lock - the shape that has eaten three optimisations in this project
+// already, twice on the very branch the feature existed to make fast.
+//
+// Signed 32 bits is enough: the value is reset every frame and holds plus or
+// minus two gigabytes, and a frame that nets more than that does not exist.
+// Signed because a free subtracts.
+//
+// The counter is written from the allocator and read once a frame by the GC
+// pacing below, both on the main thread - WoW runs Lua on one thread. A plain
+// `add [mem], reg` is not atomic, so if that ever stops being true an update
+// can be lost, which is the documented trade: a 32-bit increment can only lose
+// one, where add/adc across two words can tear the value into a number that was
+// never true. What reads it is an exponential average feeding a GC step size,
+// and it clamps negatives to zero.
+//
+// The reset stays interlocked. It runs once a frame, not once an allocation.
+static volatile LONG g_netAllocBytes = 0;   // net bytes since the last reset
 
 static void ResetAllocCounter() {
-    InterlockedExchange64(&g_netAllocBytes, 0);
+    InterlockedExchange(&g_netAllocBytes, 0);
 }
 
-static LONG64 GetAndResetNetAlloc() {
-    return InterlockedExchange64(&g_netAllocBytes, 0);
+static LONG GetAndResetNetAlloc() {
+    return InterlockedExchange(&g_netAllocBytes, 0);
 }
 
 static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t nsize) {
@@ -339,7 +361,7 @@ static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t 
                     g_origLuaAlloc(g_origLuaAllocUD, ptr, osize, 0);
                     g_luaAllocStats_freeLegacy++;
                 }
-                InterlockedAdd64(&g_netAllocBytes, -(LONG64)freedSize);
+                g_netAllocBytes -= (LONG)freedSize;
             }
             return NULL;
         }
@@ -348,7 +370,7 @@ static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t 
             g_luaAllocStats_malloc++;
             void* p = mi_malloc(nsize);
             if (p) {
-                InterlockedAdd64(&g_netAllocBytes, (LONG64)nsize);
+                g_netAllocBytes += (LONG)nsize;
             }
             return p;
         }
@@ -358,7 +380,7 @@ static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t 
             size_t oldUsable = mi_usable_size(ptr);
             void* p = mi_realloc(ptr, nsize);
             if (p) {
-                InterlockedAdd64(&g_netAllocBytes, (LONG64)nsize - (LONG64)oldUsable);
+                g_netAllocBytes += (LONG)nsize - (LONG)oldUsable;
             }
             return p;
         }
@@ -369,7 +391,7 @@ static void* __cdecl MimallocLuaAlloc(void* ud, void* ptr, size_t osize, size_t 
             size_t copySize = (osize < nsize) ? osize : nsize;
             memcpy(newPtr, ptr, copySize);
             g_origLuaAlloc(g_origLuaAllocUD, ptr, osize, 0);
-            InterlockedAdd64(&g_netAllocBytes, (LONG64)nsize - (LONG64)osize);
+            g_netAllocBytes += (LONG)nsize - (LONG)osize;
         }
         return newPtr;
     }
@@ -806,7 +828,10 @@ static void StepGC(lua_State* L, double frameMs) {
     // beats ERROR #134. Uses the heap compactor's cached sample (0 = not yet
     // measured -> ignored). Bounded to 8MB/frame so it can't itself stall.
     {
-        SIZE_T vaLargest = HeapCompactor_GetCachedLargestBlock();
+        // Below 2GB, not across the whole space. This read the full-range
+        // figure until 2026-09-02, so in a session whose low half was down to a
+        // 1MB largest block it saw 1237MB and never stepped harder once.
+        SIZE_T vaLargest = HeapCompactor_GetCachedLowHalf();
         if (vaLargest != 0 && vaLargest < 48u * 1024 * 1024) {
             stepKB *= 3;
             if (stepKB > 8192) stepKB = 8192;
@@ -1097,6 +1122,15 @@ static void ReadAddonStateFromLua(lua_State* L) {
     Api.lua_settop(L, topBefore);
 }
 
+// The walk of last resort.
+//
+// VirtualQuery once per region over the whole address space. On a fragmented
+// 3GB space that is tens of thousands of syscalls and tens of milliseconds, and
+// UpdateLuaStats was calling it from a frame up to once a second, all session,
+// for one number an addon displays. The heap compactor's monitor thread already
+// pays for this walk every ten seconds off the main thread, so the only reason
+// left to run it here is that the compactor is switched off - and then once a
+// minute, not once a second.
 static SIZE_T GetLargestFreeBlock() {
     MEMORY_BASIC_INFORMATION mbi;
     SIZE_T largestFree = 0;
@@ -1127,8 +1161,28 @@ static DWORD g_lastMemoryQueryTick = 0;
 static double g_cachedWorkingSetMB = 0.0;
 static double g_cachedCommitMB = 0.0;
 static double g_cachedLargestFreeMB = 0.0;
+// Which way the figure above was obtained, so the periodic report can say. A
+// walk here is main-thread time inside a frame; a hand-over from the monitor
+// thread is three loads.
+static DWORD g_lastOwnWalkTick   = 0;
+static unsigned long g_vaFromMonitor = 0;
+static unsigned long g_vaOwnWalks    = 0;
+static double g_vaOwnWalkMsWorst = 0.0;
 
 extern "C" void FontMetrics_GetStats(long* widthCalls, long* heightCalls);
+
+// Where the fragmentation figure came from, for the periodic report.
+//
+// Three states, not two: handed over by the monitor thread, walked here, or
+// neither because UpdateLuaStats never ran. The caller can tell them apart
+// because the two counts are separate and both can be zero.
+extern "C" void LuaOpt_GetVaSourceStats(unsigned long* fromMonitor,
+                                        unsigned long* ownWalks,
+                                        double* ownWorstMs) {
+    if (fromMonitor) *fromMonitor = g_vaFromMonitor;
+    if (ownWalks)    *ownWalks    = g_vaOwnWalks;
+    if (ownWorstMs)  *ownWorstMs  = g_vaOwnWalkMsWorst;
+}
 
 static void UpdateLuaStats(lua_State* L) {
     if (!Api.lua_pushnumber || !Api.lua_setfield || !Api.lua_gettop || !Api.lua_settop) return;
@@ -1143,7 +1197,30 @@ static void UpdateLuaStats(lua_State* L) {
                 g_cachedWorkingSetMB = (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
                 g_cachedCommitMB = (double)pmc.PagefileUsage / (1024.0 * 1024.0);
             }
-            g_cachedLargestFreeMB = (double)GetLargestFreeBlock() / (1024.0 * 1024.0);
+            // Prefer the monitor thread's result at any age. It walks every ten
+            // seconds, and a ten-second-old fragmentation figure is the same
+            // answer for a number that moves over minutes.
+            SIZE_T largest = 0;
+            unsigned long ageMs = 0;
+            if (HeapCompactor_GetLastLargestFree(&largest, &ageMs)) {
+                g_cachedLargestFreeMB = (double)largest / (1024.0 * 1024.0);
+                ++g_vaFromMonitor;
+            } else if (g_lastOwnWalkTick == 0 ||
+                       now - g_lastOwnWalkTick >= 60000) {
+                LARGE_INTEGER wf, wa, wb;
+                QueryPerformanceFrequency(&wf);
+                QueryPerformanceCounter(&wa);
+                g_cachedLargestFreeMB = (double)GetLargestFreeBlock()
+                                      / (1024.0 * 1024.0);
+                QueryPerformanceCounter(&wb);
+                g_lastOwnWalkTick = now;
+                ++g_vaOwnWalks;
+                if (wf.QuadPart) {
+                    double ms = (double)(wb.QuadPart - wa.QuadPart) * 1000.0
+                              / (double)wf.QuadPart;
+                    if (ms > g_vaOwnWalkMsWorst) g_vaOwnWalkMsWorst = ms;
+                }
+            }
         }
 
         WriteLuaGlobal_Number(L, "LUABOOST_DLL_MEM_KB",      State.luaMemoryKB);
@@ -1834,6 +1911,11 @@ void OnMainThreadSleep(DWORD mainThreadId, double frameMs) {
             g_pendingLuaStateFrames = 1;
             CrashDumper::Trace("LUA state swap (UI reload) - new VM settling");
             Log("[LuaOpt] lua_State changed (UI reload) - waiting for new VM to settle");
+
+            // This detector sees every swap; the proto cache's own l_G
+            // comparison does not, because the client's Lua memory pool hands
+            // the new global state the old one's address. Tell it here.
+            LuaProtoCache::OnLuaStateSwapped();
 
             // CRITICAL FIX: Set swapping flag BEFORE cache invalidation so inline
             // hooks (GetStrInline, RawGetIInline, LuaRawGet) bail out to original

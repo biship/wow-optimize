@@ -33,3 +33,4 @@ wow_opt.ini
 *.ini
 build.ps1
 wow-optimize.code-workspace
+RELEASE_*.md

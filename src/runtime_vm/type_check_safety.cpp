@@ -30,6 +30,10 @@
 extern "C" void Log(const char* fmt, ...);
 
 typedef int (__cdecl* fn_4D4DB0)(int64_t guid, int typeMask);
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static fn_4D4DB0 g_orig_4D4DB0 = nullptr;
 static volatile LONG g_tc_averted = 0;
 static volatile long g_tc_logged  = 0;
@@ -67,7 +71,19 @@ bool InstallTypeCheckSafety()
     CrashDumper::RegisterFeature("TypeCheckSafety");
     CrashDumper::FeatureSetActive("TypeCheckSafety", true);
     Log("[TypeCheckSafety] ACTIVE: SEH-guarding GUID type check sub_4D4DB0 (BG-load crash fix)");
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void TypeCheckSafety_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[TypeCheckSafety] not measured: the guard is not installed.");
+        return;
+    }
+    Log("[TypeCheckSafety] %ld crash(es) averted.", (long)g_tc_averted);
 }
 
 void UninstallTypeCheckSafety()

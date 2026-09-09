@@ -62,6 +62,12 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "MimallocLarge", &Settings::OptMimallocLarge },
     { "General", "VaArena", &Settings::OptVaArena },
     { "General", "CompatMode", &Settings::OptCompatMode },
+    { "General", "NoClientPatches", &Settings::OptNoClientPatches },
+    { "General", "FlightRecorder", &Settings::OptFlightRecorder },
+    { "General", "AbTest", &Settings::OptAbTest },
+    { "Graphics_Sound", "SimdGeometry", &Settings::OptSimdGeometry },
+    { "General", "AsyncWorkerPool", &Settings::OptAsyncWorkerPool },
+    { "General", "ThreadAffinity", &Settings::OptThreadAffinity },
     { "UI_Lua", "UIFrameBatch", &Settings::OptUIFrameBatch },
     { "UI_Lua", "AddonDispatcher", &Settings::OptAddonDispatcher },
     { "UI_Lua", "UIFrameAccessorFast", &Settings::OptUIFrameAccessorFast },
@@ -106,6 +112,12 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "AudioDecodeMt", &Settings::OptAudioDecodeMt },
     { "Graphics_Sound", "DbcLookupCache", &Settings::OptDbcLookupCache },
     { "General", "FileIoHooks", &Settings::OptFileIoHooks },
+    { "General", "TerrainPrefetch", &Settings::OptTerrainPrefetch },
+    { "Graphics_Sound", "TickListPrefetch", &Settings::OptTickListPrefetch },
+    { "UI_Lua", "LuaGcStockPace", &Settings::OptLuaGcStockPace },
+    { "UI_Lua", "LuaTableCensus", &Settings::OptLuaTableCensus },
+    { "UI_Lua", "UiScriptHandlerCache", &Settings::OptUiScriptHandlerCache },
+    { "UI_Lua", "UnitApiFastPath", &Settings::OptUnitApiFastPath },
     { "UI_Lua", "LuaTypeFast", &Settings::OptLuaTypeFast },
     { "General", "Win32ApiCaches", &Settings::OptWin32ApiCaches },
     { "General", "DebugApiHooks", &Settings::OptDebugApiHooks },
@@ -118,9 +130,23 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "ObjMgrFindFast", &Settings::OptObjMgrFindFast },
     { "Graphics_Sound", "QuatLerpSse2", &Settings::OptQuatLerpSse2 },
     { "UI_Lua", "LuaProtoCache", &Settings::OptLuaProtoCache },
+    { "UI_Lua", "LuaBytecodeStore", &Settings::OptLuaBytecodeStore },
     { "UI_Lua", "LuaThisFast", &Settings::OptLuaThisFast },
     { "Graphics_Sound", "AnimLod", &Settings::OptAnimLod },
     { "Graphics_Sound", "CollisionOutcode", &Settings::OptCollisionOutcode },
+    { "Graphics_Sound", "BoneMatrixUpload", &Settings::OptBoneMatrixUpload },
+    { "General", "MimallocHighArena", &Settings::OptMimallocHighArena },
+    { "General", "ClientWriteBatch", &Settings::OptClientWriteBatch },
+    { "Graphics_Sound", "AabbOverlap", &Settings::OptAabbOverlap },
+    { "Graphics_Sound", "AnimQuatUnpack", &Settings::OptAnimQuatUnpack },
+    { "UI_Lua", "LuaPoolFast", &Settings::OptLuaPoolFast },
+    { "Graphics_Sound", "AnimVec3Track", &Settings::OptAnimVec3Track },
+    { "Graphics_Sound", "M2SortKey", &Settings::OptM2SortKey },
+    { "Graphics_Sound", "FrustumAabb", &Settings::OptFrustumAabb },
+    { "Graphics_Sound", "SegmentAabb", &Settings::OptSegmentAabb },
+    { "UI_Lua", "LuaHGetDispatch", &Settings::OptLuaHGetDispatch },
+    { "Graphics_Sound", "ShadowCascadeHold", &Settings::OptShadowCascadeHold },
+    { "Graphics_Sound", "MatrixVectorSse2", &Settings::OptMatrixVectorSse2 },
     { "Graphics_Sound", "WorldStateCoalesce", &Settings::OptWorldStateCoalesce },
     { "Graphics_Sound", "D3d9RenderThread", &Settings::OptD3d9RenderThread },
     { "Combat_Net", "CombatLogFilter", &Settings::OptCombatLogFilter },
@@ -139,6 +165,9 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "QuatNormalizeSse2", &Settings::OptQuatNormalizeSse2 },
     { "Graphics_Sound", "MatrixMultiplySse2", &Settings::OptMatrixMultiplySse2 },
     { "Graphics_Sound", "DrawCensus", &Settings::OptDrawCensus },
+    { "Graphics_Sound", "DrawMerge", &Settings::OptDrawMerge },
+    { "Graphics_Sound", "M2MatrixSlotSse2", &Settings::OptM2MatrixSlotSse2 },
+    { "Graphics_Sound", "M2AnimStride", &Settings::OptM2AnimStride },
     { "UI_Lua", "LuaAllocCensus", &Settings::OptLuaAllocCensus },
     { "Graphics_Sound", "AnimCensus", &Settings::OptAnimCensus },
     { "Graphics_Sound", "HorizonOcclusionSse2", &Settings::OptHorizonOcclusionSse2 },
@@ -201,8 +230,33 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         }
 
         Log("[Config]   [General] SleepPrecisionValue=%d", g_settings.SleepPrecisionValue);
+        Log("[Config]   [General] FlightRecorderKey=0x%02X", g_settings.FlightRecorderKey);
+        Log("[Config]   [General] AbTestSubject='%s' every %d ms",
+            g_settings.AbTestSubject, g_settings.AbTestPeriodMs);
         Log("[Config]   [General] SessionLogsToKeep=%d", g_settings.SessionLogsToKeep);
         Log("[Config] %d set in the file, %d left at defaults.", fromFile, defaulted);
+
+        // The settings with no tickbox.
+        //
+        // Every one of these is read above and can be set, and none of them has
+        // an entry in the launcher - so a tester who is asked to try one has no
+        // way to find it, and until this session the launcher's Save deleted the
+        // line if they wrote it by hand. Listing them is not an invitation to
+        // turn them all on: they are off by default because several have frozen
+        // or crashed a client, and the two that did are named.
+        //
+        // Kept in step by the release check that compares the launcher's
+        // SettingItem list against the keys Config::Load reads. A name here that
+        // has since gained a tickbox is wrong in the harmless direction; one
+        // missing from here is the defect the check exists to catch.
+        Log("[Config] Settings with no launcher entry, set by hand in the ini "
+            "and now preserved when the launcher saves: AddonDispatcher, "
+            "AsyncTerrainLoader, CrtMimalloc, D3d9RenderThread, MimallocLarge, "
+            "MpqAsyncDecompress, NameplateMT, PacketOffload, RcuObjMgr, "
+            "SavedVarsAsync, UnitAuraFast, VaArena, WorldStateCoalesce. "
+            "MimallocLarge has a known heap crash and D3d9RenderThread moves "
+            "draw submission off the main thread; the rest are off because "
+            "nothing has measured them, not because they are known bad.");
 
         if (haveFile) ReportDuplicateKeys(path);
     }
@@ -484,6 +538,25 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptMimallocLarge       = GetPrivateProfileIntA("General", "MimallocLarge", 0, iniPath.c_str()) != 0;
         g_settings.OptVaArena             = GetPrivateProfileIntA("General", "VaArena", 0, iniPath.c_str()) != 0;
         g_settings.OptCompatMode          = GetPrivateProfileIntA("General", "CompatMode", 0, iniPath.c_str()) != 0;
+        g_settings.OptNoClientPatches     = GetPrivateProfileIntA("General", "NoClientPatches", 0, iniPath.c_str()) != 0;
+        g_settings.OptFlightRecorder      = GetPrivateProfileIntA("General", "FlightRecorder", 1, iniPath.c_str()) != 0;
+        g_settings.OptAbTest              = GetPrivateProfileIntA("General", "AbTest", 0, iniPath.c_str()) != 0;
+        // Inheriting DefragLf when absent. A new key defaulting to zero would
+        // silently remove a running feature from everyone who never wrote it,
+        // which is exactly the 3.18.1 regression.
+        {
+            const int inherit = g_settings.OptDefragLf ? 1 : 0;
+            g_settings.OptAsyncWorkerPool = GetPrivateProfileIntA("General", "AsyncWorkerPool", inherit, iniPath.c_str()) != 0;
+            g_settings.OptThreadAffinity  = GetPrivateProfileIntA("General", "ThreadAffinity", inherit, iniPath.c_str()) != 0;
+        }
+        g_settings.AbTestPeriodMs         = GetPrivateProfileIntA("General", "AbTestPeriodMs", 20000, iniPath.c_str());
+        GetPrivateProfileStringA("General", "AbTestSubject", "",
+                                 g_settings.AbTestSubject,
+                                 sizeof(g_settings.AbTestSubject), iniPath.c_str());
+        // 0x91 is Scroll Lock. The client binds no action to it, and a key
+        // works on a loading screen and at character select, where no addon is
+        // running and where two of the open defects appear.
+        g_settings.FlightRecorderKey      = GetPrivateProfileIntA("General", "FlightRecorderKey", 0x91, iniPath.c_str());
         // HARD-DISABLED regardless of ini: in tester logs the arena was active
         // on machines with zero fragmentation (2GB+ largest free block), so it
         // used ~0.2MB of its 64MB and delivered no benefit - while still routing
@@ -535,6 +608,12 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptFastStrnicmpOpt     = GetPrivateProfileIntA("UI_Lua", "FastStrnicmpOpt", 1, iniPath.c_str()) != 0;
         g_settings.OptLuaSNewLstrFast     = GetPrivateProfileIntA("UI_Lua", "LuaSNewLstrFast", 0, iniPath.c_str()) != 0;
         g_settings.OptStrStrSse2          = GetPrivateProfileIntA("Graphics_Sound", "StrStrSse2", 0, iniPath.c_str()) != 0;
+        // Inherits StrStrSse2 when absent, and must be read AFTER it - placed
+        // earlier in this function it would have inherited the struct
+        // initialiser rather than the value in the file, which is the same
+        // defect this key exists to fix.
+        g_settings.OptSimdGeometry        = GetPrivateProfileIntA("Graphics_Sound", "SimdGeometry",
+                                                g_settings.OptStrStrSse2 ? 1 : 0, iniPath.c_str()) != 0;
         g_settings.OptStrCatFast          = GetPrivateProfileIntA("Graphics_Sound", "StrCatFast", 0, iniPath.c_str()) != 0;
         g_settings.OptSoundMixerOpt       = GetPrivateProfileIntA("Graphics_Sound", "SoundMixerOpt", 0, iniPath.c_str()) != 0;
         g_settings.OptAudioDecodeMt       = GetPrivateProfileIntA("Graphics_Sound", "AudioDecodeMt", 0, iniPath.c_str()) != 0;
@@ -544,6 +623,16 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         // existing wow_opt.ini therefore keeps the behaviour it had.
         g_settings.OptFileIoHooks         = GetPrivateProfileIntA("General", "FileIoHooks", g_settings.OptDbcLookupCache ? 1 : 0, iniPath.c_str()) != 0;
         g_settings.OptLuaTypeFast         = GetPrivateProfileIntA("UI_Lua", "LuaTypeFast", g_settings.OptDbcLookupCache ? 1 : 0, iniPath.c_str()) != 0;
+        // Deliberately not inheriting FileIoHooks. See config.h: this one has
+        // never executed, so defaulting it off takes nothing away from anyone.
+        g_settings.OptTerrainPrefetch     = GetPrivateProfileIntA("General", "TerrainPrefetch", 0, iniPath.c_str()) != 0;
+        g_settings.OptTickListPrefetch    = GetPrivateProfileIntA("Graphics_Sound", "TickListPrefetch", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaGcStockPace      = GetPrivateProfileIntA("UI_Lua", "LuaGcStockPace", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaTableCensus      = GetPrivateProfileIntA("UI_Lua", "LuaTableCensus", 0, iniPath.c_str()) != 0;
+        // Inherit UIFrameBatch when absent, which is what these two were
+        // gated on before they had switches of their own.
+        g_settings.OptUiScriptHandlerCache = GetPrivateProfileIntA("UI_Lua", "UiScriptHandlerCache", g_settings.OptUIFrameBatch ? 1 : 0, iniPath.c_str()) != 0;
+        g_settings.OptUnitApiFastPath      = GetPrivateProfileIntA("UI_Lua", "UnitApiFastPath", g_settings.OptUIFrameBatch ? 1 : 0, iniPath.c_str()) != 0;
         // Same inheritance rule as FileIoHooks: each takes the switch it used to
         // hang off as its default, so an existing wow_opt.ini keeps behaving the
         // way it did until its owner writes the new key.
@@ -558,10 +647,31 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptVertexFmtInline     = GetPrivateProfileIntA("Graphics_Sound", "VertexFmtInline", 0, iniPath.c_str()) != 0;
         g_settings.OptObjMgrFindFast      = GetPrivateProfileIntA("General", "ObjMgrFindFast", 0, iniPath.c_str()) != 0;
         g_settings.OptQuatLerpSse2        = GetPrivateProfileIntA("Graphics_Sound", "QuatLerpSse2", 0, iniPath.c_str()) != 0;
-        g_settings.OptLuaProtoCache       = GetPrivateProfileIntA("UI_Lua", "LuaProtoCache", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaProtoCache       = GetPrivateProfileIntA("UI_Lua", "LuaProtoCache", 1, iniPath.c_str()) != 0;
+        g_settings.OptLuaBytecodeStore    = GetPrivateProfileIntA("UI_Lua", "LuaBytecodeStore", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaThisFast         = GetPrivateProfileIntA("UI_Lua", "LuaThisFast", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimLod             = GetPrivateProfileIntA("Graphics_Sound", "AnimLod", 0, iniPath.c_str()) != 0;
         g_settings.OptCollisionOutcode    = GetPrivateProfileIntA("Graphics_Sound", "CollisionOutcode", 0, iniPath.c_str()) != 0;
+        g_settings.OptBoneMatrixUpload    = GetPrivateProfileIntA("Graphics_Sound", "BoneMatrixUpload", 0, iniPath.c_str()) != 0;
+        g_settings.OptMimallocHighArena   = GetPrivateProfileIntA("General", "MimallocHighArena", 0, iniPath.c_str()) != 0;
+        g_settings.OptClientWriteBatch    = GetPrivateProfileIntA("General", "ClientWriteBatch", 1, iniPath.c_str()) != 0;
+        g_settings.MimallocHighArenaMB    = GetPrivateProfileIntA("General", "MimallocHighArenaMB", 256, iniPath.c_str());
+        if (g_settings.MimallocHighArenaMB < 8)    g_settings.MimallocHighArenaMB = 8;
+        if (g_settings.MimallocHighArenaMB > 1024) g_settings.MimallocHighArenaMB = 1024;
+        g_settings.MimallocHighArenaMaxMB = GetPrivateProfileIntA("General", "MimallocHighArenaMaxMB", 1024, iniPath.c_str());
+        if (g_settings.MimallocHighArenaMaxMB < g_settings.MimallocHighArenaMB)
+            g_settings.MimallocHighArenaMaxMB = g_settings.MimallocHighArenaMB;
+        if (g_settings.MimallocHighArenaMaxMB > 2048) g_settings.MimallocHighArenaMaxMB = 2048;
+        g_settings.OptAabbOverlap         = GetPrivateProfileIntA("Graphics_Sound", "AabbOverlap", 0, iniPath.c_str()) != 0;
+        g_settings.OptAnimQuatUnpack      = GetPrivateProfileIntA("Graphics_Sound", "AnimQuatUnpack", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaPoolFast     = GetPrivateProfileIntA("UI_Lua", "LuaPoolFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptAnimVec3Track   = GetPrivateProfileIntA("Graphics_Sound", "AnimVec3Track", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2SortKey       = GetPrivateProfileIntA("Graphics_Sound", "M2SortKey", 0, iniPath.c_str()) != 0;
+        g_settings.OptFrustumAabb     = GetPrivateProfileIntA("Graphics_Sound", "FrustumAabb", 0, iniPath.c_str()) != 0;
+        g_settings.OptSegmentAabb     = GetPrivateProfileIntA("Graphics_Sound", "SegmentAabb", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaHGetDispatch = GetPrivateProfileIntA("UI_Lua", "LuaHGetDispatch", 0, iniPath.c_str()) != 0;
+        g_settings.OptShadowCascadeHold = GetPrivateProfileIntA("Graphics_Sound", "ShadowCascadeHold", 0, iniPath.c_str()) != 0;
+        g_settings.OptMatrixVectorSse2  = GetPrivateProfileIntA("Graphics_Sound", "MatrixVectorSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptWorldStateCoalesce  = GetPrivateProfileIntA("Graphics_Sound", "WorldStateCoalesce", 0, iniPath.c_str()) != 0;
         g_settings.OptD3d9RenderThread    = GetPrivateProfileIntA("Graphics_Sound", "D3d9RenderThread", 0, iniPath.c_str()) != 0;
         // HARD-DISABLED regardless of ini: this offloads D3D9 draw/Present/Reset
@@ -593,6 +703,9 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptQuatNormalizeSse2 = GetPrivateProfileIntA("Graphics_Sound", "QuatNormalizeSse2", 1, iniPath.c_str()) != 0;
         g_settings.OptMatrixMultiplySse2 = GetPrivateProfileIntA("Graphics_Sound", "MatrixMultiplySse2", 1, iniPath.c_str()) != 0;
         g_settings.OptDrawCensus = GetPrivateProfileIntA("Graphics_Sound", "DrawCensus", 0, iniPath.c_str()) != 0;
+        g_settings.OptDrawMerge = GetPrivateProfileIntA("Graphics_Sound", "DrawMerge", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2MatrixSlotSse2 = GetPrivateProfileIntA("Graphics_Sound", "M2MatrixSlotSse2", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2AnimStride = GetPrivateProfileIntA("Graphics_Sound", "M2AnimStride", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaAllocCensus = GetPrivateProfileIntA("UI_Lua", "LuaAllocCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimCensus = GetPrivateProfileIntA("Graphics_Sound", "AnimCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptHorizonOcclusionSse2 = GetPrivateProfileIntA("Graphics_Sound", "HorizonOcclusionSse2", 0, iniPath.c_str()) != 0;

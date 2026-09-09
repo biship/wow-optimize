@@ -199,6 +199,10 @@ static long g_findPlainHits        = 0;
 static long g_findFallbacks        = 0;
 static long g_matchHits            = 0;
 static long g_matchFallbacks       = 0;
+// Of the fallbacks, those turned away on the pattern alone, before the subject
+// string was read. The gap between this and g_matchFallbacks is what still
+// walks a string to reach a decision the pattern could have made.
+static long g_matchPatternMiss     = 0;
 static long g_typeHits             = 0;
 static long g_typeFallbacks        = 0;
 static long g_mathHits             = 0;
@@ -864,6 +868,20 @@ static int __cdecl Hooked_StrFind(lua_State* L) {
     return found ? 2 : 1;
 }
 
+// Every pattern shape Hooked_StrMatch can serve, and nothing else. A superset
+// would only cost a subject scan; a subset would silently retire a fast path,
+// which is what a whitelist of exact lengths did on the first attempt - three
+// of the shapes below are not keyed on one. Kept next to the dispatch it
+// mirrors so the two are read together.
+static inline bool MatchPatternIsHandled(const char* p, size_t pLen) {
+    if (pLen <= 1) return true;                              // empty, and one char
+    if (pLen == 4 || pLen == 9 || pLen == 10) return true;   // the literal shapes
+    if (pLen >= 5 && pLen <= 6 &&
+        p[pLen - 2] == '%' && p[pLen - 1] == '+') return true;
+    if (p[0] == '^' && IsPlainLiteralPattern(p + 1, pLen - 1)) return true;
+    return IsPlainLiteralPattern(p, pLen);
+}
+
 static lua_CFunction_t orig_str_match = nullptr;
 
 static int __cdecl Hooked_StrMatch(lua_State* L) {
@@ -879,6 +897,23 @@ static int __cdecl Hooked_StrMatch(lua_State* L) {
     const char* s = lua_tolstring_(L, 1, &sLen);
     const char* p = lua_tolstring_(L, 2, &pLen);
     if (!s || !p) {
+        g_matchFallbacks++;
+        return orig_str_match(L);
+    }
+
+    // Decide on the pattern before reading the subject.
+    //
+    // A field session put 29,455,944 calls through here and took a fast path on
+    // 59,427 of them - one in five hundred. Every one of the other twenty-nine
+    // million walked the subject byte by byte looking for an embedded NUL, up
+    // to four kilobytes of it, to reach a pattern test that was never going to
+    // match. The pattern is capped at 256 bytes and usually a dozen.
+    //
+    // Handing an unhandled pattern straight to the client changes no result.
+    // The one outcome given up is the nil for an init past the end of the
+    // subject, which the client returns as well.
+    if (pLen > 256 || !MatchPatternIsHandled(p, pLen)) {
+        g_matchPatternMiss++;
         g_matchFallbacks++;
         return orig_str_match(L);
     }
@@ -3792,7 +3827,9 @@ void LogStats() {
     if (g_findPlainHits > 0 || g_findFallbacks > 0)
         Log("[FastPath] Find(plain): %ld fast, %ld fallback", g_findPlainHits, g_findFallbacks);
     if (g_matchHits > 0 || g_matchFallbacks > 0)
-        Log("[FastPath] Match: %ld fast, %ld fallback", g_matchHits, g_matchFallbacks);
+        Log("[FastPath] Match: %ld fast, %ld fallback (%ld of those decided on "
+            "the pattern alone, without reading the subject)",
+            g_matchHits, g_matchFallbacks, g_matchPatternMiss);
     if (g_typeHits > 0 || g_typeFallbacks > 0)
         Log("[FastPath] Type: %ld fast, %ld fallback", g_typeHits, g_typeFallbacks);
     if (g_mathHits > 0 || g_mathFallbacks > 0)

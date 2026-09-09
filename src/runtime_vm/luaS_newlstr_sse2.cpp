@@ -92,6 +92,12 @@ void* __cdecl Hooked_luaS_newlstr(void* L, const char* str, size_t l) {
                 if (CompareStringInline(ts_data, str, l)) {
                     uint8_t marked = *(uint8_t*)(tstring + 9);
                     if (((uint8_t)(~currentwhite) & marked & 3) != 0) {
+                        // Resurrecting a string the collector had already marked
+                        // dead. It is the one thing this fast path does that the
+                        // client's own luaS_newlstr also does, and the riskiest,
+                        // so the report says how often. The counter existed and
+                        // printed a zero nothing wrote to.
+                        g_newlstr_dead++;
                         *(uint8_t*)(tstring + 9) = (uint8_t)(marked ^ 3);
                     }
                     g_newlstr_fast_hits++;
@@ -137,7 +143,8 @@ namespace LuaSNewlstr {
             MH_DisableHook((void*)ADDR_luaS_newlstr);
         }
         if (g_newlstr_calls > 0) {
-            Log("[luaS_newlstr] Stats: Calls %u, Fast Hits %u (%.1f%%), Dead %u", 
+            Log("[luaS_newlstr] Stats: Calls %u, Fast Hits %u (%.1f%%), "
+                "resurrected %u string(s) the collector had marked dead", 
                 g_newlstr_calls, g_newlstr_fast_hits, 
                 100.0 * g_newlstr_fast_hits / g_newlstr_calls, g_newlstr_dead);
         }

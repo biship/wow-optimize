@@ -46,12 +46,62 @@
 // `mov eax, [edx-4]`. That is inside the scan, not in the early-out at 0x489726
 // that this module leaves to the client. The target is the right one.
 //
+// ---------------------------------------------------------------------------
+// Why the case where a dependant IS found cannot be shortcut too
+//
+// The obvious next step is to answer the found case from the same index rather
+// than only the not-found case, and it does not work. Decompiled, the client is:
+//
+//     while (node) {
+//         for each of nine anchor slots a in node:
+//             if (a && !(a->flags & 0x800) && a->owner == this) match = node;
+//         if (match) { move this node to just before `match`; return; }
+//         node = next(node);
+//     }
+//     move this node to the head of the list;
+//
+// The `if (match)` is inside the loop, so it stops at the FIRST NODE carrying an
+// anchor that points at `this` - not the last match in the list. What it computes
+// is therefore a position in the global list: put me immediately before the first
+// thing that depends on me. It is one step of a topological sort.
+//
+// The dependants list at this+0x38 knows which anchors point at `this`, and that
+// is what makes the empty case answerable. It does not know which of their owning
+// nodes comes first in the global list, because it holds them in registration
+// order. Recovering that would need an order key per node, and this very function
+// reorders the list on every call, so any key it maintained would be invalidated
+// by the next relink - including its own.
+//
+// There is a second reason, and it is stronger because it needs no argument about
+// ordering at all: an anchor cannot name the node that owns it.
+//
+// If exactly one node in the whole list carried an accepting anchor to `this`,
+// that node would be the match whatever order the list is in, and the ordering
+// objection above would not bite. Answering it needs the owning node of an
+// anchor. sub_489C30 allocates each one with
+// `sub_76E540(16, ".?AUFRAMENODE@CLayoutFrame@@", -2, 8)` - sixteen bytes off the
+// heap, not a field inside the frame - and assigns all four of its dwords: two
+// link words, the frame at +8, and the flags at +12. There is no fifth word and
+// no owner pointer, and because the allocation is separate the offset from an
+// anchor to the node that references it is not a constant either.
+//
+// So the found case is left to the client, and the counters below separate it as
+// `deferred`. This is settled from the disassembly rather than open; a
+// measurement of anchor-minus-node offsets was written and then removed, because
+// its answer was already on the page above.
+//
+// ---------------------------------------------------------------------------
 // The scan skips any anchor whose word at +0x0C has 0x800 set, while sub_489C30
 // registers a dependant regardless of it - the point mask it ORs into that same
 // word occupies the low bits. A dependants list holding only entries the scan
 // would reject is therefore a real state, and it is the state behind every
-// "something at +0x38 but the client found nothing" counted below. Extending the
-// shortcut to cover it is the obvious next step and is not attempted here.
+// "something at +0x38 but the client found nothing".
+//
+// That extension is implemented: AllDependantsRejected below walks the list and
+// answers not-found when every entry carries 0x800. It is not a guess. On the
+// deferred path the client averages 73 to 93 nodes at nine dereferences each and
+// finds nothing 91.6% of the time, sampled one call in 256 over 154566 of them,
+// and the module's own verification agrees independently at 89.9%.
 //
 // ---------------------------------------------------------------------------
 // This is the second attempt. The first one crashed the game on login and is
@@ -120,6 +170,7 @@
 #include "version.h"
 #include "config.h"
 #include "layout_relink_fast.h"
+#include "ab_test.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -138,15 +189,66 @@ constexpr unsigned  kStateByteOff  = 0x40;        // set to 6 by both tails
 constexpr long kLearnCalls   = 20000;
 constexpr long kResampleMask = 1023;   // one in 1024
 
+// What the deferred scan costs, measured rather than assumed.
+// Shortcuts taken on the second predicate rather than on an empty list, and
+// how many dependants were examined to reach them.
+unsigned long g_rejectShortcut = 0;
+double        g_rejectWalked   = 0.0;
+
+unsigned long g_scanSample   = 0;
+unsigned long g_scansSeen    = 0;
+double        g_nodesToMatch = 0.0;   // nodes walked before the first match
+double        g_nodesTotal   = 0.0;   // whole list length
+unsigned long g_scanNoMatch  = 0;     // walked it all and found nothing
+unsigned long g_scanLongest  = 0;
+
+// Read-only replay of sub_489710's search: the first node in list order with an
+// anchor slot pointing at `self` and without 0x800 set. Nothing is written.
+void MeasureScan(uintptr_t self) {
+    __try {
+        uint32_t linkOff = *(const uint32_t*)kNodeOffsetVar;
+        uint32_t node    = *(const uint32_t*)(kListRoot + 4);   // AC1020
+        uint32_t walked  = 0;
+        uint32_t matchAt = 0;
+        bool     found   = false;
+
+        while (node && (node & 1) == 0 && walked < 100000) {
+            ++walked;
+            if (!found) {
+                for (unsigned s = 0; s < 9; s++) {
+                    uint32_t fn = *(const uint32_t*)(node + 12 + s * 4);
+                    if (!fn) continue;
+                    if (*(const uint32_t*)(fn + 12) & 0x800) continue;
+                    if (*(const uint32_t*)(fn + 8) == (uint32_t)self) {
+                        found = true; matchAt = walked; break;
+                    }
+                }
+            }
+            node = *(const uint32_t*)(linkOff + node + 4);
+        }
+
+        g_scansSeen++;
+        g_nodesTotal += (double)walked;
+        if (found) g_nodesToMatch += (double)matchAt;
+        else       g_scanNoMatch++;
+        if (walked > g_scanLongest) g_scanLongest = walked;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 typedef uint32_t* (__fastcall* Relink_fn)(void* self, void* edx);
 Relink_fn orig_Relink = nullptr;
 
-volatile LONG g_calls        = 0;
-volatile LONG g_agreements   = 0;
-volatile LONG g_fastTaken    = 0;
-volatile LONG g_deferred     = 0;
-volatile LONG g_disagreed    = 0;
-volatile LONG g_pessimistic  = 0;   // predicted found, client found nothing
+// Plain, not Interlocked. This is the most expensive function in the client and
+// it ran 16.9 million times in one session; every one of these was a locked
+// read-modify-write on that path. They are statistics, one thread writes them,
+// and a lost increment costs one count. Lower bounds, and the report says so.
+long g_calls        = 0;
+long g_agreements   = 0;
+long g_fastTaken    = 0;
+long g_deferred     = 0;
+long g_disagreed    = 0;
+long g_pessimistic  = 0;   // predicted found, client found nothing
 // Every entry into the hook. g_calls below counts only those that get past the
 // client's own early-out and reach the scan - the ones that cost anything - and
 // it stops entirely once the module retires. This one never stops, so a log can
@@ -160,12 +262,56 @@ unsigned long g_earlyOut     = 0;
 volatile LONG g_armed        = 0;   // 1 once the fast path is trusted
 volatile LONG g_dead         = 0;   // 1 after a disagreement
 
+// Set once at init when the A/B harness names this module. Tested before
+// calling into it, so a session not testing this feature pays a predictable
+// branch on a false global rather than a call.
+bool          g_abSubject    = false;
+unsigned long g_abOffCalls   = 0;   // reached the hook while the test had it off
+
 inline uint32_t Rd(uintptr_t p)          { return *(volatile uint32_t*)p; }
 inline void     Wr(uintptr_t p, uint32_t v) { *(volatile uint32_t*)p = v; }
 
 // Empty is encoded two ways throughout this cluster: null, or a tagged sentinel
 // with the low bit set.
 inline bool IsEmptyLink(uint32_t v) { return v == 0 || (v & 1) != 0; }
+
+// Anchors the scan refuses to match on. sub_489710 tests each of the nine slots
+// with `!(*(a + 0x0C) & 0x800)` before comparing the frame, so an anchor with
+// that bit set can never satisfy it. sub_489C30 registers a dependant whatever
+// the bit says, because the point mask it ORs into the same word lives in the
+// low bits, and a dependants list holding only rejected anchors is therefore a
+// real and common state.
+constexpr unsigned kFN_flags   = 0x0C;   // the word the scan masks with 0x800
+constexpr unsigned kFN_next    = 0x04;   // dependants are chained through here
+constexpr unsigned kScanReject = 0x800;
+
+// How far to walk a dependants list before giving up and deferring. The list is
+// short in practice; the cap is only there so a corrupted chain cannot turn a
+// shortcut into an unbounded walk.
+constexpr unsigned kMaxDependants = 64;
+
+// True when every dependant carries 0x800, so the client's scan cannot match
+// any of them and will walk the whole list for nothing.
+//
+// This is what the measurement said was worth doing. On the deferred path the
+// client averages 73 to 93 nodes at nine dereferences each and finds nothing
+// 91.6% of the time, sampled one call in 256 over 154566 of them. The module's
+// own verification agrees independently: 43398 of 48265 checked calls, 89.9%,
+// had something at +0x38 and the client still found nothing.
+//
+// Read-only, bounded, and inside the caller's SEH. Anything unreadable or
+// longer than the cap answers false, which defers exactly as before.
+bool AllDependantsRejected(uint32_t head, unsigned* outCount) {
+    unsigned n = 0;
+    uint32_t e = head;
+    while (!IsEmptyLink(e)) {
+        if (++n > kMaxDependants) return false;
+        if ((Rd(e + kFN_flags) & kScanReject) == 0) { *outCount = n; return false; }
+        e = Rd(e + kFN_next);
+    }
+    *outCount = n;
+    return n > 0;
+}
 
 // The not-found tail of sub_489710, transcribed from 0x004897CE to 0x0048983D.
 // `result` is eax, `self` is ecx. There are no calls in it.
@@ -216,7 +362,7 @@ void Retire(const char* why) {
         "runs from here on; nothing is left half-applied.", why);
 }
 
-uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
+uint32_t* __fastcall Hooked_RelinkBody(void* self, void* edx) {
     (void)edx;
     // Counted before anything can return, including after this module has
     // retired, because every other counter here stops the moment it does.
@@ -236,6 +382,7 @@ uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
     g_invocations++;
     if (g_dead || !self) return orig_Relink(self, edx);
 
+
     uintptr_t This = (uintptr_t)self;
     uint32_t* result;
     bool predictNotFound;
@@ -246,12 +393,21 @@ uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
         // is false it does nothing at all, so there is nothing to be clever
         // about and the original is the cheapest correct answer.
         if (result[1] != 0) { g_earlyOut++; return orig_Relink(self, edx); }
-        predictNotFound = IsEmptyLink(Rd(This + kDependentsOff));
+        uint32_t head = Rd(This + kDependentsOff);
+        if (IsEmptyLink(head)) {
+            predictNotFound = true;
+        } else {
+            // The list is not empty, which used to end the matter. Ask whether
+            // any of it could match instead.
+            unsigned k = 0;
+            predictNotFound = AllDependantsRejected(head, &k);
+            if (predictNotFound) { ++g_rejectShortcut; g_rejectWalked += k; }
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return orig_Relink(self, edx);
     }
 
-    LONG n = InterlockedIncrement(&g_calls);
+    LONG n = ++g_calls;
     bool verifying = (g_armed == 0) || ((n & kResampleMask) == 0);
 
     if (verifying) {
@@ -277,7 +433,7 @@ uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
         // the client found a match for. This is the only one that invalidates
         // the optimisation.
         if (predictNotFound && !actualNotFound) {
-            InterlockedIncrement(&g_disagreed);
+            ++g_disagreed;
             Log("[LayoutRelink] Prediction was wrong: frame 0x%08X had nothing at "
                 "+0x38 but the client took the found path. An empty dependants "
                 "list does not imply the scan finds nothing, so this optimisation "
@@ -291,7 +447,7 @@ uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
         // correct - this is a skipped shortcut, not an error. Log the first one
         // so the asymmetry is visible in a session log, then just count them.
         if (!predictNotFound && actualNotFound) {
-            if (InterlockedIncrement(&g_pessimistic) == 1) {
+            if (++g_pessimistic == 1) {
                 Log("[LayoutRelink] Frame 0x%08X had something at +0x38 but the "
                     "client found nothing. Correct either way - we defer on "
                     "non-empty - so this is a missed shortcut, not a divergence. "
@@ -300,7 +456,7 @@ uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
             return r;
         }
 
-        LONG ok = InterlockedIncrement(&g_agreements);
+        LONG ok = ++g_agreements;
         if (g_armed == 0 && ok >= kLearnCalls) {
             InterlockedExchange(&g_armed, 1);
             Log("[LayoutRelink] %ld calls verified, no disagreement. Taking the "
@@ -311,7 +467,13 @@ uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
     }
 
     if (!predictNotFound) {
-        InterlockedIncrement(&g_deferred);
+        ++g_deferred;
+        // Nobody has measured the number the whole model rests on: how long the
+        // list the client scans actually is, and how far into it the match
+        // sits. If it is short, the scan cannot be where the time goes and this
+        // module is aimed at the wrong thing. Sampled, because measuring means
+        // walking the list a second time.
+        if ((++g_scanSample & 255u) == 0) MeasureScan(This);
         return orig_Relink(self, edx);
     }
 
@@ -321,8 +483,26 @@ uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
         Retire("the transcribed tail faulted");
         return orig_Relink(self, edx);
     }
-    InterlockedIncrement(&g_fastTaken);
+    ++g_fastTaken;
     return result;
+}
+
+// The detour proper. Kept apart from the body because the A/B harness times the
+// call, and a scope guard closing that sample on every return path cannot live
+// in a function containing __try - MSVC refuses object unwinding alongside SEH.
+// One pair of reads here covers every path the body can take.
+uint32_t* __fastcall Hooked_Relink(void* self, void* edx) {
+    if (!g_abSubject) return Hooked_RelinkBody(self, edx);
+    unsigned long long t = AbTest::TickIn();
+    uint32_t* r;
+    if (AbTest::StandAside()) {
+        g_abOffCalls++;
+        r = orig_Relink(self, edx);
+    } else {
+        r = Hooked_RelinkBody(self, edx);
+    }
+    AbTest::TickOut(t);
+    return r;
 }
 
 } // namespace
@@ -353,6 +533,15 @@ bool Init() {
     Log("[LayoutRelink] ACTIVE on sub_489710, the largest single entry in the "
         "main-thread profile (9.06%%). Verifying against the client for the first "
         "%ld calls before it changes anything.", (long)kLearnCalls);
+
+    g_abSubject = AbTest::IsSubject("LayoutRelinkFast", &g_abSubject);
+    if (g_abSubject) {
+        Log("[LayoutRelink] under A/B test: the shortcut is taken only during the "
+            "test's ON stints, and the frame times either side are reported by "
+            "AbTest. The verification above is unaffected - it still runs, and a "
+            "disagreement still retires this module whichever stint it happens "
+            "in.");
+    }
     return true;
 }
 
@@ -365,6 +554,12 @@ void LogStats() {
         g_invocations, (long)g_calls, (long)g_fastTaken, (long)g_deferred,
         (long)g_agreements, (long)g_disagreed,
         g_dead ? " - DISABLED" : "");
+    if (g_abSubject) {
+        Log("[LayoutRelink]   %lu of those invocations were handed straight to the "
+            "client because the A/B test had this feature off at the time. The "
+            "shortcut counts above therefore describe the ON stints only.",
+            g_abOffCalls);
+    }
     // The gap between the two is the client's own early-out, which this module
     // deliberately leaves alone. If almost every invocation stops there, the
     // nine percent measured in the profile is not where this module is looking
@@ -377,6 +572,28 @@ void LogStats() {
             examined, 100.0 * (double)g_earlyOut / (double)examined,
             g_dead ? "; the remaining invocations came after this module retired"
                    : "");
+    }
+    if (g_rejectShortcut > 0) {
+        Log("[LayoutRelink] %lu shortcuts came from the second test - a dependants "
+            "list where every entry carries 0x800, so the scan could not have "
+            "matched any of them - after looking at %.1f entries on average. "
+            "Before this test those all deferred and the client walked the whole "
+            "list for nothing.",
+            g_rejectShortcut, g_rejectWalked / (double)g_rejectShortcut);
+    }
+    if (g_scansSeen > 0) {
+        double avgLen   = g_nodesTotal / (double)g_scansSeen;
+        unsigned long matched = g_scansSeen - g_scanNoMatch;
+        Log("[LayoutRelink] the scan itself, sampled one deferred call in 256 "
+            "over %lu of them: the list averages %.1f nodes and its longest was "
+            "%lu. %lu found a match after %.1f nodes on average, %lu walked the "
+            "whole list and found nothing.",
+            g_scansSeen, avgLen, g_scanLongest, matched,
+            matched ? g_nodesToMatch / (double)matched : 0.0, g_scanNoMatch);
+        Log("[LayoutRelink]   this is the number the module rests on. A short "
+            "list means the scan cannot be where the time goes and the target "
+            "is wrong; a long one with the match near the end is what an index "
+            "would be worth.");
     }
     if (g_pessimistic > 0) {
         Log("[LayoutRelink] %ld of the deferred calls had a non-empty +0x38 but "

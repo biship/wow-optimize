@@ -25,15 +25,23 @@
 #include "version.h"
 
 #include "loading_state.h"
+#include "client_write_batch.h"
+#include "flight_recorder.h"
+#include "session_verdict.h"
 #include "event_coalescer.h"
+#include "combat_log_filter.h"
 #include "runtime_vm/lua_gc_governor.h"
 #include "diagnostics/crash_dumper.h"
+#include "diagnostics/sampling_profiler.h"
 
 extern "C" void Log(const char* fmt, ...);
 extern "C" void ReserveLoadingArena();
 extern "C" void ReleaseLoadingArena();
 
 static constexpr uintptr_t ADDR_FrameScript_SignalEvent = 0x0081AC90;
+
+// The client's own file-write wrapper - it carries the string "Win32 Write - %s".
+static constexpr uintptr_t kClientWrite = 0x00454910;
 
 void* g_origSignalEvent = nullptr;
 
@@ -92,7 +100,21 @@ EventKind ClassifyEvent(int eventId) {
 // ---- where a loading screen's time goes -------------------------------------
 static LARGE_INTEGER g_qpcFreq      = {};
 static LARGE_INTEGER g_loadStartQpc = {};
+// Lua compiled inside this loading screen, split the way the census splits it.
+static double        g_compileMsThisLoad      = 0.0;
+static double        g_compileMsFirstThisLoad = 0.0;
+static unsigned long long g_compilesThisLoad  = 0;
+static bool          g_compileSeen            = false;
+
 static double        g_ioMsThisLoad = 0.0;
+
+// Writes, measured because reads alone did not account for a 139-second load.
+static double        g_wrMsThisLoad = 0.0;
+static unsigned long long g_wrBytesThisLoad = 0;
+static unsigned long long g_wrCountThisLoad = 0;
+static double        g_wrMsWorst    = 0.0;
+static char          g_wrWorstName[128] = {};
+static bool          g_writeHookOn  = false;
 static uint64_t      g_ioBytesThisLoad = 0;
 static uint64_t      g_ioReadsThisLoad = 0;
 
@@ -109,6 +131,9 @@ static void LoadTimerBegin() {
     g_ioMsThisLoad = 0.0;
     g_ioBytesThisLoad = 0;
     g_ioReadsThisLoad = 0;
+    g_wrMsThisLoad = 0.0;
+    g_wrBytesThisLoad = 0;
+    g_wrCountThisLoad = 0;
 }
 
 static void LoadTimerEnd() {
@@ -134,6 +159,14 @@ static void LoadTimerEnd() {
     g_ioBytesTotal += g_ioBytesThisLoad;
     if (ms > g_loadMsWorst) g_loadMsWorst = ms;
 
+    // A load nobody would call normal. The threshold is deliberately generous:
+    // ten seconds is already something a player notices and mentions, and the
+    // reports that took weeks to diagnose were all far past it.
+    if (ms > 10000.0) {
+        Verdict::Add(ms > 60000.0 ? Verdict::Bad : Verdict::Warn,
+                     "a loading screen took %.0f s", ms / 1000.0);
+    }
+
     if (!g_readHookOn) {
         Log("[LoadingState] Load took %.0f ms - disk share not measured "
             "(the ReadFile hook is not installed in this build)", ms);
@@ -144,6 +177,96 @@ static void LoadTimerEnd() {
             (unsigned long long)g_ioReadsThisLoad,
             (double)g_ioBytesThisLoad / (1024.0 * 1024.0));
     }
+
+    if (!g_compileSeen) {
+        Log("[LoadingState]   Lua compilation not measured - the compile census "
+            "is switched off, so the largest known candidate for the rest of "
+            "this load has no number here.");
+    } else if (g_compilesThisLoad == 0) {
+        Log("[LoadingState]   measured and zero: the client compiled no Lua "
+            "inside this loading screen.");
+    } else {
+        Log("[LoadingState]   %.0f ms (%.0f%%) compiling Lua over %llu chunk(s), "
+            "%.0f ms of it source never seen before. That second figure is the "
+            "part no cache living in this process can remove.",
+            g_compileMsThisLoad,
+            (ms > 0.0) ? (100.0 * g_compileMsThisLoad / ms) : 0.0,
+            (unsigned long long)g_compilesThisLoad,
+            g_compileMsFirstThisLoad);
+    }
+    g_compileMsThisLoad = 0.0;
+    g_compileMsFirstThisLoad = 0.0;
+    g_compilesThisLoad = 0;
+
+    if (!g_writeHookOn) {
+        Log("[LoadingState]   writes not measured - the client's write wrapper is "
+            "not hooked in this build");
+    } else if (g_wrCountThisLoad) {
+        Log("[LoadingState]   and %.0f ms (%.0f%%) inside the client's own file "
+            "writes, %llu of them, %.1f MB. Worst single write %.0f ms on %s.",
+            g_wrMsThisLoad, (ms > 0.0) ? (100.0 * g_wrMsThisLoad / ms) : 0.0,
+            (unsigned long long)g_wrCountThisLoad,
+            (double)g_wrBytesThisLoad / (1024.0 * 1024.0),
+            g_wrMsWorst, g_wrWorstName[0] ? g_wrWorstName : "(unnamed)");
+    } else {
+        Log("[LoadingState]   and no file writes at all - so the time is neither "
+            "reading nor writing");
+    }
+
+    // Whatever the three lines above could not account for, this says where it
+    // actually was. Reads, writes and compiles have never added up to more than
+    // a few percent of a load, and the rest had no name until the profiler's
+    // loading histogram was reported per load rather than per session.
+    SamplingProfiler::ReportLoadWindow();
+}
+
+// The client's own file-write wrapper, sub_454910. Found from a freeze capture:
+// a tester's main thread was blocked 13 seconds inside it, twice, during a
+// character switch, and the same load reported only 1% of its 139 seconds inside
+// ReadFile. Reads were instrumented and writes were not, so the larger share had
+// nowhere to be counted.
+//
+// It is the right place rather than WriteFile itself: it is reached only for the
+// client's own files, so no lookup is needed to tell them apart, and it carries
+// the name at +76 - used there only to build an error string, and read here to
+// say which file the worst write was.
+//
+// Times the call and passes it on. Nothing else.
+typedef char (__cdecl* clientWrite_fn)(void* fileObj, const void* buf,
+                                       void* overlapped, unsigned long* pBytes);
+static clientWrite_fn orig_ClientWrite = nullptr;
+
+static char __cdecl Hooked_ClientWrite(void* fileObj, const void* buf,
+                                       void* overlapped, unsigned long* pBytes) {
+    unsigned long want = 0;
+    __try { if (pBytes) want = *pBytes; } __except (EXCEPTION_EXECUTE_HANDLER) { want = 0; }
+
+    // The batcher, when it is on, takes small writes and issues them in
+    // 64KB pieces. It reports success the way the client's own wrapper does
+    // for a write it accepted: return 1 and leave the requested count in
+    // place, which is what the original does when WriteFile succeeds in
+    // full. The time is still recorded, as close to zero, so the loading
+    // screen report shows the difference rather than losing the calls.
+    if (ClientWriteBatch::TryAbsorb(fileObj, buf, want, overlapped)) {
+        LoadingState::NoteWrite(0.0, want, nullptr);
+        return 1;
+    }
+
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    char r = orig_ClientWrite(fileObj, buf, overlapped, pBytes);
+    QueryPerformanceCounter(&b);
+
+    if (g_qpcFreq.QuadPart) {
+        double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+        const char* name = nullptr;
+        __try {
+            name = *(const char**)((const unsigned char*)fileObj + 76);
+            if (name < (const char*)0x10000 || name > (const char*)0xFFE00000) name = nullptr;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { name = nullptr; }
+        LoadingState::NoteWrite(ms, want, name);
+    }
+    return r;
 }
 
 void ApplyEventKind(EventKind kind) {
@@ -154,6 +277,7 @@ void ApplyEventKind(EventKind kind) {
                 LoadTimerBegin();
                 CrashDumper::Trace("LOADING begin (PLAYER_LEAVING_WORLD)");
                 Log("[LoadingState] Loading screen started (PLAYER_LEAVING_WORLD)");
+                SamplingProfiler::MarkLoadWindowStart();
                 ReserveLoadingArena();
             }
             break;
@@ -195,6 +319,29 @@ void ApplyEventKind(EventKind kind) {
 
 } // namespace
 
+// The client's own write wrapper, for the batcher to flush through. Null when
+// the hook did not install, which is the batcher's cue not to run.
+//
+// Defined here rather than beside the detour it returns: the detour lives in the
+// anonymous namespace above, and a LoadingState block opened inside that one
+// gets internal linkage, so the definition compiles and the link still fails.
+namespace LoadingState {
+
+// Flight recorder columns. A spike dump that shows a frame doing four thousand
+// file reads has explained itself; one that shows none has ruled I/O out, which
+// is worth as much. Declared here because NoteWrite is below and uses them.
+static int g_frRead  = -1;
+static int g_frWrite = -1;
+
+void ClaimRecorderColumns() {
+    g_frRead  = FlightRecorder::RegisterSlot("filerd");
+    g_frWrite = FlightRecorder::RegisterSlot("filewr");
+}
+ClientWriteBatch::WriteFn GetClientWriter() {
+    return (ClientWriteBatch::WriteFn)orig_ClientWrite;
+}
+}  // namespace LoadingState
+
 // Returns true if the event must be swallowed (the coalescer queued it for replay
 // at end of frame). State tracking always runs first, so it is never affected by
 // whether the coalescer is enabled.
@@ -210,6 +357,14 @@ extern "C" bool __fastcall LoadingState_OnSignalEvent(int eventId, const char* f
         // Out-of-range ids are vanishingly rare; classify without caching.
         ApplyEventKind(ClassifyEvent(eventId));
     }
+
+    // Combat log filtering has its own switch and used to be reachable only from
+    // inside the coalescer's queue, below the IsActive() gate - so with the
+    // coalescer off, which is its default and which it stays because of the
+    // buffs-and-countdowns defect, the filter's own switch did nothing. It is
+    // asked here, before that gate.
+    if (CombatLogFilter::IsActive() &&
+        CombatLogFilter::ShouldDrop(eventId, format, vaStart)) return true;
 
     if (!EventCoalescer::IsActive()) return false;
     return EventCoalescer::TryQueue(eventId, format, vaStart);
@@ -244,7 +399,36 @@ void SetReadHookInstalled(bool installed) {
     g_readHookOn = installed;
 }
 
+void NoteWrite(double ms, unsigned int bytes, const char* name) {
+    FlightRecorder::Bump(g_frWrite);
+    g_wrMsThisLoad += ms;
+    g_wrBytesThisLoad += bytes;
+    g_wrCountThisLoad++;
+    if (ms > g_wrMsWorst) {
+        g_wrMsWorst = ms;
+        g_wrWorstName[0] = 0;
+        if (name) {
+            __try {
+                const char* leaf = strrchr(name, '\\');
+                leaf = leaf ? leaf + 1 : name;
+                strncpy(g_wrWorstName, leaf, sizeof(g_wrWorstName) - 1);
+                g_wrWorstName[sizeof(g_wrWorstName) - 1] = 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                g_wrWorstName[0] = 0;
+            }
+        }
+    }
+}
+
+void NoteCompile(double ms, bool repeat) {
+    g_compileSeen = true;
+    g_compileMsThisLoad += ms;
+    if (!repeat) g_compileMsFirstThisLoad += ms;
+    ++g_compilesThisLoad;
+}
+
 void NoteRead(double ms, unsigned int bytes) {
+    FlightRecorder::Bump(g_frRead);
     g_ioMsThisLoad += ms;
     g_ioBytesThisLoad += bytes;
     g_ioReadsThisLoad++;
@@ -290,6 +474,25 @@ bool Init() {
         Log("[LoadingState] Failed to enable FrameScript_SignalEvent hook");
         g_origSignalEvent = nullptr;
         return false;
+    }
+
+    // The write timer. Separate from the event detour above so a failure here
+    // cannot take loading detection down with it.
+    if (QueryPerformanceFrequency(&g_qpcFreq) &&
+        !IsBadReadPtr((void*)kClientWrite, 8) &&
+        WineSafe_CreateHook((void*)kClientWrite, (void*)Hooked_ClientWrite,
+                            (void**)&orig_ClientWrite) == MH_OK &&
+        WO_EnableHook((void*)kClientWrite) == MH_OK) {
+        g_writeHookOn = true;
+        Log("[LoadingState] timing the client's file writes at 0x%08X. A tester's "
+            "139-second load spent 1%% of itself in ReadFile, and the freeze "
+            "watchdog caught its main thread blocked 13 seconds inside this "
+            "function - twice, during a character switch. Reads were measured and "
+            "writes were not, so the larger share had nowhere to be counted.",
+            (unsigned)kClientWrite);
+    } else {
+        Log("[LoadingState] the client's write wrapper at 0x%08X was NOT hooked - "
+            "loads will report their read share only", (unsigned)kClientWrite);
     }
 
     Log("[LoadingState] ACTIVE (FrameScript_SignalEvent @ 0x%08X) - native loading detection",

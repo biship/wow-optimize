@@ -106,6 +106,7 @@
 #include <unordered_set>
 
 #include "lua_proto_cache.h"
+#include "lua_bytecode_store.h"
 #include "MinHook.h"
 #include "version.h"
 #include "config.h"
@@ -141,6 +142,7 @@ constexpr unsigned kZ_data   = 12;
 // Proto, from luaF_newproto at 0x0085CF40 (80 bytes, every field zeroed) and
 // open_func at 0x0085F410, which writes source at +36 and maxstacksize at +79.
 constexpr unsigned kP_code            = 16;
+constexpr unsigned kP_lineinfo        = 24;
 constexpr unsigned kP_source          = 36;
 constexpr unsigned kP_sizek           = 44;
 constexpr unsigned kP_sizecode        = 48;
@@ -192,9 +194,53 @@ inline void*    RDP (const void* p, unsigned off) { return *(void* const*)   ((c
 // larger now: 402 chunks were refused for exceeding 32 KB, and with only proven
 // repeats competing for the budget there is room to keep the ones that recur.
 
-constexpr size_t kMaxChunkBytes = 128u * 1024u;
+// The cap that threw away the largest wins.
+//
+// A session reported "turned away: 36 over the 128 KB size cap (14106 KB)"
+// while the whole session compiled 40 MB. Fourteen of those forty megabytes
+// were refused at the door, in thirty-six offers, before a key was even
+// recorded for them - so the repeat detection below never saw them either.
+//
+// What they are is not a mystery: the census in the same log names them.
+// GlobalStrings.lua, 985 KB over two compiles. ChatFrame.lua, 266 over two.
+// UIParent, FriendsFrame, PaperDollFrame. The client compiles each of them once
+// per Lua state, and a session with three reloads compiles them three times.
+//
+// A megabyte admits every one of them, and the budget below is twenty-four, of
+// which that session used thirty-nine kilobytes. The cap was never what was
+// protecting the budget; the policy that only stores proven repeats is.
+constexpr size_t kMaxChunkBytes = 1024u * 1024u;
+
+// Above this, a chunk is kept the first time it is seen rather than the second.
+//
+// The rule below - record a key on first sight, keep the source on the second,
+// reuse on the third - was reasoned about small chunks and is right for them:
+// holding 185 bytes of source for each of 3669 distinct handlers to save 0.02
+// ms apiece is a bad trade. For a 492 KB file that takes ten milliseconds to
+// parse, the same arithmetic runs the other way, and the "one extra compile per
+// chunk" the policy costs is ten milliseconds rather than twenty microseconds.
+//
+// There are few of them - thirty-six offers in six minutes - so this cannot
+// spend the budget, and each one it catches is worth more than every small
+// chunk in the cache put together.
+constexpr size_t kKeepOnFirstSight = 32u * 1024u;
 constexpr size_t kMaxEntries    = 8192;
-constexpr size_t kMaxTotalBytes = 24u * 1024u * 1024u;
+// Eight megabytes, down from twenty-four, and lowered in the same change that
+// raised the per-chunk cap.
+//
+// This cache competes for the resource that is actually scarce here. A 32-bit
+// client allocates from below 2GB, three tester sessions have ended with the
+// largest free run there at one or two megabytes, and one of them wrote a
+// SavedVariables file under a garbage name because of it. Twenty-four megabytes
+// of held source to save a few hundred milliseconds of parsing is the wrong way
+// round when the alternative is a corrupted interface.
+//
+// Eight is still two hundred times what the session that motivated all of this
+// actually used, and past it the cache stops storing rather than evicting -
+// what it already holds is proven repeats and is worth more than whatever
+// arrives next. With the high-address arena switched on this memory lands above
+// 2GB and the conflict goes away, but the default has to be safe without it.
+constexpr size_t kMaxTotalBytes = 8u * 1024u * 1024u;
 constexpr size_t kMaxSeenKeys   = 32768;
 
 // --- Verification -----------------------------------------------------------
@@ -213,7 +259,42 @@ struct Entry {
     uint32_t      srcLen;
     uint32_t      nameLen;
     unsigned long hits;
+    // Read off the Proto when it was stored, checked again before it is handed
+    // back. If the block was freed and the client's Lua memory pool handed it
+    // to something else, these stop matching. See FingerprintStillHolds.
+    uint32_t      fpCode;
+    uint32_t      fpLineinfo;
+    uint32_t      fpSizecode;
 };
+
+// A recycled Proto is what the crash on 2026-08-22 was: the client faulted in
+// its own error formatter at sub_84FDF0, reading Proto->lineinfo[pc] with
+// lineinfo holding 4. Four is not a pointer, and the client's only guard there
+// is a test against zero, so a small non-zero value walks straight into a read
+// of address 4.
+//
+// The root cause is fixed elsewhere - the cache now hears about every lua_State
+// swap instead of guessing from l_G. This is the second line: three words read
+// when the Proto was stored and compared before it is used. It cannot prove a
+// Proto is alive, and a block recycled into another Proto with the same shape
+// would still pass. It does catch the case that actually happened, where the
+// pool wrote its own bookkeeping over the fields.
+bool FingerprintStillHolds(const Entry& e) {
+    __try {
+        uint32_t code     = RD32(e.proto, kP_code);
+        uint32_t lineinfo = RD32(e.proto, kP_lineinfo);
+        uint32_t sizecode = RD32(e.proto, kP_sizecode);
+        if (code != e.fpCode || lineinfo != e.fpLineinfo || sizecode != e.fpSizecode)
+            return false;
+        // Whatever they are, code has to be a real pointer and lineinfo has to
+        // be one or nothing. This is what the client itself fails to check.
+        if (code < 0x10000) return false;
+        if (lineinfo != 0 && lineinfo < 0x10000) return false;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
 std::unordered_map<uint64_t, Entry> g_cache;
 size_t g_blobBytes = 0;
@@ -238,8 +319,37 @@ bool g_dead      = false;
 
 unsigned long g_seen = 0, g_hits = 0, g_stored = 0;
 unsigned long g_tooBig = 0, g_notBuffer = 0, g_capped = 0, g_anchorFailed = 0;
+// Of the capped ones, those already known to repeat. See the capped branch.
+unsigned long      g_cappedRepeats     = 0;
+unsigned long long g_cappedRepeatBytes = 0;
 unsigned long g_verified = 0, g_firstSighting = 0, g_flushes = 0, g_onSight = 0;
+// Chunks large enough to be worth keeping the moment they are first seen. The
+// number that says whether raising the cap was the right call.
+unsigned long g_keptOnFirstSight = 0;
+unsigned long g_stale = 0;
 unsigned long long g_bytesSaved = 0, g_bytesTooBig = 0;
+
+// What the cache saves, in time rather than in kilobytes.
+//
+// This module has always reported "N KB of parsing skipped", and kilobytes of
+// source are not a saving - the whole argument for building it was that 88% of
+// compiled chunks were source already compiled, which is equally not a saving.
+// The number that decides whether it is worth its risk is how long the parses it
+// skipped would have taken.
+//
+// No A/B run is needed for it. A miss runs the client's parser and can be timed
+// directly; a hit skips it entirely and costs the lookup. Mean miss time times
+// the hit count is what the session saved, and both halves are measured here
+// rather than assumed.
+//
+// One call in 64 is timed on each side. The parser is not a per-frame hot path -
+// a few thousand calls a session - so the sampling is only there to keep a
+// context switch from dominating a small sample set.
+LARGE_INTEGER g_parseFreq = {};
+unsigned long g_missTimed = 0, g_hitTimed = 0;
+double        g_missMsTotal = 0.0, g_hitMsTotal = 0.0;
+constexpr unsigned kParseSampleMask = 63;
+unsigned long g_parseSeq = 0;
 
 // What luaY_parser handed back on a miss, for the luaL_loadbuffer hook one
 // level out to anchor. Only ever written and read on the owner thread.
@@ -267,15 +377,34 @@ uint64_t KeyOf(const char* src, size_t srcLen, const char* name, size_t nameLen)
     return h;
 }
 
+// Everything a Lua state owns goes when the state does. Everything that is
+// only a fact about source text stays.
+//
+// g_cache holds Protos, which belong to the state, so it must go. g_seenOnce
+// holds a hash and a length - twelve bytes, no pointer into anything - and used
+// to be cleared with it. That cost more than the cache ever saved: a session
+// with three reloads resets the state eight times, so a chunk first seen in one
+// state and compiled again in the next started over as unseen instead of being
+// promoted, and 4427 repeats in that session produced 532 reuses. Only 337
+// chunks were ever stored out of 8096 offered, because first sightings kept
+// being forgotten.
+//
+// Keeping it is what g_knownRepeaters already does one step further along, and
+// for the same reason.
 void FlushAll() {
     for (std::unordered_map<uint64_t, Entry>::iterator it = g_cache.begin();
          it != g_cache.end(); ++it) {
         free(it->second.blob);
     }
     g_cache.clear();
-    g_seenOnce.clear();
     g_blobBytes = 0;
 }
+
+// Set by OnLuaStateSwapped, acted on inside the parser hook where the cache is
+// actually touched. A flush from arbitrary code would be a container mutation
+// at a moment this module knows nothing about.
+bool g_swapPending = false;
+unsigned long g_swapFlushes = 0;
 
 void Retire(const char* why) {
     if (g_dead) return;
@@ -315,6 +444,21 @@ bool ProtosAgree(void* a, void* b, const char** what) {
 // Pulls the source out of the reader and decides what to do with this chunk.
 // Returns the cached Proto on a reuse that needs no check, or null to let the
 // client compile - with g_pending armed when the result is worth keeping.
+// What the client is compiling right now, filled whether or not the cache wants
+// to keep it. The in-memory cache only arms g_pending for chunks it has decided
+// to store; the disk store wants the ones it has never seen before, which is
+// precisely the set g_pending leaves out.
+struct {
+    bool        valid;
+    const char* src;
+    size_t      srcLen;
+    const char* name;
+    size_t      nameLen;
+} g_lastCompile = { false, nullptr, 0, nullptr, 0 };
+
+unsigned long g_diskServed = 0;
+unsigned long g_diskProved = 0;
+
 void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
     *checked = false;
 
@@ -331,18 +475,24 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
     size_t nameLen = strlen(name);
     g_seen++;
 
-    if (srcLen > kMaxChunkBytes) {
-        g_tooBig++;
-        g_bytesTooBig += srcLen;
-        return nullptr;
-    }
+    g_lastCompile.valid   = true;
+    g_lastCompile.src     = src;
+    g_lastCompile.srcLen  = srcLen;
+    g_lastCompile.name    = name;
+    g_lastCompile.nameLen = nameLen;
 
     // A new global state means every Proto from the old one is gone with it.
+    // Two independent reasons to drop everything, and the second is the one
+    // that matters. l_G changing proves a new state; l_G staying the same
+    // proves nothing, because the client's Lua memory pool reuses the address.
     void* lG = RDP(L, kL_lG);
-    if (lG != g_globalState) {
+    if (g_swapPending) {
+        g_swapPending = false;
+        if (g_globalState) { FlushAll(); g_flushes++; g_swapFlushes++; }
+    } else if (lG != g_globalState) {
         if (g_globalState) { FlushAll(); g_flushes++; }
-        g_globalState = lG;
     }
+    g_globalState = lG;
 
     uint64_t key = KeyOf(src, srcLen, name, nameLen);
     std::unordered_map<uint64_t, Entry>::iterator it = g_cache.find(key);
@@ -351,6 +501,17 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
         if (e.srcLen == srcLen && e.nameLen == nameLen &&
             memcmp(e.blob, src, srcLen) == 0 &&
             memcmp(e.blob + srcLen + 1, name, nameLen) == 0) {
+
+            if (!FingerprintStillHolds(e)) {
+                // Do not hand it back and do not trust anything else stored
+                // under the same state either.
+                g_stale++;
+                FlushAll();
+                Log("[ProtoCache] A kept Proto no longer looks like the one that "
+                    "was stored (\"%s\"). Everything held has been dropped; the "
+                    "client compiles this one.", name);
+                return nullptr;
+            }
 
             it->second.hits++;
             g_hits++;
@@ -380,13 +541,69 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
         return nullptr;
     }
 
+    // Nothing in memory. The disk store may still have it from an earlier
+    // session, and if it does the parse can be skipped on this first sighting
+    // rather than the third - which is the whole point of it, because a first
+    // sighting is what the in-memory cache can never help with.
+    //
+    // While the store is still proving itself the client parses as well and the
+    // two Protos are compared, and the caller is handed the client's. That is
+    // the same shape as the verification above and for the same reason.
+    if (Config::g_settings.OptLuaBytecodeStore) {
+        bool  needsCheck = false;
+        void* fromDisk = LuaBytecodeStore::Lookup(L, src, srcLen, name, nameLen,
+                                                  &needsCheck);
+        if (fromDisk) {
+            void* use = fromDisk;
+            if (needsCheck) {
+                void* fresh = orig_luaY_parser(L, z, buff, name);
+                *checked = true;
+                if (!fresh) return nullptr;
+                if (!LuaBytecodeStore::Confirm(fromDisk, fresh, name)) return fresh;
+                g_diskProved++;
+                use = fresh;
+            } else {
+                g_diskServed++;
+            }
+            // Keep it in memory too, so the next occurrence this session costs
+            // a hash lookup rather than a file read and a rebuild. Armed the
+            // same way a fresh compile is, and anchored at the same place - and
+            // subject to the source-copy cap this block now sits above.
+            if (srcLen <= kMaxChunkBytes &&
+                g_cache.size() < kMaxEntries &&
+                g_blobBytes + srcLen + nameLen + 2 <= kMaxTotalBytes) {
+                g_pending.want    = true;
+                g_pending.key     = key;
+                g_pending.src     = src;
+                g_pending.srcLen  = srcLen;
+                g_pending.name    = name;
+                g_pending.nameLen = nameLen;
+                g_pending.proto   = use;
+            }
+            return use;
+        }
+    }
+
+    // Too large to keep a copy of the source for, which is what this module
+    // spends its budget on. It sits below the disk store rather than above it:
+    // the store keeps no source, so the chunks this turns away are the ones it
+    // most wants, and a 492 KB file is where skipping a parse is worth the most.
+    if (srcLen > kMaxChunkBytes) {
+        g_tooBig++;
+        g_bytesTooBig += srcLen;
+        return nullptr;
+    }
+
     // A first sighting leaves a key and a length behind and nothing else. Only
     // something the client has now compiled twice is worth a copy of its source.
     std::unordered_map<uint64_t, uint32_t>::iterator seen = g_seenOnce.find(key);
     bool second = (seen != g_seenOnce.end() && seen->second == (uint32_t)srcLen);
     bool known  = (g_knownRepeaters.find(key) != g_knownRepeaters.end());
 
-    if (!second && !known) {
+    // Big chunks skip the waiting period; see kKeepOnFirstSight.
+    const bool bigEnoughToKeepNow = (srcLen >= kKeepOnFirstSight);
+
+    if (!second && !known && !bigEnoughToKeepNow) {
         if (g_seenOnce.size() < kMaxSeenKeys) {
             g_seenOnce[key] = (uint32_t)srcLen;
             g_firstSighting++;
@@ -395,10 +612,24 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
         }
         return nullptr;
     }
+    if (bigEnoughToKeepNow && !second && !known) ++g_keptOnFirstSight;
 
     if (g_cache.size() >= kMaxEntries ||
         g_blobBytes + srcLen + nameLen + 2 > kMaxTotalBytes) {
         g_capped++;
+        // What the budget costs, rather than only how often it binds.
+        //
+        // A session turned away 37362 chunks here against 4693 reuses, and the
+        // compile census in the same log put 3439 ms into repeats of which this
+        // module removed 391. The gap is either the budget or chunks that were
+        // never coming back, and "turned away" cannot tell them apart. So count
+        // the ones already known to repeat on their own: those are the ones a
+        // larger budget would have served, and multiplied by the measured cost
+        // of a parse they are the case for raising it - or for leaving it be.
+        if (known) {
+            g_cappedRepeats++;
+            g_cappedRepeatBytes += srcLen;
+        }
         return nullptr;
     }
 
@@ -425,6 +656,13 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
 
 void* __cdecl Hooked_luaY_parser(void* L, void* z, void* buff, const char* name) {
     g_pending.want = false;
+    g_lastCompile.valid = false;
+
+    // Taken before Classify, so a timed hit covers the lookup as well as the
+    // skipped parse - which is what the client actually pays on a hit.
+    LARGE_INTEGER enter;
+    if (g_parseFreq.QuadPart) QueryPerformanceCounter(&enter);
+    else                      enter.QuadPart = 0;
 
     if (g_dead || !L || !z || !name) return orig_luaY_parser(L, z, buff, name);
 
@@ -444,9 +682,37 @@ void* __cdecl Hooked_luaY_parser(void* L, void* z, void* buff, const char* name)
     }
 
     // Either a reuse, or a check that already ran the parser for us.
-    if (decided || checked) return decided;
+    //
+    // `decided` without `checked` is a straight reuse: the parser did not run.
+    // Timed here so the saving can be stated in milliseconds rather than in
+    // kilobytes of source, which is not a saving. A verification pass sets
+    // `checked` and did run the parser, so it is not timed as a hit.
+    if (decided || checked) {
+        if (decided && !checked && g_parseFreq.QuadPart &&
+            (++g_parseSeq & kParseSampleMask) == 0) {
+            LARGE_INTEGER e;
+            QueryPerformanceCounter(&e);
+            double ms = (double)(e.QuadPart - enter.QuadPart) * 1000.0
+                      / (double)g_parseFreq.QuadPart;
+            if (ms >= 0.0 && ms < 100.0) { g_hitMsTotal += ms; ++g_hitTimed; }
+        }
+        return decided;
+    }
 
+    const bool timeThis = g_parseFreq.QuadPart &&
+                          (++g_parseSeq & kParseSampleMask) == 0;
+    LARGE_INTEGER a;
+    if (timeThis) QueryPerformanceCounter(&a);
     void* p = orig_luaY_parser(L, z, buff, name);
+    if (timeThis) {
+        LARGE_INTEGER b2;
+        QueryPerformanceCounter(&b2);
+        double ms = (double)(b2.QuadPart - a.QuadPart) * 1000.0
+                  / (double)g_parseFreq.QuadPart;
+        // A parse that spans a context switch is not a measurement of the parser,
+        // and one of them outweighs a hundred honest samples in a mean.
+        if (ms >= 0.0 && ms < 100.0) { g_missMsTotal += ms; ++g_missTimed; }
+    }
     if (g_pending.want) g_pending.proto = p;
     return p;
 }
@@ -469,7 +735,19 @@ bool AnchorTopClosure(void* L, void* proto) {
 
 int __cdecl Hooked_luaL_loadbuffer(void* L, const char* buf, size_t sz, const char* name) {
     g_pending.want = false;
+    g_lastCompile.valid = false;
     int rc = orig_luaL_loadbuffer(L, buf, sz, name);
+
+    // The closure is on top of the stack here, which is what lua_dump needs, and
+    // the source bytes are the ones Classify read out of the reader rather than
+    // `buf` - luaL_loadbuffer skips a UTF-8 BOM before handing them on, so the
+    // two are not always the same bytes and the key has to be built from the
+    // ones the parser actually saw.
+    if (rc == 0 && !g_dead && g_lastCompile.valid) {
+        LuaBytecodeStore::Capture(L, g_lastCompile.src, g_lastCompile.srcLen,
+                                  g_lastCompile.name, g_lastCompile.nameLen);
+    }
+    g_lastCompile.valid = false;
 
     if (rc != 0 || g_dead || !g_pending.want || !g_pending.proto) {
         g_pending.want = false;
@@ -494,6 +772,9 @@ int __cdecl Hooked_luaL_loadbuffer(void* L, const char* buf, size_t sz, const ch
                 e.srcLen  = (uint32_t)g_pending.srcLen;
                 e.nameLen = (uint32_t)g_pending.nameLen;
                 e.hits    = 0;
+                e.fpCode     = RD32(g_pending.proto, kP_code);
+                e.fpLineinfo = RD32(g_pending.proto, kP_lineinfo);
+                e.fpSizecode = RD32(g_pending.proto, kP_sizecode);
                 g_cache[g_pending.key] = e;
                 g_blobBytes += blobLen;
                 g_stored++;
@@ -525,15 +806,31 @@ bool Init() {
     }
     if (WineSafe_CreateHook((void*)kLuaLLoadBuffer, (void*)Hooked_luaL_loadbuffer,
                             (void**)&orig_luaL_loadbuffer) != MH_OK) {
-        Log("[ProtoCache] luaL_loadbuffer hook NOT created");
+        // Both hooks or neither. This one anchors the Proto the parser hook
+        // keeps, and without it the collector frees a Proto still in the cache -
+        // which is the crash this module already has a story about. Leaving the
+        // parser hook created also leaves the address claimed against anything
+        // else that wants it, for a feature that is not going to run.
+        MH_RemoveHook((void*)kLuaYParser);
+        orig_luaY_parser = nullptr;
+        Log("[ProtoCache] NOT active: luaL_loadbuffer (0x%08X) is already hooked "
+            "by something else, and without it a kept Proto cannot be anchored "
+            "against the collector. If that something else is the Lua compile "
+            "census, run the two in separate sessions.",
+            (unsigned)kLuaLLoadBuffer);
         return false;
     }
     if (WO_EnableHook((void*)kLuaYParser) != MH_OK ||
         WO_EnableHook((void*)kLuaLLoadBuffer) != MH_OK) {
-        Log("[ProtoCache] hooks created but could not be enabled");
+        MH_RemoveHook((void*)kLuaYParser);
+        MH_RemoveHook((void*)kLuaLLoadBuffer);
+        orig_luaY_parser = nullptr;
+        orig_luaL_loadbuffer = nullptr;
+        Log("[ProtoCache] NOT active: hooks created but could not be enabled");
         return false;
     }
 
+    QueryPerformanceFrequency(&g_parseFreq);
     g_installed = true;
     Log("[ProtoCache] ACTIVE on luaY_parser (0x%08X). A census of tester sessions "
         "found 88%% of compiled chunks were source already compiled that session, "
@@ -553,6 +850,27 @@ void LogStats() {
     if (!g_installed) { Log("[ProtoCache] not installed - nothing measured"); return; }
     if (g_seen == 0)  { Log("[ProtoCache] installed but no chunk reached it yet"); return; }
 
+    // The saving in time, which is the figure this module exists to produce and
+    // has never printed. Kilobytes of source skipped is not a saving; the parses
+    // those kilobytes would have cost is.
+    if (g_missTimed && g_hitTimed) {
+        double meanMiss = g_missMsTotal / (double)g_missTimed;
+        double meanHit  = g_hitMsTotal  / (double)g_hitTimed;
+        Log("[ProtoCache] a parse costs %.3f ms on average over %lu timed misses; "
+            "a reuse costs %.3f ms over %lu timed hits. At %lu reuses that is "
+            "about %.0f ms of parsing this session that did not happen.",
+            meanMiss, g_missTimed, meanHit, g_hitTimed, g_hits,
+            (meanMiss - meanHit) * (double)g_hits);
+    } else if (g_missTimed || g_hitTimed) {
+        Log("[ProtoCache] only one of hit and miss was ever timed (%lu misses, "
+            "%lu hits sampled), so there is no saving to state - not a saving of "
+            "zero.", g_missTimed, g_hitTimed);
+    } else {
+        Log("[ProtoCache] no parse was timed, so the saving is not measured rather "
+            "than measured small. One call in %u is sampled.",
+            kParseSampleMask + 1);
+    }
+
     Log("[ProtoCache] %lu chunks offered, %lu reused (%.1f%%), %llu KB of parsing "
         "skipped%s",
         g_seen, g_hits, g_seen ? (100.0 * (double)g_hits / (double)g_seen) : 0.0,
@@ -569,11 +887,60 @@ void LogStats() {
         g_onSight, g_flushes, (unsigned)g_seenOnce.size(),
         (unsigned)g_knownRepeaters.size());
 
+    Log("[ProtoCache]   %lu chunk(s) were large enough to keep on first sight "
+        "rather than waiting for a second compile - those are the ones a raised "
+        "cap admits, and each is worth more than every small chunk here put "
+        "together.", g_keptOnFirstSight);
     Log("[ProtoCache]   %lu reuses verified against a fresh compile; turned away: "
         "%lu over the %u KB size cap (%llu KB), %lu after the cache filled, %lu "
-        "not a flat buffer, %lu could not be anchored",
+        "not a flat buffer, %lu could not be anchored (%lu of the resets were "
+        "reported by the state-swap watcher rather than noticed here)",
         g_verified, g_tooBig, (unsigned)(kMaxChunkBytes / 1024),
-        g_bytesTooBig / 1024, g_capped, g_notBuffer, g_anchorFailed);
+        g_bytesTooBig / 1024, g_capped, g_notBuffer, g_anchorFailed,
+        g_swapFlushes);
+    if (g_cappedRepeats) {
+        double meanMiss = g_missTimed ? (g_missMsTotal / (double)g_missTimed) : 0.0;
+        if (meanMiss > 0.0) {
+            Log("[ProtoCache]   the budget turned away %lu chunk(s) it already "
+                "knew repeat, %llu KB of source. At %.3f ms a parse that is "
+                "about %.0f ms a larger cache would have removed this session; "
+                "the rest of what was turned away had not repeated yet and may "
+                "never.",
+                g_cappedRepeats, g_cappedRepeatBytes / 1024, meanMiss,
+                meanMiss * (double)g_cappedRepeats);
+        } else {
+            Log("[ProtoCache]   the budget turned away %lu chunk(s) it already "
+                "knew repeat, %llu KB of source. What that cost is not "
+                "measured: no parse was timed, so there is nothing to multiply "
+                "by.", g_cappedRepeats, g_cappedRepeatBytes / 1024);
+        }
+    } else if (g_capped) {
+        Log("[ProtoCache]   measured and zero: of the %lu chunk(s) the budget "
+            "turned away, not one had repeated before. Raising it would have "
+            "bought nothing this session.", g_capped);
+    }
+
+    if (Config::g_settings.OptLuaBytecodeStore) {
+        // The store counts how many parses it skipped; only this module knows
+        // what a parse costs, so the two numbers have to meet somewhere.
+        if (g_missTimed)
+            LuaBytecodeStore::NoteParseCost(g_missMsTotal / (double)g_missTimed);
+        Log("[ProtoCache]   %lu chunks came back from the disk store on a first "
+            "sighting - compiles no in-process cache could have removed - and "
+            "%lu more were rebuilt from it and checked against a real parse "
+            "before anything was reused.", g_diskServed, g_diskProved);
+    }
+
+    if (g_stale)
+        Log("[ProtoCache]   %lu times a kept Proto had stopped looking like "
+            "itself and the cache was emptied. Anything above zero here means a "
+            "state swap went unseen.", g_stale);
+}
+
+void OnLuaStateSwapped() {
+    // Only a flag. The flush happens inside the parser hook, on the thread that
+    // owns the containers, before the next lookup can reach a stale entry.
+    g_swapPending = true;
 }
 
 } // namespace LuaProtoCache

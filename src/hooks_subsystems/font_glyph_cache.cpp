@@ -172,6 +172,13 @@ static char __cdecl Hooked_GxuLoadGlyph(void* fontObj, unsigned int charCode, in
     return result;
 }
 
+// Whether the glyph loader is actually detoured by us. In one session it was
+// not: something else - an overlay or a client extension - had already put a
+// jmp rel32 at 0x006C8CC0, so WineSafe_CreateHook stood aside and this cache
+// reported "0 hits, 0 misses (0.0%% hit rate)" for the whole session as though
+// it had run and found nothing worth caching.
+static bool g_hooked = false;
+
 bool Init() {
     g_hits = 0;
     g_misses = 0;
@@ -188,6 +195,7 @@ bool Init() {
         return false;
     }
 
+    g_hooked = true;
     Log("[FontGlyphCache] Active - Font Glyph Pre-Caching Atlas Initialized");
     return true;
 }
@@ -197,6 +205,18 @@ bool Init() {
 // Shutdown does not run and these numbers reached no log at all - four tester
 // sessions contain none of them.
 void LogStats() {
+    if (!g_hooked) {
+        Log("[FontGlyphCache] not installed - the glyph loader at 0x006C8CC0 "
+            "could not be detoured, and the reason is at the top of this log. "
+            "Zero hits here would have meant nothing to cache; it means nothing "
+            "ran.");
+        return;
+    }
+    if (g_hits == 0 && g_misses == 0) {
+        Log("[FontGlyphCache] installed and the glyph loader was never called. "
+            "That is a measurement: no text was drawn through this path.");
+        return;
+    }
     Log("[FontGlyphCache] %lld hits, %lld misses (%.1f%% hit rate)",
         g_hits, g_misses,
         (g_hits + g_misses) ? (100.0 * g_hits / (g_hits + g_misses)) : 0.0);

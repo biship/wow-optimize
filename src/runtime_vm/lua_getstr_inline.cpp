@@ -25,6 +25,10 @@ extern "C" void Log(const char* fmt, ...);
 // Statistics (diagnostic only; plain increments. The Lua VM is
 // single-threaded, so we use plain increments for minimum overhead.)
 // ----------------------------------------------------------------
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static volatile LONG64 g_total_calls = 0;
 static volatile LONG64 g_first_node_hits = 0;
 static volatile LONG64 g_chain_walks = 0;
@@ -150,7 +154,30 @@ bool InstallLuaGetStrInline()
     }
 
     Log("[GetStrInline] Hook ACTIVE (safe first-node fast path + chain walk)");
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void LuaGetStrInline_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[GetStrInline] not measured: the hook is not installed.");
+        return;
+    }
+    const LONG64 total = g_total_calls, first = g_first_node_hits;
+    const LONG64 walks = g_chain_walks, nils = g_nil_returns;
+    const LONG64 depth = g_chain_depth_total;
+    if (total == 0) {
+        Log("[GetStrInline] measured and zero: no string lookup reached it.");
+        return;
+    }
+    Log("[GetStrInline] %lld calls, %lld first-node (%.1f%%), %lld chain walks "
+        "(avg depth %.1f), %lld nil.",
+        (long long)total, (long long)first, 100.0 * (double)first / (double)total,
+        (long long)walks, walks > 0 ? (double)depth / (double)walks : 0.0,
+        (long long)nils);
 }
 
 void UninstallLuaGetStrInline()

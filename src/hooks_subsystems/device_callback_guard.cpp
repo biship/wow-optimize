@@ -282,7 +282,10 @@ bool Init() {
 }
 
 void LogStats() {
-    if (!Config::g_settings.OptDeviceCbGuard) return;
+    if (!Config::g_settings.OptDeviceCbGuard) {
+        Log("[DeviceCbGuard] not measured: switched off.");
+        return;
+    }
     if (g_guardedCalls == 0) {
         // Silent on a healthy client, but say the walk ran at all so a log
         // without the line below is not mistaken for the guard being off.

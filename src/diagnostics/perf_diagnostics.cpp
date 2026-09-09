@@ -1,4 +1,5 @@
 #include "perf_diagnostics.h"
+#include "../core/world_position.h"
 #include "version.h"
 #include "crash_dumper.h"
 #include <psapi.h>
@@ -8,6 +9,15 @@
 
 extern "C" void Log(const char* fmt, ...);
 extern void CrashDumper_DumpHookTrace(int count);
+// Whether an address belongs to this project's allocator.
+//
+// The stutter snapshot has been printing "private (heap/allocator)" against the
+// largest reservations for as long as it has existed, and a tester log finally
+// showed why that is not enough: 128 MB, 128 MB, 51 MB, 32 MB, 32 MB, every one
+// of them below 2GB and every one of them described with the same six words. The
+// question the whole low-address-space investigation turns on is whether those
+// are the client's or ours, and mimalloc can answer it directly.
+extern "C" bool mi_is_in_heap_region(const void* p);
 extern "C" void mi_process_info(size_t* elapsed_msecs, size_t* user_msecs, size_t* system_msecs,
                                 size_t* current_rss, size_t* peak_rss,
                                 size_t* current_commit, size_t* peak_commit,
@@ -18,8 +28,6 @@ namespace PerfDiagnostics {
 static DWORD g_lastDiagTick = 0;
 static std::atomic<long> g_stutterCount{0};
 
-static float* const g_playerX = (float*)0x00BE1F30;
-static float* const g_playerY = (float*)0x00BE1F34;
 
 // Insert one allocation into a descending top-N list, dropping the smallest.
 template <typename T>
@@ -42,22 +50,173 @@ static void DescribeAllocation(uintptr_t base, DWORD type, char* out, size_t out
         lstrcpynA(out, "image", (int)outSize);
         return;
     }
-    lstrcpynA(out, (type == MEM_MAPPED) ? "mapped file/section" : "private (heap/allocator)",
+    if (type == MEM_MAPPED) { lstrcpynA(out, "mapped file/section", (int)outSize); return; }
+    // "private" covers both heaps in this process, and which one it is decides
+    // whether the fix is ours to make.
+    bool ours = false;
+    __try { ours = mi_is_in_heap_region((const void*)base); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ours = false; }
+    lstrcpynA(out, ours ? "private - THIS TOOL'S ALLOCATOR (mimalloc)"
+                        : "private - the client's own heap, or something else",
               (int)outSize);
+}
+
+// Who is holding the low 2GB.
+//
+// The one question nobody has been able to answer. A tester session ends with
+// "VA Space (below 2GB): Free=16MB LargestBlock=1MB" while the working set is
+// 903MB, so a gigabyte of the half the client allocates from is *reserved* and
+// not resident - and nothing said by what. That is the state in which a
+// SavedVariables filename comes out as ")_.lua".
+//
+// The snapshot above already collects exactly this, but over the whole address
+// space, where a 3GB machine's high half swamps the list. Restricted to the low
+// half it names the owner instead: a module by filename, a mapped section, or
+// private memory, which on this client means the allocator.
+//
+// Called from the heap compactor's monitor thread, so the walk is not on the
+// main thread - the whole point of the last release's work. Rate limited by the
+// caller, because it is a full VirtualQuery walk.
+void LogLowHalfOccupancy(const char* why) {
+    static const uintptr_t kLowEnd = 0x80000000u;
+
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    SIZE_T commitPrivate = 0, commitMapped = 0, commitImage = 0, reservedOnly = 0;
+    SIZE_T totalFree = 0, largestFree = 0, currentFree = 0;
+    // Split by owner, which is the whole point of looking at this half.
+    SIZE_T oursBytes = 0, theirsBytes = 0;
+    unsigned oursRegions = 0;
+
+    struct TopEntry { uintptr_t base; SIZE_T size; DWORD type; };
+    const int kTopN = 10;
+    TopEntry top[kTopN] = {};
+    uintptr_t runBase = 0; SIZE_T runSize = 0; DWORD runType = 0;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    uintptr_t addr = 0;
+    unsigned regions = 0;
+
+    while (addr < kLowEnd && VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) {
+        uintptr_t base = (uintptr_t)mbi.BaseAddress;
+        if (base >= kLowEnd) break;
+
+        // A region straddling the boundary counts only its low part, or the
+        // totals inflate and the answer is about a range nobody asked about.
+        SIZE_T size = mbi.RegionSize;
+        if (base + size > kLowEnd) size = (SIZE_T)(kLowEnd - base);
+
+        if (mbi.State == MEM_FREE) {
+            totalFree += size;
+            currentFree += size;
+            if (currentFree > largestFree) largestFree = currentFree;
+        } else {
+            currentFree = 0;
+            if (mbi.State == MEM_COMMIT) {
+                if      (mbi.Type == MEM_IMAGE)  commitImage   += size;
+                else if (mbi.Type == MEM_MAPPED) commitMapped  += size;
+                else                             commitPrivate += size;
+            } else {
+                reservedOnly += size;
+            }
+            if (mbi.Type == MEM_PRIVATE) {
+                bool ours = false;
+                __try { ours = mi_is_in_heap_region((const void*)base); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { ours = false; }
+                if (ours) { oursBytes += size; ++oursRegions; }
+                else      { theirsBytes += size; }
+            }
+            uintptr_t allocBase = (uintptr_t)mbi.AllocationBase;
+            if (allocBase != runBase) {
+                if (runSize > 0) TrackTopReservation(top, kTopN, runBase, runSize, runType);
+                runBase = allocBase; runSize = 0; runType = mbi.Type;
+            }
+            runSize += size;
+        }
+
+        ++regions;
+        addr = base + mbi.RegionSize;
+        if (mbi.RegionSize == 0) addr += 0x10000;
+        if (addr < base) break;                       // overflow
+    }
+    if (runSize > 0) TrackTopReservation(top, kTopN, runBase, runSize, runType);
+
+    QueryPerformanceCounter(&t1);
+    double walkMs = freq.QuadPart
+                  ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+                  : 0.0;
+
+    Log("[LowHalf] === WHAT IS HOLDING THE LOW 2GB === (%s)", why ? why : "no reason given");
+    Log("[LowHalf]   free %.0f MB in %u region(s), largest run %.0f MB",
+        totalFree / (1024.0 * 1024.0), regions, largestFree / (1024.0 * 1024.0));
+    Log("[LowHalf]   in use: private %.0f MB, mapped %.0f MB, image %.0f MB, "
+        "reserved but never committed %.0f MB",
+        commitPrivate / (1024.0 * 1024.0), commitMapped / (1024.0 * 1024.0),
+        commitImage / (1024.0 * 1024.0), reservedOnly / (1024.0 * 1024.0));
+
+    {
+        size_t elapsed = 0, userMs = 0, sysMs = 0, rss = 0, peakRss = 0,
+               commit = 0, peakCommit = 0, faults = 0;
+        mi_process_info(&elapsed, &userMs, &sysMs, &rss, &peakRss,
+                        &commit, &peakCommit, &faults);
+        Log("[LowHalf]   mimalloc holds %.0f MB committed across the whole address "
+            "space (peak %.0f MB). If the private figure above is close to it, the "
+            "low half went to this tool's allocator rather than to the client.",
+            commit / (1024.0 * 1024.0), peakCommit / (1024.0 * 1024.0));
+    }
+
+    // The one line this dump exists to produce.
+    Log("[LowHalf]   of the private memory below 2GB, %.0f MB in %u region(s) "
+        "belongs to this tool's allocator and %.0f MB does not. If the first "
+        "number is the larger one, Keep the Allocator Above 2GB is the fix; if "
+        "the second is, it is not.",
+        oursBytes / (1024.0 * 1024.0), oursRegions,
+        theirsBytes / (1024.0 * 1024.0));
+
+    Log("[LowHalf]   largest %d reservations below 2GB:", kTopN);
+    for (int i = 0; i < kTopN && top[i].size > 0; ++i) {
+        char owner[MAX_PATH];
+        DescribeAllocation(top[i].base, top[i].type, owner, sizeof(owner));
+        Log("[LowHalf]     0x%08X  %7.1f MB  %s",
+            (unsigned)top[i].base, top[i].size / (1024.0 * 1024.0), owner);
+    }
+    Log("[LowHalf]   walk took %.1f ms on the heap monitor thread, not on the "
+        "main one.", walkMs);
+    Log("[LowHalf] ====================================");
 }
 
 void LogPerformanceSnapshot(double elapsedMs) {
     DWORD now = GetTickCount();
     if (now - g_lastDiagTick < 5000) return; // Rate-limit to once every 5 seconds
     g_lastDiagTick = now;
+
+    // This snapshot is expensive and it runs on the main thread, inside the
+    // frame it is describing - the address-space walk below is VirtualQuery once
+    // per region and costs tens of milliseconds on a fragmented 3GB space. That
+    // is the right trade for a stutter that has already happened, but only if
+    // the log says how much of the reported frame was this. Unsaid, the next
+    // reader subtracts nothing and treats the whole spike as the client's.
+    LARGE_INTEGER snapFreq, snapStart;
+    QueryPerformanceFrequency(&snapFreq);
+    QueryPerformanceCounter(&snapStart);
     
     g_stutterCount.fetch_add(1, std::memory_order_relaxed);
     
     Log("[PerfDiag] === STUTTER DETECTED (Frame duration: %.1f ms) ===", elapsedMs);
     
-    // 1. Coordinates & Zone
-    if (g_playerX && g_playerY) {
-        Log("[PerfDiag]   Player position: X=%.2f, Y=%.2f", *g_playerX, *g_playerY);
+    // 1. Where this happened. Not a player position: the client's terrain
+    //    streaming centre, the only world coordinate available here that the
+    //    client actually writes. Said plainly when it cannot be read - a
+    //    stutter at the origin and a stutter with no world are different facts,
+    //    and the line this replaces printed 0.00, 0.00 for both, always.
+    float pos[3];
+    if (WowWorld::StreamCentre(pos)) {
+        Log("[PerfDiag]   World position: X=%.2f, Y=%.2f, Z=%.2f",
+            pos[0], pos[1], pos[2]);
+    } else {
+        Log("[PerfDiag]   World position: no world loaded, nothing to report");
     }
     
     // 2. Memory State
@@ -218,6 +377,17 @@ void LogPerformanceSnapshot(double elapsedMs) {
     Log("[PerfDiag]   Last 16 hook calls before stutter:");
     CrashDumper_DumpHookTrace(16);
     
+    if (snapFreq.QuadPart) {
+        LARGE_INTEGER snapEnd;
+        QueryPerformanceCounter(&snapEnd);
+        double snapMs = (double)(snapEnd.QuadPart - snapStart.QuadPart) * 1000.0
+                      / (double)snapFreq.QuadPart;
+        Log("[PerfDiag]   Collecting this snapshot took %.1f ms on the main "
+            "thread. The %.1f ms frame above was measured before it ran, so "
+            "this is not part of that number - but it is part of the next "
+            "frame, and most of it is the address-space walk.",
+            snapMs, elapsedMs);
+    }
     Log("[PerfDiag] ==================================================");
 }
 

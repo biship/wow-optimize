@@ -18,6 +18,10 @@
 extern "C" void Log(const char* fmt, ...);
 
 typedef int (__cdecl* sub_508320_fn)(int a1, int a2);
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static sub_508320_fn g_orig_sub_508320 = nullptr;
 
 static volatile LONG64 g_total_calls  = 0;
@@ -82,7 +86,20 @@ bool InstallSoundBufferGuard()
 
     Log("[SndBuffer] ACTIVE: SEH guard on sub_508320 (buffer + update), covers 0x508740+0x508950");
     g_soundBufferGuardInstalled = true;
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void SoundBufferGuard_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[SndBuffer] not measured: the guard is not installed.");
+        return;
+    }
+    Log("[SndBuffer] %lld call(s), %lld recovered from a crash.",
+        (long long)g_total_calls, (long long)g_recovered);
 }
 
 void UninstallSoundBufferGuard()

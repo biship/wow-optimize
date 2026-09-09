@@ -16,8 +16,11 @@
 // Configuration
 static constexpr DWORD MONITOR_INTERVAL_MS = 10000;     // Check every 10s (was 3 - reduce CPU overhead)
 static constexpr DWORD LOADING_INTERVAL_MS = 3000;      // Faster checks during loading screens
+// The one threshold, and it is read against the largest free run below 2GB.
+// A WARNING_THRESHOLD of 32MB used to sit beside it, checked against the whole
+// address space; it is gone with the branch that read it. An unused constant
+// with that name is an invitation to wire it back to the wrong figure.
 static constexpr SIZE_T CRITICAL_THRESHOLD = 16 * 1024 * 1024;  // 16MB
-static constexpr SIZE_T WARNING_THRESHOLD = 32 * 1024 * 1024;  // 32MB
 
 // Statistics
 static std::atomic<uint64_t> g_checksPerformed{0};
@@ -54,6 +57,8 @@ extern "C" void Log(const char* fmt, ...);
 extern "C" void mi_collect(bool force);
 #include <mimalloc.h>
 #include "crash_dumper.h"
+#include "perf_diagnostics.h"
+#include "mimalloc_high_arena.h"
 
 // Largest free virtual address range, measured twice.
 //
@@ -71,14 +76,53 @@ extern "C" void mi_collect(bool force);
 // contradiction rather than as two different questions.
 //
 // `lowHalfOut` receives the figure for the low 2 GB when it is wanted.
-static SIZE_T GetLargestFreeBlock(SIZE_T* lowHalfOut = nullptr) {
+// What this walk costs, because it is the prime suspect for a stall we cause.
+//
+// Tester logs carry "STALL periodic maintenance took 42.6 ms" and "39.5 ms" -
+// forty milliseconds on the main thread, inside a frame, every five minutes,
+// from this project's own reporting. Logging is not the cause: it goes through a
+// lock-free ring to a writer thread. This walk is: VirtualQuery over the whole
+// address space, one call per region, and a fragmented 3 GB VA has tens of
+// thousands of regions. The session where that stall was recorded had 149 MB free
+// below 2 GB with a largest block of 19 MB, which is exactly that shape.
+//
+// Suspecting is not measuring, so it is timed and the region count is reported
+// with it. If it comes back at two milliseconds the suspicion is wrong and the
+// stall is somewhere else in the report.
+// The monitor thread's most recent walk, for the report to read instead of
+// walking again on the main thread. Written by one thread and read by another;
+// they are plain SIZE_T on 32-bit x86, so a read cannot tear, and a report that
+// caught a value mid-update would be one monitor interval out of date rather than
+// wrong.
+static volatile SIZE_T g_lastWalkFree = 0;
+static volatile SIZE_T g_lastWalkLow  = 0;
+static volatile SIZE_T g_lastWalkLowTotal = 0;
+static volatile DWORD  g_lastWalkTick = 0;
+
+static double   g_walkMsWorst = 0.0;
+static double   g_walkMsTotal = 0.0;
+static unsigned g_walkCount   = 0;
+static unsigned g_walkRegionsWorst = 0;
+
+// Returns the largest free run over all of user address space. Optionally also
+// the largest free run below 2GB and the sum of every free region there - the
+// two figures the periodic report used to get by walking the address space a
+// second time, on the main thread, inside a frame.
+static SIZE_T GetLargestFreeBlock(SIZE_T* lowHalfOut = nullptr,
+                                  SIZE_T* lowTotalOut = nullptr) {
     static const uintptr_t LOW_HALF_END = 0x80000000u;
+    static LARGE_INTEGER freq = {};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER wa;
+    QueryPerformanceCounter(&wa);
+    unsigned regions = 0;
 
     MEMORY_BASIC_INFORMATION mbi;
     SIZE_T largestFree = 0;
     SIZE_T currentFree = 0;
     SIZE_T largestLow  = 0;
     SIZE_T currentLow  = 0;
+    SIZE_T lowTotal    = 0;
     uintptr_t addr = 0;
 
     while (VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) {
@@ -95,6 +139,7 @@ static SIZE_T GetLargestFreeBlock(SIZE_T* lowHalfOut = nullptr) {
                                ? (SIZE_T)(LOW_HALF_END - base)
                                : mbi.RegionSize;
                 currentLow += lowPart;
+                lowTotal   += lowPart;
                 if (lowPart != mbi.RegionSize) {
                     if (currentLow > largestLow) largestLow = currentLow;
                     currentLow = 0;
@@ -109,6 +154,7 @@ static SIZE_T GetLargestFreeBlock(SIZE_T* lowHalfOut = nullptr) {
             }
         }
 
+        ++regions;
         addr = base + mbi.RegionSize;
         if (addr < base) break; // Overflow
     }
@@ -116,7 +162,17 @@ static SIZE_T GetLargestFreeBlock(SIZE_T* lowHalfOut = nullptr) {
     if (currentFree > largestFree) largestFree = currentFree;
     if (currentLow  > largestLow)  largestLow  = currentLow;
 
-    if (lowHalfOut) *lowHalfOut = largestLow;
+    if (freq.QuadPart) {
+        LARGE_INTEGER wb;
+        QueryPerformanceCounter(&wb);
+        double ms = (double)(wb.QuadPart - wa.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        g_walkMsTotal += ms;
+        ++g_walkCount;
+        if (ms > g_walkMsWorst) { g_walkMsWorst = ms; g_walkRegionsWorst = regions; }
+    }
+
+    if (lowHalfOut)  *lowHalfOut  = largestLow;
+    if (lowTotalOut) *lowTotalOut = lowTotal;
     return largestFree;
 }
 
@@ -153,9 +209,24 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         DWORD interval = LuaOpt::IsLoadingMode() ? LOADING_INTERVAL_MS : MONITOR_INTERVAL_MS;
         Sleep(interval);
         
-        SIZE_T largestLow = 0;
-        SIZE_T largestFree = GetLargestFreeBlock(&largestLow);
+        SIZE_T largestLow = 0, lowTotal = 0;
+        SIZE_T largestFree = GetLargestFreeBlock(&largestLow, &lowTotal);
         g_checksPerformed++;
+
+        // Published for the report, which used to walk the address space again on
+        // the main thread to get the same two numbers. This thread has just paid
+        // for that walk off the main thread; there is no reason to pay again
+        // inside a frame.
+        g_lastWalkFree = largestFree;
+        g_lastWalkLow  = largestLow;
+        g_lastWalkLowTotal = lowTotal;
+        g_lastWalkTick = GetTickCount();
+
+        // Top the high arena up before the allocator has to go to the OS for
+        // more, which it does bottom-up and into the half the client needs.
+        // Here rather than on the main thread because it reserves address
+        // space, and this thread already exists to do that kind of work.
+        MimallocHighArena::Grow();
 
         // The low half is what actually runs out, and it is what the trigger
         // reads now.
@@ -176,6 +247,20 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         // achieves anything - see the recovery check in RunPendingWork.
         if (largestLow < CRITICAL_THRESHOLD) {
             DWORD nowTick2 = GetTickCount();
+
+            // Name what is holding the low half, once when it first runs out
+            // and then rarely. Every log that has ever shown this state has
+            // shown the number and not the owner, so the same question gets
+            // asked of every tester and answered by none of them. This is a
+            // full VirtualQuery walk, which is why it is here on the monitor
+            // thread and rate limited rather than in the periodic report.
+            static DWORD lastOccupancyTick = 0;
+            if (lastOccupancyTick == 0 ||
+                (nowTick2 - lastOccupancyTick) >= 300000) {
+                lastOccupancyTick = nowTick2;
+                PerfDiagnostics::LogLowHalfOccupancy(
+                    "largest free block below 2GB went under 16MB");
+            }
             bool due = (g_lastCompactTick == 0) ||
                        (nowTick2 - g_lastCompactTick) >= g_compactIntervalMs;
             if (due && !g_compactionGaveUp) {
@@ -206,32 +291,19 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         while (largestFree > maxVal && 
                !g_maxLargestBlock.compare_exchange_weak(maxVal, largestFree));
         
-        // Check thresholds — only *request* compaction here; the main thread
-        // performs the actual heap mutation (see HeapCompactor_RunPendingWork).
-        if (largestFree < CRITICAL_THRESHOLD) {
-            // Rate-limited: this fires every monitor tick once the process is out
-            // of address space, and a tester log shows it repeating unchanged for
-            // five minutes. One line per 30s is enough to establish the state.
-            static DWORD lastCriticalTick = 0;
-            DWORD nowTick = GetTickCount();
-            if (nowTick - lastCriticalTick > 30000) {
-                Log("[HeapCompactor] CRITICAL: LargestFreeBlock=%uMB (<%dMB) - requesting compaction",
-                    (unsigned)(largestFree / (1024*1024)), (int)(CRITICAL_THRESHOLD / (1024*1024)));
-                lastCriticalTick = nowTick;
-            }
-            g_pendingWork.store(2, std::memory_order_release);
-        } else if (largestFree < WARNING_THRESHOLD) {
-            // Proactively compact before reaching critical threshold
-            static DWORD lastWarningTick = 0;
-            DWORD now = GetTickCount();
-            if (now - lastWarningTick > 30000) { // Max 1 per 30 seconds
-                Log("[HeapCompactor] WARNING: LargestFreeBlock=%uMB (<32MB) - requesting proactive compaction",
-                    (unsigned)(largestFree / (1024*1024)));
-                int expected = 0;
-                g_pendingWork.compare_exchange_strong(expected, 1, std::memory_order_release);
-                lastWarningTick = now;
-            }
-        }
+        // The thresholds that used to be checked here are gone.
+        //
+        // They tested largestFree - the largest run anywhere in user address
+        // space - against 16MB and 32MB, and requested the same compaction the
+        // low-half check above requests. largestLow can never exceed largestFree,
+        // so largestFree < 16MB implies largestLow < 16MB and the block above has
+        // already fired: strictly redundant, and removing them changes nothing
+        // for any input.
+        //
+        // What they were not was harmless. A second threshold on the wrong figure
+        // is what let two other modules sit calm through a session with one
+        // megabyte left below 2GB, and their log lines said "LargestFreeBlock"
+        // with no range on it while the line above named its own.
     }
 
     Log("[HeapCompactor] Monitor thread shutting down");
@@ -357,8 +429,46 @@ void HeapCompactor_Shutdown() {
 // Printed from the periodic report, not from Shutdown: this DLL exits through
 // TerminateProcess and a teardown-only counter never reaches a log.
 extern "C" void HeapCompactor_LogStats() {
-    SIZE_T low = 0;
-    SIZE_T all = GetLargestFreeBlock(&low);
+    // Read the monitor thread's last walk rather than walking again here.
+    //
+    // This function runs on the main thread from the periodic report, and the
+    // walk it used to do is VirtualQuery over the whole address space, one call
+    // per region. Tester logs carry "periodic maintenance took 42.6 ms" against a
+    // frame median near ten, and the session that recorded it had the low half
+    // fragmented to a 19 MB largest block - tens of thousands of regions.
+    //
+    // The monitor thread walks every ten seconds anyway and now publishes what it
+    // found. A report reading that is at most one interval out of date, which for
+    // a figure printed every five minutes is nothing, and the age is printed so
+    // nobody has to assume it.
+    //
+    // Before the monitor has run once there is nothing to read, and the walk
+    // happens here - once, at the first report.
+    SIZE_T low = 0, all = 0;
+    DWORD  ageMs = 0;
+    if (g_lastWalkTick) {
+        all   = g_lastWalkFree;
+        low   = g_lastWalkLow;
+        ageMs = GetTickCount() - g_lastWalkTick;
+    } else {
+        all = GetLargestFreeBlock(&low);
+    }
+
+    // Printed before the numbers it produced, because if this walk is what a
+    // tester is seeing as a forty-millisecond stall then it is the more important
+    // of the two facts. It runs on the main thread, inside a frame.
+    if (g_walkCount) {
+        Log("[HeapCompactor] the address-space walk that produces the figures "
+            "below: %u run(s), %.1f ms in total, worst %.1f ms over %u regions. "
+            "This runs on the main thread and lands inside a frame, and a "
+            "\"periodic maintenance\" stall in this log is worth comparing "
+            "against it.",
+            g_walkCount, g_walkMsTotal, g_walkMsWorst, g_walkRegionsWorst);
+    }
+    Log("[HeapCompactor] the figures below are %lu ms old - taken by the monitor "
+        "thread, not walked again here. That walk is VirtualQuery over the whole "
+        "address space and this function runs inside a frame.",
+        (unsigned long)ageMs);
     Log("[HeapCompactor] %uMB largest free below 2GB, %uMB across all address "
         "space; %llu compactions, %lluKB recovered, next attempt no sooner than "
         "%us%s",
@@ -372,10 +482,79 @@ extern "C" SIZE_T HeapCompactor_GetLargestFreeBlock() {
     return GetLargestFreeBlock();
 }
 
+// The low half separately, which is the number that matters: the client
+// allocates from below 2GB and a caller that wants to say how much room was left
+// at some moment needs that figure rather than the whole address space.
+extern "C" SIZE_T HeapCompactor_GetLargestFreeLowHalf() {
+    SIZE_T low = 0;
+    GetLargestFreeBlock(&low);
+    return low;
+}
+
+// The same figure without the walk, for callers on the main thread.
+//
+// Returns the monitor thread's last result and how old it is, or 0 with an age of
+// 0 when the monitor has not run yet - which is a different fact from "no memory
+// left" and the caller has to be able to tell them apart. The walk is
+// VirtualQuery over the whole address space and costs tens of milliseconds on a
+// fragmented one; that is not a price a diagnostic should charge inside a frame.
+extern "C" SIZE_T HeapCompactor_GetLastLowHalf(unsigned long* ageMsOut) {
+    if (!g_lastWalkTick) { if (ageMsOut) *ageMsOut = 0; return 0; }
+    if (ageMsOut) *ageMsOut = (unsigned long)(GetTickCount() - g_lastWalkTick);
+    return g_lastWalkLow;
+}
+
+
+// Both low-half figures at once, for the periodic report.
+//
+// Returns false when the monitor has not walked yet, so the caller can say "not
+// measured" rather than print two zeros. Kept separate from the accessor above
+// because that one has a caller which wants only the largest block.
+extern "C" bool HeapCompactor_GetLowHalfSnapshot(SIZE_T* largestOut,
+                                                 SIZE_T* totalOut,
+                                                 unsigned long* ageMsOut) {
+    if (!g_lastWalkTick) return false;
+    if (largestOut) *largestOut = g_lastWalkLow;
+    if (totalOut)   *totalOut   = g_lastWalkLowTotal;
+    if (ageMsOut)   *ageMsOut   = (unsigned long)(GetTickCount() - g_lastWalkTick);
+    return true;
+}
+
+
+// The largest free run over all of user address space, from the same cached
+// walk. Two other modules had their own copy of this walk and ran it on the
+// main thread - one of them up to once a second, for a number an addon
+// displays. False when the monitor has not walked yet.
+extern "C" bool HeapCompactor_GetLastLargestFree(SIZE_T* largestOut,
+                                                 unsigned long* ageMsOut) {
+    if (!g_lastWalkTick) return false;
+    if (largestOut) *largestOut = g_lastWalkFree;
+    if (ageMsOut)   *ageMsOut   = (unsigned long)(GetTickCount() - g_lastWalkTick);
+    return true;
+}
+
 // Cheap cached read (no VirtualQuery walk) for per-frame consumers like the GC
 // step. Returns the last value the monitor sampled; 0 means "not sampled yet".
 extern "C" SIZE_T HeapCompactor_GetCachedLargestBlock() {
     return g_lastLargestBlock.load();
+}
+
+// The same reading for the low half, which is the one every consumer of the
+// line above actually wanted.
+//
+// txtsd's 2026-09-02 session: "VA Space (below 2GB): Free=16MB
+// LargestBlock=1MB WARNING: fragmented" four reports running, while this
+// module reported 1237MB free across all of user address space in the same
+// second. The client allocates from below 2GB. Every consumer read the second
+// number, so the pressure governor sat in GREEN and the Lua collector never
+// stepped harder, for a whole session, while the client could not get 2MB.
+// ElvUI.lua was written to disk that session as ")_.lua".
+//
+// Zero means the monitor has not walked yet, which callers must treat as "not
+// measured" rather than "nothing free" - the same contract as above.
+extern "C" SIZE_T HeapCompactor_GetCachedLowHalf() {
+    if (!g_lastWalkTick) return 0;
+    return g_lastWalkLow;
 }
 
 extern "C" void HeapCompactor_GetStats(uint64_t* checks, uint64_t* compactions, 
@@ -392,5 +571,6 @@ extern "C" void HeapCompactor_GetStats(uint64_t* checks, uint64_t* compactions,
 // Compactor disabled: report "no data" so VA-pressure consumers stay inert.
 #include <windows.h>
 extern "C" SIZE_T HeapCompactor_GetCachedLargestBlock() { return 0; }
+extern "C" SIZE_T HeapCompactor_GetCachedLowHalf() { return 0; }
 
 #endif // TEST_DISABLE_HEAP_COMPACTOR

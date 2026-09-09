@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <cstring>
 #include <emmintrin.h>
+#include <intrin.h>
 
 #include "horizon_occlusion_sse2.h"
 #include "config.h"
@@ -304,6 +305,211 @@ static void __cdecl Hooked_HorizonBuild(int xyBase, int zBase, uint32_t* indices
     }
 }
 
+// ---------------------------------------------------------------------------
+// The consumer: sub_78FDC0's scan of the array this module builds
+//
+// The build is 2.46% of executing time in an older profile. Its consumer is the
+// largest single wow.exe entry in the most recent session - 3621 samples, 1.91%
+// of everything sampled - and nothing had looked at it.
+//
+// sub_78FDC0 projects the eight corners of a bounding box, works out the column
+// range they cover, and then walks that range one column at a time asking
+// whether any column's horizon is below the box's top:
+//
+//     fld   [ebp-20h]                ; the box's maximum projected y
+//   loop:
+//     fcom  flt_CD8938[ecx*4]
+//     fnstsw ax
+//     test  ah, 41h
+//     jz    visible                  ; this column is below it - stop, drawn
+//     add   ecx, 1
+//     cmp   ecx, edx
+//     jle   loop
+//     fstp  st                       ; ran off the end - occluded
+//
+// Up to 384 iterations, each with an fcom and an fnstsw. The status-word
+// transfer after a compare is the slowest way x86 has ever had to branch on a
+// float, and it is inside the loop.
+//
+// Four columns at a time with one packed compare and a movemask is the same
+// question asked four times at once. It needs no tolerance and no harness for
+// precision: both sides are floats sitting in memory that nothing has computed
+// on, and fcom widening them to 80 bits answers exactly what an ordered packed
+// single compare answers, for every input including NaN. This is the same case
+// as the collision outcode, which has now verified 3043 times in the field
+// without one disagreement.
+//
+// What can still be wrong is the reading of the registers, so the first calls
+// run both and compare the index.
+//
+// Register contract at 0x0078FF62, read off the disassembly:
+//
+//   in   ecx  first column, already clamped to 0..383
+//        edx  last column, inclusive, already clamped
+//        ebp  the caller's frame; [ebp-20h] is the box's maximum y, a float
+//        x87  balanced - the fld this replaces is the first push
+//   out  jump to 0x0078FF89 when a column is below it (the client's "visible"
+//        path, entered past its fstp because nothing was pushed), or to
+//        0x0078FF7C for occluded. eax, ecx and edx are dead at both.
+//
+// The two targets are reached from elsewhere in the function with a balanced x87
+// stack already - 0x78FF43 and 0x78FF47 both jump to 0x78FF89, and 0x78FF60
+// jumps to 0x78FF7C - so neither expects a value to pop.
+
+static constexpr uintptr_t ADDR_ScanHead = 0x0078FF62;
+static constexpr uintptr_t ADDR_ScanFound = 0x0078FF89;   // a column is below: visible
+static constexpr uintptr_t ADDR_ScanNone  = 0x0078FF7C;   // ran off the end: occluded
+// Not constexpr: a cast from an integer to a pointer is not a constant
+// expression, and the array is fixed at a known address in the client anyway.
+static float* const        kHorizon       = (float*)0x00CD8938;
+static constexpr int       kColumns       = 384;
+
+// The ten bytes the jump replaces, which are exactly two whole instructions:
+//
+//   78FF62: D9 45 E0                fld   dword ptr [ebp-20h]
+//   78FF65: D8 14 8D 38 89 CD 00    fcom  dword ptr flt_CD8938[ecx*4]
+//
+// Ten and not eight. The fcom is seven bytes and ends at 0x78FF6B; saving eight
+// would leave its last two, CD 00, sitting after the nop fill as an int 0. It is
+// unreachable either way, but a disassembler reading it should see nops.
+static const unsigned char kScanHeadBytes[10] = {
+    0xD9, 0x45, 0xE0, 0xD8, 0x14, 0x8D, 0x38, 0x89, 0xCD, 0x00
+};
+
+static bool  g_scanPatched = false;
+static bool  g_scanDead    = false;
+static unsigned char g_scanSaved[sizeof(kScanHeadBytes)] = {};
+static void* g_scanFound = (void*)ADDR_ScanFound;
+static void* g_scanNone  = (void*)ADDR_ScanNone;
+
+static unsigned long long g_scanCalls   = 0;
+static unsigned long long g_scanColumns = 0;   // how far the scan actually walked
+static unsigned long      g_scanMaxRun  = 0;
+static unsigned long      g_scanVerified = 0;
+static unsigned long      g_scanMismatch = 0;
+static const unsigned long kScanVerify = 20000;
+
+// Returns the first index in [first,last] whose horizon is below maxY, or -1.
+static inline int ScanScalar(int first, int last, float maxY) {
+    for (int i = first; i <= last; ++i)
+        if (kHorizon[i] < maxY) return i;
+    return -1;
+}
+
+static inline int ScanSse(int first, int last, float maxY) {
+    // Unaligned loads, deliberately. The array is at 0x00CD8938, which is eight
+    // modulo sixteen, so no index at all makes an aligned address and an aligned
+    // load would fault on the first call. Aligning the loop to a four-index
+    // boundary would not help either, for the same reason.
+    const __m128 v = _mm_set1_ps(maxY);
+    int i = first;
+    for (; i + 3 <= last; i += 4) {
+        const __m128 h = _mm_loadu_ps(kHorizon + i);
+        const int m = _mm_movemask_ps(_mm_cmplt_ps(h, v));
+        if (m) {
+            unsigned long bit;
+            _BitScanForward(&bit, (unsigned long)m);
+            return i + (int)bit;
+        }
+    }
+    for (; i <= last; ++i)
+        if (kHorizon[i] < maxY) return i;
+    return -1;
+}
+
+// Returns 1 when a column below maxY was found, 0 when none was.
+extern "C" int __cdecl HorizonScan_Run(int first, int last, float maxY) {
+    ++g_scanCalls;
+    if (first < 0) first = 0;
+    if (last >= kColumns) last = kColumns - 1;
+    if (first > last) return 0;
+
+    const unsigned long run = (unsigned long)(last - first + 1);
+    g_scanColumns += run;
+    if (run > g_scanMaxRun) g_scanMaxRun = run;
+
+    if (g_scanDead) return ScanScalar(first, last, maxY) >= 0 ? 1 : 0;
+
+    const int mine = ScanSse(first, last, maxY);
+    if (g_scanVerified < kScanVerify) {
+        const int theirs = ScanScalar(first, last, maxY);
+        if (mine != theirs) {
+            ++g_scanMismatch;
+            g_scanDead = true;
+            Log("[Horizon] SCAN DISABLED: the packed compare found column %d and "
+                "the client's own order found %d over [%d,%d]. There is no "
+                "arithmetic in this to round, so a difference means the registers "
+                "were misread. Every scan from here goes the client's way.",
+                mine, theirs, first, last);
+            return theirs >= 0 ? 1 : 0;
+        }
+        ++g_scanVerified;
+    }
+    return mine >= 0 ? 1 : 0;
+}
+
+// Register marshalling only. ebp belongs to the client throughout, which is why
+// the box's maximum y is read from its frame here rather than passed in.
+static __declspec(naked) void HorizonScanThunk() {
+    __asm {
+        push dword ptr [ebp-0x20]       // maxY, as a float argument
+        push edx                        // last column
+        push ecx                        // first column
+        call HorizonScan_Run
+        add  esp, 12
+        test eax, eax
+        jnz  found
+        jmp  dword ptr [g_scanNone]     // ran off the end: occluded
+found:
+        jmp  dword ptr [g_scanFound]    // a column is below it: visible
+    }
+}
+
+static bool ScanBytesMatch() {
+    __try {
+        return memcmp((const void*)ADDR_ScanHead, kScanHeadBytes,
+                      sizeof(kScanHeadBytes)) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool PatchScan() {
+    if (!ScanBytesMatch()) {
+        Log("[Horizon] scan NOT replaced: the bytes at 0x%08X are not the loop "
+            "this was read from.", (unsigned)ADDR_ScanHead);
+        return false;
+    }
+    if (!WowOpt_ClientPatchAllowed((const void*)ADDR_ScanHead)) {
+        Log("[Horizon] scan NOT replaced: No Client Patches is on.");
+        return false;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect((void*)ADDR_ScanHead, sizeof(g_scanSaved),
+                        PAGE_EXECUTE_READWRITE, &old)) {
+        Log("[Horizon] scan NOT replaced: could not make 0x%08X writable",
+            (unsigned)ADDR_ScanHead);
+        return false;
+    }
+    memcpy(g_scanSaved, (const void*)ADDR_ScanHead, sizeof(g_scanSaved));
+
+    unsigned char patch[sizeof(g_scanSaved)];
+    patch[0] = 0xE9;
+    *(int32_t*)(patch + 1) =
+        (int32_t)((uintptr_t)&HorizonScanThunk - (ADDR_ScanHead + 5));
+    // The three bytes after the jump are the tail of the fcom it split.
+    // Unreachable; filled so a disassembler shows nops rather than half of one.
+    memset(patch + 5, 0x90, sizeof(patch) - 5);
+    memcpy((void*)ADDR_ScanHead, patch, sizeof(patch));
+
+    DWORD ignored = 0;
+    VirtualProtect((void*)ADDR_ScanHead, sizeof(g_scanSaved), old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_ScanHead,
+                          sizeof(g_scanSaved));
+    g_scanPatched = true;
+    return true;
+}
+
 bool Init() {
     if (!Config::g_settings.OptHorizonOcclusionSse2) return true;
 
@@ -319,6 +525,11 @@ bool Init() {
     }
 
     g_active = true;
+    // The consumer of the array this builder writes. Same feature, same globals,
+    // same switch: turning the builder on and its reader off would be two halves
+    // of one thing behind one tickbox, which is the defect this project keeps
+    // finding. It patches independently and says so if it could not.
+    PatchScan();
     Log("[Horizon] SSE2 terrain horizon builder installed at 0x%08X - verifying "
         "against the client for the first %ld calls",
         (unsigned)ADDR_HorizonBuild, VERIFY_CALLS);
@@ -326,19 +537,71 @@ bool Init() {
 }
 
 void LogStats() {
-    if (!g_active) return;
+    if (!g_active) {
+        // This is in the diagnostic run, so a tester who ticks it and gets no
+        // line back cannot tell a failed install from a quiet one.
+        Log("[Horizon] not measured: the replacement is not active. Either the "
+            "switch is off or the install refused - the reason is earlier in "
+            "this log.");
+        return;
+    }
     Log("[Horizon] %ld calls, %s",
         g_calls,
         g_abandoned ? "abandoned - the client's routine is doing the work"
                     : (g_trusted ? "verified, running ours"
                                  : "still verifying against the client"));
+
+    if (!g_scanPatched) {
+        Log("[Horizon]   the column scan in sub_78FDC0 is NOT replaced - the "
+            "reason is above.");
+        return;
+    }
+    if (g_scanCalls == 0) {
+        Log("[Horizon]   the column scan is patched and has not run. That is a "
+            "measurement: either nothing was tested against the horizon, or the "
+            "patch is not on the path it was read from.");
+        return;
+    }
+    // The average run is the number that decides whether this was worth doing.
+    // Four columns at a time saves nothing on a scan of two and a great deal on
+    // one of two hundred, and until now nobody knew which this is.
+    Log("[Horizon]   column scan: %llu call(s) over %llu column(s), %.1f on "
+        "average, longest %lu of 384. Four are compared at a time.",
+        g_scanCalls, g_scanColumns,
+        (double)g_scanColumns / (double)g_scanCalls, g_scanMaxRun);
+    if (g_scanMismatch) {
+        Log("[Horizon]   the scan DISAGREED with the client %lu time(s) and is "
+            "retired. There is no arithmetic in it, so that is a misread "
+            "register, not a rounding difference.", g_scanMismatch);
+    } else if (g_scanVerified < kScanVerify) {
+        Log("[Horizon]   %lu of %lu scans checked against the client's own order "
+            "so far, none differed.", g_scanVerified, kScanVerify);
+    } else {
+        Log("[Horizon]   %lu scans checked against the client's own order, none "
+            "differed, and the check is off.", kScanVerify);
+    }
 }
 
 void Shutdown() {
     if (!g_active) return;
     g_active = false;
     MH_DisableHook((void*)ADDR_HorizonBuild);
-    LogStats();
+    if (g_scanPatched) {
+        DWORD old = 0;
+        if (VirtualProtect((void*)ADDR_ScanHead, sizeof(g_scanSaved),
+                           PAGE_EXECUTE_READWRITE, &old)) {
+            memcpy((void*)ADDR_ScanHead, g_scanSaved, sizeof(g_scanSaved));
+            DWORD ignored = 0;
+            VirtualProtect((void*)ADDR_ScanHead, sizeof(g_scanSaved), old, &ignored);
+            FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_ScanHead,
+                                  sizeof(g_scanSaved));
+        }
+        g_scanPatched = false;
+    }
+    // No LogStats here. It returns on !g_active, which was cleared four lines
+    // up, so the call has never printed anything - and this DLL leaves through
+    // TerminateProcess anyway, where Shutdown does not run at all. The periodic
+    // report is where these numbers reach a log.
 }
 
 } // namespace HorizonOcclusion

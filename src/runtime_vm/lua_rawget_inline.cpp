@@ -15,6 +15,10 @@
 extern "C" void Log(const char* fmt, ...);
 
 // Statistics
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static volatile long g_rawgetCalls = 0;
 static volatile long g_rawgetFast  = 0;
 
@@ -122,7 +126,26 @@ bool InstallLuaRawGetInline() {
     Log("[LuaRawGet] ACTIVE: inline lua_rawget (0x84E600)");
     CrashDumper::RegisterFeature("LuaRawGet");
     CrashDumper::FeatureSetActive("LuaRawGet", true);
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void LuaRawGetInline_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[LuaRawGet] not measured: the hook is not installed.");
+        return;
+    }
+    const LONG64 total = g_rawgetCalls, fast = g_rawgetFast;
+    if (total == 0) {
+        Log("[LuaRawGet] measured and zero: no raw read reached it.");
+        return;
+    }
+    Log("[LuaRawGet] %lld calls, %lld inline (%.1f%%).",
+        (long long)total, (long long)fast,
+        100.0 * (double)fast / (double)total);
 }
 
 void UninstallLuaRawGetInline() {

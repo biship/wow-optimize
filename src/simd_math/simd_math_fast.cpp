@@ -5,8 +5,10 @@
 // ============================================================================
 
 #include "simd_math_fast.h"
+#include "ab_test.h"
 #include "MinHook.h"
 #include "version.h"
+#include "config.h"
 #include <windows.h>
 #include <xmmintrin.h>
 #include <emmintrin.h>
@@ -28,7 +30,20 @@ static int  g_featureToken = -1;
 // A lost increment only delays a sample, and the number is never reported.
 static long g_calls = 0;
 
-static void __cdecl Hooked_MatVec3Mul(float* outVec, const float* inVec, const float* matrix) {
+// The known-negative control for the A/B harness.
+//
+// Everything else the harness measures has an unknown answer. This one does not:
+// the standalone harness above Init timed this replacement at 3.333 ns against
+// 2.497 ns for the code it replaces, with output bit-identical over 4096 random
+// matrices. It is slower, and it is off by default because of that.
+//
+// So it is the one subject whose result is known in advance, which makes it the
+// calibration case. If the harness reports this as faster, the harness is wrong -
+// and a measurement system with no case where the answer is known cannot be
+// checked at all.
+static bool g_abSubject = false;
+
+static void __cdecl Hooked_MatVec3MulBody(float* outVec, const float* inVec, const float* matrix) {
 #if TEST_DISABLE_SIMD_MATH_FAST
     orig_MatVec3Mul(outVec, inVec, matrix);
 #else
@@ -78,12 +93,23 @@ static void __cdecl Hooked_MatVec3Mul(float* outVec, const float* inVec, const f
 #endif
 }
 
+// The detour proper, split so the harness can time the call on both sides.
+// Returns void, so there is no result to hold and no chance of the local-static
+// mistake the strncmp wrapper was generated with.
+static void __cdecl Hooked_MatVec3Mul(float* outVec, const float* inVec, const float* matrix) {
+    if (!g_abSubject) { Hooked_MatVec3MulBody(outVec, inVec, matrix); return; }
+    unsigned long long abTick = AbTest::TickIn();
+    if (AbTest::StandAside()) orig_MatVec3Mul(outVec, inVec, matrix);
+    else                      Hooked_MatVec3MulBody(outVec, inVec, matrix);
+    AbTest::TickOut(abTick);
+}
+
 // 2. Vector3 Normalize Hook Target: 0x004C3420
 // Original signature is __thiscall returning void.
 typedef void (__thiscall *Vec3Normalize_fn)(float* vec);
 static Vec3Normalize_fn orig_Vec3Normalize = nullptr;
 
-static void __fastcall Hooked_Vec3Normalize(float* vec, void* unused) {
+static void __fastcall Hooked_Vec3NormalizeBody(float* vec, void* unused) {
 #if TEST_DISABLE_SIMD_MATH_FAST
     orig_Vec3Normalize(vec);
 #else
@@ -106,10 +132,44 @@ static void __fastcall Hooked_Vec3Normalize(float* vec, void* unused) {
 #endif
 }
 
+// The detour proper, split so the harness can time the call on both sides.
+// Returns void, so there is no result to hold and no chance of the local-static
+// mistake the strncmp wrapper was generated with.
+static void __fastcall Hooked_Vec3Normalize(float* vec, void* unused) {
+    if (!g_abSubject) { Hooked_Vec3NormalizeBody(vec, unused); return; }
+    unsigned long long abTick = AbTest::TickIn();
+    if (AbTest::StandAside()) orig_Vec3Normalize(vec);
+    else                      Hooked_Vec3NormalizeBody(vec, unused);
+    AbTest::TickOut(abTick);
+}
+
 bool Init() {
     #if TEST_DISABLE_SIMD_MATH_FAST
     return true;
     #endif
+
+    // Off unless asked for, and the reason is three lines up in this file: the
+    // harness above the hook measured 3.333 ns for this against 2.497 ns for the
+    // code it replaces, with the output bit-identical - worst relative
+    // difference 0.000e+00 over 4096 random matrices.
+    //
+    // A replacement that is slower than the original and returns the same answer
+    // is not an optimization, and this one is not rare: a tester's session ran it
+    // 566,247,424 times over 107,724 frames, which is 5257 calls a frame. By
+    // those numbers it costs about 4.4 microseconds of every frame and buys
+    // nothing. The number was in this comment all along and nobody subtracted.
+    //
+    // The code stays because the analysis in it is worth keeping - the
+    // single-precision version of this hook is what caused the first-person
+    // camera snapping, and that is a lesson with an address attached.
+    if (!Config::g_settings.OptMatrixVectorSse2) {
+        Log("[SimdMathFast] not installing MatVec3Mul: measured at 3.333 ns "
+            "against 2.497 ns for the client's own routine, with bit-identical "
+            "output, over 4096 random matrices. Slower and identical is negative "
+            "value, and it runs about 5257 times a frame. Set MatrixVectorSse2=1 "
+            "to install it anyway.");
+        return true;
+    }
 
     void* target_mul = (void*)0x004C21B0;
 
@@ -145,6 +205,15 @@ bool Init() {
     // Installed independently now, and 0x004C3420 is left to the module that owns
     // it rather than fought over.
     bool mulOk = false;
+    g_abSubject = AbTest::IsSubject("MatrixVectorSse2", &g_abSubject);
+    if (g_abSubject) {
+        Log("[SimdMathFast] under A/B test, and this is the calibration case: "
+            "a standalone harness measured this replacement at 3.333 ns "
+            "against 2.497 ns for the code it replaces, output bit-identical. "
+            "It is SLOWER, and the harness should say so. If it reports this "
+            "one as faster, the harness is what is wrong.");
+    }
+
     if (MH_CreateHook(target_mul, (void*)Hooked_MatVec3Mul, (void**)&orig_MatVec3Mul) == MH_OK) {
         if (MH_EnableHook(target_mul) == MH_OK) {
             mulOk = true;
@@ -165,7 +234,7 @@ bool Init() {
     // to be kept: registering a token and discarding it leaves a counter nothing
     // can ever increment, which is exactly how this module came to be reported
     // as never having run.
-    g_featureToken = CrashDumper::FeatureTokenForCounting("MatrixVectorSSE2");
+    g_featureToken = CrashDumper::FeatureTokenForCounting("MatrixVectorSSE2", 8192);
     SamplingProfiler::RegisterSelfSymbol("MatVec3Mul_SSE2", (const void*)&Hooked_MatVec3Mul);
     return true;
 }

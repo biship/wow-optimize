@@ -1,7 +1,28 @@
-cmake_minimum_required(VERSION 3.14)
+# 3.15, not 3.14, and the reason is load-bearing.
+#
+# MSVC_RUNTIME_LIBRARY and CMAKE_MSVC_RUNTIME_LIBRARY are governed by policy
+# CMP0091, which arrived in 3.15. Asking for 3.14 leaves that policy at OLD, and
+# at OLD both settings are IGNORED - silently, with no warning. So the line below
+# said "force static CRT globally" and forced nothing: the generated project
+# carried <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>, and the shipped DLL
+# imported MSVCP140.dll, VCRUNTIME140.dll and the api-ms-win-crt-* set.
+#
+# That is not a cosmetic difference.
+#   * It makes the Visual C++ Redistributable a requirement to load at all. A
+#     user without it sees the injector do nothing, with no message.
+#   * This project's own rule is that MSVCP140 must not be pulled in, because it
+#     is loaded during early init and has crashed under Wine/Proton. The rule was
+#     being enforced in the source and broken by the build.
+#
+# The policy is set explicitly as well as implied by the version, so that raising
+# or lowering cmake_minimum_required later cannot quietly turn it back off.
+cmake_minimum_required(VERSION 3.15)
+cmake_policy(SET CMP0091 NEW)
 project(wow_optimize LANGUAGES C CXX)
 
-# Force static CRT globally for all targets and dependencies (mimalloc, minhook, etc.)
+# Static CRT for every target and dependency (mimalloc, minhook). Now that
+# CMP0091 is NEW this is actually applied - check it the way it was found, by
+# reading the DLL's import table rather than by trusting the setting.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Keep optimized builds debuggable.  Release remains /O2, but every native
@@ -66,6 +87,9 @@ FetchContent_MakeAvailable(mimalloc)
 add_library(wow_optimize SHARED
     src/core/dllmain.cpp
     src/core/config.cpp
+    src/core/world_position.cpp
+    src/hooks_subsystems/tick_list_prefetch.cpp
+    src/diagnostics/lua_table_census.cpp
     # Windows file-version metadata. This was never attached to a target, so the
     # shipped DLL carried no version resource at all and the file sat at 3.12.0
     # unnoticed through several releases.
@@ -108,6 +132,12 @@ add_library(wow_optimize SHARED
     src/diagnostics/lua_compile_census.h
     src/diagnostics/shadow_state_probe.cpp
     src/diagnostics/shadow_state_probe.h
+    src/diagnostics/flight_recorder.cpp
+    src/diagnostics/flight_recorder.h
+    src/diagnostics/ab_test.cpp
+    src/diagnostics/ab_test.h
+    src/diagnostics/session_verdict.cpp
+    src/diagnostics/session_verdict.h
     src/hooks_subsystems/strncmp_sse2.cpp
     src/hooks_subsystems/strncmp_sse2.h
     src/diagnostics/anim_census.cpp
@@ -117,8 +147,23 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/objmgr_find_fast.cpp
     src/hooks_subsystems/anim_lod.cpp
     src/simd_math/collision_outcode_sse2.cpp
+    src/simd_math/aabb_overlap_sse2.cpp
+    src/simd_math/anim_quat_unpack_sse2.cpp
+    src/simd_math/anim_vec3_track_sse2.cpp
+    src/hooks_subsystems/m2_sort_key_cache.cpp
+    src/simd_math/frustum_aabb_sse2.cpp
+    src/simd_math/segment_aabb_sse2.cpp
+    src/runtime_vm/lua_hget_dispatch.cpp
+    src/runtime_vm/lua_pool_fast.cpp
     src/runtime_vm/lua_proto_cache.cpp
+    src/runtime_vm/lua_bytecode_store.cpp
+    src/runtime_vm/lua_undump.cpp
     src/simd_math/quat_lerp_sse2.cpp
+    src/simd_math/bone_matrix_upload_sse2.cpp
+    src/simd_math/m2_matrix_slot_sse2.cpp
+    src/hooks_subsystems/m2_anim_stride.cpp
+    src/allocators/mimalloc_high_arena.cpp
+    src/hooks_subsystems/client_write_batch.cpp
     src/hooks_subsystems/render_null_guard.cpp
     src/hooks_subsystems/device_callback_guard.cpp
     src/hooks_subsystems/layout_relink_fast.cpp

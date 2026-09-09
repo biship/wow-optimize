@@ -44,6 +44,10 @@
 extern "C" void Log(const char* fmt, ...);
 
 typedef void* (__thiscall* fn_5C6800)(void* pThis);
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static fn_5C6800 g_orig_5C6800 = nullptr;
 static volatile long g_ul_averted = 0;
 static volatile long g_ul_logged  = 0;
@@ -90,7 +94,19 @@ bool InstallObjectUnlinkSafety()
     CrashDumper::FeatureSetActive("ObjectUnlinkSafety", true);
     Log("[ObjectUnlinkSafety] ACTIVE: SEH-guarding intrusive-list unlink sub_5C6800 "
         "(object-reaper NULL-write crash fix)");
+    g_statsInstalled = true;
     return true;
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void ObjectUnlinkSafety_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[ObjectUnlinkSafety] not measured: the guard is not installed.");
+        return;
+    }
+    Log("[ObjectUnlinkSafety] %ld crash(es) averted.", (long)g_ul_averted);
 }
 
 void UninstallObjectUnlinkSafety()

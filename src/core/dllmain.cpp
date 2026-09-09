@@ -19,6 +19,12 @@
 #include <io.h>
 #include <intrin.h>
 #include <emmintrin.h>
+// Depends on nothing, and the freeze watchdog below reports to it hundreds of
+// lines before the rest of these headers are reached.
+#include "session_verdict.h"
+// Same reason as session_verdict.h: the freeze watchdog reports to it hundreds
+// of lines before the rest of these headers are reached.
+#include "flight_recorder.h"
 #include "ui_cache.h"
 #include "api_cache.h"
 #include "lua_fastpath.h"
@@ -34,8 +40,23 @@
 #include "objmgr_find_fast.h"
 #include "quat_lerp_sse2.h"
 #include "lua_proto_cache.h"
+#include "lua_bytecode_store.h"
+#include "lua_undump.h"
 #include "anim_lod.h"
 #include "collision_outcode_sse2.h"
+#include "bone_matrix_upload_sse2.h"
+#include "m2_matrix_slot_sse2.h"
+#include "m2_anim_stride.h"
+#include "mimalloc_high_arena.h"
+#include "client_write_batch.h"
+#include "aabb_overlap_sse2.h"
+#include "anim_quat_unpack_sse2.h"
+#include "anim_vec3_track_sse2.h"
+#include "m2_sort_key_cache.h"
+#include "frustum_aabb_sse2.h"
+#include "segment_aabb_sse2.h"
+#include "runtime_vm/lua_hget_dispatch.h"
+#include "runtime_vm/lua_pool_fast.h"
 #include "anim_census.h"
 #include "net_diag.h"
 #include "../simd_math/horizon_occlusion_sse2.h"
@@ -108,6 +129,10 @@ static volatile long g_foreignDetours = 0;
 extern "C" void WowOpt_LogForeignDetour(void* target, unsigned char firstByte) {
     long n = InterlockedIncrement(&g_foreignDetours);
     if (n <= 16) {
+        Verdict::Add(Verdict::Note,
+                     "0x%08X was already detoured by something else - an overlay, "
+                     "a client extension - so our hook stood aside",
+                     (unsigned)(uintptr_t)target);
         Log("[Hooks] 0x%08X already carries a %s (0x%02X) - another party hooked "
             "it first, so this one is left alone",
             (unsigned)(uintptr_t)target,
@@ -122,21 +147,98 @@ extern "C" void WowOpt_LogForeignDetour(void* target, unsigned char firstByte) {
 // ours, and the two want different fixes.
 static volatile long g_duplicateHooks = 0;
 
-extern "C" void WowOpt_LogDuplicateHook(void* target) {
+// A cap of eight was hiding the size of this. A tester's session reported 271
+// addresses claimed twice, and named eight of them - not enough to tell which
+// feature was quietly losing, and 271 is not a rounding error: it is 271 places
+// where a switch a tester ticked may install nothing.
+//
+// Naming the loser is what makes the list actionable. The address alone says a
+// collision happened; the detour that lost says which of our modules it was,
+// and every detour registers itself with the profiler now, so the symbol table
+// printed with the profile places it.
+// Which detour owns each address we successfully hooked. Filled on success,
+// consulted when MinHook says a target is already taken.
+//
+// This exists because the count was being read as something it was not. It said
+// "271 addresses targeted by more than one of our own modules", and it was
+// counting attempts. LuaFastPath rediscovers and re-hooks its fifty-five
+// functions after every UI reload, so each reload added fifty-five to a number
+// labelled "addresses" - the figure climbed 55, 163, 271 through one session
+// while the set of addresses never changed. Reading the disassembly of our own
+// build finds three genuine cross-module overlaps, not two hundred.
+//
+// A module re-attempting its own hook is harmless and expected. Two different
+// modules aiming at one function is the thing worth reporting, so the two are
+// now told apart by whether the detour is the same one that already won.
+namespace {
+constexpr int kOwnerSlots = 1024;              // power of two, open addressed
+struct HookOwner { uintptr_t target; uintptr_t detour; };
+HookOwner g_hookOwners[kOwnerSlots] = {};
+volatile long g_reattempts = 0;
+
+inline int OwnerSlot(uintptr_t target) {
+    return (int)(((target >> 4) * 2654435761u) & (kOwnerSlots - 1));
+}
+}  // namespace
+
+extern "C" void WowOpt_RecordHookOwner(uintptr_t target, const void* detour) {
+    int i = OwnerSlot(target);
+    for (int n = 0; n < kOwnerSlots; n++) {
+        HookOwner& s = g_hookOwners[i];
+        if (s.target == 0) { s.target = target; s.detour = (uintptr_t)detour; return; }
+        if (s.target == target) return;         // first owner keeps the slot
+        i = (i + 1) & (kOwnerSlots - 1);
+    }
+}
+
+extern "C" void WowOpt_LogDuplicateHook(void* target, void* loser) {
+    uintptr_t t = (uintptr_t)target;
+    int i = OwnerSlot(t);
+    for (int n = 0; n < kOwnerSlots; n++) {
+        HookOwner& s = g_hookOwners[i];
+        if (s.target == 0) break;
+        if (s.target == t) {
+            if (s.detour == (uintptr_t)loser) {
+                // The same module asking again, which several do after a UI
+                // reload. Counted so its absence is not mistaken for silence.
+                InterlockedIncrement(&g_reattempts);
+                return;
+            }
+            break;
+        }
+        i = (i + 1) & (kOwnerSlots - 1);
+    }
+
     long n = InterlockedIncrement(&g_duplicateHooks);
-    if (n <= 8) {
-        Log("[Hooks] 0x%08X is already hooked by another module of ours - two "
-            "implementations aimed at one function, and only one of them runs",
-            (unsigned)(uintptr_t)target);
+    Verdict::Add(Verdict::Warn,
+                 "0x%08X is hooked by two of our own modules; only the first "
+                 "installed runs", (unsigned)t);
+    if (n <= 48) {
+        Log("[Hooks] 0x%08X is already hooked by a DIFFERENT module of ours - the "
+            "detour that lost is at %p, and only the first one installed runs",
+            (unsigned)t, loser);
+    } else if (n == 49) {
+        Log("[Hooks] ... more collisions follow; only the first 48 are named.");
     }
 }
 
 extern "C" void WowOpt_ReportForeignDetours() {
     long dup = g_duplicateHooks;
     if (dup > 0) {
-        Log("[Hooks] %ld address%s targeted by more than one of our own modules. "
+        Log("[Hooks] %ld address%s targeted by two DIFFERENT modules of ours. "
             "Whichever installs first wins, which is not decided anywhere on "
-            "purpose.", dup, dup == 1 ? "" : "es");
+            "purpose - so a switch a tester ticked can install nothing and say "
+            "nothing. Each line above names the detour that lost; place it with "
+            "the symbol table the profiler prints.", dup, dup == 1 ? "" : "es");
+    }
+
+    long re = g_reattempts;
+    if (re > 0) {
+        Log("[Hooks] %ld further attempt%s came from the module that already owns "
+            "the address - LuaFastPath re-hooks its own functions after every UI "
+            "reload, and that is expected. These used to be counted with the line "
+            "above, which is how a fixed set of addresses read as a number that "
+            "climbed all session.", re, re == 1 ? "" : "s");
     }
 
     long n = g_foreignDetours;
@@ -157,6 +259,31 @@ static void UpdateMainThreadActivity() {
 }
 
 // Classify a code address to "module.dll+0xOFFSET" (or raw hex if not in a module).
+// Does a call instruction end exactly at this address? A return address always
+// has one; a stale word left on the stack, a pointer to a global, or a string
+// literal almost never does. x86 calls are E8 rel32, FF /2 in its addressing
+// forms, and the far 9A, so every length one of those can take is checked
+// against the bytes immediately before the candidate.
+//
+// This is a filter, not a proof. FF /2 is matched by scanning a window, so a
+// byte pattern inside an unrelated instruction can still pass, and a candidate
+// whose preceding page is unmapped is rejected rather than guessed at. It turns
+// a list where most entries were noise into one where most are real, which is
+// the difference between a diagnostic that steers the work and one that misleads
+// it.
+static bool FreezeCallPrecedes(uintptr_t addr) {
+    __try {
+        const unsigned char* p = (const unsigned char*)addr;
+        if (p[-5] == 0xE8) return true;               // call rel32
+        if (p[-7] == 0x9A) return true;               // far call
+        for (int len = 2; len <= 7; len++) {          // call r/m32, FF /2
+            if (p[-len] == 0xFF && ((p[-len + 1] >> 3) & 7) == 2) return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return false;
+}
+
 static void FreezeClassifyAddr(uintptr_t addr, char* out) {
     HMODULE hm = NULL;
     if (addr >= 0x10000 &&
@@ -242,6 +369,66 @@ static void FreezeDumpOtherThreads(DWORD mainTid) {
 // return addresses tell us who called it: d3d9.dll/vulkan = DXVK GPU/pipeline
 // wait, wow_optimize.dll = our fault, Wow.exe = engine/addon. This is what turns
 // a useless "SleepHook 10s ago" into an actual diagnosis.
+// A burst of EIP samples from the frozen thread, and what they say.
+//
+// CaptureFreezeLocation takes one. For a thread that is genuinely blocked one is
+// enough - every sample would be the same address anyway. For a thread that is
+// spinning it is close to useless: it names whichever instruction the loop
+// happened to be on, and a reader reasonably concludes the thread is stuck
+// there. A user chasing dead freezes in raids and battlegrounds got
+// "STUCK AT: EIP=wow.exe+0x44E2B2" out of this, which is lua_pushnumber, a
+// twelve-instruction leaf that cannot hang. The thread was running Lua the
+// whole time.
+//
+// Two hundred samples tell the two apart on their own. All landing in one place
+// means blocked. Spread across a range means spinning, and the spread names the
+// loop. Neither needs a debugger, which is what makes it useful to hand to
+// someone who cannot get symbols for the client.
+static void SampleFrozenThread(DWORD mainTid) {
+    if (mainTid == 0) return;
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, mainTid);
+    if (!h) return;
+
+    constexpr int kSamples = 200;
+    uintptr_t eips[kSamples];
+    int got = 0;
+    for (int i = 0; i < kSamples; i++) {
+        if (SuspendThread(h) == (DWORD)-1) break;
+        CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(h, &ctx)) eips[got++] = ctx.Eip;
+        ResumeThread(h);
+        Sleep(5);                       // one second of wall clock in total
+    }
+    CloseHandle(h);
+    if (got < 8) return;
+
+    // Distinct addresses first: that number alone answers the question.
+    uintptr_t uniq[kSamples]; int uniqN = 0, counts[kSamples] = {};
+    for (int i = 0; i < got; i++) {
+        int j = 0;
+        for (; j < uniqN; j++) if (uniq[j] == eips[i]) { counts[j]++; break; }
+        if (j == uniqN) { uniq[uniqN] = eips[i]; counts[uniqN] = 1; uniqN++; }
+    }
+
+    Log("!!! %d samples over one second landed on %d distinct addresses. %s",
+        got, uniqN,
+        uniqN <= 2 ? "That is a blocked thread: it is not executing."
+                   : "That is a running thread: it is spinning, not blocked, and "
+                     "the addresses below are the loop.");
+
+    // Top five, largest first.
+    for (int shown = 0; shown < 5; shown++) {
+        int best = -1;
+        for (int j = 0; j < uniqN; j++)
+            if (counts[j] > 0 && (best < 0 || counts[j] > counts[best])) best = j;
+        if (best < 0 || counts[best] == 0) break;
+        char buf[MAX_PATH + 32];
+        FreezeClassifyAddr(uniq[best], buf);
+        Log("!!!     %5.1f%%  %s", 100.0 * (double)counts[best] / (double)got, buf);
+        counts[best] = 0;
+    }
+}
+
 static void CaptureFreezeLocation(DWORD mainTid) {
     if (mainTid == 0) return;
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
@@ -252,6 +439,21 @@ static void CaptureFreezeLocation(DWORD mainTid) {
     // the stack). Do NOT call GetModuleHandleExA here: it takes the loader lock,
     // and if the thread froze while holding that lock (e.g. mid DLL load) we'd
     // deadlock. Classification happens after we resume.
+    //
+    // What follows is a raw scan of the words at ESP, not a frame walk, and for
+    // a long time it printed every one of them that landed inside a loaded
+    // module under the heading "stack ->". That reads as a call chain and is
+    // not one: the same list carries stale return addresses from calls that
+    // already returned, pointers to globals and string literals, and any
+    // integer that happens to fall in a module's range. A tester's freeze was
+    // read here as "the client called into our DLL and back out again" on the
+    // strength of one such word - which turned out to sit on a `mov [global],
+    // eax`, an address no call can ever return to.
+    //
+    // A real return address has a call instruction ending exactly where it
+    // points. Checking that is cheap and throws out most of the noise, so the
+    // candidates are split into ones that survive it and ones that do not, and
+    // neither is called a stack frame.
     uintptr_t eip = 0, rawStack[96]; int rawCount = 0;
     if (SuspendThread(h) != (DWORD)-1) {
         CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
@@ -272,7 +474,14 @@ static void CaptureFreezeLocation(DWORD mainTid) {
         char buf[MAX_PATH + 32];
         FreezeClassifyAddr(eip, buf);
         Log("!!!   STUCK AT: EIP=%s", buf);
-        int shown = 0;
+        // The one line a freeze report is read for. Deduplicated by text, so a
+        // stall that recurs at the same address becomes one counted entry.
+        Verdict::Add(Verdict::Bad, "main thread was stuck at %s", buf);
+        // Read from the watchdog thread while the main thread is stuck, which is
+        // the one moment nothing is writing the ring - and the one moment the
+        // player could not press the key even if they wanted to.
+        FlightRecorder::Mark("the main thread stopped responding");
+        int shown = 0, rejected = 0;
         for (int i = 0; i < rawCount && shown < 6; i++) {
             uintptr_t v = rawStack[i];
             HMODULE hm = NULL;
@@ -280,11 +489,19 @@ static void CaptureFreezeLocation(DWORD mainTid) {
                 GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    (LPCSTR)v, &hm) && hm) {
+                if (!FreezeCallPrecedes(v)) { rejected++; continue; }
                 FreezeClassifyAddr(v, buf);
-                Log("!!!     stack -> %s", buf);
+                Log("!!!     called from: %s", buf);
                 shown++;
             }
         }
+        if (shown == 0)
+            Log("!!!     no word at ESP had a call instruction in front of it - "
+                "no caller could be identified, and EIP above is the only "
+                "trustworthy address here");
+        if (rejected)
+            Log("!!!     %d further word(s) pointed into a module but had no call "
+                "in front of them - stale returns or data, not callers", rejected);
     }
 }
 
@@ -294,6 +511,7 @@ namespace PerfDiagnostics { void LogPerformanceSnapshot(double elapsedMs); }
 
 static DWORD WINAPI FreezeWatchdogProc(LPVOID) {
     bool escalatedThisStall = false;   // reset once the main thread ticks again
+    bool locatedThisStall   = false;   // one location per stall, see below
     while (g_freezeWatchdogActive) {
         Sleep(5000);
         if (!g_freezeWatchdogActive) break;
@@ -302,7 +520,7 @@ static DWORD WINAPI FreezeWatchdogProc(LPVOID) {
         if (lastTick == 0) continue;
 
         DWORD elapsed = GetTickCount() - lastTick;
-        if (elapsed <= 10000) escalatedThisStall = false;
+        if (elapsed <= 10000) { escalatedThisStall = false; locatedThisStall = false; }
         if (elapsed > 10000) {
             // Loading screens, UI reloads and lua_State swaps legitimately block
             // the main thread (cold MPQ asset loads + addon (re)load). That is NOT
@@ -326,15 +544,52 @@ static DWORD WINAPI FreezeWatchdogProc(LPVOID) {
                 Log("!!! LOADING STALL !!! Main thread blocked %u ms and still flagged as "
                     "loading/transition -- this is no longer a normal load", elapsed);
                 CaptureFreezeLocation(g_mainThreadId);
+                SampleFrozenThread(g_mainThreadId);
                 PerfDiagnostics::LogPerformanceSnapshot((double)elapsed);
+            }
+
+            // One stack, once, for a block this long even when it is expected.
+            //
+            // Issue #57 is a loading screen that stayed up for ten to twelve
+            // seconds after the world was audibly and playably loaded. This
+            // watchdog saw it: the same session recorded main-thread blocks of
+            // 14103, 11265 and 11792 ms, and dismissed all three on this line
+            // because a transition was in progress. The escalation above only
+            // fires past 45 seconds, so nothing captured where the thread was,
+            // and the one instrument that could have answered the report said
+            // nothing by design.
+            //
+            // Eleven seconds is not a cold zone load on a machine that loads the
+            // same zone in two. Capturing the location costs a handful of lines
+            // once per stall and turns the next report into an answerable one.
+            // The 45-second escalation keeps its full snapshot; this adds only
+            // the location.
+            if (expected && elapsed > 8000 && !locatedThisStall) {
+                locatedThisStall = true;
+                Log("[FreezeWatchdog] blocked %u ms and flagged as loading/transition. "
+                    "That is long enough to be worth a location even though it may "
+                    "be a legitimate load:", elapsed);
+                CaptureFreezeLocation(g_mainThreadId);
             }
 
             if (expected) {
                 Log("[FreezeWatchdog] main thread blocked %u ms during loading/transition (expected, not a hang)", elapsed);
+                // Rounded to seconds so a run of stalls of similar length becomes
+                // one counted line rather than forty near-identical ones.
+                Verdict::Add(elapsed > 20000 ? Verdict::Bad : Verdict::Warn,
+                             "main thread blocked ~%us during a load or transition",
+                             elapsed / 1000);
             } else {
                 Log("!!! FREEZE DETECTED !!! Main thread silent for %u ms (no loading/transition active)", elapsed);
+                Verdict::Add(Verdict::Bad,
+                             "main thread frozen ~%us with no load in progress",
+                             elapsed / 1000);
                 Log("!!! Last main thread tick: %u, current: %u", lastTick, GetTickCount());
                 CaptureFreezeLocation(g_mainThreadId);
+                // One address cannot tell a blocked thread from a spinning one,
+                // and the difference decides whether a debugger or a profiler is
+                // the right tool next.
+                SampleFrozenThread(g_mainThreadId);
 
                 // Concise suspect list only: features that logged an error or were
                 // active right up to the stall. The old full dump printed 100+
@@ -444,6 +699,9 @@ static void StopFreezeWatchdog() {
 #include "datastore_fastpath.h"
 #include "string_ops_fast.h"
 #include "heap_compactor.h"
+extern "C" void LuaOpt_GetVaSourceStats(unsigned long* fromMonitor,
+                                        unsigned long* ownWalks,
+                                        double* ownWorstMs);
 #include "version_checker.h"
 #include "lua_tonumber_fast.h"
 #include "lua_pushnumber_fast.h"
@@ -457,11 +715,14 @@ static void StopFreezeWatchdog() {
 #include "addon_profiler.h"
 #include "lua_compile_census.h"
 #include "shadow_state_probe.h"
+#include "ab_test.h"
 #include "crt_memcpy_fast.h"
 #include "frame_script_dispatch.h"
 #include "strcat_fast.h"
 #include "script_handler_cache.h"
 #include "dbc_lookup_cache.h"
+#include "../hooks_subsystems/tick_list_prefetch.h"
+#include "../diagnostics/lua_table_census.h"
 #include "event_dispatch_cache.h"
 #include "lua_getstr_inline.h"
 #include "lua_rawgeti_inline.h"
@@ -529,6 +790,25 @@ void ClearCombatLogCache();
 #include "version.h"
 #include "config.h"
 
+// These two have no header of their own.
+void ObjectUnlinkSafety_LogStats(void);
+void TypeCheckSafety_LogStats(void);
+
+// The diagnostic mode that writes nothing into the wow.exe image, and what it
+// turned away. Read straight from the settings rather than mirrored into a flag,
+// so there is no window in which a hook installs before the mirror is set.
+// Installs are not a hot path, so the interlocked count costs nothing here.
+static volatile long g_clientPatchesRefused = 0;
+
+extern "C" int WowOpt_NoClientPatches(void) {
+    return Config::g_settings.OptNoClientPatches ? 1 : 0;
+}
+
+extern "C" void WowOpt_NoteClientPatchRefused(void) {
+    InterlockedIncrement(&g_clientPatchesRefused);
+}
+
+
 // ================================================================
 // TOGGLES// Each toggle disables a specific optimization for binary search
 // during crash investigation. Set to 1 to DISABLE the feature.
@@ -541,7 +821,9 @@ void ClearCombatLogCache();
 #define CRASH_TEST_DISABLE_GETFILEATTR     0   // GetFileAttributesA cache
 #endif
 #ifndef CRASH_TEST_DISABLE_GLOBALALLOC
-#define CRASH_TEST_DISABLE_GLOBALALLOC     1   // GlobalAlloc->mimalloc (enabled with consistency fixes)
+// DEAD FLAG - no #if anywhere reads it, and its comment contradicts its value.
+// InstallGlobalAllocHooks decides this itself and logs that it is disabled.
+#define CRASH_TEST_DISABLE_GLOBALALLOC     1
 #endif
 #define CRASH_TEST_DISABLE_CS_ENTER        1   // CriticalSection TryEnter spin (causes login freeze)
 #define CRASH_TEST_DISABLE_CS_INIT         1   // InitializeCriticalSection hook (causes login freeze/crash)
@@ -560,13 +842,15 @@ void ClearCombatLogCache();
 #define CRASH_TEST_DISABLE_TICK_COUNT      1   // GetTickCount/timeGetTime redirection to QPC (DISABLED to fix random stutters and CPU overhead)
 #define CRASH_TEST_DISABLE_LUA_INTERNALS   0   // Lua VM internals (concat hook)
 #define CRASH_TEST_DISABLE_THREAD_AFFINITY   0   // Thread core pinning (re-enabled - was disabled preemptively)
-#define CRASH_TEST_DISABLE_SHORT_WAIT_SPIN   1   // WaitSpin (ALREADY DISABLED - tested bad)
+#define CRASH_TEST_DISABLE_SHORT_WAIT_SPIN   1   // WaitSpin - tested bad. DEAD FLAG: no #if reads it.
 #ifndef CRASH_TEST_DISABLE_VA_ARENA
 #define CRASH_TEST_DISABLE_VA_ARENA          0   // VA Arena compiled in; activation is runtime opt-in via Config OptVaArena (default off). Set to 1 to hard-remove.
 #endif
-#define CRASH_TEST_DISABLE_DISPATCH_POOL     1   // DispatchPool (ALREADY DISABLED - tested bad)
-#define CRASH_TEST_DISABLE_BGPRELOAD_CACHE   1   // bgpreloadsleep cache (ALREADY DISABLED - 0 hits)
-#define CRASH_TEST_DISABLE_SUBTASK_EVENTPOOL 1   // Subtask event pool (ALREADY DISABLED - 0 hits)
+// DEAD FLAGS - no #if anywhere reads these three. The code they name is not in
+// the build; setting them to 0 puts none of it back. Kept for the note.
+#define CRASH_TEST_DISABLE_DISPATCH_POOL     1   // DispatchPool - tested bad
+#define CRASH_TEST_DISABLE_BGPRELOAD_CACHE   1   // bgpreloadsleep cache - 0 hits
+#define CRASH_TEST_DISABLE_SUBTASK_EVENTPOOL 1   // Subtask event pool - 0 hits
 
 // Feature toggles for hooks
 #ifndef CRASH_TEST_DISABLE_GETFILESIZE_CACHE
@@ -989,9 +1273,14 @@ long g_crtStrcmpHits = 0, g_crtStrcmpFallbacks = 0;
 long g_crtMemcmpHits = 0, g_crtMemcmpFallbacks = 0;
 long g_crtMemcpyHits = 0, g_crtMemcpyFallbacks = 0;
 long g_crtMemsetHits = 0, g_crtMemsetFallbacks = 0;
-volatile LONG64 g_memchrHits = 0, g_memchrFallbacks = 0;
-volatile LONG64 g_strchrHits = 0, g_strchrFallbacks = 0;
-volatile LONG64 g_strcpyHits = 0, g_strcpyFallbacks = 0;
+// Plain 32-bit. These were LONG64 bumped with InterlockedIncrement64 from
+// crt_char_fast.cpp, which meant every memchr, strchr and strcpy the client
+// made paid a lock cmpxchg8b retry loop on 32-bit x86 - on the fast-path return
+// as well, which is the path those replacements exist to reach. Lower bounds
+// now, and the lines below say so.
+long g_memchrHits = 0, g_memchrFallbacks = 0;
+long g_strchrHits = 0, g_strchrFallbacks = 0;
+long g_strcpyHits = 0, g_strcpyFallbacks = 0;
 static uint64_t g_tableReshapeHits = 0;
 static uint64_t g_getstrHits = 0, g_getstrFallbacks = 0;
 static uint64_t g_combatLogCacheHits = 0, g_combatLogCacheMisses = 0;
@@ -1022,7 +1311,8 @@ bool   g_isMultiClient = false;         // Set by DetectMultiClient() via named 
 static HANDLE g_instanceMutex = NULL;   // "wow_optimize_instance_v2" mutex
 static DWORD  g_nextStatsDumpTick = 0;  // Next periodic stats dump (GetTickCount)
 static DWORD  g_nextMiCollectTick = 0;  // Next mimalloc collect (multi-client only)
-static void   DumpPeriodicStats();
+static void   DumpPeriodicStats(const char* why = "periodic",
+                                bool atProcessExit = false);
 
 // ================================================================
 // Logging - ring buffer + background thread
@@ -1031,8 +1321,22 @@ static void   DumpPeriodicStats();
 static FILE* g_log = nullptr;
 static FILE* g_sessionLog = nullptr;
 
-static constexpr int LOG_RING_SIZE = 2048;
+// The ring reserves LOG_RING_SIZE * LOG_LINE_MAX bytes of this DLL's image, and
+// that image is mapped into the low 2GB, which is the half the client allocates
+// from and the half that has run out on three tester machines - one of them
+// wrote a SavedVariables file under a garbage name because of it.
+//
+// It was 2048 slots of 2048 bytes: 4.01 MB reserved for lines that are measured
+// at 104 to 165 characters in the middle, 434 at the 99th percentile and 794 at
+// the longest over every log to hand. Both numbers were round rather than
+// chosen.
+//
+// 1024 by 1024 is 1.00 MB and still twice the longest line ever seen. A line
+// that does not fit is truncated by _vsnprintf and counted, so if this is ever
+// too small the log says how often rather than quietly losing the tail.
+static constexpr int LOG_RING_SIZE = 1024;
 static constexpr int LOG_RING_MASK = LOG_RING_SIZE - 1;
+static constexpr int LOG_LINE_MAX  = 1024;
 
 // ready: 0 = free (producer may fill), 1 = filled, 2 = claimed by a consumer.
 // The ring has two consumers - the background log thread and whichever thread calls
@@ -1041,14 +1345,107 @@ static constexpr int LOG_RING_MASK = LOG_RING_SIZE - 1;
 static constexpr LONG LOG_SLOT_FREE = 0;
 static constexpr LONG LOG_SLOT_FILLED = 1;
 static constexpr LONG LOG_SLOT_CLAIMED = 2;
+// A producer owns the slot while it formats into it. Without this state the
+// producer only read `ready` and then spent microseconds inside _vsnprintf
+// with no claim on the buffer, so a second producer that wrapped onto the same
+// slot in the meantime saw 0 as well and wrote into it too.
+//
+// prince [SANC]'s three-hour log has the result at offset 2425790: a line that
+// stops after eight characters of its message with another thread's complete
+// line, prefix and all, written into the wound. Two threads, one 2 KB buffer.
+// The consumer side was already careful; this side was not.
+static constexpr LONG LOG_SLOT_WRITING = 3;
 
 struct LogEntry {
-    char text[2048];
+    char text[LOG_LINE_MAX];
     volatile LONG ready;
 };
 
+// --- What is not working, collected as it is said --------------------------
+//
+// prince [SANC]'s three-hour log is forty-eight thousand lines. The things in
+// it that were actually wrong are three lines: a feature he had switched on
+// whose dependency he had not, and three hooks an overlay had taken before we
+// got there. They sit around line five hundred. Nobody reads to line five
+// hundred, so a bug report arrives as "something is off" and the answer was in
+// the file all along.
+//
+// Every module already says when it refuses to install, stands down or
+// retires. Those lines are copied here as they are written and reprinted
+// together at the top of every report. No module had to be changed for it, and
+// one written tomorrow is covered by the same words it would use anyway.
+//
+// What is deliberately not collected: a switch the player left off. "DISABLED
+// via configuration" is not a fault, and on a default install there are a
+// hundred of them. Only a module that was asked to run and did not.
+static constexpr int  PROBLEM_MAX  = 48;
+// Compared over this much, so a line that ends in "(3630s ago)" is recognised
+// as the one that already ends in "(30s ago)" and is kept once.
+static constexpr int  PROBLEM_KEY  = 120;
+static char           g_problem[PROBLEM_MAX][208];
+static volatile LONG  g_problemCount = 0;
+static volatile LONG  g_problemDropped = 0;
+
+static bool ProblemWorthKeeping(const char* m) {
+    // The report prints each kept line back under [Wrong], and those lines
+    // carry the words that got them kept. Without this the list feeds on
+    // itself: a tester's first report held two entries, the second held six,
+    // and every one after that would have held more.
+    if (m[0] == '[' && m[1] == 'W' && m[2] == 'r' && m[3] == 'o' &&
+        m[4] == 'n' && m[5] == 'g' && m[6] == ']') {
+        return false;
+    }
+
+    static const char* kNotAFault[] = {
+        "via configuration", "switched off", "compiled out", "not in this build",
+        "crash isolation", "for stability", "on purpose"
+    };
+    for (int i = 0; i < 7; i++) if (strstr(m, kNotAFault[i])) return false;
+
+    static const char* kFault[] = {
+        "NOT active", "not installed:", "STANDING DOWN", "STOOD DOWN",
+        "Retired", "RETIRED", "BAD PROLOGUE", "already detoured",
+        "hook targets skipped", "could not hook", "Could not hook"
+    };
+    for (int i = 0; i < 11; i++) if (strstr(m, kFault[i])) return true;
+    return false;
+}
+
+// The dedup scan races with other producers; the worst it can do is keep a
+// line twice, and a report that says a thing twice is not a defect worth a
+// lock on the logging path.
+static void NoteProblem(const char* m) {
+    if (g_problemCount > PROBLEM_MAX) return;
+    if (!ProblemWorthKeeping(m)) return;
+
+    LONG n = g_problemCount;
+    if (n > PROBLEM_MAX) n = PROBLEM_MAX;
+    for (LONG i = 0; i < n; i++) {
+        if (strncmp(g_problem[i], m, PROBLEM_KEY) == 0) return;
+    }
+
+    LONG slot = InterlockedIncrement(&g_problemCount) - 1;
+    if (slot >= PROBLEM_MAX) { InterlockedIncrement(&g_problemDropped); return; }
+    _snprintf(g_problem[slot], sizeof(g_problem[0]) - 1, "%s", m);
+    g_problem[slot][sizeof(g_problem[0]) - 1] = '\0';
+    // The ring's text carries the newline it will be written with.
+    size_t len = strlen(g_problem[slot]);
+    while (len && (g_problem[slot][len - 1] == '\n' || g_problem[slot][len - 1] == '\r')) {
+        g_problem[slot][--len] = '\0';
+    }
+}
+
 static LogEntry g_logRing[LOG_RING_SIZE] = {};
 static volatile LONG g_logWritePos = 0;
+// A full ring drops the line. That was already true and silent, which is the
+// shape this project keeps being caught by: a log with lines missing reads
+// exactly like a log of a session where nothing happened.
+static volatile LONG g_logDropped = 0;
+// Lines the formatter had to cut short. Zero on every log measured so far; if it
+// stops being zero, LOG_LINE_MAX is the thing to change.
+static volatile LONG g_logTruncated = 0;
+// For the per-reporter timing in the periodic dump.
+static LARGE_INTEGER g_statsFreq = {};
 static volatile LONG g_logReadPos = 0;
 static HANDLE g_logEvent = NULL;
 static HANDLE g_logThread = NULL;
@@ -1269,7 +1666,14 @@ void LogFlushImmediate() {
     LONG idx = InterlockedIncrement(&g_logWritePos) - 1;
     int slot = idx & LOG_RING_MASK;
 
-    if (g_logRing[slot].ready) return;
+    // Take the slot before touching its buffer. A plain read here is what tore
+    // a tester's line in half: the check passed, formatting began, the ring
+    // wrapped, and a second producer passed the same check on the same slot.
+    if (InterlockedCompareExchange(&g_logRing[slot].ready,
+                                   LOG_SLOT_WRITING, LOG_SLOT_FREE) != LOG_SLOT_FREE) {
+        InterlockedIncrement(&g_logDropped);
+        return;
+    }
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -1283,22 +1687,38 @@ void LogFlushImmediate() {
         case LOG_LEVEL_CRITICAL: lvlStr = "CRITICAL"; break;
     }
 
-    int offset = _snprintf(g_logRing[slot].text, 128, "[%02u-%02u-%02u %02u:%02u:%02u.%03u] [TID: %u] [%s] [%s] ",
+    // Kept, because the collector below has to skip it: the timestamp sits in
+    // the first forty-odd characters, and comparing lines that include it makes
+    // every repeat of the same fault look like a new one.
+    int prefixLen = _snprintf(g_logRing[slot].text, 128, "[%02u-%02u-%02u %02u:%02u:%02u.%03u] [TID: %u] [%s] [%s] ",
         st.wYear % 100, st.wMonth, st.wDay,
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
         GetCurrentThreadId(), lvlStr, context);
+    if (prefixLen < 0) prefixLen = 0;
+    int offset = prefixLen;
 
     va_list args;
     va_start(args, fmt);
-    int msgLen = _vsnprintf(g_logRing[slot].text + offset, 2046 - offset, fmt, args);
+    int msgLen = _vsnprintf(g_logRing[slot].text + offset,
+                            LOG_LINE_MAX - 2 - offset, fmt, args);
     va_end(args);
-    if (msgLen < 0) msgLen = 2046 - offset;
+    if (msgLen < 0) {
+        msgLen = LOG_LINE_MAX - 2 - offset;
+        InterlockedIncrement(&g_logTruncated);
+    }
     offset += msgLen;
 
     g_logRing[slot].text[offset] = '\n';
     g_logRing[slot].text[offset + 1] = '\0';
 
-    InterlockedExchange(&g_logRing[slot].ready, 1);
+    // Read while the slot is still ours. After the handover below the consumer
+    // may free it and another producer may be writing over this text.
+    NoteProblem(g_logRing[slot].text + prefixLen);
+
+    // WRITING -> FILLED hands the slot to whichever consumer gets there first.
+    // InterlockedExchange is a full barrier on x86, so the text above is
+    // visible before the state that advertises it.
+    InterlockedExchange(&g_logRing[slot].ready, LOG_SLOT_FILLED);
     SetEvent(g_logEvent);
 
     // Only flush immediately on ERROR or CRITICAL events to preserve FPS performance
@@ -1516,6 +1936,11 @@ static void PreciseSleep(double milliseconds) {
     }
 }
 
+// The flight recorder column for our own periodic tick, so a spike dump can
+// say "this frame was us" instead of leaving the reader to infer it. That
+// has been the answer before.
+static int g_frSlotMaint = -1;
+
 static void RunPeriodicMaintenanceOnMainThread() {
     if (g_mainThreadId == 0 || GetCurrentThreadId() != g_mainThreadId)
         return;
@@ -1524,6 +1949,7 @@ static void RunPeriodicMaintenanceOnMainThread() {
     // lands inside a frame. When a hitch is reported, the first question is
     // whether we caused it, and this is the probe that answers it. The inner
     // probes attribute further once this one fires.
+    FlightRecorder::Bump(g_frSlotMaint);
     StallProbe maintenanceProbe("periodic maintenance", 4.0);
 
     DWORD nowTick = GetTickCount();
@@ -1531,6 +1957,20 @@ static void RunPeriodicMaintenanceOnMainThread() {
     if (g_nextStatsDumpTick == 0) {
         g_nextStatsDumpTick = nowTick + 30000;
     } else if ((LONG)(nowTick - g_nextStatsDumpTick) >= 0) {
+        // Its own probe, inside the maintenance one.
+        //
+        // Tester logs carry "periodic maintenance took 42.6 ms" - forty
+        // milliseconds on the main thread, inside a frame, against a frame median
+        // near ten, and caused entirely by this DLL's own reporting. The outer
+        // probe cannot say whether that is the report or the rest of maintenance,
+        // and the report is fifty-eight LogStats calls deep, so guessing which
+        // one would be guessing.
+        //
+        // This narrows it to the report or not-the-report in one number. The
+        // address-space walk inside HeapCompactor_LogStats now times itself as
+        // well, so between the two the next log says whether that walk is the
+        // whole of it.
+        StallProbe statsProbe("periodic stats dump", 4.0);
         DumpPeriodicStats();
         g_nextStatsDumpTick = nowTick + 300000;
     }
@@ -1678,6 +2118,7 @@ static void MainThreadPump() {
 #endif
 
         // Enable D3D9 State Manager frame update
+        M2AnimStride::OnFrame();
         OnFrameD3D9StateManager(g_mainThreadId);
         OnFrameRenderHooks(g_mainThreadId);
         OnFrameLogicHooks(g_mainThreadId);
@@ -1893,17 +2334,23 @@ static recv_fn      orig_recv      = nullptr;
 static WSARecv_fn   orig_WSARecv   = nullptr;
 
 static long g_recvCalls      = 0;
-static long g_recvBytes      = 0;
+// Bytes, not calls, so two words: a session that receives more than two
+// gigabytes used to report a negative kilobyte count.
+static unsigned long g_recvBytes      = 0;
+static unsigned long g_recvBytesWraps = 0;
 static long g_recvWouldBlock = 0;
 static long g_WSARecvCalls   = 0;
-static long g_WSARecvBytes   = 0;
+static unsigned long g_WSARecvBytes   = 0;
+static unsigned long g_WSARecvBytesWraps = 0;
 static long g_WSARecvWouldBlock = 0;
 
 static int WINAPI hooked_recv(SOCKET s, char* buf, int len, int flags) {
     int result = orig_recv(s, buf, len, flags);
     if (result > 0) {
         g_recvCalls++;
-        g_recvBytes += result;
+        { const unsigned long before = g_recvBytes;
+          g_recvBytes += (unsigned long)result;
+          if (g_recvBytes < before) ++g_recvBytesWraps; }
     } else if (result == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
@@ -1920,7 +2367,9 @@ static int WINAPI hooked_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCou
                                lpFlags, lpOverlapped, lpCompletionRoutine);
     if (result == 0 && lpNumberOfBytesRecvd) {
         g_WSARecvCalls++;
-        g_WSARecvBytes += *lpNumberOfBytesRecvd;
+        { const unsigned long before = g_WSARecvBytes;
+          g_WSARecvBytes += *lpNumberOfBytesRecvd;
+          if (g_WSARecvBytes < before) ++g_WSARecvBytesWraps; }
     } else if (result == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
@@ -1932,7 +2381,10 @@ static int WINAPI hooked_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCou
 
 static bool InstallNetworkHooks() {
     Log("Network hook: DISABLED for stability (native socket layer is optimal)");
-    return true;
+    // Returns false: it did not install. Returning true put it in the
+    // feature summary as a working feature, which is the same lie the
+    // summary was fixed for telling in the other direction.
+    return false;
 }
 
 // ================================================================
@@ -2414,6 +2866,10 @@ static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
 static BOOL WINAPI hooked_ReadFile_Inner(HANDLE hFile, LPVOID lpBuffer,
     DWORD nBytesToRead, LPDWORD lpBytesRead, LPOVERLAPPED lpOverlapped)
 {
+    // Reading a file whose tail we are still holding would read stale
+    // bytes. It goes out first. The seek the read implies also ends the
+    // size check for this file.
+    ClientWriteBatch::FlushHandle(hFile, true);
     // Skip: overlapped I/O, non-MPQ, or not initialized
     if (lpOverlapped)
         return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
@@ -3055,7 +3511,10 @@ static BOOL WINAPI hooked_HeapValidate(HANDLE hHeap, DWORD dwFlags, LPCVOID lpMe
 
 static bool InstallHeapRedirectToMimalloc() {
     Log("Heap safety redirect bridge: DISABLED for stability (HeapAlloc redirection is inactive)");
-    return true;
+    // Returns false: it did not install. Returning true put it in the
+    // feature summary as a working feature, which is the same lie the
+    // summary was fixed for telling in the other direction.
+    return false;
 }
 
 // ================================================================
@@ -3302,6 +3761,11 @@ static long g_sfpRedirected = 0;
 static DWORD WINAPI hooked_SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
     PLONG lpDistanceToMoveHigh, DWORD dwMoveMethod)
 {
+    // A seek past buffered bytes would write them at the new position, and
+    // after one the file size no longer has to equal what was handed over -
+    // so the batcher stops checking this file rather than reporting a
+    // mismatch that is not a loss.
+    ClientWriteBatch::FlushHandle(hFile, true);
     LARGE_INTEGER liDist;
     if (lpDistanceToMoveHigh) {
         liDist.LowPart  = (DWORD)lDistanceToMove;
@@ -3503,7 +3967,10 @@ static HANDLE WINAPI hooked_GetCurrentThread(void) {
 
 static bool InstallThreadIdCacheHook() {
     Log("ThreadId cache: DISABLED for stability (native GetCurrentThreadId is optimal).");
-    return true;
+    // Returns false: it did not install. Returning true put it in the
+    // feature summary as a working feature, which is the same lie the
+    // summary was fixed for telling in the other direction.
+    return false;
 }
 
 // ================================================================
@@ -3617,6 +4084,153 @@ static bool PathPassesThroughMPQ(const char* path) {
     return false;
 }
 
+// Every SavedVariables file the client opens for writing, named once each.
+//
+// A tester reports addon names coming out garbled - in the addon list and in the
+// SavedVariables filenames on disk. A name on disk means the client wrote a file
+// under a corrupted name and the corruption outlived the session. Nothing in our
+// logs records those names, so there is no way to see when a bad one first
+// appears or what else was happening at the time.
+//
+// This is not a fix and it names no cause. It puts the filename in the log at
+// the moment the client creates it, with a timestamp, so the next report can be
+// read rather than guessed at. Names are remembered so a file reopened every few
+// seconds is logged once.
+// A name the client wrote that no addon could have produced.
+//
+// The first capture: on 2026-09-01 a tester's client opened ")_.lua" for writing,
+// between DBM-ChamberOfAspects.lua and Overachiever_Tabs.lua, during a character
+// switch. Every other name in that session was clean. Two characters, both
+// printable, so no test on the bytes alone would have caught it - the only thing
+// wrong with ")_" is that there is no addon called that.
+//
+// So the test is exactly that. A SavedVariables file is named after a folder in
+// Interface\AddOns, and the path being opened carries the client's own root, so
+// the folder can be looked for rather than guessed at. The account-wide
+// SavedVariables.lua is the one file with no addon behind it.
+//
+// Returns true when the name is real, and also when the check could not be made.
+static bool SavedVarsNameHasAddon(const char* path, const char* leaf) {
+    // "...\WTF\Account\..." - everything before \WTF\ is the client's root.
+    const char* wtf = nullptr;
+    for (const char* p = path; p[0] && p[1] && p[2] && p[3] && p[4]; p++) {
+        if (p[0] == '\\' &&
+            (p[1] == 'W' || p[1] == 'w') && (p[2] == 'T' || p[2] == 't') &&
+            (p[3] == 'F' || p[3] == 'f') && p[4] == '\\') { wtf = p; break; }
+    }
+    if (!wtf) return true;                       // not a path we can check
+
+    size_t rootLen = (size_t)(wtf - path);
+    size_t leafLen = strlen(leaf);
+    if (leafLen < 5 || _stricmp(leaf + leafLen - 4, ".lua") != 0) return true;
+    if (_stricmp(leaf, "SavedVariables.lua") == 0) return true;
+
+    static const char kSub[] = "\\Interface\\AddOns\\";
+    const size_t kSubLen = sizeof(kSub) - 1;
+    size_t nameLen = leafLen - 4;
+    char probe[MAX_PATH];
+    if (rootLen + kSubLen + nameLen + 1 > sizeof(probe)) return true;
+
+    memcpy(probe, path, rootLen);
+    memcpy(probe + rootLen, kSub, kSubLen);
+    memcpy(probe + rootLen + kSubLen, leaf, nameLen);
+    probe[rootLen + kSubLen + nameLen] = 0;
+
+    return GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES;
+}
+
+static unsigned g_savedVarsBadNames = 0;
+
+// A flight-recorder column and its slot. The garbled names arrive in a burst
+// during a character switch, and how that burst is shaped - steady, or one frame
+// doing all of it - is not visible in a per-window count.
+static int g_frSlotSavedVars = -1;
+
+static void NoteSavedVariablesWrite(const char* path) {
+    if (!path) return;
+    const char* leaf = strrchr(path, '\\');
+    leaf = leaf ? leaf + 1 : path;
+
+    // Above the dedupe below, not after it. The dedupe exists so the log names
+    // each file once; this column wants every open, and a counter placed after an
+    // early return stops counting the moment that return starts firing - which is
+    // its own entry in the list of ways this project has lied to itself.
+    FlightRecorder::Bump(g_frSlotSavedVars);
+
+    // Widened past the sixty-four it held: one session logged about seventy
+    // distinct files, and the table filling silently turned the dedupe off, so
+    // every reopen from that point on would have been logged again.
+    static char s_seen[192][64];
+    static int  s_count = 0;
+    static bool s_full = false;
+    for (int i = 0; i < s_count; i++)
+        if (strcmp(s_seen[i], leaf) == 0) return;
+    if (s_count < 192) {
+        strncpy(s_seen[s_count], leaf, sizeof(s_seen[0]) - 1);
+        s_seen[s_count][sizeof(s_seen[0]) - 1] = 0;
+        s_count++;
+    } else if (!s_full) {
+        s_full = true;
+        Log("[SavedVars] more than 192 distinct names - from here a reopened file "
+            "is logged again rather than once");
+    }
+
+    if (!SavedVarsNameHasAddon(path, leaf)) {
+        g_savedVarsBadNames++;
+        // The third event nobody can react to. It happens mid-transition, the
+        // player has no idea it happened until they look at the folder later,
+        // and by then the frames around it are long gone.
+        FlightRecorder::Mark("a SavedVariables file was written under a name "
+                             "matching no addon");
+        Verdict::Add(Verdict::Bad,
+                     "SavedVariables written under a name matching no addon "
+                     "folder: %s", leaf);
+        Log("!!! [SavedVars] \"%s\" has no folder in Interface\\AddOns, so no addon "
+            "can have produced it. This is the garbled-name defect, caught as the "
+            "file is created.", leaf);
+        Log("!!!   full path: %s", path);
+
+        char hex[3 * 48 + 1];
+        int n = 0;
+        for (const unsigned char* q = (const unsigned char*)leaf; *q && n < 48; q++, n++)
+            sprintf(hex + n * 3, "%02X ", *q);
+        hex[n * 3] = 0;
+        Log("!!!   the name as bytes: %s", hex);
+
+        // Whether the client had run out of room when it built that string. It
+        // allocates from below 2GB, and a garbled name appearing while the
+        // largest block there is a few megabytes is a different situation from
+        // one appearing with room to spare. Nothing has ever recorded which.
+        PROCESS_MEMORY_COUNTERS pmc = {};
+        pmc.cb = sizeof(pmc);
+        unsigned wsMb = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))
+                      ? (unsigned)(pmc.WorkingSetSize / (1024 * 1024)) : 0u;
+        // The cached figure, not a fresh walk. This fires during a character
+        // switch - already the heaviest transition the client makes, and the one
+        // a tester reported as a 139-second loading screen - and a VirtualQuery
+        // pass over a fragmented address space costs tens of milliseconds. Ten
+        // seconds of staleness changes nothing about "was it out of room"; adding
+        // a stall to the moment being investigated changes the thing being
+        // measured.
+        unsigned long vaAgeMs = 0;
+        SIZE_T lowFree = HeapCompactor_GetLastLowHalf(&vaAgeMs);
+        if (vaAgeMs == 0 && lowFree == 0) {
+            Log("!!!   at that moment: working set %u MB. The free-space figure is "
+                "not available - the heap monitor had not run yet, which is not "
+                "the same as no memory being free. Bad names so far: %u.",
+                wsMb, g_savedVarsBadNames);
+        } else {
+            Log("!!!   at that moment: working set %u MB, largest free block below "
+                "2GB %u MB as of %lu ms earlier. Bad names so far this session: %u.",
+                wsMb, (unsigned)(lowFree / (1024 * 1024)), vaAgeMs,
+                g_savedVarsBadNames);
+        }
+        return;
+    }
+
+    Log("[SavedVars] client opened for writing: %s", leaf);
+}
+
 static HANDLE WINAPI hooked_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare,
     LPSECURITY_ATTRIBUTES lpSA, DWORD dwDisposition, DWORD dwFlags, HANDLE hTemplate)
 {
@@ -3626,7 +4240,13 @@ static HANDLE WINAPI hooked_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD
         size_t len = strlen(lpFileName);
         const char* checkPath = lpFileName;
         char fixedPath[MAX_PATH];
-        if (len > 0 && lpFileName[len-1] == '\\') {
+        // The length was not checked against the buffer. A path longer than
+        // MAX_PATH ending in a backslash overflowed this stack array, and Win32
+        // takes paths well past MAX_PATH - through the extended prefix, and
+        // through a relative path in a deep working directory. Nothing here
+        // needs the whole path, only the extension, so an over-long one skips
+        // the trim and is examined as it arrived.
+        if (len > 0 && len < sizeof(fixedPath) && lpFileName[len-1] == '\\') {
             memcpy(fixedPath, lpFileName, len);
             fixedPath[len-1] = 0;
             checkPath = fixedPath;
@@ -3661,6 +4281,8 @@ static HANDLE WINAPI hooked_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD
             extern bool ContainsWTF(const char* path);
             const char* luaExt = strrchr(lpFileName, '.');
             if (ContainsWTF(lpFileName) && luaExt && _stricmp(luaExt, ".lua") == 0) {
+                if (dwAccess & (GENERIC_WRITE | FILE_WRITE_DATA | GENERIC_ALL))
+                    NoteSavedVariablesWrite(lpFileName);
                 #if !TEST_DISABLE_SAVED_VARS_ASYNC
                 if (dwAccess & (GENERIC_WRITE | FILE_WRITE_DATA | GENERIC_ALL)) {
                     extern void TrackSVHandle(HANDLE h);
@@ -3704,6 +4326,8 @@ static HANDLE WINAPI hooked_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWOR
         extern bool ContainsWTF(const char* path);
         const char* luaExt = strrchr(buf, '.');
         if (ContainsWTF(buf) && luaExt && _stricmp(luaExt, ".lua") == 0) {
+            if (dwAccess & (GENERIC_WRITE | FILE_WRITE_DATA | GENERIC_ALL))
+                NoteSavedVariablesWrite(buf);
             #if !TEST_DISABLE_SAVED_VARS_ASYNC
             if (dwAccess & (GENERIC_WRITE | FILE_WRITE_DATA | GENERIC_ALL)) {
                 extern void TrackSVHandle(HANDLE h);
@@ -3740,6 +4364,11 @@ static BOOL WINAPI hooked_CloseHandle(HANDLE hObject) {
     if (!hObject || hObject == INVALID_HANDLE_VALUE ||
         hObject == GetCurrentProcess() || hObject == GetCurrentThread())
         return orig_CloseHandle(hObject);
+    // First, and before anything below can fail or take a lock: if this
+    // handle is the one the write batcher is holding, its bytes go out now
+    // while the handle is still open, and the file size is checked against
+    // what the client handed over.
+    ClientWriteBatch::OnClosing(hObject);
 #if !CRASH_TEST_DISABLE_MPQ_MMAP
     AcquireSRWLockExclusive(&g_mpqMapLock);
     DestroyMpqMapping(hObject);
@@ -3915,6 +4544,10 @@ static FlushFileBuffers_fn orig_FlushFileBuffers = nullptr;
 static long g_flushSkipped = 0;
 
 static BOOL WINAPI hooked_FlushFileBuffers(HANDLE hFile) {
+    // Asking the OS to flush a file whose tail is still in our buffer would
+    // flush the wrong thing. Ours goes out first, and the size check stays
+    // valid because nothing seeked.
+    ClientWriteBatch::FlushHandle(hFile, false);
     if (IsMpqHandle(hFile)) {
         InterlockedIncrement(&g_flushSkipped);
         return TRUE;
@@ -4249,6 +4882,10 @@ static void ConfigureMimalloc() {
     // RAM back under pressure.
     mi_option_set(mi_option_purge_decommits, 0);
 
+    // The high arena goes in before the pre-warm, so the 32MB below lands in
+    // it rather than carving another hole in the low half.
+    MimallocHighArena::Init();
+
     // Pre-warm allocator with 32MB to reduce VA space pressure
     // 64MB was too aggressive for HD clients with 37+ MPQs (VA fragmentation)
     void* warmup = mi_malloc(32 * 1024 * 1024);
@@ -4267,8 +4904,23 @@ static void ConfigureMimalloc() {
         for (int i = 0; i < SEEDS_PER_SIZE; i++) if (batch[i]) mi_free(batch[i]);
     }
 
-    Log("mimalloc v%d.%d.%d configured (eager commit, reset purge, pre-warmed 32MB + 23 size classes)",
-        mi_version() / 100, (mi_version() % 100) / 10, mi_version() % 10);
+    // This line said "eager commit" while the option four lines below it is set
+    // to 0, and it is the line a reader reaches for when working out where two
+    // gigabytes of address space went. It now states the options as set, and
+    // says what reset purge costs: freed pages give physical memory back and
+    // keep their address space, which on a 32-bit client is the scarce half.
+    Log("mimalloc v%d.%d.%d configured (arena eager commit OFF, purge by "
+        "MEM_RESET after %dms, large OS pages %s, pre-warmed 32MB + 23 size "
+        "classes). Reset purge returns physical pages and keeps the address "
+        "space, which is deliberate - MEM_DECOMMIT unmapped buffers a GL driver "
+        "was still reading on its own thread - but it means freed memory does "
+        "not raise the largest free block below 2GB. Only a collect does.",
+        // MI_MALLOC_VERSION is major, then two digits of minor, then two of
+        // patch: 30302 is 3.3.2. Dividing by 100 printed it as "v303.0.2" in
+        // every log this project has ever produced.
+        mi_version() / 10000, (mi_version() / 100) % 100, mi_version() % 100,
+        (int)mi_option_get(mi_option_purge_delay),
+        TEST_ENABLE_LARGE_PAGES ? "allowed" : "off");
 }
 
 static void AdjustMimallocForMultiClient() {
@@ -4337,7 +4989,10 @@ static void TryRemoveFPSCap() {
         searchFrom = found + 1;
     }
 
-    if (addr) {
+    if (addr && !WowOpt_ClientPatchAllowed((void*)(addr + 1))) {
+        Log("FPS cap: patch site found at 0x%08X and left alone (NoClientPatches)",
+            (unsigned)addr);
+    } else if (addr) {
         DWORD old;
         if (VirtualProtect((void*)(addr + 1), 4, PAGE_EXECUTE_READWRITE, &old)) {
             *(uint32_t*)(addr + 1) = 200;  // stock cap — 999 breaks camera interpolation
@@ -4352,8 +5007,77 @@ static void TryRemoveFPSCap() {
 // Periodic stats dump called from hooked_Sleep.
 //
 
-static void DumpPeriodicStats() {
+// --- which reporter is the slow one ------------------------------------------
+//
+// A field log carries "periodic stats dump took 112.2 ms" on the main thread,
+// with the outer maintenance probe reporting the same figure - so all of it is
+// the report and none of it is the rest of maintenance. At a 4.84 ms median
+// that is twenty-three frames in a row, once every five minutes, caused
+// entirely by this DLL talking about itself.
+//
+// The probe could narrow it to the report or not-the-report and no further,
+// and there are seventy-odd reporters in here. This times each one and names
+// the worst few, so the next log says which rather than which half.
+namespace {
+struct StatTimeRec { const char* name; double ms; };
+StatTimeRec g_statTimes[96];
+int         g_statTimeCount = 0;
+
+struct StatTimer {
+    const char*   name;
+    LARGE_INTEGER a;
+    StatTimer(const char* n) : name(n) { QueryPerformanceCounter(&a); }
+    ~StatTimer() {
+        if (g_statTimeCount >= 96 || !g_statsFreq.QuadPart) return;
+        LARGE_INTEGER b;
+        QueryPerformanceCounter(&b);
+        g_statTimes[g_statTimeCount].name = name;
+        g_statTimes[g_statTimeCount].ms =
+            (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_statsFreq.QuadPart;
+        g_statTimeCount++;
+    }
+};
+}  // namespace
+#define STAT_TIME(nm, call) do { StatTimer _st(nm); call; } while (0)
+
+static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     extern long g_assetPathHits;
+
+    if (!g_statsFreq.QuadPart) QueryPerformanceFrequency(&g_statsFreq);
+    g_statTimeCount = 0;
+
+    // The first thing in the report, because it is the first thing anyone
+    // reading a bug report needs and it used to be scattered over six thousand
+    // lines of start-up.
+    {
+        LONG n = g_problemCount;
+        if (n > PROBLEM_MAX) n = PROBLEM_MAX;
+        Log("========================================");
+        if (n == 0) {
+            Log("[Wrong] Nothing has reported a fault. Every module that was "
+                "switched on installed, and none has stood down or retired.");
+        } else {
+            Log("[Wrong] %ld thing(s) did not work. Each was asked to run and "
+                "did not; a switch left off is not counted here.", (long)n);
+            for (LONG i = 0; i < n; i++) Log("[Wrong]   %s", g_problem[i]);
+            if (g_problemDropped > 0) {
+                Log("[Wrong]   and %ld more that did not fit.",
+                    (long)g_problemDropped);
+            }
+        }
+        LONG dropped = g_logDropped;
+        if (dropped > 0) {
+            Log("[Wrong] %ld log line(s) were dropped because the ring was full "
+                "when they were written, so this file is missing that many "
+                "entries.", (long)dropped);
+        }
+        LONG cut = g_logTruncated;
+        if (cut > 0) {
+            Log("[Wrong] %ld log line(s) were longer than a ring slot and lost "
+                "their tail.", (long)cut);
+        }
+        Log("========================================");
+    }
     extern long g_assetPathMisses;
     extern long g_tvalueMemcpyHits;
     extern long g_sysInfoHits;
@@ -4375,34 +5099,108 @@ static void DumpPeriodicStats() {
     // Renderer line here too: DXVK's d3d9.dll can load after the startup probe,
     // so re-report it once detection has reliably latched. Makes any mid-session
     // log slice self-describing (GPU is static; logged once at startup).
-    Log("[Stats] Renderer: %s", DXVKBridge::IsActive() ? "DXVK / Vulkan translation" : "native Direct3D 9");
-
-    // Virtual address space scan (32-bit fragmentation indicator)
+    // Three states. "native Direct3D 9" used to cover both "we looked and it is",
+    // and every way the look itself could fail - d3d9.dll not loaded yet, no
+    // version resource, our own version.dll proxy not forwarding. A tester on
+    // DXVK reading "native Direct3D 9" sends the wrong log to the wrong place.
     {
-        MEMORY_BASIC_INFORMATION mbi;
-        uintptr_t addr = 0x10000;
+        DXVKBridge::Stats dx = {};
+        DXVKBridge::GetStats(&dx);
+        if (dx.active)
+            Log("[Stats] Renderer: DXVK / Vulkan translation (%s)",
+                dx.detectionReason ? dx.detectionReason : "reason not recorded");
+        else
+            Log("[Stats] Renderer: no translation layer seen - %s",
+                dx.detectionReason ? dx.detectionReason : "reason not recorded");
+    }
+
+    // Virtual address space fragmentation, below 2GB.
+    //
+    // This used to walk the low 2GB here, with VirtualQuery, once per region,
+    // on the main thread, inside a frame, every five minutes. Tester logs put
+    // "STALL periodic maintenance took 42.6 ms" against a frame median near
+    // ten, and a fragmented low half has tens of thousands of regions at a
+    // syscall each - which is the whole of that number, near enough.
+    //
+    // The heap compactor's monitor thread already walks for exactly these two
+    // figures every ten seconds, off the main thread. Taking its last result
+    // costs three loads. The walk is kept only for the case where that thread
+    // is not running - the compactor switched off, or its first pass not done
+    // - and then it says so, with what it cost, rather than quietly charging
+    // a frame for it.
+    {
         SIZE_T largestFree = 0;
-        SIZE_T totalFree = 0;
-        while (addr < 0x7FFF0000) {
-            if (VirtualQuery((void*)addr, &mbi, sizeof(mbi))) {
-                if (mbi.State == MEM_FREE) {
-                    if (mbi.RegionSize > largestFree) largestFree = mbi.RegionSize;
-                    totalFree += mbi.RegionSize;
+        SIZE_T totalFree   = 0;
+        unsigned long vaAgeMs = 0;
+        bool  cached = HeapCompactor_GetLowHalfSnapshot(&largestFree, &totalFree,
+                                                        &vaAgeMs);
+        double walkMs = 0.0;
+        if (!cached) {
+            LARGE_INTEGER wf, wa, wb;
+            QueryPerformanceFrequency(&wf);
+            QueryPerformanceCounter(&wa);
+            MEMORY_BASIC_INFORMATION mbi;
+            uintptr_t addr = 0x10000;
+            while (addr < 0x7FFF0000) {
+                if (VirtualQuery((void*)addr, &mbi, sizeof(mbi))) {
+                    if (mbi.State == MEM_FREE) {
+                        if (mbi.RegionSize > largestFree) largestFree = mbi.RegionSize;
+                        totalFree += mbi.RegionSize;
+                    }
+                    addr += mbi.RegionSize;
+                    if (mbi.RegionSize == 0) addr += 0x10000;
+                } else {
+                    addr += 0x10000;
                 }
-                addr += mbi.RegionSize;
-                if (mbi.RegionSize == 0) addr += 0x10000;
-            } else {
-                addr += 0x10000;
             }
+            QueryPerformanceCounter(&wb);
+            if (wf.QuadPart)
+                walkMs = (double)(wb.QuadPart - wa.QuadPart) * 1000.0
+                       / (double)wf.QuadPart;
         }
-        // Naming the range matters: this walk stops at 2GB, while the heap
-        // compactor measures all of user address space and reports gigabytes on
-        // the same client in the same second. Without the range on each line the
-        // two read as a contradiction.
-        Log("[Stats] VA Space (below 2GB): Free=%.0fMB LargestBlock=%.0fMB%s",
+        // Naming the range matters: these figures stop at 2GB, while the heap
+        // compactor reports all of user address space and shows gigabytes on the
+        // same client in the same second. Without the range on each line the two
+        // read as a contradiction.
+        //
+        // Saying where the numbers came from matters for the same reason. A
+        // reading up to ten seconds old is not the same claim as one taken now,
+        // and a line that does not say which invites the reader to assume.
+        char vaHow[96];
+        if (cached)
+            _snprintf(vaHow, sizeof(vaHow) - 1,
+                      " (from the heap monitor's walk %lu ms ago)", vaAgeMs);
+        else
+            _snprintf(vaHow, sizeof(vaHow) - 1,
+                      " (walked here, on this thread, in %.1f ms - the heap "
+                      "monitor has not published one)", walkMs);
+        vaHow[sizeof(vaHow) - 1] = 0;
+        Log("[Stats] VA Space (below 2GB): Free=%.0fMB LargestBlock=%.0fMB%s%s",
             totalFree / (1024.0 * 1024.0),
             largestFree / (1024.0 * 1024.0),
-           (largestFree < 64 * 1024 * 1024) ? " WARNING: fragmented" : "");
+           (largestFree < 64 * 1024 * 1024) ? " WARNING: fragmented" : "",
+            vaHow);
+        // The same walk used to live in three places. Two of them are gone; this
+        // says whether the third is still paying for it, and what it cost.
+        {
+            unsigned long fromMon = 0, ownWalks = 0;
+            double ownWorst = 0.0;
+            LuaOpt_GetVaSourceStats(&fromMon, &ownWalks, &ownWorst);
+            if (fromMon || ownWalks)
+                Log("[Stats]   the addon's copy of that figure was taken from the "
+                    "heap monitor %lu time(s) and walked on this thread %lu "
+                    "time(s), worst %.1f ms. It used to walk every time, up to "
+                    "once a second.", fromMon, ownWalks, ownWorst);
+        }
+        // The client allocates from below 2GB. A tester whose garbled addon names
+        // appeared while the largest block there was 11 MB had this line in his
+        // log nine times and nobody read it against the complaint.
+        if (largestFree < 32 * 1024 * 1024) {
+            Verdict::Add(largestFree < 16 * 1024 * 1024 ? Verdict::Bad : Verdict::Warn,
+                         "only %.0fMB largest free block below 2GB - the client "
+                         "allocates from there",
+                         largestFree / (1024.0 * 1024.0));
+        }
     }    
     Log("[Stats] ====================================");
 
@@ -4502,15 +5300,15 @@ static void DumpPeriodicStats() {
             g_crtMemsetHits, g_crtMemsetFallbacks,
            (double)g_crtMemsetHits / (g_crtMemsetHits + g_crtMemsetFallbacks) * 100.0);
     if (g_memchrHits + g_memchrFallbacks > 0)
-        Log("[Stats] CRT memchr: %lld fast, %lld fallback (%.1f%%)",
+        Log("[Stats] CRT memchr: %ld fast, %ld fallback (%.1f%%, lower bound)",
             g_memchrHits, g_memchrFallbacks,
            (double)g_memchrHits / (g_memchrHits + g_memchrFallbacks) * 100.0);
     if (g_strchrHits + g_strchrFallbacks > 0)
-        Log("[Stats] CRT strchr: %lld fast, %lld fallback (%.1f%%)",
+        Log("[Stats] CRT strchr: %ld fast, %ld fallback (%.1f%%, lower bound)",
             g_strchrHits, g_strchrFallbacks,
            (double)g_strchrHits / (g_strchrHits + g_strchrFallbacks) * 100.0);
     if (g_strcpyHits + g_strcpyFallbacks > 0)
-        Log("[Stats] CRT strcpy: %lld fast, %lld fallback (%.1f%%)",
+        Log("[Stats] CRT strcpy: %ld fast, %ld fallback (%.1f%%, lower bound)",
             g_strcpyHits, g_strcpyFallbacks,
            (double)g_strcpyHits / (g_strcpyHits + g_strcpyFallbacks) * 100.0);
 
@@ -4526,7 +5324,7 @@ static void DumpPeriodicStats() {
     // }
 
     if (g_tableReshapeHits > 0)
-        Log("[Stats] Lua Table Rehash: %ld rounded to pow2", g_tableReshapeHits);
+        Log("[Stats] Lua Table Rehash: %I64u rounded to pow2", g_tableReshapeHits);
     if (g_getstrHits + g_getstrFallbacks > 0) {
         Log("[Stats] luaH_getstr: %I64u hits, %I64u fallbacks (%.1f%%)",
             g_getstrHits, g_getstrFallbacks,
@@ -4571,7 +5369,8 @@ static void DumpPeriodicStats() {
         double usedMB = (double)g_vaArenaUsedPages * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
         double peakMB = (double)g_vaArenaPeakPages * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
         double capMB  = (double)VA_ARENA_MAX_PAGES * VA_ARENA_PAGE_SIZE / (1024.0 * 1024.0);
-        Log("[Stats] VA Arena: %ld hits, %ld fallbacks, %ld fail (%.1f%% arena, %.1f MB used, %.1f MB peak of %.0f MB)",
+        Log("[Stats] VA Arena: %ld hits, %ld did not qualify, %ld qualified and "
+            "failed to commit (%.1f%% arena, %.1f MB used, %.1f MB peak of %.0f MB)",
             g_vaArenaHits, g_vaArenaFallbacks, g_vaArenaFailures,
             arenaPct, usedMB, peakMB, capMB);
         // g_vaArenaFull is the key sizing signal: qualifying allocations we had
@@ -4603,8 +5402,11 @@ static void DumpPeriodicStats() {
     // Receive-side network stats
     if (g_recvCalls > 0 || g_WSARecvCalls > 0)
         Log("[Stats] Network RX: recv=%ld calls, %.1f KB, %ld wouldblock | WSARecv=%ld calls, %.1f KB, %ld wouldblock",
-            g_recvCalls, g_recvBytes / 1024.0, g_recvWouldBlock,
-            g_WSARecvCalls, g_WSARecvBytes / 1024.0, g_WSARecvWouldBlock);
+            g_recvCalls,
+            ((double)g_recvBytesWraps * 4294967296.0 + (double)g_recvBytes) / 1024.0,
+            g_recvWouldBlock, g_WSARecvCalls,
+            ((double)g_WSARecvBytesWraps * 4294967296.0 + (double)g_WSARecvBytes) / 1024.0,
+            g_WSARecvWouldBlock);
     if (fps.phase2Active) {
         Log("[Stats] Phase2: find=%ld/%ld match=%ld/%ld type=%ld math=%ld strlen=%ld byte=%ld tostr=%ld/%ld tonum=%ld next=%ld/%ld rawget=%ld/%ld rawset=%ld/%ld tins=%ld/%ld trem=%ld/%ld concat=%ld/%ld unpack=%ld/%ld select=%ld/%ld raweq=%ld/%ld sub=%ld lower=%ld upper=%ld ipairs=%ld/%ld iter=%ld/%ld random=%ld/%ld sqrt=%ld/%ld rep=%ld/%ld find_full=%ld/%ld",
             fps.findPlainHits, fps.findFallbacks, fps.matchHits, fps.matchFallbacks, fps.typeHits, fps.mathHits, fps.strlenHits, fps.strbyteHits,
@@ -4658,54 +5460,151 @@ static void DumpPeriodicStats() {
     // If the sampling profiler is active, fold its current top-50 into the
     // periodic dump. Shutdown() is skipped on the fast process-exit path, so
     // this is the only way the profile reliably reaches the log.
-    if (Config::g_settings.OptSamplingProfiler) {
+    // Not at process exit: the sampler runs on its own thread, that thread is
+    // already gone by then, and if it died holding the ring's lock this would
+    // hang a quitting process. Every other report below is a plain read of a
+    // counter the main thread owns.
+    if (Config::g_settings.OptSamplingProfiler && !atProcessExit) {
         SamplingProfiler::DumpNow();
     }
 #endif
     CpuTopology::Report();
-    FrameBench::Report("periodic");
-    CrashDumper::ReportFeatureActivity();
+    FrameBench::Report(why);
+    STAT_TIME("CrashDumper::ReportFeatureActivity", CrashDumper::ReportFeatureActivity());
     CrashDumper::ReportFirstChanceSummary();
-    PerfDiagnostics::LogStats();
-    LuaGCGovernor::LogStats();
-    LuaMemPoolFast::LogStats();
-    HeapCompactor_LogStats();
-    VertexFmtInline::LogStats();
-    ObjMgrFindFast::LogStats();
-    QuatLerpSse2::LogStats();
-    LuaProtoCache::LogStats();
-    AnimLod::LogStats();
-    CollisionOutcode::LogStats();
-    LuaThisCache_LogStats();
-    LuaAllocCensus::LogStats();
+    STAT_TIME("PerfDiagnostics::LogStats", PerfDiagnostics::LogStats());
+    STAT_TIME("LuaGCGovernor::LogStats", LuaGCGovernor::LogStats());
+    STAT_TIME("LuaMemPoolFast::LogStats", LuaMemPoolFast::LogStats());
+    STAT_TIME("HeapCompactor_LogStats", HeapCompactor_LogStats());
+    STAT_TIME("VertexFmtInline::LogStats", VertexFmtInline::LogStats());
+    STAT_TIME("ObjMgrFindFast::LogStats", ObjMgrFindFast::LogStats());
+    STAT_TIME("QuatLerpSse2::LogStats", QuatLerpSse2::LogStats());
+    STAT_TIME("QualityGovernor::LogStats", QualityGovernor::LogStats());
+    STAT_TIME("LuaProtoCache::LogStats", LuaProtoCache::LogStats());
+    STAT_TIME("LuaBytecodeStore::LogStats", LuaBytecodeStore::LogStats());
+    STAT_TIME("LuaUndump::LogStats", LuaUndump::LogStats());
+    LuaBytecodeStore::SaveIfDirty();
+    STAT_TIME("AnimLod::LogStats", AnimLod::LogStats());
+    STAT_TIME("CollisionOutcode::LogStats", CollisionOutcode::LogStats());
+    STAT_TIME("BoneMatrixUpload::LogStats", BoneMatrixUpload::LogStats());
+    STAT_TIME("M2MatrixSlot::LogStats", M2MatrixSlot::LogStats());
+    STAT_TIME("M2AnimStride::LogStats", M2AnimStride::LogStats());
+    STAT_TIME("MimallocHighArena::LogStats", MimallocHighArena::LogStats());
+    STAT_TIME("ClientWriteBatch::LogStats", ClientWriteBatch::LogStats());
+    STAT_TIME("AabbOverlap::LogStats", AabbOverlap::LogStats());
+    STAT_TIME("AnimQuatUnpack::LogStats", AnimQuatUnpack::LogStats());
+    STAT_TIME("AnimVec3Track::LogStats", AnimVec3Track::LogStats());
+    STAT_TIME("M2SortKey::LogStats", M2SortKey::LogStats());
+    STAT_TIME("FrustumAabb::LogStats", FrustumAabb::LogStats());
+    STAT_TIME("SegmentAabb::LogStats", SegmentAabb::LogStats());
+    STAT_TIME("LuaHGetDispatch::LogStats", LuaHGetDispatch::LogStats());
+    STAT_TIME("LuaPoolFast::LogStats", LuaPoolFast::LogStats());
+    STAT_TIME("CombatLogFilter::LogStats", CombatLogFilter::LogStats());
+    STAT_TIME("LuaThisCache_LogStats", LuaThisCache_LogStats());
+    STAT_TIME("LuaAllocCensus::LogStats", LuaAllocCensus::LogStats());
+
+    // These modules printed their counters only from an uninstall path that
+    // nothing calls; the DLL leaves through TerminateProcess and the linker had
+    // dropped those functions entirely. Seven of them count averted crashes,
+    // which is the number that says whether a guard is earning its hook.
+    STAT_TIME("ObjectUnlinkSafety_LogStats", ObjectUnlinkSafety_LogStats());
+    STAT_TIME("TypeCheckSafety_LogStats", TypeCheckSafety_LogStats());
+    STAT_TIME("SoundBufferGuard_LogStats", SoundBufferGuard_LogStats());
+    STAT_TIME("SoundDriverGuard_LogStats", SoundDriverGuard_LogStats());
+    STAT_TIME("SoundEmitterGuard_LogStats", SoundEmitterGuard_LogStats());
+    STAT_TIME("LuaGetTableSafety_LogStats", LuaGetTableSafety_LogStats());
+    STAT_TIME("LuaNewKeySafety_LogStats", LuaNewKeySafety_LogStats());
+    STAT_TIME("LuaGetStrInline_LogStats", LuaGetStrInline_LogStats());
+    STAT_TIME("LuaRawGetInline_LogStats", LuaRawGetInline_LogStats());
+    STAT_TIME("LuaRawGetIInline_LogStats", LuaRawGetIInline_LogStats());
+    STAT_TIME("LuaTobooleanInline_LogStats", LuaTobooleanInline_LogStats());
+    STAT_TIME("StrtodFast_LogStats", StrtodFast_LogStats());
+    STAT_TIME("RegexCache_LogStats", RegexCache_LogStats());
+    STAT_TIME("MatrixCopySSE2_LogStats", MatrixCopySSE2_LogStats());
     ReportCrtFreeStats();
     if (g_spinTaken > 0 || g_spinSkipped > 0) {
         Log("[SleepPrecision] busy-wait taken %ld, handed back %ld (frames over "
             "%.0f ms give the time to the scheduler instead)",
             (long)g_spinTaken, (long)g_spinSkipped, SPIN_ABORT_FRAME_MS);
     }
-    LuaFastPath::LogStats();
-    ObjVisCache::LogStats();
-    FontGlyphCache::LogStats();
+    STAT_TIME("LuaFastPath::LogStats", LuaFastPath::LogStats());
+    STAT_TIME("ObjVisCache::LogStats", ObjVisCache::LogStats());
+    STAT_TIME("FontGlyphCache::LogStats", FontGlyphCache::LogStats());
     WowOpt_ReportForeignDetours();
-    ApiCache::LogStats();
-    TextureUnloadDelay::LogStats();
-    NetDiag::LogStats();
-    RenderNullGuard_LogStats();
-    StrncmpSse2::LogStats();
-    DbcLookupCache_LogStats();
-    LuaCompileCensus::LogStats();
-    AnimCensus::LogStats();
-    DeviceCallbackGuard::LogStats();
-    LayoutRelinkFast::LogStats();
-    HorizonOcclusion::LogStats();
-    D3D9StateCache::LogStats();
+    STAT_TIME("ApiCache::LogStats", ApiCache::LogStats());
+    STAT_TIME("TextureUnloadDelay::LogStats", TextureUnloadDelay::LogStats());
+    STAT_TIME("Verdict::LogStats", Verdict::LogStats());
+    STAT_TIME("NetDiag::LogStats", NetDiag::LogStats());
+    // Said every report, not once at startup, because the whole value of this
+    // mode is that a log from it cannot be read as a log from a normal run.
+    if (Config::g_settings.OptNoClientPatches) {
+        Log("[NoClientPatches] ON - %ld write%s into the wow.exe image refused. "
+            "No optimisation ran this session; the socket watch, the crash "
+            "reporter and the frame timing live outside the client and did.",
+            g_clientPatchesRefused, g_clientPatchesRefused == 1 ? "" : "s");
+    }
+    STAT_TIME("RenderNullGuard_LogStats", RenderNullGuard_LogStats());
+    STAT_TIME("StrncmpSse2::LogStats", StrncmpSse2::LogStats());
+    STAT_TIME("DbcLookupCache_LogStats", DbcLookupCache_LogStats());
+    STAT_TIME("LuaCompileCensus::LogStats", LuaCompileCensus::LogStats());
+    STAT_TIME("FlightRecorder::LogStats", FlightRecorder::LogStats());
+    STAT_TIME("AbTest::LogStats", AbTest::LogStats());
+    STAT_TIME("AnimCensus::LogStats", AnimCensus::LogStats());
+    STAT_TIME("PredictivePrefetch::LogStats", PredictivePrefetch::LogStats());
+    STAT_TIME("TickListPrefetch::LogStats", TickListPrefetch::LogStats());
+    STAT_TIME("LuaTableCensus::LogStats", LuaTableCensus::LogStats());
+    STAT_TIME("D3D9StateManager_LogStats", D3D9StateManager_LogStats());
+    STAT_TIME("SimdHooks_LogStats", SimdHooks_LogStats());
+    STAT_TIME("DeviceCallbackGuard::LogStats", DeviceCallbackGuard::LogStats());
+    STAT_TIME("LayoutRelinkFast::LogStats", LayoutRelinkFast::LogStats());
+    STAT_TIME("HorizonOcclusion::LogStats", HorizonOcclusion::LogStats());
+    STAT_TIME("D3D9StateCache::LogStats", D3D9StateCache::LogStats());
     D3D9StateCache::ReportDrawCensus();
-    AsyncSoundLoader::LogStats();
-    VertexBufferPrealloc::LogStats();
-    LuaBytecodeCache::LogStats();
-    CombatLogBuffer::LogStats();
-    MpqAsyncDecompress::LogStats();
+    STAT_TIME("AsyncSoundLoader::LogStats", AsyncSoundLoader::LogStats());
+    STAT_TIME("VertexBufferPrealloc::LogStats", VertexBufferPrealloc::LogStats());
+    STAT_TIME("LuaBytecodeCache::LogStats", LuaBytecodeCache::LogStats());
+    STAT_TIME("CombatLogBuffer::LogStats", CombatLogBuffer::LogStats());
+    STAT_TIME("MpqAsyncDecompress::LogStats", MpqAsyncDecompress::LogStats());
+
+    // Last, so it covers everything above it. The report is the only thing in
+    // this DLL that reliably costs the player a visible pause, and it costs it
+    // for our benefit rather than theirs, so it has to be able to say where it
+    // went.
+    if (g_statTimeCount > 0) {
+        double sum = 0.0;
+        for (int i = 0; i < g_statTimeCount; i++) sum += g_statTimes[i].ms;
+
+        int worst[5];
+        int found = 0;
+        for (int i = 0; i < g_statTimeCount; i++) {
+            int at = found;
+            if (found < 5) {
+                found++;
+            } else if (g_statTimes[i].ms > g_statTimes[worst[4]].ms) {
+                at = 4;
+            } else {
+                continue;
+            }
+            while (at > 0 && g_statTimes[i].ms > g_statTimes[worst[at - 1]].ms) {
+                worst[at] = worst[at - 1];
+                at--;
+            }
+            worst[at] = i;
+        }
+
+        Log("[Report] %d reporter(s) took %.1f ms of main thread between them. "
+            "That is a pause the player sees, so the slowest are named:",
+            g_statTimeCount, sum);
+        for (int i = 0; i < found; i++) {
+            if (g_statTimes[worst[i]].ms < 0.5) break;
+            Log("[Report]   %-38s %6.1f ms", g_statTimes[worst[i]].name,
+                g_statTimes[worst[i]].ms);
+        }
+        if (found == 0 || g_statTimes[worst[0]].ms < 0.5) {
+            Log("[Report]   none of them reached half a millisecond, so the "
+                "cost is spread rather than in one place.");
+        }
+    }
 }
 
 // ================================================================
@@ -4928,6 +5827,13 @@ static SwapPresentTiming_fn orig_SwapPresentTiming = nullptr;
 // hooked_Sleep tick, which is gated to fire at most once every 8ms - i.e. it
 // stops tracking frames at all above ~125fps.
 extern "C" void WowOpt_OnFrameBoundary() {
+    // Retires the render-sort key cache. It was bumped from MainThreadPump,
+    // which is reached from hooked_Sleep and from the frame limiter and so runs
+    // twice per frame - halving the cache's life for no reason. This is the
+    // boundary a presented frame actually marks, and the render sort that fills
+    // the cache happens before it, so one generation now spans exactly one pass.
+    M2SortKey::NewFrame();
+
     // Deferred unit field writes and coalesced world states must be applied on a
     // real frame boundary. Addons read unit state the moment an event arrives, so
     // a descriptor write that is still sitting in a queue is read as stale, and no
@@ -4942,6 +5848,12 @@ extern "C" void WowOpt_OnFrameBoundary() {
     //
     // Calling from both present paths costs an empty-queue check per frame: each
     // of these takes its lock, sees head == tail, and returns.
+    // The per-frame ring, and the key that dumps it. Both are one presented
+    // frame apart by construction, which is the resolution the ring is for.
+    FlightRecorder::OnFrame();
+    FlightRecorder::PollHotkey();
+    AbTest::OnFrame();
+
     // A presented frame is the honest proof that the main thread is alive.
     //
     // The liveness signal used to come only from hooked_Sleep and the frame
@@ -6090,6 +7002,20 @@ static bool InstallSysMetricsCache() {
 typedef BOOL (WINAPI* IsDebuggerPresent_fn)();
 static IsDebuggerPresent_fn orig_IsDebuggerPresent = nullptr;
 
+// The only hook here whose reason was never written down, and the one whose
+// shape most invites the wrong reading.
+//
+// For anyone playing normally it does nothing at all: no debugger is attached,
+// so the real IsDebuggerPresent already returns FALSE and the detour returns the
+// same answer through one more jump. It changes something only when a debugger
+// IS attached, and then what it changes is the client's own reaction to that.
+//
+// It stays because removing it is not free either: some overlays and injectors
+// set the debug flag on a process nobody is debugging, and the client taking its
+// debugger path in that case is a behaviour change for a tester rather than a
+// fix. It is not a performance hook, it never was, and it is not evidence of one
+// - said plainly so the next reader does not have to guess, and so nobody counts
+// it among the optimizations.
 static BOOL WINAPI hooked_IsDebuggerPresent() { return FALSE; }
 
 static bool InstallNoDebuggerPresent() {
@@ -6897,7 +7823,21 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #if !TEST_DISABLE_CVAR_NULL_GUARD
     // Was installed unconditionally, so a log could read CvarNullGuard=0 and
     // still show "[CvarGuard] ACTIVE". The setting has existed all along.
-    if (Config::g_settings.OptCvarNullGuard) InstallCvarNullGuard();
+    // Six guards hang off this one switch and the log should say so, because the
+    // switch is named after the first of them. A reader who turns off "Client
+    // Crash Guards" to isolate a problem is turning off all six, and one who
+    // turned off the old "Null Pointer CVar Safeguard" was doing that without
+    // knowing it.
+    if (Config::g_settings.OptCvarNullGuard) {
+        Log("[CrashGuards] ON - this one switch covers the CVar null write, the "
+            "Lua table read, the GUID type check that crashes on battleground "
+            "load, the object reaper unlink, and two further null and bounds "
+            "checks. Each reports separately below.");
+        InstallCvarNullGuard();
+    } else {
+        Log("[CrashGuards] OFF - all six client crash guards are disabled, not "
+            "just the CVar one the key is named after.");
+    }
 #endif
     if (Config::g_settings.OptVulkanDXVK) {
         InstallD3DEvictPatch();
@@ -6919,6 +7859,15 @@ static DWORD WINAPI MainThread(LPVOID param) {
     LoadingState::Init();
 #if !TEST_DISABLE_EVENT_COALESCER
     EventCoalescer::Init();
+#else
+    // Compiled out, so the launcher no longer offers a checkbox for it. It
+    // suppressed whitelisted events and re-emitted them a frame later from the
+    // Sleep hook, which runs Lua handlers at a point in the frame the client
+    // does not expect, and it was never validated across the in-world to glue
+    // teardown where the character-switch crashes happen.
+    Log("[EventCoalescer] not in this build: compiled out via "
+        "TEST_DISABLE_EVENT_COALESCER. The Combat_Net/EventCoalescer key is "
+        "read and has nothing to turn on.");
 #endif
 #if !TEST_DISABLE_LUAS_NEWLSTR_SSE2
     // The launcher has always offered a switch for this; nothing read it, so the
@@ -6958,7 +7907,9 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #if !TEST_DISABLE_HEAP_REDIRECT
     Log("--- Process Heap Redirect ---");
     bool heapRedirectOk = InstallHeapRedirectToMimalloc();
-    if (!heapRedirectOk) Log("[HeapRedirect] install failed -- process heap stays stock");
+    // The install says why it declined; "failed" would be a second and
+    // wrong explanation for the same line.
+    (void)heapRedirectOk;
 #else
     Log("[HeapRedirect] DISABLED via TEST_DISABLE_HEAP_REDIRECT");
 #endif
@@ -7005,6 +7956,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
     // in, the report must say so rather than print a confident zero.
     LoadingState::SetReadHookInstalled(readOk);
     bool closeOk = Config::g_settings.OptFileIoHooks && InstallCloseHandleHook();
+
+    // After the close hook, because that is the flush the batcher cannot do
+    // without, and it is told rather than left to guess.
+    ClientWriteBatch::Init(LoadingState::GetClientWriter(), closeOk);
     bool flushOk = Config::g_settings.OptFileIoHooks && InstallFlushFileBuffersHook();
     Log("--- Async MPQ I/O ---");
     // Worker started after init completes to avoid race with hook setup
@@ -7206,6 +8161,11 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool profOk = Config::g_settings.OptWin32ApiCaches && InstallGetPrivateProfileCache();
 
     Log("--- Message Pump ---");
+    // Both of the remaining UIFrameBatch uses gate code that is compiled out:
+    // this one by CRASH_TEST_DISABLE_MSGPUMP_RC1, which its own note calls
+    // CONFIRMED BROKEN with an infinite freeze, and the deferred field updates
+    // below by TEST_DISABLE_DEFERRED_FIELD_UPDATES. Neither has ever run, so
+    // the switch reads as gating four things and controls two.
     bool msgPumpOk = Config::g_settings.OptUIFrameBatch && InstallMsgPumpHook();
 
     Log("--- Swap/Present ---");
@@ -7237,8 +8197,24 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- Quaternion Interpolation (SSE2) ---");
     QuatLerpSse2::Init();
     LuaProtoCache::Init();
+    LuaBytecodeStore::Init();
     AnimLod::Init();
     CollisionOutcode::Init();
+    BoneMatrixUpload::Init();
+
+    Log("--- M2 Matrix Slot Copy (SSE2) ---");
+    M2MatrixSlot::Install();
+
+    Log("--- M2 Animation Stride ---");
+    M2AnimStride::Install();
+    AabbOverlap::Init();
+    AnimQuatUnpack::Init();
+    AnimVec3Track::Init();
+    M2SortKey::Init();
+    FrustumAabb::Init();
+    SegmentAabb::Init();
+    LuaHGetDispatch::Init();
+    LuaPoolFast::Init();
 
     Log("--- UnitAura Fast Path ---");
 #if !TEST_DISABLE_UNIT_AURA_FAST
@@ -7388,6 +8364,15 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("--- Shadow State Probe ---");
     ShadowStateProbe::Init();
+    // Before the modules that claim columns in it, so their RegisterSlot
+    // calls have somewhere to land.
+    FlightRecorder::Init();
+    g_frSlotSavedVars = FlightRecorder::RegisterSlot("svopen");
+    // Our own periodic tick, so a dump can say "this frame was us" instead of
+    // leaving the reader to infer it. That has been the answer before.
+    g_frSlotMaint = FlightRecorder::RegisterSlot("wowopt");
+    LoadingState::ClaimRecorderColumns();
+    AbTest::Init();
 
     Log("--- Event Name Hash Cache ---");
 
@@ -7397,7 +8382,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool strcpyOk = Config::g_settings.OptStrCatFast && InstallStrcatFast();
 
     Log("--- Script Handler Cache ---");
-    bool scriptHandlerOk = Config::g_settings.OptUIFrameBatch && InstallScriptHandlerCache();
+    bool scriptHandlerOk = Config::g_settings.OptUiScriptHandlerCache && InstallScriptHandlerCache();
 
     Log("--- DBC Lookup Cache ---");
     bool dbcLookupOk = Config::g_settings.OptDbcLookupCache && InstallDbcLookupCache();
@@ -7508,7 +8493,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool luaRefFastOk = false, luaUnrefFastOk = false, luaCallMetaFastOk = false;
     bool pushResultFastOk = false, addLStringFastOk = false;
     bool loadstrFastOk = false, yieldFastOk = false;
-    Log("[LuaInlineBatch] ALL DISABLED via TEST_DISABLE_LUA_INLINE_BATCH");
+    Log("[LuaInlineBatch] ALL DISABLED via TEST_DISABLE_LUA_INLINE_BATCH: "
+        "21 hooks, after confirmed TValue corruption at luaD_precall 0x5565E9.");
+    Log("[LuaInlineBatch] every install gated on UI_Lua/LuaOpcacheWrites is in "
+        "that group, all ten of them, so that key now turns nothing on and the "
+        "launcher no longer offers it. Reads, Strings and Tables still gate 20, "
+        "4 and 7 live installs.");
 #endif
 
     // --- Safe group 1: string/number validation ---
@@ -7715,7 +8705,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
         // when any caller changes thread affinity.
         InstallWineSTIPNoop();
     }
-    g_threadAffOk = Config::g_settings.OptDefragLf && !Config::g_settings.OptCompatMode && InstallThreadAffinity();
+    g_threadAffOk = Config::g_settings.OptThreadAffinity && !Config::g_settings.OptCompatMode && InstallThreadAffinity();
 
     Log("--- VA Arena ---");
     vaOk = InstallVAArena();
@@ -7783,7 +8773,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("");
     Log("--- Object Visibility Cache ---");
 #if TEST_DISABLE_OBJ_VIS_CACHE
-    Log("[ObjVisCache] DISABLED (feature flag)");
+    // Compiled out, so the launcher no longer offers a checkbox for it. It had
+    // been sitting there default ON, describing itself as "on unless you turn
+    // it off", above a build that never contained it.
+    Log("[ObjVisCache] not in this build: compiled out via "
+        "TEST_DISABLE_OBJ_VIS_CACHE. The General/ObjVisCache key is read and "
+        "has nothing to turn on.");
 #else
     if (Config::g_settings.OptObjVisCache) ObjVisCache::Init();
 #endif
@@ -8033,8 +9028,9 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- SavedVariables Async Writer ---");
 #if !TEST_DISABLE_SAVED_VARS_ASYNC
     // Same correction as NameplateMT: InstallSavedVarsAsync is a stub that logs
-    // "Bypassed for stability" and returns true, so there is nothing on a
-    // background thread to keep off Wine either.
+    // "Bypassed for stability", so there is nothing on a background thread to
+    // keep off Wine either. It returns false now, so the feature summary stops
+    // counting it as a working feature.
     bool savedVarsAsyncOk = Config::g_settings.OptSavedVarsAsync && InstallSavedVarsAsync();
 #else
     bool savedVarsAsyncOk = false;
@@ -8103,17 +9099,21 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool d3d9StateOk = Config::g_settings.OptD3d9StateManager && InstallD3D9StateManager();
 
     Log("");
+    // No switch. It gated an ini key with no tickbox that decided only whether
+    // the two lines below appeared, because this function installs nothing - the
+    // module's one piece of real work runs from the frame pump either way. A
+    // reader is better served by the lines always being there and saying so.
     Log("--- Render Hooks (backbuffer) ---");
-    bool renderHooksOk = Config::g_settings.OptDefragLf && InstallRenderHooks(); // BISECT
+    bool renderHooksOk = InstallRenderHooks();
 
     Log("");
     Log("--- SIMD Hooks (SSE2 matrix, frustum, color) ---");
-    bool simdHooksOk = Config::g_settings.OptStrStrSse2 && InstallSimdHooks(); // BISECT
+    bool simdHooksOk = Config::g_settings.OptSimdGeometry && InstallSimdHooks(); // BISECT
 
     Log("");
     Log("--- Logic Hooks (combat text, UI cache, heartbeat) ---");
 #if !TEST_DISABLE_UNIT_API_FASTPATH
-    bool logicHooksOk = Config::g_settings.OptUIFrameBatch && InstallLogicHooks();
+    bool logicHooksOk = Config::g_settings.OptUnitApiFastPath && InstallLogicHooks();
 #else
     bool logicHooksOk = false;
     Log("[LogicHooks] DISABLED via TEST_DISABLE_UNIT_API_FASTPATH");
@@ -8125,7 +9125,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- Async Hooks (worker pool, particle, prefetch) ---");
-    bool asyncHooksOk = Config::g_settings.OptDefragLf && InstallAsyncHooks(); // BISECT
+    bool asyncHooksOk = Config::g_settings.OptAsyncWorkerPool && InstallAsyncHooks(); // BISECT
 
     Log("");
     Log("--- Loading Defragmenter & Pre-committer ---");
@@ -8184,11 +9184,18 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("");
     Log("--- Velocity-Based Predictive Asset Prefetcher ---");
 #if !TEST_DISABLE_PREDICTIVE_PREFETCH
-    bool predictivePrefetchOk = Config::g_settings.OptFileIoHooks && PredictivePrefetch::Init();
+    bool predictivePrefetchOk = Config::g_settings.OptTerrainPrefetch && PredictivePrefetch::Init();
 #else
     bool predictivePrefetchOk = false;
     Log("[PredictivePrefetch] DISABLED via TEST_DISABLE_PREDICTIVE_PREFETCH");
 #endif
+
+    // Its own line, outside the block above. Put inside it, this was compiled
+    // out entirely by TEST_DISABLE_PREDICTIVE_PREFETCH - a different feature's
+    // compile-time switch - and the linker then dropped Init and the thunk as
+    // unreferenced, leaving only a LogStats that said "not installed".
+    TickListPrefetch::Init();
+    LuaTableCensus::Init();
 
     Log("");
     Log("--- Parallel M2 Geometry SIMD Skinning ---");
@@ -8199,7 +9206,11 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("--- SSE2 Math Fast Paths ---");
-    bool simdMathOk = Config::g_settings.OptStrStrSse2 && SimdMathFast::Init();
+    // Was gated on OptStrStrSse2 - a string-search switch - so it could not be
+    // turned off deliberately by anyone who wanted to. It has its own key now,
+    // and that key defaults off; see the module for the measurement that decided
+    // it.
+    bool simdMathOk = SimdMathFast::Init();
 
     Log("");
     Log("--- Incremental Combat Log Parsing ---");
@@ -8251,7 +9262,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     if (Config::g_settings.OptMouseClipRelease) MouseClipRelease::Init();
 
     Log("--- 10 More New Performance & Stability Features ---");
-    if (Config::g_settings.OptCombatLogFilter) CombatLogFilter::Init();
+    CombatLogFilter::Init();   // reads its own switch, and reports which way
     if (Config::g_settings.OptSoundVolumeLimit) SoundVolumeLimit::Init();
     if (Config::g_settings.OptTerrainHeightCache) TerrainHeightCache::Init();
 
@@ -8429,18 +9440,28 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("");
     Log("  [ -- ] mimalloc CRT redirect (REMOVED)");  // destabilized Winsock
+    // Three states, not two. Every one of these lines used to print FAIL when
+    // its flag was false, and most of the flags are "switch && Install()", so a
+    // setting the user had simply turned off was reported as a failure of the
+    // tool. A Warmane player chasing a login error was sent straight at
+    // "[FAIL] Network" by this, and that line meant nothing except that
+    // PacketOffload was unticked.
+    auto HookState = [](bool enabled, bool ok) -> const char* {
+        if (!enabled) return " off";
+        return ok ? " OK " : "FAIL";
+    };
     Log("  [%s] Sleep hook (PreciseSleep)",    sleepOk     ? " OK " : "FAIL");
-    Log("  [%s] GetTickCount (QPC)",           tickOk      ? " OK " : "FAIL");
-    Log("  [%s] timeGetTime (QPC sync)",       tgtOk       ? " OK " : "FAIL");
+    Log("  [%s] GetTickCount (QPC)",           HookState(Config::g_settings.OptTimingFix, tickOk));
+    Log("  [%s] timeGetTime (QPC sync)",       HookState(Config::g_settings.OptTimingFix, tgtOk));
     Log("  [%s] Heap optimization (LFH)",      heapOk      ? " OK " : "FAIL");
-    Log("  [%s] ThreadId cache (TLS)",         tidOk       ? " OK " : "FAIL");
+    Log("  [%s] ThreadId cache (TLS)",         HookState(Config::g_settings.OptThreadIdCache, tidOk));
     #if !CRASH_TEST_DISABLE_QPC_CACHE
-        Log("  [%s] QPC cache (50us coalesce)",    qpcOk       ? " OK " : "FAIL");
+        Log("  [%s] QPC cache (50us coalesce)",    HookState(Config::g_settings.OptTimingFix, qpcOk));
     #else
         Log("  [SKIP] QPC cache (crash isolation)");
     #endif        
-    Log("  [%s] IsBadPtr (fast VirtualQuery)", bpOk        ? " OK " : "FAIL");    
-    Log("  [%s] CompareStringA (ASCII fast)",  cmpOk       ? " OK " : "FAIL");
+    Log("  [%s] IsBadPtr (fast VirtualQuery)", HookState(Config::g_settings.OptDebugApiHooks, bpOk));    
+    Log("  [%s] CompareStringA (ASCII fast)",  HookState(Config::g_settings.OptStrStrSse2, cmpOk));
     Log("  [%s] MBT/WCT (SSE2 ASCII fast)",    mbwcOk      ? " OK " : "SKIP");
     Log("  [%s] CRT mem/str fast paths",        crtOk       ? " OK " : "SKIP");
     Log("  [%s] GetSystemInfo cache",            sysInfoOk    ? " OK " : "SKIP");
@@ -8453,20 +9474,21 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("  [%s] Batch 24 kernel caches",        batch30Ok    ? " OK " : "SKIP");
     Log("  [%s] Batch 35 kernel caches",        batch35Ok    ? " OK " : "SKIP");
     Log("  [%s] Batch 38 kernel caches",        batch38Ok    ? " OK " : "SKIP");    
-    Log("  [%s] OutputDebugString (no-op)",    debugOk     ? " OK " : "FAIL");
-    Log("  [%s] CriticalSection (spin+try)",   csOk        ? " OK " : "FAIL");
-    Log("  [%s] Network (NODELAY+ACK+QoS+KA)", netOk      ? " OK " : "FAIL");
-    Log("  [%s] CreateFile (sequential I/O)",  fileOk      ? " OK " : "FAIL");
-    Log("  [%s] ReadFile (adaptive MPQ cache)", readOk     ? " OK " : "FAIL");
+
+    Log("  [%s] OutputDebugString (no-op)",    HookState(Config::g_settings.OptDebugApiHooks, debugOk));
+    Log("  [%s] CriticalSection (spin+try)",   HookState(Config::g_settings.OptLockSpinHooks, csOk));
+    Log("  [%s] Network (NODELAY+ACK+QoS+KA)", HookState(Config::g_settings.OptPacketOffload, netOk));
+    Log("  [%s] CreateFile (sequential I/O)",  HookState(Config::g_settings.OptFileIoHooks, fileOk));
+    Log("  [%s] ReadFile (adaptive MPQ cache)", HookState(Config::g_settings.OptFileIoHooks, readOk));
     #if !CRASH_TEST_DISABLE_MPQ_MMAP
         Log("  [ OK ] MPQ memory mapping (1-256MB files)");
     #else
         Log("  [SKIP] MPQ memory mapping (disabled - stability)");
     #endif  
-    Log("  [%s] CloseHandle (cache cleanup)",  closeOk     ? " OK " : "FAIL");
-    Log("  [%s] FlushFileBuffers (MPQ skip)",  flushOk     ? " OK " : "FAIL");
-    Log("  [%s] GetFileAttributesA (cache)",   faOk        ? " OK " : "FAIL");
-    Log("  [%s] SetFilePointer (64-bit)",      sfpOk       ? " OK " : "FAIL");
+    Log("  [%s] CloseHandle (cache cleanup)",  HookState(Config::g_settings.OptFileIoHooks, closeOk));
+    Log("  [%s] FlushFileBuffers (MPQ skip)",  HookState(Config::g_settings.OptFileIoHooks, flushOk));
+    Log("  [%s] GetFileAttributesA (cache)",   HookState(Config::g_settings.OptFileIoHooks, faOk));
+    Log("  [%s] SetFilePointer (64-bit)",      HookState(Config::g_settings.OptFileIoHooks, sfpOk));
     Log("  [%s] GlobalAlloc (mimalloc GMEM_FIXED)", gaOk      ? " OK " : "FAIL");
     // Reported here because it was reported nowhere, and its absence let a
     // "hits=0 misses=0" line stand in for "this was never built in".
@@ -8504,7 +9526,8 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("  [%s] D3D9 State Manager (15 hooks)",   d3d9StateOk ? " OK " : "SKIP");
     Log("  [%s] Render Hooks (anim+backbuffer)",    renderHooksOk ? " OK " : "SKIP");
     Log("  [%s] SIMD Hooks (SSE2 matrix+frustum)", simdHooksOk ? " OK " : "SKIP");
-    Log("  [%s] Logic Hooks (CT+UI+heartbeat)",    logicHooksOk ? " OK " : "SKIP");
+    Log("  [%s] Logic Hooks (CT+UI+heartbeat) - installs no hooks, see above",
+        logicHooksOk ? " OK " : "SKIP");
     Log("  [%s] Memory Hooks (slabs+GUID)",        memHooksOk ? " OK " : "SKIP");
     Log("  [%s] Async Hooks (workers+particles)",  asyncHooksOk ? " OK " : "SKIP");
 
@@ -8653,10 +9676,9 @@ struct FSizeEntry {
 
 static FSizeEntry g_fsizeCache[FSIZE_CACHE_SIZE] = {};
 
-// GetFileSizeEx cache disabled � disabled in production
-// hang after character select. Windows reuses handle values; caching
-// by handle returns stale sizes for recycled handles.
-#define TEST_DISABLE_GETFILESIZE_CACHE  1
+// The flag that used to sit here read 1 and was referenced by no #if, so it
+// said the cache was compiled out while deciding nothing; the reason it does
+// not exist is on the function below.
 
 
 
@@ -9851,6 +10873,11 @@ static LPVOID WINAPI Hooked_VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD 
             SIZE_T spanSize = (SIZE_T)pagesNeeded * VA_ARENA_PAGE_SIZE;
             LPVOID committed = orig_VirtualAlloc(result, spanSize, MEM_COMMIT, flProtect);
             if (!committed) {
+                // The request qualified, the arena had room, and the commit
+                // failed anyway. That is a different thing from a request that
+                // never qualified, and both used to land in the fallback count
+                // while the "fail" column printed a zero nothing wrote to.
+                InterlockedIncrement(&g_vaArenaFailures);
                 // Rollback bitmap + span
                 AcquireSRWLockExclusive(&g_vaArenaLock);
                 for (DWORD i = 0; i < pagesNeeded; i++) {
@@ -9865,6 +10892,7 @@ static LPVOID WINAPI Hooked_VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD 
             InterlockedIncrement(&g_vaArenaHits);
             return result;
         } __except(EXCEPTION_EXECUTE_HANDLER) {
+            InterlockedIncrement(&g_vaArenaFailures);
             goto va_fallback;
         }
 #endif
@@ -9956,10 +10984,16 @@ static bool InstallVAArena() {
     return false;
 #else
     // Opt-in: the arena hooks VirtualAlloc/VirtualFree process-wide, so it stays
-    // off unless a tester explicitly enables it in the launcher. Default users
-    // are unaffected - we return before reserving anything or installing hooks.
+    // off unless a tester enables it deliberately. Default users are unaffected -
+    // we return before reserving anything or installing hooks.
+    //
+    // The line below used to name a launcher tickbox called "Segregated VA
+    // Arena". There is no such entry and there never was, so the one instruction
+    // it gave a tester was to look for something that does not exist. The key is
+    // real; only the place to set it was wrong.
     if (!Config::g_settings.OptVaArena) {
-        Log("VA Arena: DISABLED (opt-in; enable 'Segregated VA Arena' in the launcher to test)");
+        Log("VA Arena: DISABLED (opt-in, and there is no tickbox for it - set "
+            "VaArena=1 under [General] in wow_opt.ini, in the WTF folder)");
         return false;
     }
 
@@ -10144,9 +11178,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
                 FlushSavedVarsAsyncSynchronously();
 #endif
                 ClearAssetPathCache();
-                // The distribution is the point of the whole session; emit it
-                // before the log is finalized or it is lost on every normal exit.
-                FrameBench::Report("session end");
+                // The whole report, not only the frame times. The periodic dump
+                // fires at 30 s and then every 300 s, so a session shorter than
+                // about five and a half minutes produced exactly one, taken
+                // before the player had done anything - which is what a tester's
+                // five-minute session reporting a visual defect looked like on
+                // 2026-08-21: one AnimLod line from the first half-minute and
+                // nothing after it. Emit it here or it is lost on every normal
+                // exit, since this process leaves through TerminateProcess and
+                // Shutdown() never runs.
+                __try {
+                    DumpPeriodicStats("session end", true);
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    FrameBench::Report("session end");
+                }
                 LogFinalizeOnProcessExit(
                     "wow_optimize.dll: process terminating, detours removed and the "
                     "D3D9 device vtable restored, skipping the rest of cleanup");
@@ -10156,6 +11201,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             // Dynamic FreeLibrary - safe to clean up
             __try {
 #if !TEST_DISABLE_SAMPLING_PROFILER
+            // Puts ten bytes of wow.exe back. It matters only on a real
+            // DLL_PROCESS_DETACH, and this DLL usually leaves through
+            // TerminateProcess, where nothing here runs and nothing needs to.
+            // Anything still buffered goes out before the client can be
+            // torn down under it. TerminateProcess usually gets there
+            // first, which is why every other flush point exists.
+            ClientWriteBatch::FlushAll("process detach");
+            BoneMatrixUpload::Shutdown();
+            M2MatrixSlot::Shutdown();
+            M2AnimStride::Shutdown();
             SamplingProfiler::Shutdown();
 #endif
             TextureUnloadDelay::Shutdown();

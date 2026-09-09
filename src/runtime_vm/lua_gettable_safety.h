@@ -20,3 +20,4 @@ bool InstallLuaGetTableSafety();
 void UninstallLuaGetTableSafety();
 LONG64 GetTableSafety_GetBlockedCount();
 LONG64 GetTableSafety_GetTotalCount();
+void LuaGetTableSafety_LogStats(void);

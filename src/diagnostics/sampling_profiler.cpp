@@ -14,6 +14,7 @@
 #include <cstring>
 #include <algorithm>
 #include "sampling_profiler.h"
+#include "session_verdict.h"
 #include "lua_addon_sampler.h"
 #include "frame_bench.h"
 #include "version.h"
@@ -25,6 +26,15 @@ extern "C" void Log(const char* fmt, ...);
 // true while a zone/UI load or transition is in progress.
 namespace LuaOpt { bool IsLoadingMode(); }
 
+// Declared rather than included: loading_state.h pulls in the write batcher.
+//
+// At file scope on purpose. Written inside namespace SamplingProfiler it
+// becomes SamplingProfiler::LoadingState::IsLoading, which compiles and then
+// fails to link against a name nothing defines - the same shape as a
+// namespace opened inside an anonymous one, which cost a link error in
+// loading_state.cpp the same week.
+namespace LoadingState { bool IsLoading(); }
+
 namespace SamplingProfiler {
 
 // Samples taken during loading screens / the first few seconds after start are
@@ -33,6 +43,11 @@ namespace SamplingProfiler {
 // actually costs frame time in the world. Counted separately for transparency.
 static DWORD    g_samplerStartTick = 0;
 static uint64_t g_skippedSamples = 0;
+// The share of main-thread samples that were executing rather than blocked in
+// a kernel wait, from the most recent report. Negative until one has run, so a
+// caller can tell "not measured" from "measured and low".
+static double   g_lastWorkPct     = -1.0;
+static uint64_t g_lastWorkSamples = 0;
 static const DWORD PROFILER_WARMUP_MS = 15000;
 
 // ---- configuration ------------------------------------------------
@@ -82,6 +97,40 @@ static int          g_knownCount = 0;
 // by the sampler thread and read only at shutdown (after the thread
 // is joined), so no synchronization is needed beyond the atomic
 // write index.
+// Fine-grained buckets over wow.exe, 512 bytes each. Declared here rather than
+// beside the dump because the sampler fills a second copy of them live.
+static constexpr int WOW_FINE_SHIFT = 9;
+static constexpr int WOW_FINE_SLOTS = (int)((WOW_END - WOW_BASE) >> WOW_FINE_SHIFT) + 1;
+
+// That second copy, filled only while a loading screen is up.
+//
+// A tester loading screen took 25 seconds. The loading timer accounts for two
+// percent of it in ReadFile and ten percent in the client's own file writes. The
+// other eighty-eight has never been attributed to anything, and loading screens
+// are the complaint this project hears most.
+//
+// The ring the main report reads is a window of recent samples, so a load that
+// happened twenty minutes ago has rolled out of it. This accumulates instead,
+// live, at one shift and one increment per sample - which is why it is a fine
+// histogram and not a function lookup. Naming happens at dump time, against the
+// same symbol table the rest of the report uses.
+static uint32_t g_loadFineCounts[WOW_FINE_SLOTS];
+// A copy of the above taken when a loading screen starts, so the one that just
+// finished can be reported on its own. 64 KB, written once per load.
+static uint32_t g_loadWindowBase[WOW_FINE_SLOTS];
+static uint64_t g_loadWindowInWow = 0;
+static uint64_t g_loadWindowTotal = 0;
+static bool     g_loadWindowOpen  = false;
+static uint64_t g_loadSamples   = 0;   // taken while loading, anywhere
+static uint64_t g_loadInWow     = 0;   // and of those, inside wow.exe
+static uint64_t g_loadInSelf    = 0;   // inside this DLL
+static uint64_t g_loadElsewhere = 0;   // a system DLL, the driver, a wait
+
+// This DLL's own mapped range. Declared here because the sampler classifies a
+// loading-screen sample by it before the dump code that used to own it.
+static uintptr_t g_selfBase = 0;
+static uintptr_t g_selfEnd  = 0;
+
 static constexpr int RING_SIZE = 1 << 20;  // ~1M samples (~17 min at 1ms)
 // Committed on Init rather than living in BSS. The profiler is off by default,
 // but a static array is committed the moment the DLL is mapped, so every player
@@ -213,12 +262,18 @@ static void BuildKnownFuncTable() {
         { 0x00494A10,   214, "Hot_494A10" },
         { 0x007A50C0,   384, "Hot_7A50C0" },
         { 0x007C6D50,  1166, "Collision_ClipVertsToBox" },
+        // Seventeen callers, once per scene node per culling pass. Its samples
+        // used to be attributed to whichever named function preceded it.
+        { 0x0078F370,    97, "AABB_Overlap" },
         // Classifies every vertex of a collision model against the query box
         // as a six-bit outcode, four vertices per unrolled pass, then tests
         // each triangle by ANDing its three. Called once per line-of-sight or
         // pick ray from sub_7C9A00. The six bounds live on the x87 stack for
         // the whole loop, which is why 158 of its 418 instructions are x87.
-        { 0x008203B0,   872, "Hot_8203B0" },
+        // Named from a profile before anyone had read it. It contains the same
+        // bone matrix transpose as sub_829BA0, in a second draw path, and
+        // BoneMatrixUpload patches both.
+        { 0x008203B0,   872, "M2_BoneMatrixUploadB" },
         { 0x00857CA0,  5151, "luaV_execute" },
         // The Lua bytecode dispatch loop, and the client has two of them.
         // luaD_call at 0x00856760 picks by the byte at G(L)+20 - the script
@@ -250,7 +305,28 @@ static void BuildKnownFuncTable() {
         // percentages were never the hard part, working out what they belonged to
         // was.
         { 0x0082F0F0,  6267, "M2_AnimateModel" },        // bone tracks + matrix per bone
+
+        // The four blocks the fld/fstp scan found and nothing has ever claimed.
+        // None of them has profile evidence, which is exactly why they are here:
+        // the fine histogram reports raw addresses for anything hot, and a raw
+        // address needs this build's linker map to resolve. Named, one uncapped
+        // session answers whether any of them is worth replacing, and the answer
+        // may well be no.
+        //
+        // Each holds a run of pure fld/fstp with no arithmetic between - the one
+        // shape that vectorises with no precision argument at all. See
+        // m2_matrix_slot_sse2.cpp for what claiming one looks like.
+        { 0x00823130,  2909, "PureFloatMove_sub823130" },   // 32/32 block at 0x008236B3
+        { 0x008EDFC0,  2410, "PureFloatMove_sub8EDFC0" },   // 24/24 at 0x008EE463, 0x008EE746
+        { 0x007762A0,  1303, "PureFloatMove_sub7762A0" },   // 20/20 at 0x00776448
+        { 0x0094A440,   785, "PureFloatMove_sub94A440" },   // 21/21 at 0x0094A649
         { 0x00828680,   885, "M2_AnimTrackQuat" },
+        // 3.35% of executing time in the corrected profile, and it showed as
+        // "wow!0x00829D29" - a raw address that cost a func_profile call to place.
+        // The loop it names transposes a 4x4 bone matrix into three vec4s with
+        // twelve x87 load/store pairs; BoneMatrixUpload replaces it.
+        { 0x00829BA0,   660, "M2_BoneMatrixUpload" },
+        { 0x00829E40,   247, "M2_BoneMatrixUploadOuter" },  // its only caller
         // Quaternion track, not a vector one: it unpacks each component from
         // a uint16 as (double)v * 0.000030518044 - 1.0, eight or sixteen times
         // per call, each through a store and an fild.
@@ -595,6 +671,21 @@ static DWORD WINAPI SamplerThreadProc(LPVOID) {
                 g_ring[idx] = eip;
                 g_writeIdx++;
                 g_totalSamples++;
+
+                // A second, accumulating histogram for loading screens only.
+                // One atomic load and one increment; the naming is deferred.
+                if (::LoadingState::IsLoading()) {
+                    ++g_loadSamples;
+                    if (eip >= WOW_BASE && eip <= WOW_END) {
+                        ++g_loadInWow;
+                        uint32_t lf = (uint32_t)((eip - WOW_BASE) >> WOW_FINE_SHIFT);
+                        if (lf < WOW_FINE_SLOTS) g_loadFineCounts[lf]++;
+                    } else if (g_selfBase && eip >= g_selfBase && eip < g_selfEnd) {
+                        ++g_loadInSelf;
+                    } else {
+                        ++g_loadElsewhere;
+                    }
+                }
             }
         }
 
@@ -629,17 +720,45 @@ static int g_modCount = 0;
 // showed up as a top-4 consumer (~8% of main-thread time) and we need to know
 // WHICH of our hooks costs that. Reported as "wowopt+0xNNNN" (offset from our
 // DLL base) so it maps directly to wow_optimize.map.
-static uintptr_t g_selfBase = 0;
-static uintptr_t g_selfEnd  = 0;
 
 // Our own functions, by absolute address, so a hot spot inside this DLL prints a
 // name instead of an offset nobody can resolve without the matching .map.
 // Every Lua fast path registers itself, which alone is 55 names, plus the
 // allocator hooks and the caches. 64 was exactly enough to overflow.
-static constexpr int MAX_SELF_SYMBOLS = 128;
+// Raised from 128 when every detour in the project started registering itself.
+// The DLL installs a few hundred, and a table that fills up silently leaves the
+// hot code it would have named indistinguishable from code nobody registered.
+static constexpr int MAX_SELF_SYMBOLS = 512;
 struct SelfSymbol { uintptr_t addr; const char* name; };
 static SelfSymbol g_selfSymbols[MAX_SELF_SYMBOLS] = {};
 static int        g_selfSymbolCount = 0;
+
+bool ShareForRange(uintptr_t lo, uintptr_t hi, unsigned long minSamples,
+                   double* outPercent, unsigned long* outSamples,
+                   unsigned long* outWindow) {
+    if (outPercent) *outPercent = 0.0;
+    if (outSamples) *outSamples = 0;
+    if (outWindow)  *outWindow  = 0;
+
+    if (!g_ring || hi <= lo) return false;
+
+    uint64_t total = g_totalSamples;
+    uint64_t n     = (total < RING_SIZE) ? total : RING_SIZE;
+    if (n < (uint64_t)minSamples) return false;
+
+    uint64_t startIdx = (total <= RING_SIZE) ? 0 : (total - RING_SIZE);
+
+    unsigned long hits = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        uintptr_t eip = g_ring[(startIdx + i) % RING_SIZE];
+        if (eip >= lo && eip < hi) hits++;
+    }
+
+    if (outPercent) *outPercent = 100.0 * (double)hits / (double)n;
+    if (outSamples) *outSamples = hits;
+    if (outWindow)  *outWindow  = (unsigned long)n;
+    return true;
+}
 
 void RegisterSelfSymbol(const char* name, const void* addr) {
     if (!name || !addr) return;
@@ -670,11 +789,30 @@ void RegisterSelfSymbol(const char* name, const void* addr) {
     g_selfSymbolCount++;
 }
 
+// Called from the one wrapper every hook in this project passes through, so a
+// detour installed anywhere gets a name without its module having to remember.
+//
+// The name is the address being hooked, which is what a reader wants: seeing
+// "hook@00489710" beside a hot offset says the time is in our detour on the UI
+// layout relink, and no linker map is needed to know it. RegisterSelfSymbol
+// keeps the pointer rather than a copy, so the text has to outlive the call -
+// hence the fixed pool rather than a local buffer.
+extern "C" void WowOpt_NoteDetour(uintptr_t target, const void* detour) {
+    if (!detour) return;
+    static char  s_names[MAX_SELF_SYMBOLS][16];
+    static int   s_used = 0;
+    if (s_used >= MAX_SELF_SYMBOLS) return;
+    char* n = s_names[s_used];
+    wsprintfA(n, "hook@%08X", (unsigned)target);
+    s_used++;
+    RegisterSelfSymbol(n, detour);
+}
+
 // Nearest registered symbol at or below addr, within a sane distance. The bound
 // matters: without it every unregistered hot spot would be attributed to whichever
 // registered function happens to sit lowest in the image, which is worse than
 // admitting we do not know.
-static const char* ResolveSelfSymbol(uintptr_t addr) {
+static const char* ResolveSelfSymbol(uintptr_t addr, uintptr_t* outDelta = nullptr) {
     const char* best = nullptr;
     uintptr_t bestDelta = 0x4000;   // 16 KB
     for (int i = 0; i < g_selfSymbolCount; i++) {
@@ -685,8 +823,20 @@ static const char* ResolveSelfSymbol(uintptr_t addr) {
             best = g_selfSymbols[i].name;
         }
     }
+    if (outDelta) *outDelta = best ? bestDelta : 0;
     return best;
 }
+
+// The distance past a registered symbol at which its name stops being evidence.
+// Nothing here records a function's size - RegisterSelfSymbol is handed an entry
+// point and nothing else - so a sample far past one is at best "somewhere after
+// it" and at worst inside an unregistered neighbour. Naming those was how
+// txtsd's 2026-08-22 session reported wowopt!dbc_lookup_cache at 1.00% of the
+// profile while the cache's own counter recorded 336908 calls over 184004
+// frames, which is 1.8 calls a frame and cannot cost one percent of anything.
+// Past this the offset is printed, so a reader can see the label is a
+// neighbourhood and not a function.
+static constexpr uintptr_t kSelfSymbolTrusted = 0x200;   // 512 bytes
 static constexpr int SELF_PAGES = 4096;   // covers a 16MB image
 static uint32_t g_selfPageCounts[SELF_PAGES];
 
@@ -711,8 +861,6 @@ static uint32_t g_selfFineCounts[SELF_FINE_SLOTS];
 // so "which client function is worth hooking" could not be answered from a log at
 // all. 512 bytes over the 8MB image costs 64KB of counters and usually lands on
 // one function, which can then be decompiled directly.
-static constexpr int WOW_FINE_SHIFT = 9;       // 512-byte buckets
-static constexpr int WOW_FINE_SLOTS = (int)((WOW_END - WOW_BASE) >> WOW_FINE_SHIFT) + 1;
 static uint32_t g_wowFineCounts[WOW_FINE_SLOTS];
 
 // Prints the top SELF_FINE_TOP buckets of a histogram, largest first. Selection is
@@ -757,24 +905,86 @@ static uintptr_t HottestAddressInPage(uintptr_t pageBase) {
     return at;
 }
 
+// Where our own registered symbols sit, as offsets from the module base.
+//
+// Nine percent of executing time in a tester's uncapped session was inside this
+// DLL, spread over entries like "wowopt+0x11300" that name nothing. Resolving
+// those needs the linker map for that exact build, which nobody has when they
+// are reading a log - and guessing with a map from a different build is how this
+// project has already produced three wrong conclusions in a day, because a
+// nearest-symbol name reaches past the end of its own function.
+//
+// So the table goes in the log. An offset between two entries below is inside
+// the first of them, and one past the last is code nobody has registered. That
+// is the difference between a number a reader can act on and a number they can
+// only stare at. It costs a handful of lines, once per report.
+static void DumpSelfSymbolTable() {
+    // Once per session, not once per report. Every detour in the project
+    // registers itself now, so this is a few hundred lines; repeating it in each
+    // periodic profile would bury the profile itself. The addresses do not move
+    // during a run, so one printing serves every report in the log.
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+
+    if (g_selfSymbolCount == 0 || !g_selfBase) {
+        Log("[SamplingProfiler] === no self-symbols registered - every wowopt+0x "
+            "entry below is unresolvable without this build's linker map ===");
+        return;
+    }
+
+    // Insertion sort by offset; the table is small and this runs once a report.
+    int order[MAX_SELF_SYMBOLS];
+    for (int i = 0; i < g_selfSymbolCount; i++) order[i] = i;
+    for (int i = 1; i < g_selfSymbolCount; i++) {
+        int k = order[i], j = i - 1;
+        while (j >= 0 && g_selfSymbols[order[j]].addr > g_selfSymbols[k].addr) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = k;
+    }
+
+    Log("[SamplingProfiler] === wow_optimize.dll SYMBOLS (%d registered, offsets "
+        "from the module base) - use these to place any wowopt+0x entry below; an "
+        "offset between two of them is inside the first ===", g_selfSymbolCount);
+    for (int i = 0; i < g_selfSymbolCount; i++) {
+        const SelfSymbol& s = g_selfSymbols[order[i]];
+        Log("[SamplingProfiler]   +0x%05X  %s",
+            (unsigned)(s.addr - g_selfBase), s.name);
+    }
+}
+
+// `baseline`, when given, is a copy of `counts` taken earlier and every slot is
+// read as the difference. That is how one loading screen is reported out of a
+// histogram that accumulates across all of them, without a second 64 KB array
+// to hold the subtraction.
+static inline uint32_t SlotAt(const uint32_t* counts, const uint32_t* baseline, int i) {
+    uint32_t c = counts[i];
+    if (!baseline) return c;
+    uint32_t b = baseline[i];
+    return (c > b) ? (c - b) : 0u;
+}
+
 static void DumpFineHistogram(const uint32_t* counts, int slots, int shift,
                               uint64_t total, const char* title,
-                              const char* addrFormat, uintptr_t addrBase) {
+                              const char* addrFormat, uintptr_t addrBase,
+                              const uint32_t* baseline = nullptr) {
     int idx[SELF_FINE_TOP];
     int found = 0;
 
     for (int i = 0; i < slots; i++) {
-        uint32_t c = counts[i];
+        uint32_t c = SlotAt(counts, baseline, i);
         if (!c) continue;
         int at = found;
         if (found < SELF_FINE_TOP) {
             found++;
-        } else if (c > counts[idx[SELF_FINE_TOP - 1]]) {
+        } else if (c > SlotAt(counts, baseline, idx[SELF_FINE_TOP - 1])) {
             at = SELF_FINE_TOP - 1;
         } else {
             continue;
         }
-        while (at > 0 && c > counts[idx[at - 1]]) {
+        while (at > 0 && c > SlotAt(counts, baseline, idx[at - 1])) {
             idx[at] = idx[at - 1];
             at--;
         }
@@ -785,12 +995,15 @@ static void DumpFineHistogram(const uint32_t* counts, int slots, int shift,
 
     Log("[SamplingProfiler] === %s ===", title);
     for (int i = 0; i < found; i++) {
-        uint32_t c = counts[idx[i]];
+        uint32_t c = SlotAt(counts, baseline, idx[i]);
         char addr[32];
         uintptr_t slotAddr = addrBase + ((uintptr_t)idx[i] << shift);
-        const char* sym = (addrBase == 0) ? ResolveSelfSymbol(g_selfBase + slotAddr) : nullptr;
-        if (sym) wsprintfA(addr, "wowopt!%.20s", sym);
-        else     wsprintfA(addr, addrFormat, (unsigned)slotAddr);
+        uintptr_t delta = 0;
+        const char* sym = (addrBase == 0)
+                        ? ResolveSelfSymbol(g_selfBase + slotAddr, &delta) : nullptr;
+        if (sym && delta < kSelfSymbolTrusted) wsprintfA(addr, "wowopt!%.20s", sym);
+        else if (sym) wsprintfA(addr, "wowopt!%.14s+0x%X", sym, (unsigned)delta);
+        else          wsprintfA(addr, addrFormat, (unsigned)slotAddr);
         Log("[SamplingProfiler]   %-14s %8u samples (%5.2f%%)",
             addr, c, 100.0 * (double)c / (double)total);
     }
@@ -979,6 +1192,10 @@ static void DumpResults() {
     memset(g_selfPageCounts, 0, sizeof(g_selfPageCounts));
     memset(g_selfFineCounts, 0, sizeof(g_selfFineCounts));
     memset(g_wowFineCounts, 0, sizeof(g_wowFineCounts));
+    // Deliberately NOT cleared here. The main histogram is rebuilt from the
+    // ring on every dump; the loading one accumulates across the session,
+    // because a load that happened twenty minutes ago is exactly the one
+    // somebody wants to know about.
 
     // Snapshot loaded modules so system samples can be attributed to a DLL.
     BuildModuleTable();
@@ -1140,6 +1357,13 @@ static void DumpResults() {
     uint64_t workSamples = (n > waitSamples) ? (n - waitSamples) : 0;
     double   workPct     = n ? (100.0 * (double)workSamples / (double)n) : 0.0;
 
+    // Published for the A/B harness. A frame-time comparison in a session the
+    // client spends waiting on the GPU cannot show a CPU saving, and it used to
+    // print one anyway while this line, in the same log, said the client was
+    // not CPU-bound.
+    g_lastWorkPct = workPct;
+    g_lastWorkSamples = n;
+
     Log("[SamplingProfiler] === MAIN THREAD: %.1f%% executing, %.1f%% blocked "
         "(%llu of the %llu most recent samples were a kernel wait; %llu taken in "
         "all, and everything below describes the recent ones) ===",
@@ -1217,7 +1441,8 @@ static void DumpResults() {
         "loading/warmup where the main thread was left alone) ===",
         TOP_N, (unsigned long long)n, (unsigned long long)g_skippedSamples);
 
-    int printed = 0;
+    int    printed = 0;
+    double pctSum  = 0.0;
     for (int i = 0; i < bucketCount && printed < TOP_N; i++) {
         if (buckets[i].count == 0) break;
         double pct = 100.0 * (double)buckets[i].count / (double)n;
@@ -1257,8 +1482,10 @@ static void DumpResults() {
         } else if (g_selfBase && buckets[i].addr >= g_selfBase && buckets[i].addr < g_selfEnd) {
             // A hot page inside our own DLL — label by offset from our base so it
             // maps directly to wow_optimize.map (which of our hooks costs time).
-            const char* sym = ResolveSelfSymbol(buckets[i].addr);
-            if (sym) wsprintfA(label, "wowopt!%.24s", sym);
+            uintptr_t delta = 0;
+            const char* sym = ResolveSelfSymbol(buckets[i].addr, &delta);
+            if (sym && delta < kSelfSymbolTrusted) wsprintfA(label, "wowopt!%.24s", sym);
+            else if (sym) wsprintfA(label, "wowopt!%.16s+0x%X", sym, (unsigned)delta);
             else     wsprintfA(label, "wowopt+0x%05X", (unsigned)(buckets[i].addr - g_selfBase));
             name = label;
         } else {
@@ -1283,14 +1510,64 @@ static void DumpResults() {
             Log("[SamplingProfiler] %3d. %-24s  %8llu samples (%5.2f%% total, %5.2f%% of executing)",
                 printed + 1, name, (unsigned long long)buckets[i].count, pct, workPctOfEntry);
         }
+        pctSum += pct;
         printed++;
+    }
+
+    // The arithmetic that has to hold before any of the above is worth reading.
+    //
+    // These are shares of one whole, so the fifty largest of them cannot come to
+    // a small number. When this profiler divided ring-window counts by a lifetime
+    // total, its top fifty summed to 12% and every entry was understated 5.6x -
+    // and that was found by noticing the sum, not by reading the code. A profile
+    // whose top entry was really 9.7% had already been read as flat for a week.
+    //
+    // The threshold is deliberately loose. Fifty buckets out of thousands may
+    // genuinely not reach half the profile on a flat workload, so only a sum small
+    // enough to be arithmetically suspicious says anything.
+    if (printed >= 10 && pctSum < 15.0) {
+        Verdict::Add(Verdict::Warn,
+                     "the profiler's top %d entries sum to %.0f%% of the profile, "
+                     "too little for shares of one whole - suspect the denominator",
+                     printed, pctSum);
+        Log("[SamplingProfiler] the %d entries above sum to %.1f%% of the profile. "
+            "They are shares of one whole and cannot legitimately be this small; "
+            "the last time this happened the denominator was a lifetime sample "
+            "count while the numerators came from a ring window.", printed, pctSum);
     }
 
     // Our own hot spots at 256-byte resolution, then the client's at 512-byte.
     // Both are narrow enough to land on a single function, which the 4KB page
     // buckets in the ranking above cannot do.
+    DumpSelfSymbolTable();
     DumpFineHistogram(g_selfFineCounts, SELF_FINE_SLOTS, SELF_FINE_SHIFT, n,
                       "wow_optimize.dll HOT SPOTS (256-byte resolution)", "wowopt+0x%05X", 0);
+    // Loading screens, separately, because they are the complaint this project
+    // hears most and the loading timer can only account for twelve percent of
+    // one - two in reads and ten in the client's own writes.
+    if (g_loadSamples == 0) {
+        Log("[SamplingProfiler] === LOADING SCREENS === no sample was taken "
+            "while one was up. Either none came up, or none lasted long enough "
+            "to be sampled - not a measurement that they are fast.");
+    } else {
+        Log("[SamplingProfiler] === LOADING SCREENS: %llu sample(s) taken while "
+            "one was up, %.1f%% of the session. Of those, %.0f%% were inside "
+            "wow.exe, %.0f%% inside this tool, and %.0f%% in a system library, a "
+            "driver or a wait ===",
+            (unsigned long long)g_loadSamples,
+            total ? (100.0 * (double)g_loadSamples / (double)total) : 0.0,
+            100.0 * (double)g_loadInWow     / (double)g_loadSamples,
+            100.0 * (double)g_loadInSelf    / (double)g_loadSamples,
+            100.0 * (double)g_loadElsewhere / (double)g_loadSamples);
+        Log("[SamplingProfiler]   these accumulate over the whole session rather "
+            "than living in the ring, so a load twenty minutes ago is still "
+            "here. The shares below are of the wow.exe samples only.");
+        DumpFineHistogram(g_loadFineCounts, WOW_FINE_SLOTS, WOW_FINE_SHIFT,
+                          g_loadInWow,
+                          "WHERE A LOADING SCREEN GOES (512-byte resolution)",
+                          "0x%08X", WOW_BASE);
+    }
+
     DumpFineHistogram(g_wowFineCounts, WOW_FINE_SLOTS, WOW_FINE_SHIFT, n,
                       "wow.exe HOT SPOTS (512-byte resolution)", "0x%08X", WOW_BASE);
 
@@ -1306,6 +1583,16 @@ static void DumpResults() {
 }
 
 // ---- public API ---------------------------------------------------
+// The share of main-thread samples that were executing rather than blocked, as
+// of the last report. False when no report has run, so a caller can tell "not
+// measured" from "measured and low".
+bool GetExecutingShare(double* pct, unsigned long long* samples) {
+    if (g_lastWorkPct < 0.0) return false;
+    if (pct)     *pct = g_lastWorkPct;
+    if (samples) *samples = g_lastWorkSamples;
+    return true;
+}
+
 bool Init(HANDLE mainThread) {
     if (!g_ring) {
         // VirtualAlloc returns zeroed pages, which is what the ring wants anyway.
@@ -1398,6 +1685,65 @@ uint64_t GetSampleCount() { return g_totalSamples; }
 void DumpNow() {
     if (!g_running) return;
     DumpResults();
+}
+
+
+// --- one loading screen at a time -------------------------------------------
+
+void MarkLoadWindowStart() {
+    if (!g_running) { g_loadWindowOpen = false; return; }
+    // The sampler writes these from its own thread while this copies them. A
+    // slot that changes mid-copy moves one sample between this window and the
+    // next, which is not a difference a profile can show.
+    memcpy(g_loadWindowBase, g_loadFineCounts, sizeof(g_loadWindowBase));
+    g_loadWindowInWow = g_loadInWow;
+    g_loadWindowTotal = g_loadSamples;
+    g_loadWindowOpen  = true;
+}
+
+void ReportLoadWindow() {
+    if (!g_running) {
+        Log("[LoadingState]   where it went is not measured: the sampling "
+            "profiler is off. LOGGING: FULL in the launcher turns it on, and "
+            "the next load says which addresses the time was in.");
+        return;
+    }
+    if (!g_loadWindowOpen) {
+        Log("[LoadingState]   where it went is not measured: the profiler "
+            "started after this load began.");
+        return;
+    }
+    g_loadWindowOpen = false;
+
+    uint64_t inWow = (g_loadInWow > g_loadWindowInWow)
+                   ? (g_loadInWow - g_loadWindowInWow) : 0;
+    uint64_t took  = (g_loadSamples > g_loadWindowTotal)
+                   ? (g_loadSamples - g_loadWindowTotal) : 0;
+
+    if (took == 0) {
+        Log("[LoadingState]   not measured: the profiler took no sample at all "
+            "during this load, which at a %lu ms interval means it was not "
+            "running rather than that the load was short.",
+            (unsigned long)SAMPLE_INTERVAL_MS);
+        return;
+    }
+    if (inWow == 0) {
+        Log("[LoadingState]   measured and zero: %llu sample(s) were taken "
+            "during this load and not one landed inside wow.exe. The time was "
+            "in a driver, a system library or a wait, and the address "
+            "histogram cannot name those.", (unsigned long long)took);
+        return;
+    }
+
+    Log("[LoadingState]   the main thread during this load: %llu sample(s), "
+        "%llu of them inside wow.exe (%.0f%%). The rest were in a driver, a "
+        "system library or a wait. This is where the time went that was neither "
+        "read, written nor compiled.",
+        (unsigned long long)took, (unsigned long long)inWow,
+        100.0 * (double)inWow / (double)took);
+    DumpFineHistogram(g_loadFineCounts, WOW_FINE_SLOTS, WOW_FINE_SHIFT,
+                      inWow, "THIS LOADING SCREEN (512-byte resolution)",
+                      "0x%08X", WOW_BASE, g_loadWindowBase);
 }
 
 } // namespace SamplingProfiler

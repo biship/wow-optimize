@@ -35,6 +35,8 @@
 #include "net_diag.h"
 #include "crash_dumper.h"
 #include "config.h"
+#include "session_verdict.h"
+#include "flight_recorder.h"
 #include "MinHook.h"
 #include "version.h"
 
@@ -58,6 +60,11 @@ static send_fn        orig_send        = nullptr;
 
 static bool g_active = false;
 
+// A flight-recorder column. The question a drop always raises is whether
+// traffic thinned out before it or stopped dead, and a per-window byte
+// count cannot answer that.
+static int g_frSlotRecv = -1;
+
 // Hot path state. Four writes per receive, no locks - these are counters read
 // only when something has already gone wrong.
 static volatile DWORD  g_lastRecvTick  = 0;
@@ -68,9 +75,21 @@ static          uint64_t g_sendBytes   = 0;
 static volatile DWORD  g_lastSendTick  = 0;
 static volatile DWORD  g_firstRecvTick = 0;
 
-// One report per session. A disconnect cascades - recv fails, then send fails,
-// then the socket closes - and three copies of the same story is noise.
+// One report per connection. A disconnect cascades - recv fails, then send
+// fails, then the socket closes - and three copies of the same story is noise.
+//
+// Per connection, not per session, which is what it used to be. A raid log with
+// three separate drops in it carried one report, for the first, and both of the
+// drops the player actually wrote the report about produced nothing at all. The
+// latch is cleared in WatchSocket when traffic moves to a new socket, so it is
+// always cleared after the old connection has had its say and before the new one
+// can need it.
 static volatile LONG g_reported = 0;
+
+// How many connections have carried traffic this session. Printed in the
+// periodic line too, because the receive counters restart with each one and a
+// count that suddenly falls otherwise reads as a broken counter.
+static volatile LONG g_connSeq = 0;
 
 // Which socket the counters above are describing.
 //
@@ -112,6 +131,8 @@ static void WatchSocket(SOCKET s) {
     g_sendBytes     = 0;
     g_firstRecvTick = 0;
     g_lastSendTick  = 0;
+    InterlockedIncrement(&g_connSeq);
+    InterlockedExchange(&g_reported, 0);
 }
 
 static bool IsWatched(SOCKET s) { return g_watchedSocket == (LONG)s; }
@@ -140,7 +161,20 @@ static void ReportDisconnect(const char* how, int err) {
     DWORD sinceSend = (g_lastSendTick != 0) ? (now - g_lastSendTick) : 0;
     DWORD sessionMs = (g_firstRecvTick != 0) ? (now - g_firstRecvTick) : 0;
 
-    Log("!!! DISCONNECT !!! %s%s%s", how,
+    // A connection that carried neither long enough nor much enough to be a world
+    // session is the logon exchange ending, which is a normal step in starting the
+    // game. It gets a line rather than a banner. Silence is what let the
+    // per-session latch look harmless for as long as it did.
+    if (sessionMs < kRealSessionMs && g_recvBytes < kRealSessionBytes) {
+        Log("[NetDiag] Connection %ld ended (%s) after %lu ms and %llu bytes - too "
+            "short to be a world session, so this is the logon handoff",
+            g_connSeq, how, (unsigned long)sessionMs,
+            (unsigned long long)g_recvBytes);
+        return;
+    }
+
+    Verdict::Add(Verdict::Bad, "disconnected: %s", how);
+    Log("!!! DISCONNECT !!! (connection %ld) %s%s%s", g_connSeq, how,
         (err && *ErrorName(err)) ? " - " : "",
         (err && *ErrorName(err)) ? ErrorName(err) : "");
 
@@ -168,7 +202,22 @@ static void ReportDisconnect(const char* how, int err) {
         LuaOpt::IsReloading() ? 1 : 0,
         LuaOpt::IsSwapping() ? 1 : 0);
 
+    // A clean close of a healthy connection has one known cause on at least one
+    // server, and the reader of this log deserves to be told rather than left to
+    // repeat the whole investigation. Only said when the mode is off, because
+    // with it on this report is the experiment rather than a complaint.
+    if (err == 0 && mainSilent < 1000 && !Config::g_settings.OptNoClientPatches) {
+        Log("!!!   The client was healthy when this happened, so nothing here "
+            "stalled or crashed. On WoWCircle two players stopped being dropped "
+            "entirely once they enabled No Client Patches in the launcher, which "
+            "stops this DLL writing anything into WoW.exe. That turns every "
+            "optimisation off - it is the trade, not a fix.");
+    }
+
     CrashDumper::DumpTrace(12, 30000);
+    // Nobody reacts to a disconnect in time to press a key, so the ring is
+    // written out here instead.
+    FlightRecorder::Mark("the connection ended");
     Log("!!! END DISCONNECT REPORT !!!");
 }
 
@@ -188,6 +237,7 @@ static int WINAPI Hooked_recv(SOCKET s, char* buf, int len, int flags) {
         if (g_firstRecvTick == 0) g_firstRecvTick = now;
         InterlockedIncrement(&g_recvCalls);
         g_recvBytes += (uint64_t)r;
+        FlightRecorder::Bump(g_frSlotRecv);
     } else if (r == 0) {
         if (IsWatched(s)) ReportDisconnect("the server closed the connection cleanly", 0);
     } else {
@@ -214,6 +264,7 @@ static int WINAPI Hooked_WSARecv(SOCKET s, LPWSABUF bufs, DWORD count,
             if (g_firstRecvTick == 0) g_firstRecvTick = now;
             InterlockedIncrement(&g_recvCalls);
             g_recvBytes += (uint64_t)*got;
+            FlightRecorder::Bump(g_frSlotRecv);
         } else if (IsWatched(s)) {
             ReportDisconnect("the server closed the connection cleanly", 0);
         }
@@ -297,18 +348,20 @@ bool Init() {
         return false;
     }
 
+    g_frSlotRecv = FlightRecorder::RegisterSlot("recv");
+
     g_active = true;
     Log("[NetDiag] Watching the receive path, %d/4 entry points - reports once if "
-        "the connection ends", installed);
+        "a connection ends", installed);
     return true;
 }
 
 void LogStats() {
     if (!g_active) return;
     DWORD now = GetTickCount();
-    Log("[NetDiag] %ld receives (%llu bytes), %ld sends (%llu bytes), last byte "
-        "%lu ms ago",
-        g_recvCalls, (unsigned long long)g_recvBytes,
+    Log("[NetDiag] connection %ld: %ld receives (%llu bytes), %ld sends (%llu "
+        "bytes), last byte %lu ms ago",
+        g_connSeq, g_recvCalls, (unsigned long long)g_recvBytes,
         g_sendCalls, (unsigned long long)g_sendBytes,
         (unsigned long)(g_lastRecvTick ? (now - g_lastRecvTick) : 0));
 }

@@ -10,10 +10,10 @@
 
 #define WOW_OPTIMIZE_VERSION_MAJOR  3
 #define WOW_OPTIMIZE_VERSION_MINOR  19
-#define WOW_OPTIMIZE_VERSION_PATCH  0
+#define WOW_OPTIMIZE_VERSION_PATCH  1
 #define WOW_OPTIMIZE_VERSION_BUILD  0
 
-#define WOW_OPTIMIZE_VERSION_STR    "3.19.0"
+#define WOW_OPTIMIZE_VERSION_STR    "3.19.2"
 #define WOW_OPTIMIZE_AUTHOR         "SUPREMATIST"
 
 #ifndef CRASH_TEST_DISABLE_PHASE2
@@ -277,6 +277,8 @@
 // 3. Throttling OnUpdate breaks MoveAnything position tracking and addon timing
 //    contracts (addons expect OnUpdate every frame for smooth animation).
 // Would need complete rewrite with different hook target and proper addon compat.
+// DEAD FLAG - no #if reads it. The feature described above was never written,
+// so this decides nothing and setting it to 0 puts nothing back.
 #define TEST_DISABLE_FRAME_THROTTLE     1
 
 // Tooltip String Caching - cache formatted tooltip strings by item/spell ID
@@ -390,6 +392,16 @@
 // SSE2 6-plane frustum culling (sub_9839E0, CFrustum::IsAABBVisible).
 // Vectorized check using transposed SSE2 dot products.
 // Set to 1 to revert to original FPU scalar implementation.
+//
+// It has been 1 for as long as the history records and nobody wrote down why,
+// so the client's own version is what runs and what the profile measures -
+// between 0.45% and 1.56% of executing time across a tester's reports.
+//
+// The FrustumAabb module now hooks that same address, under its own switch and
+// with its own verification. Turning this flag back to 0 would put two of our
+// modules on one function; the guard in WowOpt_CreateHookGuarded would catch it
+// and log a duplicate, but the second one to try would look like a defect in the
+// target instead of a collision. Retire one before enabling the other.
 #define TEST_DISABLE_FRUSTUM_CULL        1
 
 // SSE2 Ray-Triangle Intersection (sub_9836B0 / sub_983490).
@@ -487,8 +499,12 @@
 // Parallel Network Packet Deserialization Offloader
 #define TEST_DISABLE_NET_PACKET_OFFLOAD 0
 
-// Velocity-Based Predictive Asset Prefetcher
-#define TEST_DISABLE_PREDICTIVE_PREFETCH 1
+// Velocity-Based Predictive Asset Prefetcher.
+// Was 1, with no note saying why. It read its coordinate from an address the
+// client never writes, so it could not have worked whatever this said. It now
+// has a real one and a runtime switch of its own that defaults off, and leaving
+// this at 1 would make that switch a control the DLL cannot read.
+#define TEST_DISABLE_PREDICTIVE_PREFETCH 0
 
 // Low-Latency GPU Sync (Max Frame Latency = 1)
 #define TEST_DISABLE_LOW_LATENCY_SYNC    0
@@ -618,8 +634,17 @@
 // re-verified safe against disassembly and re-enabled via their own G-flags.
 // The crash root causes were the LuaStackFast / pushnumber / pushvalue /
 // inline-batch-dangerous groups (confirmed at luaD_precall 0x5565E9).
+#define TEST_DISABLE_BONE_MATRIX_UPLOAD  0  // enabled: the bone matrix transpose
+#define TEST_DISABLE_MIMALLOC_HIGH_ARENA 0  // enabled: the high-address mimalloc arena
+#define TEST_DISABLE_CLIENT_WRITE_BATCH  0  // enabled: batching the client's tiny file writes
 #define TEST_DISABLE_LUA_SAFE_G1         0  
 #define TEST_DISABLE_LUA_SAFE_G2         0  // enabled: Safe Group 2 hooks
+// G2A groups the three debug/execution-control hooks below it. dllmain.cpp
+// nests them inside "#if !TEST_DISABLE_LUA_SAFE_G2A", but the macro was never
+// declared here, where every other rung of this ladder lives - so a bisection
+// reading this file could not see the group level existed. The behaviour is
+// unchanged: an undeclared macro reads as 0 in #if, which is what it now says.
+#define TEST_DISABLE_LUA_SAFE_G2A 0
 #define TEST_DISABLE_LUA_SAFE_G2AL 0
 #define TEST_DISABLE_LUA_SAFE_G2AI 0
 #define TEST_DISABLE_LUA_SAFE_G2B 0
@@ -754,6 +779,11 @@
 // ================================================================
 #ifndef WOWOPT_ISWINE_DEFINED
 #define WOWOPT_ISWINE_DEFINED
+// Everything from here down is C and C++ that the resource compiler cannot
+// parse. version.rc includes this file so the version numbers have one home
+// instead of five, and RC_INVOKED is what lets it stop reading at this line.
+#ifndef RC_INVOKED
+
 #include <windows.h>
 static inline bool IsWine() {
     static int cached = -1;
@@ -806,6 +836,43 @@ static inline bool RunningUnderTranslation() { return IsWine() || IsRosetta(); }
 // MinHook patching WoW .text section (0x00400000-0x00FFFFFF) may
 // invalidate JIT translations. System DLL hooks are safe (separate modules).
 // Only available in TUs that include MinHook.h before version.h.
+// ================================================================
+
+// Whether this run is forbidden to write anything into the wow.exe image, and
+// the tally of what that refused. Both live in dllmain.cpp; see the note at the
+// head of WowOpt_CreateHookGuarded for what the mode is for.
+extern "C" int  WowOpt_NoClientPatches(void);
+extern "C" void WowOpt_NoteClientPatchRefused(void);
+
+// The client's mapped image, resolved once. Its own base and SizeOfImage, so a
+// relocated or differently sized build answers correctly rather than against a
+// constant. Anything outside it - ws2_32, kernel32, d3d9, our own code - is not
+// the client and is left alone by the mode above.
+static inline bool WowOpt_InsideClientImage(const void* addr) {
+    static uintptr_t base = 0, end = 0;
+    if (!end) {
+        HMODULE h = GetModuleHandleA(NULL);
+        if (!h) return false;
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)h;
+        IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((char*)h + dos->e_lfanew);
+        base = (uintptr_t)h;
+        end  = base + nt->OptionalHeader.SizeOfImage;
+    }
+    uintptr_t a = (uintptr_t)addr;
+    return a >= base && a < end;
+}
+
+// The same refusal for a write this project performs itself rather than through
+// MinHook. Returns true when the write may go ahead. Call it with the address
+// about to be written and a name for the log; a patch site that does not ask is
+// a hole in the experiment, not an optimisation that got away with it.
+static inline bool WowOpt_ClientPatchAllowed(const void* addr) {
+    if (!WowOpt_NoClientPatches()) return true;
+    if (!WowOpt_InsideClientImage(addr)) return true;
+    WowOpt_NoteClientPatchRefused();
+    return false;
+}
+
 #if defined(MH_ALL_HOOKS) || defined(MH_OK)
 #ifndef WOWOPT_WINESAFE_HOOK_DEFINED
 #define WOWOPT_WINESAFE_HOOK_DEFINED
@@ -816,7 +883,13 @@ static inline bool RunningUnderTranslation() { return IsWine() || IsRosetta(); }
 // Defined in dllmain.cpp; declared here because this header is included from
 // every translation unit that installs a hook.
 extern "C" void WowOpt_LogForeignDetour(void* target, unsigned char firstByte);
-extern "C" void WowOpt_LogDuplicateHook(void* target);
+extern "C" void WowOpt_LogDuplicateHook(void* target, void* loser);
+// Records which detour won an address, so a later duplicate can be told apart
+// from the same module simply asking again.
+extern "C" void WowOpt_RecordHookOwner(uintptr_t target, const void* detour);
+// Records a detour's address with the sampling profiler under a name made from
+// the function it hooks. Cheap and silent; safe before the profiler has started.
+extern "C" void WowOpt_NoteDetour(uintptr_t target, const void* detour);
 
 static inline MH_STATUS WowOpt_CreateHookGuarded(void* target, void* detour, void** original) {
 #if ALLOW_WOW_INTERNAL_HOOKS_ON_WINE == 0
@@ -837,6 +910,32 @@ static inline MH_STATUS WowOpt_CreateHookGuarded(void* target, void* detour, voi
         }
     }
 #endif
+    // Refuse every target inside the client's own image, when asked to.
+    //
+    // Three disconnects have now been measured from the inside and all three
+    // look the same: recv returns 0, so the server sent FIN, while data was
+    // still arriving and the main thread was still ticking. That is a
+    // server-side close of a healthy connection, and this DLL cannot tell a
+    // routine kick from a server noticing that a hundred-odd entry points in
+    // wow.exe start with a jmp that was not there on disk.
+    //
+    // One tester's friend removed the DLL, kept the addon, and stopped being
+    // dropped. That is one uncontrolled data point and it points here, so the
+    // question needs an experiment rather than an argument.
+    //
+    // This is that experiment. With the mode on, nothing is written into the
+    // wow.exe image: the socket observer still runs (ws2_32), the crash
+    // reporter still runs (kernel32, ntdll), the frame timing still runs (the
+    // D3D9 vtable lives in d3d9.dll), so a session still produces the same
+    // disconnect report. What stops is every optimisation, because every one of
+    // them is a patch. If the drops continue in this mode, they are not our
+    // patches. If they stop, they are, and the count below says how many were
+    // refused so the run cannot be mistaken for a normal one.
+    if (WowOpt_NoClientPatches() && WowOpt_InsideClientImage(target)) {
+        WowOpt_NoteClientPatchRefused();
+        return MH_ERROR_UNSUPPORTED_FUNCTION;
+    }
+
     // Refuse a target that somebody else has already detoured.
     //
     // A player on Ascension was kicked seconds after using an ability and then
@@ -876,7 +975,7 @@ static inline MH_STATUS WowOpt_CreateHookGuarded(void* target, void* detour, voi
             // maintained was the half that silently lost the race. The caller
             // usually logs this as "hook FAILED", which reads like a defect in
             // the target rather than a collision between two of ours.
-            WowOpt_LogDuplicateHook(target);
+            WowOpt_LogDuplicateHook(target, detour);
             return probe;
         }
         if (probe == MH_OK) {
@@ -886,7 +985,19 @@ static inline MH_STATUS WowOpt_CreateHookGuarded(void* target, void* detour, voi
         return MH_ERROR_UNSUPPORTED_FUNCTION;
     }
 
-    return MH_CreateHook(target, detour, original);
+    MH_STATUS st = MH_CreateHook(target, detour, original);
+    // Name the detour to the profiler. Fifty-nine files install hooks and only
+    // fourteen register a symbol, which is why about nine percent of executing
+    // time in a tester's profile appeared as bare "wowopt+0x" offsets that need
+    // this exact build's linker map to resolve. This is the one wrapper every
+    // hook in the project passes through, so registering here names all of them
+    // at once, and the name it makes - the address being hooked - is the thing a
+    // reader actually wants to know.
+    if (st == MH_OK) {
+        WowOpt_NoteDetour((uintptr_t)target, detour);
+        WowOpt_RecordHookOwner((uintptr_t)target, detour);
+    }
+    return st;
 }
 
 // Every direct MH_CreateHook in this project now goes through the same check.
@@ -961,6 +1072,8 @@ static inline bool WO_LateBatchAllowed() {
 
 #define CRASH_TEST_DISABLE_MODHANDLE_CACHE         0
 
+// DEAD FLAG - no #if reads it, and dllmain.cpp defines the same name again.
+// InstallGlobalAllocHooks decides this itself and says so in the log.
 #define CRASH_TEST_DISABLE_GLOBALALLOC         1
 
 #define CRASH_TEST_DISABLE_VA_ARENA         0   // compiled in; activation is runtime opt-in via Config OptVaArena (default off). This is the authoritative definition (included before dllmain's #ifndef fallback).
@@ -977,3 +1090,4 @@ enum LogLevel {
 
 extern "C" void LogEx(LogLevel level, const char* context, const char* fmt, ...);
 
+#endif  // RC_INVOKED

@@ -13,6 +13,7 @@
 #include "MinHook.h"
 #include "version.h"
 #include "crash_dumper.h"
+#include "session_verdict.h"
 #include <intrin.h>
 
 #include <dbghelp.h>
@@ -1133,21 +1134,24 @@ int RegisterFeature(const char* name) {
     return (int)idx;
 }
 
-int FeatureTokenForCounting(const char* name) {
+int FeatureTokenForCounting(const char* name, unsigned hitStride) {
     if (!name) return -1;
+    if (hitStride == 0) hitStride = 1;
 
     LONG count = InterlockedCompareExchange(&s_featureCount, 0, 0);
     if (count > MAX_TRACKED_FEATURES) count = MAX_TRACKED_FEATURES;
     for (int i = 0; i < count; i++) {
         if (s_features[i].name && strcmp(s_features[i].name, name) == 0) {
-            s_features[i].counted = true;
+            s_features[i].counted   = true;
+            s_features[i].hitStride = hitStride;
             return i;
         }
     }
 
     int token = RegisterFeature(name);
     if (token >= 0) {
-        s_features[token].counted = true;
+        s_features[token].counted   = true;
+        s_features[token].hitStride = hitStride;
     }
     return token;
 }
@@ -1170,6 +1174,20 @@ void ReportFirstChanceSummary() {
         "someone (%ld of them repeats of the previous address). These are not "
         "crashes - something is using exceptions as control flow.",
         total, (LONG)g_firstChanceRepeats);
+
+    // A count that stops moving after startup is a client that throws while
+    // setting itself up and then behaves; one that keeps climbing is something
+    // faulting on a hot path and being caught. The two read identically from a
+    // single report and differently across two, so what is worth surfacing is
+    // the growth rather than the total.
+    static LONG s_lastTotal = -1;
+    if (s_lastTotal >= 0 && total > s_lastTotal) {
+        Verdict::Add(Verdict::Warn,
+                     "fatal-class exceptions are still being raised and caught - "
+                     "%ld more since the last report, %ld in all",
+                     total - s_lastTotal, total);
+    }
+    s_lastTotal = total;
 }
 
 void ReportFeatureActivity() {
@@ -1191,7 +1209,18 @@ void ReportFeatureActivity() {
         Log("[Features] Did work (%d):", ran);
         for (int i = 0; i < count; i++) {
             if (s_features[i].active && s_features[i].counted && s_features[i].hits > 0) {
-                Log("[Features]     %-32s %u", s_features[i].name, s_features[i].hits);
+                unsigned stride = s_features[i].hitStride ? s_features[i].hitStride : 1;
+                if (stride == 1) {
+                    Log("[Features]     %-32s %u", s_features[i].name, s_features[i].hits);
+                } else {
+                    // Scaled, because otherwise this column silently mixes units.
+                    // Stated as an estimate: the sample count is a plain counter
+                    // on a hot path, so it is itself a lower bound.
+                    Log("[Features]     %-32s ~%.0f  (%u samples x %u)",
+                        s_features[i].name,
+                        (double)s_features[i].hits * (double)stride,
+                        s_features[i].hits, stride);
+                }
             }
         }
     }

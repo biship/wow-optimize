@@ -46,6 +46,10 @@ bool IsActive();
 
 // Get total number of samples collected (for diagnostics).
 uint64_t GetSampleCount();
+// Share of main-thread samples executing rather than blocked, from the last
+// report. False when none has run. A frame-time comparison in a session with a
+// low share cannot show a CPU saving.
+bool GetExecutingShare(double* pct, unsigned long long* samples);
 
 // Dump the current top-50 hot functions to the log without stopping sampling.
 // Called from the periodic stats dump so the profile is captured even when the
@@ -64,5 +68,34 @@ void DumpNow();
 // Call it at install time with the detour's own address. Costs one array slot and
 // nothing at sample time - resolution happens only when the profile is printed.
 void RegisterSelfSymbol(const char* name, const void* addr);
+
+// What share of the profile sits inside [lo, hi). For a module that changes how
+// often some client code runs and wants to report the cost of having done so,
+// rather than only the cost of its own work.
+//
+// Measured over the same window the periodic dump uses - the last RING_SIZE
+// samples - and never over the lifetime total. Dividing a windowed count by a
+// lifetime total is what understated every percentage this profiler printed
+// before 133c4456 by 5.6x.
+//
+// Returns false when there is nothing to answer with: profiler off, or fewer
+// than `minSamples` samples in the window. A caller that gets false must say it
+// could not see this rather than print a zero.
+bool ShareForRange(uintptr_t lo, uintptr_t hi, unsigned long minSamples,
+                   double* outPercent, unsigned long* outSamples,
+                   unsigned long* outWindow);
+
+// --- Where a single loading screen went -------------------------------------
+//
+// The loading-screen split can say what a load was not: a measured 5504 ms load
+// spent 156 ms inside ReadFile, nothing compiling Lua and nothing writing. That
+// leaves 97% with no name on it, and the profiler already samples through a
+// loading screen into its own histogram - the two had just never been joined.
+//
+// MarkLoadWindowStart takes a copy of that histogram; ReportLoadWindow prints
+// the difference, which is where the main thread was during that one load
+// rather than across every load of the session.
+void MarkLoadWindowStart();
+void ReportLoadWindow();
 
 } // namespace SamplingProfiler

@@ -21,6 +21,10 @@ extern "C" void Log(const char* fmt, ...);
 
 // int __cdecl sub_85CAB0(lua_State* L, Table* t, TValue* key) -> Node*
 typedef void* (__cdecl* newkey_fn)(int L, int t, void* key);
+// Whether the hook actually went in, so the report can tell a guard
+// that never fired from one that was never installed.
+static bool g_statsInstalled = false;
+
 static newkey_fn g_orig_newkey = nullptr;
 
 // Private throw-away node returned when the original would crash. 40 bytes =
@@ -89,8 +93,21 @@ bool InstallLuaNewKeySafety()
     CrashDumper::FeatureSetActive("LuaNewKeySafety", true);
 
     Log("[NewKeySafety] ACTIVE: SEH guard on luaH_newkey (sub_85CAB0), fixes 0x85CB43 crash");
+    g_statsInstalled = true;
     return true;
 #endif
+}
+
+// Printed from the periodic report. The counters used to be printed only
+// from the uninstall path, which nothing calls: the DLL leaves through
+// TerminateProcess, and the linker had dropped the function outright.
+void LuaNewKeySafety_LogStats(void) {
+    if (!g_statsInstalled) {
+        Log("[NewKeySafety] not measured: the guard is not installed.");
+        return;
+    }
+    Log("[NewKeySafety] %lld calls, %lld recovered from chain corruption.",
+        (long long)g_total_calls, (long long)g_recovered);
 }
 
 void UninstallLuaNewKeySafety()

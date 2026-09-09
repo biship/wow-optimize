@@ -40,6 +40,7 @@
 #include <intrin.h>
 
 #include "strncmp_sse2.h"
+#include "ab_test.h"
 #include "MinHook.h"
 #include "version.h"
 #include "config.h"
@@ -110,7 +111,13 @@ int Compare(const char* s1, const char* s2, size_t n) {
     return 0;
 }
 
-static int __cdecl Hooked_Strncmp(const char* s1, const char* s2, size_t n) {
+// Set at init when the A/B harness names this module. This hook runs tens of
+// millions of times a session, so a fraction of a nanosecond either way is
+// real time - and whether it is faster than what it replaced has never been
+// measured on a live client, only in a standalone harness.
+static bool g_abSubject = false;
+
+static int __cdecl Hooked_StrncmpBody(const char* s1, const char* s2, size_t n) {
     ++g_calls;
 
     if (n == 0) return 0;
@@ -125,6 +132,20 @@ static int __cdecl Hooked_Strncmp(const char* s1, const char* s2, size_t n) {
         }
     }
     return orig_strncmp(s1, s2, n);
+}
+
+// The detour proper, split from the body so the harness can time the call on
+// both sides. One branch on a false global when no test names this module.
+static int __cdecl Hooked_Strncmp(const char* s1, const char* s2, size_t n) {
+    if (!g_abSubject) return Hooked_StrncmpBody(s1, s2, n);
+    unsigned long long abTick = AbTest::TickIn();
+    // `int r`, not `static int r`. A function-local static is initialised once,
+    // so every call after the first would have returned the first comparison's
+    // answer - on a function the client uses tens of millions of times a session.
+    int r = AbTest::StandAside() ? orig_strncmp(s1, s2, n)
+                                 : Hooked_StrncmpBody(s1, s2, n);
+    AbTest::TickOut(abTick);
+    return r;
 }
 
 // Run ours against the client's own strncmp, on the client's own code, before
@@ -205,6 +226,13 @@ bool Init() {
     }
 
     g_active = true;
+    g_abSubject = AbTest::IsSubject("StrncmpSse2", &g_abSubject);
+    if (g_abSubject) {
+        Log("[StrncmpSSE2] under A/B test: it alternates on and off in stints and "
+            "AbTest reports the cost of the call each way. At 268 million calls in "
+            "a measured session, a fraction of a nanosecond either way is real "
+            "time, and nothing has ever compared the two on a live client.");
+    }
     CrashDumper::RegisterFeature("StrncmpSse2");
     Log("[StrncmpSSE2] ACTIVE - strncmp at 0x%08X (SSE2, 16 bytes per compare, "
         "1.55%% of executing time in a tester profile)", (unsigned)ADDR_Strncmp);
@@ -212,7 +240,18 @@ bool Init() {
 }
 
 void LogStats() {
-    if (!g_active) return;
+    // An A/B subject. A subject that prints nothing cannot answer whether its
+    // hot path was reached during an OFF stint, which is what decides whether a
+    // null result means anything.
+    if (!g_active) {
+        Log("[StrncmpSSE2] not measured: the replacement is not installed.");
+        return;
+    }
+    if (g_calls == 0) {
+        Log("[StrncmpSSE2] measured and zero: installed, and the client did not "
+            "compare a string through it.");
+        return;
+    }
     Log("[StrncmpSSE2] %ld calls", g_calls);
 }
 
