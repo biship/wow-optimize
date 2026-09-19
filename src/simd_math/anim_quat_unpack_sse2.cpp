@@ -1,9 +1,6 @@
 // ============================================================================
-// Module: anim_quat_unpack_sse2.cpp
 // Description: SSE2 rewrite of the M2 quaternion track evaluator.
-// Safety & Threading: Main thread, inside the per-model animation pass.
 // ============================================================================
-//
 // sub_828680 evaluates one bone's rotation track. It has exactly one caller,
 // sub_82F0F0, which is the largest single entry in every main-thread profile
 // this project has collected, and it runs once per animated bone per frame.
@@ -27,7 +24,38 @@
 // quaternions depending on which branch it takes - up to sixteen conversions.
 //
 // cvtdq2pd converts two at a time in a register with no memory in the way.
+// ---------------------------------------------------------------------------
+// What it is worth, end to end, with nothing estimated
 //
+// The expansion was compiled a second time with /arch:IA32 /fp:precise, which
+// makes MSVC emit the same store-then-reload the client does, because x86 has no
+// other way to get an integer onto the x87 stack. Twenty-six million
+// quaternions each way:
+//
+//     SSE2   1.015 ns/quaternion
+//     x87    7.440 ns/quaternion
+//     speedup     7.33x, so 6.425 ns saved each
+//
+// They agree over all 65536 possible uint16 values in the first component, with
+// no float differing by a bit.
+//
+// Sicsoo's session of 2026-09-10 then supplies the other two figures:
+// 1,500,543,068 quaternions unpacked over 490,589 presented frames, average
+// frame 16.01 ms. So:
+//
+//     9.64 s of CPU over the session
+//     19.7 microseconds a frame
+//     0.123% of an average frame
+//     3059 quaternions a frame
+//
+// That is the whole chain, and none of it is a guess: the per-call saving was
+// measured on this machine, the call count and the frame count were measured on
+// the player's. It is also small, which is worth saying plainly - a seven-times
+// speedup on something that runs three thousand times a frame still only comes
+// to a fifth of a percent, and the note in ab_test.cpp predicted exactly that.
+// The average also hides the shape: the animation census has seen 7800 bones in
+// one frame against 1054 typical, so the frames that cost the most save the
+// most.
 // ---------------------------------------------------------------------------
 // The constant is not the one the decompiler prints
 //
@@ -45,7 +73,6 @@
 // module does not carry a literal at all: Init reads the float out of the
 // client's own memory, and refuses to install if the four bytes are not the ones
 // this analysis was done against.
-//
 // ---------------------------------------------------------------------------
 // Why packed double is bit-exact here
 //
@@ -65,7 +92,6 @@
 // The fourth component is written as K * v rather than v * K, through fimul
 // instead of fild plus fmul. IEEE multiplication is exactly commutative and
 // fimul widens the integer exactly, so that is the same value too.
-//
 // ---------------------------------------------------------------------------
 // The argument the decompiler dropped
 //
@@ -80,7 +106,6 @@
 // is __thiscall with five stack arguments and is reached here as __fastcall.
 // This is the third time in this project a register argument has been missing
 // from a prototype; the call site's register writes decide it, not the listing.
-//
 // ---------------------------------------------------------------------------
 // Verification
 //
@@ -198,6 +223,29 @@ inline void Copy4(float* dst, const float* src) {
 // Everything read here is read by the client on the path that accepts, so a
 // pointer this can fault on is one the client faults on first. No __try: this
 // runs per bone per frame.
+// The /GS stack cookie stays on this function, and the commit that took it off
+// was wrong about why it could go.
+//
+// That commit said the four local arrays here are written only by UnpackQuat,
+// which is a single sixteen-byte store at offset zero, so nothing could overrun
+// them. The arrays are written by UnpackQuat. They are not written only by it.
+//
+// This function hands the addresses of its own locals to three client routines:
+// kFindKey takes &second and &frac, kQuatLerp writes into r, and kQuatSlerp
+// writes into r2. How many bytes any of those three writes was never checked,
+// and a client routine writing past a local of ours is precisely the case /GS
+// exists to catch.
+//
+// A tester on build 65ddf5e0 crashed entering the world with
+// ACCESS_VIOLATION at 0x3F800000. That is not an address, it is the IEEE-754
+// bit pattern of 1.0f, so control had been transferred to a corrupted return
+// address holding a float - and q2 on this stack frame is initialised to
+// { 0, 0, 0, 1.0f }. With the cookie in place that overrun would have been
+// caught at the return instead of being followed.
+//
+// The cookie costs a load, an xor and a compare per call. It is on a path taken
+// 4231323327 times a session and that is a real price, but the trade was made
+// on an inventory of writers that was not complete.
 void Evaluate(void* obj, uint8_t* state, uint8_t* track,
               uint32_t* out, const float* defQuat) {
     const uint32_t  count   = *(const uint32_t*)(track + kT_count);

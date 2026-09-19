@@ -46,6 +46,8 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "WowExtendedHooks", &Settings::OptWowExtendedHooks },
     { "General", "WowSubsystemHooks", &Settings::OptWowSubsystemHooks },
     { "General", "LockTuning", &Settings::OptLockTuning },
+    { "General", "LockTuningInitHook", &Settings::OptLockTuningInitHook },
+    { "General", "SystemHooksClientOnly", &Settings::OptSystemHooksClientOnly },
     { "General", "AsyncMpqIo", &Settings::OptAsyncMpqIo },
     { "General", "ThreadIdCache", &Settings::OptThreadIdCache },
     { "General", "PriorityGuard", &Settings::OptPriorityGuard },
@@ -64,6 +66,7 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "CompatMode", &Settings::OptCompatMode },
     { "General", "NoClientPatches", &Settings::OptNoClientPatches },
     { "General", "FlightRecorder", &Settings::OptFlightRecorder },
+    { "General", "CameraReplay", &Settings::OptCameraReplay },
     { "General", "AbTest", &Settings::OptAbTest },
     { "Graphics_Sound", "SimdGeometry", &Settings::OptSimdGeometry },
     { "General", "AsyncWorkerPool", &Settings::OptAsyncWorkerPool },
@@ -88,8 +91,11 @@ static const BoolSetting kBoolSettings[] = {
     // was inert: whatever you set, the DLL read the absent-key default of off and
     // neither feature could be turned on by anyone.
     { "Graphics_Sound", "AsyncTexLoader", &Settings::OptAsyncTexLoader },
-    { "UI_Lua", "AsyncTerrainLoader", &Settings::OptAsyncTerrainLoader },
     { "UI_Lua", "RcuObjMgr", &Settings::OptRcuObjMgr },
+    { "UI_Lua", "ObjMgrEnumFast", &Settings::OptObjMgrEnumFast },
+    { "General", "FreezeCatcher", &Settings::OptFreezeCatcher },
+    { "General", "MpqOpenCensus", &Settings::OptMpqOpenCensus },
+    { "General", "MpqNegativeCache", &Settings::OptMpqNegativeCache },
     { "Graphics_Sound", "MipBiasGovernor", &Settings::OptMipBiasGovernor },
     { "Combat_Net", "CombatLogLeakFix", &Settings::OptCombatLogLeakFix },
     { "Combat_Net", "CombatLogParser", &Settings::OptCombatLogParser },
@@ -134,8 +140,15 @@ static const BoolSetting kBoolSettings[] = {
     { "UI_Lua", "LuaThisFast", &Settings::OptLuaThisFast },
     { "Graphics_Sound", "AnimLod", &Settings::OptAnimLod },
     { "Graphics_Sound", "CollisionOutcode", &Settings::OptCollisionOutcode },
+    { "Graphics_Sound", "CollisionRayOutcode", &Settings::OptCollisionRayOutcode },
+    { "Graphics_Sound", "RayTriangleSse2", &Settings::OptRayTriangleSse2 },
     { "Graphics_Sound", "BoneMatrixUpload", &Settings::OptBoneMatrixUpload },
+    { "Graphics_Sound", "UiBatchFill", &Settings::OptUiBatchFill },
+    { "Graphics_Sound", "ParticleFill", &Settings::OptParticleFill },
     { "General", "MimallocHighArena", &Settings::OptMimallocHighArena },
+    { "General", "VaCensus", &Settings::OptVaCensus },
+    { "General", "HighPlacementModules", &Settings::OptHighPlacementModules },
+    { "General", "HighPlacementClient", &Settings::OptHighPlacementClient },
     { "General", "ClientWriteBatch", &Settings::OptClientWriteBatch },
     { "Graphics_Sound", "AabbOverlap", &Settings::OptAabbOverlap },
     { "Graphics_Sound", "AnimQuatUnpack", &Settings::OptAnimQuatUnpack },
@@ -149,12 +162,12 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "MatrixVectorSse2", &Settings::OptMatrixVectorSse2 },
     { "Graphics_Sound", "WorldStateCoalesce", &Settings::OptWorldStateCoalesce },
     { "Graphics_Sound", "D3d9RenderThread", &Settings::OptD3d9RenderThread },
+    { "Graphics_Sound", "RenderStateDedup", &Settings::OptRenderStateDedup },
     { "Combat_Net", "CombatLogFilter", &Settings::OptCombatLogFilter },
     { "Graphics_Sound", "SoundVolumeLimit", &Settings::OptSoundVolumeLimit },
     { "Graphics_Sound", "TerrainHeightCache", &Settings::OptTerrainHeightCache },
     { "Graphics_Sound", "TextureUnloadDelay", &Settings::OptTextureUnloadDelay },
     { "Graphics_Sound", "M2MatrixSimd", &Settings::OptM2MatrixSimd },
-    { "General", "MpqAsyncDecompress", &Settings::OptMpqAsyncDecompress },
     { "Graphics_Sound", "SimdMatrixTransform", &Settings::OptSimdMatrixTransform },
     { "Graphics_Sound", "SpellEffectCulling", &Settings::OptSpellEffectCulling },
     { "Graphics_Sound", "RenderNullGuard", &Settings::OptRenderNullGuard },
@@ -168,6 +181,7 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "DrawMerge", &Settings::OptDrawMerge },
     { "Graphics_Sound", "M2MatrixSlotSse2", &Settings::OptM2MatrixSlotSse2 },
     { "Graphics_Sound", "M2AnimStride", &Settings::OptM2AnimStride },
+    { "Graphics_Sound", "M2AnimReuse", &Settings::OptM2AnimReuse },
     { "UI_Lua", "LuaAllocCensus", &Settings::OptLuaAllocCensus },
     { "Graphics_Sound", "AnimCensus", &Settings::OptAnimCensus },
     { "Graphics_Sound", "HorizonOcclusionSse2", &Settings::OptHorizonOcclusionSse2 },
@@ -231,9 +245,11 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
 
         Log("[Config]   [General] SleepPrecisionValue=%d", g_settings.SleepPrecisionValue);
         Log("[Config]   [General] FlightRecorderKey=0x%02X", g_settings.FlightRecorderKey);
+        Log("[Config]   [General] CameraReplayKey=0x%02X", g_settings.CameraReplayKey);
         Log("[Config]   [General] AbTestSubject='%s' every %d ms",
             g_settings.AbTestSubject, g_settings.AbTestPeriodMs);
         Log("[Config]   [General] SessionLogsToKeep=%d", g_settings.SessionLogsToKeep);
+        Log("[Config]   [General] HighPlacementMinKB=%d", g_settings.HighPlacementMinKB);
         Log("[Config] %d set in the file, %d left at defaults.", fromFile, defaulted);
 
         // The settings with no tickbox.
@@ -251,8 +267,8 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         // missing from here is the defect the check exists to catch.
         Log("[Config] Settings with no launcher entry, set by hand in the ini "
             "and now preserved when the launcher saves: AddonDispatcher, "
-            "AsyncTerrainLoader, CrtMimalloc, D3d9RenderThread, MimallocLarge, "
-            "MpqAsyncDecompress, NameplateMT, PacketOffload, RcuObjMgr, "
+            "CrtMimalloc, D3d9RenderThread, MimallocLarge, "
+            "NameplateMT, PacketOffload, RcuObjMgr, "
             "SavedVarsAsync, UnitAuraFast, VaArena, WorldStateCoalesce. "
             "MimallocLarge has a known heap crash and D3d9RenderThread moves "
             "draw submission off the main thread; the rest are off because "
@@ -463,7 +479,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
             WritePrivateProfileStringA("UI_Lua", "LuaJIT", "0", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "LuaGetTimeFast", "0", iniPath.c_str());
             WritePrivateProfileStringA("Graphics_Sound", "AsyncTexLoader", "0", iniPath.c_str());
-            WritePrivateProfileStringA("UI_Lua", "AsyncTerrainLoader", "0", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "RcuObjMgr", "0", iniPath.c_str());
             WritePrivateProfileStringA("Graphics_Sound", "MipBiasGovernor", "0", iniPath.c_str());
 
@@ -496,7 +511,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
 
             WritePrivateProfileStringA("Graphics_Sound", "TextureUnloadDelay", "0", iniPath.c_str());
             WritePrivateProfileStringA("Graphics_Sound", "M2MatrixSimd", "0", iniPath.c_str());
-            WritePrivateProfileStringA("General", "MpqAsyncDecompress", "0", iniPath.c_str());
             WritePrivateProfileStringA("Graphics_Sound", "SimdMatrixTransform", "0", iniPath.c_str());
             WritePrivateProfileStringA("Graphics_Sound", "SpellEffectCulling", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "CrtMimalloc", "0", iniPath.c_str());
@@ -522,6 +536,8 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptWowExtendedHooks   = GetPrivateProfileIntA("General", "WowExtendedHooks", 1, iniPath.c_str()) != 0;
         g_settings.OptWowSubsystemHooks  = GetPrivateProfileIntA("General", "WowSubsystemHooks", 1, iniPath.c_str()) != 0;
         g_settings.OptLockTuning         = GetPrivateProfileIntA("General", "LockTuning", 1, iniPath.c_str()) != 0;
+        g_settings.OptLockTuningInitHook = GetPrivateProfileIntA("General", "LockTuningInitHook", 0, iniPath.c_str()) != 0;
+        g_settings.OptSystemHooksClientOnly = GetPrivateProfileIntA("General", "SystemHooksClientOnly", 1, iniPath.c_str()) != 0;
         g_settings.OptAsyncMpqIo         = GetPrivateProfileIntA("General", "AsyncMpqIo", 1, iniPath.c_str()) != 0;
         g_settings.OptThreadIdCache      = GetPrivateProfileIntA("General", "ThreadIdCache", 1, iniPath.c_str()) != 0;
         g_settings.OptPriorityGuard      = GetPrivateProfileIntA("General", "PriorityGuard", 1, iniPath.c_str()) != 0;
@@ -557,6 +573,10 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         // works on a loading screen and at character select, where no addon is
         // running and where two of the open defects appear.
         g_settings.FlightRecorderKey      = GetPrivateProfileIntA("General", "FlightRecorderKey", 0x91, iniPath.c_str());
+        g_settings.OptCameraReplay        = GetPrivateProfileIntA("General", "CameraReplay", 0, iniPath.c_str()) != 0;
+        g_settings.CameraReplayKey        = GetPrivateProfileIntA("General", "CameraReplayKey", 0x13, iniPath.c_str());
+        if (g_settings.CameraReplayKey < 1 || g_settings.CameraReplayKey > 0xFE)
+            g_settings.CameraReplayKey = 0x13;
         // HARD-DISABLED regardless of ini: in tester logs the arena was active
         // on machines with zero fragmentation (2GB+ largest free block), so it
         // used ~0.2MB of its 64MB and delivered no benefit - while still routing
@@ -583,8 +603,11 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptLuaGcCoalesce       = GetPrivateProfileIntA("UI_Lua", "LuaGcCoalesce", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaGetTimeFast      = GetPrivateProfileIntA("UI_Lua", "LuaGetTimeFast", 0, iniPath.c_str()) != 0;
         g_settings.OptAsyncTexLoader      = GetPrivateProfileIntA("Graphics_Sound", "AsyncTexLoader", 0, iniPath.c_str()) != 0;
-        g_settings.OptAsyncTerrainLoader  = GetPrivateProfileIntA("UI_Lua", "AsyncTerrainLoader", 0, iniPath.c_str()) != 0;
         g_settings.OptRcuObjMgr           = GetPrivateProfileIntA("UI_Lua", "RcuObjMgr", 0, iniPath.c_str()) != 0;
+        g_settings.OptObjMgrEnumFast      = GetPrivateProfileIntA("UI_Lua", "ObjMgrEnumFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptFreezeCatcher       = GetPrivateProfileIntA("General", "FreezeCatcher", 0, iniPath.c_str()) != 0;
+        g_settings.OptMpqOpenCensus       = GetPrivateProfileIntA("General", "MpqOpenCensus", 0, iniPath.c_str()) != 0;
+        g_settings.OptMpqNegativeCache    = GetPrivateProfileIntA("General", "MpqNegativeCache", 0, iniPath.c_str()) != 0;
         g_settings.OptMipBiasGovernor     = GetPrivateProfileIntA("Graphics_Sound", "MipBiasGovernor", 0, iniPath.c_str()) != 0;
 
         // Combat & Network
@@ -652,16 +675,32 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptLuaThisFast         = GetPrivateProfileIntA("UI_Lua", "LuaThisFast", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimLod             = GetPrivateProfileIntA("Graphics_Sound", "AnimLod", 0, iniPath.c_str()) != 0;
         g_settings.OptCollisionOutcode    = GetPrivateProfileIntA("Graphics_Sound", "CollisionOutcode", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionRayOutcode = GetPrivateProfileIntA("Graphics_Sound", "CollisionRayOutcode", 0, iniPath.c_str()) != 0;
+        g_settings.OptRayTriangleSse2     = GetPrivateProfileIntA("Graphics_Sound", "RayTriangleSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptBoneMatrixUpload    = GetPrivateProfileIntA("Graphics_Sound", "BoneMatrixUpload", 0, iniPath.c_str()) != 0;
+        g_settings.OptUiBatchFill         = GetPrivateProfileIntA("Graphics_Sound", "UiBatchFill", 0, iniPath.c_str()) != 0;
+        g_settings.OptParticleFill        = GetPrivateProfileIntA("Graphics_Sound", "ParticleFill", 0, iniPath.c_str()) != 0;
         g_settings.OptMimallocHighArena   = GetPrivateProfileIntA("General", "MimallocHighArena", 0, iniPath.c_str()) != 0;
         g_settings.OptClientWriteBatch    = GetPrivateProfileIntA("General", "ClientWriteBatch", 1, iniPath.c_str()) != 0;
         g_settings.MimallocHighArenaMB    = GetPrivateProfileIntA("General", "MimallocHighArenaMB", 256, iniPath.c_str());
         if (g_settings.MimallocHighArenaMB < 8)    g_settings.MimallocHighArenaMB = 8;
         if (g_settings.MimallocHighArenaMB > 1024) g_settings.MimallocHighArenaMB = 1024;
-        g_settings.MimallocHighArenaMaxMB = GetPrivateProfileIntA("General", "MimallocHighArenaMaxMB", 1024, iniPath.c_str());
+        // 1024 was the old default and it was also, by coincidence, exactly
+        // what the module's own half-of-the-high-region rule allowed, so both
+        // limits landed on the same number and the allocator hit it early. A
+        // field session had it at "ceiling 1023 MB" against 1552 MB committed.
+        // The fraction rule in mimalloc_high_arena.cpp is the real limit now;
+        // this is the manual override above it.
+        g_settings.MimallocHighArenaMaxMB = GetPrivateProfileIntA("General", "MimallocHighArenaMaxMB", 2048, iniPath.c_str());
         if (g_settings.MimallocHighArenaMaxMB < g_settings.MimallocHighArenaMB)
             g_settings.MimallocHighArenaMaxMB = g_settings.MimallocHighArenaMB;
         if (g_settings.MimallocHighArenaMaxMB > 2048) g_settings.MimallocHighArenaMaxMB = 2048;
+        g_settings.OptVaCensus             = GetPrivateProfileIntA("General", "VaCensus", 0, iniPath.c_str()) != 0;
+        g_settings.OptHighPlacementModules = GetPrivateProfileIntA("General", "HighPlacementModules", 0, iniPath.c_str()) != 0;
+        g_settings.OptHighPlacementClient  = GetPrivateProfileIntA("General", "HighPlacementClient", 0, iniPath.c_str()) != 0;
+        g_settings.HighPlacementMinKB      = GetPrivateProfileIntA("General", "HighPlacementMinKB", 1024, iniPath.c_str());
+        if (g_settings.HighPlacementMinKB < 64)    g_settings.HighPlacementMinKB = 64;
+        if (g_settings.HighPlacementMinKB > 65536) g_settings.HighPlacementMinKB = 65536;
         g_settings.OptAabbOverlap         = GetPrivateProfileIntA("Graphics_Sound", "AabbOverlap", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimQuatUnpack      = GetPrivateProfileIntA("Graphics_Sound", "AnimQuatUnpack", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaPoolFast     = GetPrivateProfileIntA("UI_Lua", "LuaPoolFast", 0, iniPath.c_str()) != 0;
@@ -674,6 +713,13 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptMatrixVectorSse2  = GetPrivateProfileIntA("Graphics_Sound", "MatrixVectorSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptWorldStateCoalesce  = GetPrivateProfileIntA("Graphics_Sound", "WorldStateCoalesce", 0, iniPath.c_str()) != 0;
         g_settings.OptD3d9RenderThread    = GetPrivateProfileIntA("Graphics_Sound", "D3d9RenderThread", 0, iniPath.c_str()) != 0;
+        // Skipping a SetRenderState that changes nothing has nothing to do with
+        // running under a translation layer, so it has its own key. An absent key
+        // inherits the pair it used to be gated on, which keeps an existing ini
+        // behaving the same.
+        g_settings.OptRenderStateDedup    = GetPrivateProfileIntA("Graphics_Sound", "RenderStateDedup",
+                                              (g_settings.OptVulkanDXVK || g_settings.OptD3d9RenderThread) ? 1 : 0,
+                                              iniPath.c_str()) != 0;
         // HARD-DISABLED regardless of ini: this offloads D3D9 draw/Present/Reset
         // calls to a worker thread, but WoW's device isn't created
         // D3DCREATE_MULTITHREADED, so cross-thread rendering is undefined
@@ -692,7 +738,6 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         // Parse Features 31-50
         g_settings.OptTextureUnloadDelay = GetPrivateProfileIntA("Graphics_Sound", "TextureUnloadDelay", 0, iniPath.c_str()) != 0;
         g_settings.OptM2MatrixSimd = GetPrivateProfileIntA("Graphics_Sound", "M2MatrixSimd", 0, iniPath.c_str()) != 0;
-        g_settings.OptMpqAsyncDecompress = GetPrivateProfileIntA("General", "MpqAsyncDecompress", 0, iniPath.c_str()) != 0;
         g_settings.OptSimdMatrixTransform = GetPrivateProfileIntA("Graphics_Sound", "SimdMatrixTransform", 0, iniPath.c_str()) != 0;
         g_settings.OptSpellEffectCulling = GetPrivateProfileIntA("Graphics_Sound", "SpellEffectCulling", 0, iniPath.c_str()) != 0;
         g_settings.OptRenderNullGuard = GetPrivateProfileIntA("Graphics_Sound", "RenderNullGuard", 1, iniPath.c_str()) != 0;
@@ -706,6 +751,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptDrawMerge = GetPrivateProfileIntA("Graphics_Sound", "DrawMerge", 0, iniPath.c_str()) != 0;
         g_settings.OptM2MatrixSlotSse2 = GetPrivateProfileIntA("Graphics_Sound", "M2MatrixSlotSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptM2AnimStride = GetPrivateProfileIntA("Graphics_Sound", "M2AnimStride", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2AnimReuse  = GetPrivateProfileIntA("Graphics_Sound", "M2AnimReuse", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaAllocCensus = GetPrivateProfileIntA("UI_Lua", "LuaAllocCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimCensus = GetPrivateProfileIntA("Graphics_Sound", "AnimCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptHorizonOcclusionSse2 = GetPrivateProfileIntA("Graphics_Sound", "HorizonOcclusionSse2", 0, iniPath.c_str()) != 0;

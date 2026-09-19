@@ -6,7 +6,6 @@
 // measured session at roughly 5900 cycles each. Nothing that makes the inside of
 // it cheaper reaches that number; the only lever big enough is doing it less
 // often for models the player cannot see the difference on.
-//
 // ---------------------------------------------------------------------------
 // Why the previous attempt could not work, and why this one can
 //
@@ -27,7 +26,6 @@
 // the call and the tail goes with it, which is the glowing shoulder pads bug
 // that guard exists to prevent. Skip only the loop and the model keeps its pose
 // while its materials, particles and attachments carry on animating normally.
-//
 // ---------------------------------------------------------------------------
 // The cut, and why it needs no new control flow at all
 //
@@ -52,7 +50,6 @@
 // fits without splitting an instruction, and nothing in the client jumps into
 // them: the only cross references are to 0x0082F418 itself, two jumps and a
 // fall-through.
-//
 // ---------------------------------------------------------------------------
 // What a held frame looks like
 //
@@ -106,6 +103,24 @@ constexpr uintptr_t kTailAddr    = 0x0082F420;   // the jbe, for the signature
 constexpr uintptr_t kRunAddr     = 0x0082F41D;   // mov [ebp+arg_10],edi ; jbe
 constexpr uintptr_t kHoldAddr    = 0x008302A3;   // where the client's own jbe goes
 
+// The x87 TOP field on entry to the decision, and how often it came back
+// different.
+//
+// This module shares its five bytes and its destination with m2_anim_reuse, so
+// it shares the trap. Three instructions before the cut the client runs
+// `fst [ebp+var_98]` - fst, not fstp - leaving one value live on the x87 stack,
+// and the tail at 0x008302B4 pops it with `fstp st`. Jumping there with an empty
+// stack is a masked underflow: no fault, an indefinite value written, the tag
+// word left wrong, and every float in the rest of the frame quietly wrong.
+//
+// Nothing between the cut and the jump may touch the x87 stack. Nothing does
+// today - the built object contains zero x87 instructions - but that holds only
+// until a float appears somewhere in the decision, which the compiler will
+// answer with the x87 stack and no warning. So the thunk checks instead of
+// trusting, and a decision that moved the stack refuses to hold.
+unsigned short g_topBefore = 0;
+unsigned long  g_fpuMoved  = 0;
+
 // Read by the naked thunk, so plain addresses rather than a struct.
 void* g_retRun  = (void*)kRunAddr;
 void* g_retHold = (void*)kHoldAddr;
@@ -135,6 +150,12 @@ unsigned long g_frame = 0;
 float g_camera[3] = {};
 bool  g_cameraOk = false;
 unsigned long g_cameraFrames = 0;
+// Every frame boundary, whether or not the camera was readable on it. Without
+// this, a clock that never ticks and a camera that never reads produce the same
+// report line - "the camera was readable for only 0 frames" - and the first of
+// those two is not the camera's fault. The sibling module spent six field
+// sessions being read the wrong way for exactly this reason.
+unsigned long g_frames       = 0;
 
 // Plain, main thread only. Lower bounds if that ever stops being true.
 unsigned long g_calls = 0;
@@ -207,9 +228,25 @@ namespace {
 __declspec(naked) void Thunk() {
     __asm {
         pushad
+        // TOP, bits 11..13 of the status word. Inside pushad, so ax is free.
+        fnstsw ax
+        and  ax, 3800h
+        mov  word ptr [g_topBefore], ax
+
         push esi
         call M2AnimStride_Decide
         add  esp, 4
+
+        // If the decision moved the x87 stack, the tail's fstp would pop the
+        // wrong thing. Refuse to hold rather than hand back a frame of
+        // indefinite floats.
+        fnstsw ax
+        and  ax, 3800h
+        cmp  ax, word ptr [g_topBefore]
+        je   top_unchanged
+        mov  byte ptr [g_m2StrideHold], 0
+        inc  dword ptr [g_fpuMoved]
+    top_unchanged:
         popad
 
         cmp  byte ptr [g_m2StrideHold], 0
@@ -297,6 +334,7 @@ void OnPresent() {
 
 void OnFrame() {
     if (!g_patched) return;
+    ++g_frames;
     float c[3];
     if (WowWorld::StreamCentre(c)) {
         g_camera[0] = c[0];
@@ -324,15 +362,39 @@ void LogStats() {
             "reached.");
         return;
     }
+    // The frame clock, printed before anything that depends on it. The sibling
+    // module reported 2 repeats in 454 million calls purely because this counter
+    // was being advanced by something that is not a frame, and no line in its
+    // report could say so.
+    if (g_frames == 0) {
+        Log("[Wrong] [M2Stride] the bone loop ran %lu time(s) and the frame "
+            "counter is still zero. The stride bands are counted in frames, so "
+            "nothing below can be right. OnFrame is not being called.", g_calls);
+    } else {
+        Log("[M2Stride] %lu frame(s) seen, %.1f call(s) per frame.",
+            g_frames, (double)g_calls / (double)g_frames);
+    }
     Log("[M2Stride] %lu of %lu bone loops held (%.1f%%). %lu were inside %.0f "
         "yards and never eligible, %lu had no readable world position.",
         g_held, g_calls, 100.0 * (double)g_held / (double)g_calls,
         g_nearKept, kNearYd, g_noPos);
+    // Printed whether or not it fired, because zero is the answer that says the
+    // decision path is still free of x87 and the hold is safe to take.
+    Log("[M2Stride]   the x87 stack depth was unchanged across the decision on "
+        "every call but %lu. The tail pops a value the client left on the stack, "
+        "so a non-zero figure here means something in the decision now uses the "
+        "FPU and those calls refused to hold rather than corrupt the frame.",
+        g_fpuMoved);
     Log("[M2Stride]   held by band: %lu at %.0f-%.0f yd (1 frame in %u), %lu at "
         "%.0f-%.0f (1 in %u), %lu past %.0f (1 in %u).",
         g_bandHeld[0], kNearYd, kMidYd, kStrideMid,
         g_bandHeld[1], kMidYd, kFarYd, kStrideFar,
         g_bandHeld[2], kFarYd, kStrideVeryFar);
+    if (g_frames > 0 && g_cameraFrames == 0) {
+        Log("[M2Stride]   the frame boundary was reached %lu time(s) and the "
+            "camera was readable on none of them, so no distance was ever "
+            "available. That is the camera, not the clock.", g_frames);
+    }
     if (g_cameraFrames < kWarmupFrames) {
         Log("[M2Stride]   the camera was readable for only %lu frames, under the "
             "%u this waits for, so most of the session held nothing whatever the "

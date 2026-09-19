@@ -1,9 +1,7 @@
 // ============================================================================
-// Module: lua_this_cache.cpp
 // Description: Inlines the object lookup every Lua call to a UI method starts with.
 // Safety & Threading: Main thread, alongside the Lua state.
 // ============================================================================
-//
 // sub_4A81B0 is the prologue of every FrameScript method binding in the client -
 // 674 call sites, one for each `frame:SetText`, `frame:GetWidth` and the rest.
 // Every call from Lua into a UI object runs it first. What it does:
@@ -18,7 +16,6 @@
 //
 // Four calls into the Lua API and a push/pop pair, to read one pointer out of
 // one table slot. This reads it directly instead.
-//
 // ---------------------------------------------------------------------------
 // The module that used to be here claimed this and did nothing
 //
@@ -26,7 +23,6 @@
 // diagnosis was wrong: sub_4A81B0 takes L in ESI, which no plain C detour can
 // receive, but MinHook enters the detour with the caller's registers intact. A
 // naked thunk reads ESI and passes it on, which is what this does.
-//
 // ---------------------------------------------------------------------------
 // What lua_rawgeti does besides fetch, which is the whole difficulty
 //
@@ -46,7 +42,6 @@
 // one instruction later with nothing in between, so nothing can observe it and
 // nothing reproduces it. lua_settop with a negative index only moves L->top; its
 // own taint stamping is on the positive branch, which this path never takes.
-//
 // ---------------------------------------------------------------------------
 // Declining rather than reproducing
 //
@@ -172,15 +167,32 @@ static uint32_t ComputeThis(uint32_t L, int wantedType) {
 //   0 - declined, run the client's routine and return its answer
 //   1 - computed, but still checking: run the client's routine too and compare
 //   2 - computed and trusted: do not run the client's routine at all
+// Faults the guard caught. The client's routine reads the same Lua stack, the
+// same object and calls the same virtual type check, so a fault here is one it
+// would take too; once kVerifyFirst lookups have run guarded and matched, the
+// armed path calls ComputeThis without an exception frame. A caught fault also
+// disables the module, so the unguarded path is never reached after one.
+static unsigned long g_caught = 0;
+
+static __declspec(noinline) bool ComputeGuarded(uint32_t L, int wantedType, uint32_t* mine) {
+    __try {
+        *mine = ComputeThis(L, wantedType);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++g_caught;
+        return false;
+    }
+}
+
 extern "C" int __cdecl LuaThisFast_Compute(uint32_t L, int wantedType, uint32_t* out) {
     *out = 0;
     if (g_dead || !L) return 0;
     ++g_calls;
 
     uint32_t mine;
-    __try {
+    if (g_armed != 0 && g_caught == 0) {
         mine = ComputeThis(L, wantedType);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } else if (!ComputeGuarded(L, wantedType, &mine)) {
         g_dead = true;
         Log("[LuaThis] Disabled for this session: the inline lookup faulted. The "
             "client's own routine runs from here on.");
@@ -311,9 +323,19 @@ void GetLuaThisCacheStats(uint64_t* hits, uint64_t* total) {
 }
 
 void LuaThisCache_LogStats() {
-    if (!Config::g_settings.OptLuaThisFast) return;
+    // Printed rather than returned on. Every other reporter here says "switched
+    // off"; this one said nothing, so a log carried no [LuaThis] line at all and
+    // a reader could not tell the switch from a module that failed to build.
+    if (!Config::g_settings.OptLuaThisFast) {
+        Log("[LuaThis] not measured: switched off (UI_Lua/LuaThisFast).");
+        return;
+    }
     if (!g_installed) { Log("[LuaThis] not installed - nothing measured"); return; }
     if (g_calls == 0) { Log("[LuaThis] installed but never called"); return; }
+    Log("[LuaThis]   exception guard: %lu fault(s) caught; the armed path runs %s.",
+        g_caught, !g_armed ? "guarded, still verifying"
+                  : (g_caught ? "guarded, because the guard has caught something"
+                              : "without an exception frame"));
     Log("[LuaThis] %lu lookups, %lu inline, %lu handed back to the client, "
         "%lu verified against it%s",
         g_calls, g_fast, g_declined, g_verified,

@@ -1,9 +1,6 @@
 // ============================================================================
-// Module: aabb_overlap_sse2.cpp
 // Description: SSE2 replacement for the client's box-overlap predicate.
-// Safety & Threading: Main thread, same as the function it replaces.
 // ============================================================================
-//
 // sub_78F370 asks whether two axis-aligned boxes overlap. It is 39 instructions,
 // eight basic blocks, and seventeen functions call it - the scene-graph culling
 // walks (sub_7A50C0 and its five siblings at 0x7A5xxx), the visibility passes at
@@ -22,7 +19,6 @@
 // an integer register, and there are six of them; each of the six branches is
 // then decided by scene data, so a walk over a mixed set of nodes mispredicts on
 // most of them.
-//
 // ---------------------------------------------------------------------------
 // Why this one is bit-exact rather than close
 //
@@ -33,7 +29,6 @@
 // including every NaN. That is the one shape in this project needing no
 // tolerance, no error table and no harness. The same reasoning carries the
 // collision outcode replacement in this directory.
-//
 // ---------------------------------------------------------------------------
 // The predicate, read out of the disassembly rather than the decompiler
 //
@@ -60,7 +55,6 @@
 // _mm_cmpge_ps and _mm_cmple_ps are both ordered and both false on a NaN operand,
 // so the replacement rejects a NaN box exactly where the client does. Signed zero
 // compares equal under fcom and under cmpps alike.
-//
 // ---------------------------------------------------------------------------
 // Reading twenty-four bytes where the client sometimes reads twelve
 //
@@ -76,7 +70,6 @@
 // already fault in the client whenever two boxes overlap - and boxes overlap
 // constantly. A pointer this hook can crash on is one the client crashes on
 // first.
-//
 // ---------------------------------------------------------------------------
 // Verification
 //
@@ -106,6 +99,7 @@
 #include "config.h"
 #include "sampling_profiler.h"
 #include "ab_test.h"
+#include "self_bench.h"
 #include "session_verdict.h"
 
 extern "C" void Log(const char* fmt, ...);
@@ -131,12 +125,37 @@ bool g_armed     = false;
 // tests a plain bool instead of calling out on every invocation.
 bool g_abSubject = false;
 bool g_dead      = false;
+int  g_benchSlot = -1;
 
 // Plain 32-bit on a leaf this hot. A lost increment costs a number, and the
 // report says the numbers are lower bounds.
-unsigned long g_calls    = 0;
-unsigned long g_verified = 0;
-unsigned long g_overlaps = 0;
+// Plain 32-bit, because a locked increment on a path this hot has eaten whole
+// optimisations in this project before. But 32 bits is not enough to divide by:
+// a field session has this counter at 3865121557, against a wrap at 4294967296, and
+// the call counter always wraps before the hit counter because every call
+// increments it while only a hit increments the other. Past the wrap the report
+// divides a real count by a wrapped one.
+//
+// That is not hypothetical here. The sibling module frustum_aabb printed
+// "1496607690 visibility tests, 1691870587 came back visible (113.0%)" and once
+// 73322.0%, which is more things visible than tests run. Same shape, same fix:
+// each counter keeps its wraps and the report recombines them as a double.
+unsigned long g_calls     = 0;
+unsigned long g_callWraps = 0;
+unsigned long g_verified  = 0;
+unsigned long g_overlaps  = 0;
+unsigned long g_overWraps = 0;
+
+inline void Bump(unsigned long& low, unsigned long& wraps) {
+    const unsigned long before = low;
+    low = before + 1;
+    if (low < before) ++wraps;
+}
+
+inline double Total(unsigned long low, unsigned long wraps) {
+    return (double)low + (double)wraps * 4294967296.0;
+}
+
 
 constexpr unsigned long kVerifyFirst  = 20000;
 constexpr unsigned long kResampleMask = 4095;
@@ -166,17 +185,23 @@ inline int Sse2Overlap(const float* self, const float* other) {
 }  // namespace
 
 int __fastcall Hooked_OverlapBody(const float* self, void* edx, const float* other) {
-    g_calls++;
+    Bump(g_calls, g_callWraps);
 
     if (g_dead) return orig_Overlap(self, edx, other);
 
 
+    const uint64_t tA = SelfBench::Now();
     int mine = Sse2Overlap(self, other);
+    const uint64_t tB = SelfBench::Now();
 
     // Unarmed, or one call in kResampleMask+1 afterwards: run the client's own
     // code and compare. Its answer is the one returned either way.
     if (!g_armed || (g_calls & kResampleMask) == 0) {
+        // The verification already runs both halves on the same input. Timing
+        // it is the only paired comparison this project gets without asking a
+        // tester to configure anything.
         int theirs = orig_Overlap(self, edx, other);
+        SelfBench::Pair(g_benchSlot, tB - tA, SelfBench::Now() - tB);
         g_verified++;
         if ((theirs != 0) != (mine != 0)) {
             g_dead = true;
@@ -195,11 +220,11 @@ int __fastcall Hooked_OverlapBody(const float* self, void* edx, const float* oth
                 "now answering directly and rechecking one call in %lu",
                 g_verified, kResampleMask + 1);
         }
-        if (theirs) g_overlaps++;
+        if (theirs) Bump(g_overlaps, g_overWraps);
         return theirs;
     }
 
-    if (mine) g_overlaps++;
+    if (mine) Bump(g_overlaps, g_overWraps);
     return mine;
 }
 
@@ -239,6 +264,7 @@ bool Init() {
     }
 
     g_abSubject = AbTest::IsSubject("AabbOverlap", &g_abSubject);
+    g_benchSlot = SelfBench::Register("AabbOverlap");
     if (g_abSubject) {
         Log("[AabbOverlap] under A/B test: it alternates on and off in stints "
             "and AbTest reports the frame times either way. The correctness "
@@ -263,10 +289,12 @@ void LogStats() {
     if (!g_installed) { Log("[AabbOverlap] not installed - nothing measured"); return; }
     if (g_calls == 0) { Log("[AabbOverlap] installed but never called"); return; }
 
-    Log("[AabbOverlap] %lu calls, %lu boxes overlapped (%.1f%%), %lu verified "
+    const double callsTotal   = Total(g_calls, g_callWraps);
+    const double overlapTotal = Total(g_overlaps, g_overWraps);
+    Log("[AabbOverlap] %.0f calls, %.0f boxes overlapped (%.1f%%), %lu verified "
         "against the client%s. Counts are lower bounds.",
-        g_calls, g_overlaps,
-        g_calls ? (100.0 * (double)g_overlaps / (double)g_calls) : 0.0,
+        callsTotal, overlapTotal,
+        callsTotal > 0.0 ? (100.0 * overlapTotal / callsTotal) : 0.0,
         g_verified,
         g_dead ? " - RETIRED on a disagreement"
                : (g_armed ? " - armed" : " - still verifying, every call still "

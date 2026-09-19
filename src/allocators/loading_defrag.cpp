@@ -1,5 +1,4 @@
 // ============================================================================
-// Module: loading_defrag.cpp
 // Description: Speculative pre-committing and VA defragmentation during loading screens.
 // Safety & Threading: Safe background thread execution. Main thread updates zone history.
 // ============================================================================
@@ -41,7 +40,10 @@ static const fn_FrameScript_Execute FrameScript_Execute_ = (fn_FrameScript_Execu
 static HANDLE g_defragThread = nullptr;
 static HANDLE g_defragEvent = nullptr;
 static std::atomic<bool> g_shutdown{false};
-static std::atomic<bool> g_loadingActive{false};
+// Not static any more: lua_optimize.h reads this inline. See the note there.
+// IsLoadingActive() below is still the only thing that applies the watchdog, so
+// the two are not interchangeable in general - only in the safe direction.
+std::atomic<bool> g_loadingActive{false};
 
 // Zone history tracking
 static char g_currentZone[128] = "Unknown";
@@ -72,12 +74,10 @@ static DWORD WINAPI DefragWorkerThread(LPVOID) {
 
         if (g_shutdown.load(std::memory_order_relaxed)) break;
 
-        // Reset before deciding, not after acting. The event is manual-reset, and
-        // the reset used to live inside the branch below - so a wake-up that found
-        // loading already finished left the event signalled forever and this loop
-        // span at full speed on one core for the rest of the session. Reaching that
-        // state became easy once the initial world entry started opening and
-        // closing the loading window back to back.
+        // Reset before deciding, not after acting. The event is manual-reset, so
+        // a wake-up that finds loading already finished must still clear it: left
+        // signalled, this loop spins at full speed on one core for the rest of
+        // the session.
         ResetEvent(g_defragEvent);
 
         if (g_loadingActive.load(std::memory_order_acquire)) {

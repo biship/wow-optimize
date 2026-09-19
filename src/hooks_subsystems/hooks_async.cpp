@@ -1,9 +1,3 @@
-// ============================================================================
-// Module: hooks_async.cpp
-// Description: Installs and manages target intercepts for subsystem `hooks_async.cpp`.
-// Safety & Threading: Stack layouts and register conventions must match target function definitions exactly.
-// ============================================================================
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -22,9 +16,7 @@ typedef unsigned long _DWORD;
 
 extern "C" void Log(const char* fmt, ...);
 
-// ================================================================
 // Memory validation
-// ================================================================
 static bool IsReadable(uintptr_t addr) {
     if (addr == 0) return false;
     MEMORY_BASIC_INFORMATION mbi;
@@ -33,9 +25,7 @@ static bool IsReadable(uintptr_t addr) {
     return !(mbi.Protect & PAGE_NOACCESS) && !(mbi.Protect & PAGE_GUARD);
 }
 
-// ================================================================
 // Shared Worker Pool Infrastructure
-// ================================================================
 // Lightweight SPMC ring buffer for fire-and-forget tasks.
 // Each hook enqueues a task; N worker threads dequeue and process.
 // Pattern established in combatlog_mt.cpp and reused here.
@@ -334,17 +324,10 @@ extern "C" char __cdecl Hooked_ParticleEmitterUpdate(int a1, int a2, int a3, int
     return 1;
 }
 
-// Two SSE2 helpers lived here, SSE2_TransformParticles and SSE2_LerpColors4.
-// Both were static with no caller anywhere in the tree - they never ran, and
-// they made this file read as though particle transforms and colour blending
-// were accelerated when nothing of the sort was wired up.
-//
-// SSE2_LerpColors4 was also wrong, which is the reason for saying so here
-// rather than deleting them quietly: it computed aHi32 from aLo16 instead of
-// aHi16 and did the same for b, so it read the low eight bytes twice, ignored
-// the high eight entirely, and still stored a full sixteen. If anyone had
-// wired it up expecting four particles it would have blended two and
-// overwritten the rest. They are in the history if the work is ever picked up.
+// Nothing here accelerates particle transforms or colour blending. Two SSE2
+// helpers that claimed to are in the history, uncalled; one of them read the low
+// eight bytes twice and stored a full sixteen, so picking that work up means
+// starting from the disassembly rather than from them.
 
 // ================================================================
 // 2. Map (.ADT) Terrain Pre-parsing
@@ -604,9 +587,7 @@ static size_t StripColorCodes(char* str, size_t len) {
     return writeIdx;
 }
 
-// ================================================================
 // Public API
-// ================================================================
 
 bool InstallAsyncHooks(void) {
     // Initialize worker pool
@@ -712,16 +693,8 @@ bool InstallAsyncHooks(void) {
 
     Log("[AsyncHooks] Worker pool: %d threads, %d task slots", ASYNC_POOL_WORKERS, TASK_QUEUE_SIZE);
 
-    // 0x007D9A20 is claimed by async_terrain_loader.cpp as well, which is a whole
-    // terrain feature built around it rather than the single prefetch hook here.
-    // Whichever initialised first used to win and the other logged a duplicate, so
-    // which of the two a player got depended on link order. The dedicated module
-    // wins by name now.
     #if !TEST_DISABLE_ADT_PREFETCH
-    if (ADDR_ADT_CHUNK_LOAD && Config::g_settings.OptAsyncTerrainLoader) {
-        Log("[AsyncHooks] ADT prefetcher: leaving 0x%08X to AsyncTerrainLoader, "
-            "which owns this function", ADDR_ADT_CHUNK_LOAD);
-    } else if (ADDR_ADT_CHUNK_LOAD) {
+    if (ADDR_ADT_CHUNK_LOAD) {
         if (WineSafe_CreateHook((void*)ADDR_ADT_CHUNK_LOAD, (void*)Hooked_sub_7D9A20, (void**)&orig_AdtChunkLoad) == MH_OK) {
             if (WO_EnableHook((void*)ADDR_ADT_CHUNK_LOAD) == MH_OK) {
                 Log("[AsyncHooks] Hook installed: ADT prefetcher (0x%08X)", ADDR_ADT_CHUNK_LOAD);

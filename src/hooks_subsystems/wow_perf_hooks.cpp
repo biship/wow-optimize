@@ -1,12 +1,7 @@
-// ============================================================================
-// Module: wow_perf_hooks.cpp
-// Description: Installs and manages target intercepts for subsystem `wow_perf_hooks.cpp`.
-// Safety & Threading: Stack layouts and register conventions must match target function definitions exactly.
-// ============================================================================
-
 #include "wow_perf_hooks.h"
 #include "MinHook.h"
 #include "version.h"
+#include "config.h"
 #include <mimalloc.h>
 #include <cstdint>
 #include <cstring>
@@ -482,9 +477,7 @@ typedef void (__cdecl *SoundSysTick_fn)(int);
 static SoundSysTick_fn orig_SoundSysTick = nullptr;
 
 
-// ================================================================
 // Installation / Shutdown / Stats
-// ================================================================
 namespace WowPerfHooks {
     bool InstallAll() {
         int installed = 0;
@@ -520,9 +513,11 @@ namespace WowPerfHooks {
             {(void*)0x0042E3B0, (void*)Hooked_MemStormBlockFree, (void**)&orig_MemStormBlockFree, "P9 memorystorm block free"},
             {(void*)0x004270F0, (void*)Hooked_VirtualDispatch,   (void**)&orig_VirtualDispatch,   "P10 virtual dispatch"},
             {(void*)0x004283D0, (void*)Hooked_DelCSWrapper,      (void**)&orig_DelCSWrapper,      "P11 deleteCS wrapper"},
-            // P12 REMOVED: 0x878760 already hooked by W14 (wow_opt_hooks). P12 uses __cdecl vs W14 __fastcall — wrong CC.
+            // P12 stays out: it declares __cdecl where the client function is
+            // __fastcall, so installing it corrupts the stack.
             // {(void*)0x00878760, (void*)Hooked_SoundVolumeLookup, (void**)&orig_SoundVolumeLookup, "P12 sound volume lookup"},
-            // P13 REMOVED: 0x878610 already hooked by W16 (wow_opt_hooks). Duplicate = MH_ERROR_ALREADY_CREATED.
+            // P13 stays out: nothing has established it is correct. Reinstating
+            // it needs the evidence any new hook needs.
             // {(void*)0x00878610, (void*)Hooked_SoundMixUpdate,    (void**)&orig_SoundMixUpdate,    "P13 sound mix update"},
             {(void*)0x008799E0, (void*)Hooked_SoundChannelAlloc, (void**)&orig_SoundChannelAlloc, "P14 sound channel alloc"},
             // P15 REMOVED: 0x879390 already hooked by W17 (wow_opt_hooks). Duplicate = MH_ERROR_ALREADY_CREATED.
@@ -537,6 +532,13 @@ namespace WowPerfHooks {
         };
 
         for (auto& h : hooks) {
+            // P5 is the Lua Type Fast Path the launcher offers under its own
+            // switch. That switch used to gate hot_patch.cpp, which hooks the
+            // same address and therefore always lost to this entry and logged
+            // "MH_CreateHook FAILED" every session. The feature ran regardless,
+            // off OptWowPerfHooks, so the key controlled nothing it named.
+            if (h.addr == (void*)0x0084DEB0 && !Config::g_settings.OptLuaTypeFast)
+                continue;
             if (WineSafe_CreateHook(h.addr, h.hook, h.orig) == MH_OK) {
                 if (MH_EnableHook(h.addr) == MH_OK) {
                     Log("[WowPerf] %s: ACTIVE @ 0x%08X", h.name, (uintptr_t)h.addr);
@@ -554,21 +556,21 @@ namespace WowPerfHooks {
     }
 
     void DumpStats() {
-        // Several entries below are commented out of the install table above,
-        // so their counters can only ever read 0/0. A zero here means "not
-        // hooked" and not "hooked and idle"; the ACTIVE lines at startup say
-        // which ones were installed.
+        // Seven lines for seven installed hooks.
+        //
+        // This printed nineteen counter pairs, twelve of which belong to
+        // entries commented out of the install table and can only ever read
+        // 0/0. That was harmless while this function ran only from ShutdownAll,
+        // which the DLL never reaches. It now runs from the periodic report, so
+        // twelve permanent zeroes would be repeated every five minutes for the
+        // length of a session. The reasons those twelve are not installed stay
+        // where they are, beside the table.
         Log("[WowPerf] hits/calls below are plain counters on hooked client "
             "functions and are lower bounds.");
-        Log("[WowPerf] PushStr: %d/%d | FreeWrap: %d/%d | MallocWrap: %d/%d | DsLookup: %d/%d",
-            g_p1Hits, g_p1Calls, g_p2Hits, g_p2Calls, g_p3Fast, g_p3Calls, g_p4Cached, g_p4Calls);
-        Log("[WowPerf] LuaType: %d/%d | ObjDestroy: %d/%d | SoundPlay: %d/%d | MemStorm: %d/%d",
-            g_p5Fast, g_p5Calls, g_p6Prefetched, g_p6Calls, g_p7Skipped, g_p7Calls, g_p8Batched, g_p8Calls);
-        Log("[WowPerf] BlockFree: %d/%d | VirtDisp: %d/%d | DelCS: %d/%d | VolLookup: %d/%d",
-            g_p9Inline, g_p9Calls, g_p10Cached, g_p10Calls, g_p11Fast, g_p11Calls, g_p12Coalesced, g_p12Calls);
-        Log("[WowPerf] ChanAlloc: %d/%d | Stop: %d/%d | Ambient: %d/%d",
-            g_p14Cached, g_p14Calls, g_p15Fast, g_p15Calls, g_p16Deduped, g_p16Calls);
-        Log("[WowPerf] MusicSel: %d/%d | SfxPrio: %d/%d | KitLookup: %d/%d",
-            g_p17Prefetched, g_p17Calls, g_p18Inline, g_p18Calls, g_p19Cached, g_p19Calls);
+        Log("[WowPerf] PushStr: %d/%d | LuaType: %d/%d | MemStorm: %d/%d",
+            g_p1Hits, g_p1Calls, g_p5Fast, g_p5Calls, g_p8Batched, g_p8Calls);
+        Log("[WowPerf] BlockFree: %d/%d | VirtDisp: %d/%d | DelCS: %d/%d | ChanAlloc: %d/%d",
+            g_p9Inline, g_p9Calls, g_p10Cached, g_p10Calls,
+            g_p11Fast, g_p11Calls, g_p14Cached, g_p14Calls);
     }
 }

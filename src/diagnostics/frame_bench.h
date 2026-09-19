@@ -1,25 +1,10 @@
 #pragma once
 
-// ============================================================================
-// Module: frame_bench.h
-// Description: Frame-time distribution benchmark - the instrument that lets one
-//              build be compared against another.
-//
-// This project has around fifty optimization toggles and no way to tell whether
-// any of them helps. Every feature has been justified by theory; the README's
-// "Performance Metrics" section contains no numbers. Two of the largest findings
-// this month were cases where our own code made the game slower, and both were
-// found by measurement rather than review.
-//
-// So: record every presented frame, and report the distribution in a form two
-// runs can be diffed on. Percentiles, not an average - an average hides exactly
-// the stutters players complain about. Loading screens are excluded, because a
-// single zone load would dominate the tail and make runs incomparable.
-//
-// The config fingerprint in the report is what makes an A/B honest: it is a hash
-// of the whole settings block, so a log can be checked to have actually run the
-// configuration it claims to.
-// ============================================================================
+// Frame-time distribution, so one build can be compared against another.
+// Percentiles rather than an average, because an average hides the stutters.
+// Loading screens are excluded: one zone load would own the tail. The report
+// carries a hash of the whole settings block, so a log can be checked to have
+// run the configuration it claims.
 
 namespace FrameBench {
 
@@ -41,6 +26,12 @@ void OnPresent(Source src);
 // Writes the distribution to the log. Safe to call repeatedly; each call reports
 // the whole session so far.
 void Report(const char* reason);
+
+// Dumps the flight recorder if the frame just measured was slow enough to mark.
+// Separate from OnPresent because the recorder is fed later in the same frame
+// boundary: marking from inside OnPresent dumps a ring whose newest entry is the
+// frame before the slow one, which is the frame nobody asked about.
+void FlushAutoMark();
 
 // 95th percentile frame time over the last few seconds, or 0 before enough frames
 // have been seen.
@@ -79,5 +70,14 @@ double MedianMs();
 // same median has a long tail. Reading the median alone is what made the profiler
 // call an uncapped session capped.
 double SessionP95Ms();
+
+// A measured stretch inside the session, for a benchmark run. Every frame from
+// BeginWindow to EndWindow is reported as its own distribution under `name`,
+// without touching the session figures or the periodic report's interval. The
+// same exclusions apply: loading screens and gaps are left out and counted.
+void BeginWindow(const char* name);
+// Logs the window and closes it. False when no window was open.
+bool EndWindow();
+bool WindowOpen();
 
 } // namespace FrameBench

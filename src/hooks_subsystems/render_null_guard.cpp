@@ -1,6 +1,4 @@
 // ============================================================================
-// Module: render_null_guard.cpp
-//
 // sub_873060 is called from the M2 draw path (sub_8203B0 and sub_820AE0, plus
 // sub_7A84D0 and sub_873160). It does two things:
 //
@@ -26,11 +24,10 @@
 // attribute, and exactly the kind of report that arrives as "the screen flickers
 // occasionally after changing a graphics setting".
 //
-// So two changes over the previous version. The D43024 test now matches what the
-// original actually dereferences - the original only indexes it when D43020 is
-// set - instead of demanding it unconditionally. And every suppression is
-// counted and attributed, because until now this could fire on every draw call
-// in the game and nothing anywhere would have said so.
+// So the D43024 test matches what the original actually dereferences: it only
+// indexes that when D43020 is set. And every suppression is counted and
+// attributed, because otherwise this can fire on every draw call in the game
+// with nothing anywhere saying so.
 //
 // The IsDeviceReady check is left as it was. sub_873060 never touches the D3D9
 // device pointer itself, so on the face of it that check guards something this
@@ -66,22 +63,53 @@ static bool g_active = false;
 // Suppression accounting. This runs on the render thread only, and these are
 // counters read after the fact, so plain increments are enough - an interlocked
 // pair on a per-draw path would cost more than the call being guarded.
-static volatile long g_calls        = 0;
-static volatile long g_suppressed   = 0;
-static volatile long g_noParamTable = 0;   // D43020 set but D43024 null
-static volatile long g_noGxDevice   = 0;   // C5DF88 null
-static volatile long g_deviceNotReady = 0; // D3D9 device missing or vtable bad
+// Sixty-four bits, and not for tidiness. A field session has g_calls at
+// 1097427112 and these were signed 32-bit, where the wrap is at 2147483648 - so
+// a session about twice as long prints a negative number of draw calls. This
+// project has been there: fifteen signed counters in matrix_copy_sse2 did
+// exactly that, one of them ran out inside the second hour and took the total
+// with it.
+//
+// The width was chosen by measurement rather than by the rule of thumb. On this
+// target a volatile 64-bit increment is 1.03 ns against 1.24 for the
+// plain-32-with-a-wrap-counter pattern, because the 64-bit form is two
+// dependent ALU operations and the other one has a compare and a branch. The
+// rule in CLAUDE.md about never using a plain 64-bit counter is about a value
+// tearing when another thread reads it; these are written and read on the main
+// thread, and the report says the counts are lower bounds.
+static volatile LONG64 g_calls        = 0;
+static volatile LONG64 g_suppressed   = 0;
+static volatile LONG64 g_noParamTable = 0;   // D43020 set but D43024 null
+static volatile LONG64 g_noGxDevice   = 0;   // C5DF88 null
+static volatile LONG64 g_deviceNotReady = 0; // D3D9 device missing or vtable bad
 
-static bool IsDeviceReady() {
-    uintptr_t pGxDevice = *(uintptr_t*)0x00C5DF88;
+// The last D3D9 device whose vtable word was checked and found sane.
+//
+// Not a cache of the answer - a cache of the last step of it. The walk from the
+// global to the vtable is three dependent loads, and this hook takes 1097427112
+// calls in a field session and has suppressed none of them, so all three run a
+// billion times to reach the same conclusion.
+//
+// Keyed on the device pointer itself, so a device that is torn down and replaced
+// is checked again. That is no weaker than checking every time: if the object at
+// that address were freed and the address reused, the unconditional version
+// would read the recycled memory and range-check whatever it found, and pass as
+// well.
+static uintptr_t g_lastGoodDevice = 0;
+
+// Takes the CGxDevice the caller has already loaded rather than reading the
+// global a second time. It was read two lines above the call.
+static bool IsDeviceReady(uintptr_t pGxDevice) {
     if (pGxDevice < 0x10000 || pGxDevice > 0xFFE00000) return false;
 
-    uintptr_t pD3d9Device = *(uintptr_t*)(pGxDevice + 0x397C);
+    const uintptr_t pD3d9Device = *(uintptr_t*)(pGxDevice + 0x397C);
     if (pD3d9Device < 0x10000 || pD3d9Device > 0xFFE00000) return false;
+    if (pD3d9Device == g_lastGoodDevice) return true;
 
-    uintptr_t pVtable = *(uintptr_t*)pD3d9Device;
+    const uintptr_t pVtable = *(uintptr_t*)pD3d9Device;
     if (pVtable < 0x10000 || pVtable > 0xFFE00000) return false;
 
+    g_lastGoodDevice = pD3d9Device;
     return true;
 }
 
@@ -97,11 +125,12 @@ static int __cdecl Hooked_873060(int a1, int a2)
         ++g_noParamTable; ++g_suppressed;
         return 1;
     }
-    if (!*C5DF88) {
+    const uintptr_t gx = *(uintptr_t*)C5DF88;
+    if (!gx) {
         ++g_noGxDevice; ++g_suppressed;
         return 1;
     }
-    if (!IsDeviceReady()) {
+    if (!IsDeviceReady(gx)) {
         ++g_deviceNotReady; ++g_suppressed;
         return 1;
     }
@@ -156,16 +185,18 @@ void RenderNullGuard_LogStats()
     }
 
     if (g_suppressed == 0) {
-        Log("[RenderGuard] %ld draw-path calls, none suppressed", g_calls);
+        Log("[RenderGuard] %lld draw-path calls, none suppressed - the three "
+            "null conditions it exists for did not occur. Counts are lower "
+            "bounds.", (long long)g_calls);
         return;
     }
 
     // Worth saying loudly. Each suppressed call is a model drawn with whatever
     // parameters the previous one left behind.
-    Log("[RenderGuard] %ld of %ld draw-path calls SUPPRESSED (%.3f%%) - each one "
+    Log("[RenderGuard] %lld of %lld draw-path calls SUPPRESSED (%.3f%%) - each one "
         "is a model drawn with the previous model's parameters",
         g_suppressed, g_calls, (double)g_suppressed * 100.0 / (double)g_calls);
-    Log("[RenderGuard]   parameter table null: %ld   CGxDevice null: %ld   "
-        "D3D9 device not ready: %ld",
+    Log("[RenderGuard]   parameter table null: %lld   CGxDevice null: %lld   "
+        "D3D9 device not ready: %lld",
         g_noParamTable, g_noGxDevice, g_deviceNotReady);
 }

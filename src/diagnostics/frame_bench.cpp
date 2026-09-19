@@ -1,5 +1,4 @@
 // ============================================================================
-// Module: frame_bench.cpp
 // Description: Frame-time distribution benchmark.
 // Safety & Threading: Main thread only (called from the present path).
 // ============================================================================
@@ -123,6 +122,14 @@ static double g_p95Ms         = 0.0;   // same walk, so the two are always compa
 static uint64_t g_medianAtFrame = 0;
 static DWORD  g_lastSlowReport = 0;
 static uint64_t g_slowFrames  = 0;
+// The worst frame the quiet period swallowed since the last report, and how many
+// it swallowed. Without these the log names whichever frame happened to fall
+// after the window rather than the one worth looking at.
+static double   g_quietWorstMs   = 0.0;
+static unsigned g_quietSuppressed = 0;
+// Reason for an auto-mark that the frame boundary has not dumped yet. Empty
+// when there is none; see FlushAutoMark.
+static char   g_pendingMark[96] = {0};
 
 double MedianMs() { return g_medianMs; }
 double SessionP95Ms() { return g_p95Ms; }
@@ -188,6 +195,8 @@ void Init() {
     g_medianAtFrame = 0;
     g_lastSlowReport = 0;
     g_slowFrames = 0;
+    g_quietWorstMs = 0.0;
+    g_quietSuppressed = 0;
     g_ready = QueryPerformanceFrequency(&g_freq) && g_freq.QuadPart > 0;
 }
 
@@ -231,6 +240,21 @@ double RecentP95Ms() {
 // Accumulation is kept separate from the clock so the distribution can be
 // exercised on known input: given a synthetic series of frame times, the
 // percentiles it reports are checkable without running the game.
+// A benchmark window: the session counters as they stood when it opened, so the
+// window is a subtraction at the end like the periodic interval, plus its own
+// maximum, which a subtraction cannot recover.
+static uint32_t      g_benchBuckets[BUCKET_COUNT];
+static uint64_t      g_benchFrames  = 0;
+static double        g_benchSumMs   = 0.0;
+static double        g_benchOver33  = 0.0;
+static double        g_benchOver50  = 0.0;
+static double        g_benchOver100 = 0.0;
+static uint64_t      g_benchGaps    = 0;
+static double        g_benchMaxMs   = 0.0;
+static bool          g_benchOpen    = false;
+static char          g_benchName[64];
+static LARGE_INTEGER g_benchStart   = {};
+
 static void Accumulate(double ms) {
     if (ms <= 0.0) return;
 
@@ -242,6 +266,7 @@ static void Accumulate(double ms) {
     g_sumMs += ms;
     if (ms > g_maxMs) g_maxMs = ms;
     if (ms > g_windowMaxMs) g_windowMaxMs = ms;
+    if (g_benchOpen && ms > g_benchMaxMs) g_benchMaxMs = ms;
     if (ms > 33.0)  g_over33  += 1.0;
     if (ms > 50.0)  g_over50  += 1.0;
     if (ms > 100.0) g_over100 += 1.0;
@@ -262,8 +287,19 @@ static void Accumulate(double ms) {
 
     // Report at most one in a while. A burst of hitches shares one cause, and the
     // logging itself must not become part of the problem it is describing.
+    //
+    // The quiet period must not decide WHICH frame gets described. A tester
+    // session reported a 953 ms frame while the same burst held one of 6011 ms
+    // and one of 1802 ms with 7152 file reads in it, because those fell inside
+    // the window and the first frame after it was the one that got written up.
+    // So the worst frame suppressed here is remembered and named beside the one
+    // that is reported.
     DWORD now = GetTickCount();
-    if (g_lastSlowReport != 0 && (now - g_lastSlowReport) < SLOW_FRAME_QUIET_MS) return;
+    if (g_lastSlowReport != 0 && (now - g_lastSlowReport) < SLOW_FRAME_QUIET_MS) {
+        if (ms > g_quietWorstMs) g_quietWorstMs = ms;
+        ++g_quietSuppressed;
+        return;
+    }
     g_lastSlowReport = now;
 
     // Only events from inside the stalled frame can explain it. Anything older is
@@ -272,6 +308,14 @@ static void Accumulate(double ms) {
     DWORD window = (DWORD)(ms + 0.5) + 50;
     Log("[FrameBench] slow frame: %.1f ms (%.1fx the %.2f ms median) - events within it:",
         ms, ms / (g_medianMs > 0.0 ? g_medianMs : 1.0), g_medianMs);
+    if (g_quietSuppressed) {
+        Log("[FrameBench]   %u further slow frame(s) since the last report are not "
+            "written up, and the worst of them ran %.1f ms. Read that figure, not "
+            "the one above, as how bad this burst got.",
+            g_quietSuppressed, g_quietWorstMs);
+        g_quietSuppressed = 0;
+        g_quietWorstMs = 0.0;
+    }
     CrashDumper::DumpTrace(8, window);
 
     // A 43x spike with "(nothing traced in this window)" under it is the shape
@@ -288,13 +332,25 @@ static void Accumulate(double ms) {
     const double autoMarkAt =
         (g_medianMs > 0.0 && g_medianMs * AUTO_MARK_FACTOR > AUTO_MARK_FLOOR_MS)
             ? g_medianMs * AUTO_MARK_FACTOR : AUTO_MARK_FLOOR_MS;
+    //
+    // Held until the frame boundary has fed the recorder. This function runs
+    // first in the boundary, before FlightRecorder::OnFrame writes the frame it
+    // is describing, so marking from here dumped a ring ending one frame before
+    // the spike.
     if (ms >= autoMarkAt && FlightRecorder::IsRecording()) {
-        char why[96];
-        _snprintf(why, sizeof(why) - 1, "frame of %.0f ms, %.0fx the median",
+        _snprintf(g_pendingMark, sizeof(g_pendingMark) - 1,
+                  "frame of %.0f ms, %.0fx the median",
                   ms, ms / (g_medianMs > 0.0 ? g_medianMs : 1.0));
-        why[sizeof(why) - 1] = 0;
-        FlightRecorder::Mark(why);
+        g_pendingMark[sizeof(g_pendingMark) - 1] = 0;
     }
+}
+
+void FlushAutoMark() {
+    if (!g_pendingMark[0]) return;
+    char why[96];
+    memcpy(why, g_pendingMark, sizeof(why));
+    g_pendingMark[0] = 0;
+    FlightRecorder::Mark(why);
 }
 
 void OnPresent(Source src) {
@@ -445,6 +501,84 @@ void Report(const char* reason) {
             "\"slow frame\" lines above for what each was doing",
             (unsigned long long)g_slowFrames, SLOW_FRAME_FACTOR);
     }
+}
+
+bool WindowOpen() { return g_benchOpen; }
+
+void BeginWindow(const char* name) {
+    if (!g_ready) {
+        Log("[FrameBench] benchmark window \"%s\" not opened: no timer",
+            name ? name : "unnamed");
+        return;
+    }
+    if (g_benchOpen) EndWindow();
+    memcpy(g_benchBuckets, g_buckets, sizeof(g_buckets));
+    g_benchFrames  = g_frames;
+    g_benchSumMs   = g_sumMs;
+    g_benchOver33  = g_over33;
+    g_benchOver50  = g_over50;
+    g_benchOver100 = g_over100;
+    g_benchGaps    = g_gaps;
+    g_benchMaxMs   = 0.0;
+    lstrcpynA(g_benchName, name ? name : "unnamed", sizeof(g_benchName));
+    QueryPerformanceCounter(&g_benchStart);
+    g_benchOpen = true;
+    Log("[FrameBench] benchmark window \"%s\" opened", g_benchName);
+}
+
+bool EndWindow() {
+    if (!g_benchOpen) return false;
+    g_benchOpen = false;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const double wallS = (double)(now.QuadPart - g_benchStart.QuadPart) /
+                         (double)g_freq.QuadPart;
+    const uint64_t frames = g_frames - g_benchFrames;
+    const uint64_t gaps   = g_gaps - g_benchGaps;
+
+    Log("[FrameBench] === BENCHMARK WINDOW \"%s\" ===", g_benchName);
+    if (frames == 0) {
+        Log("[FrameBench]   not measured: no frame was counted in %.1f s of wall "
+            "clock. Loading screens are left out, and %llu gap(s) over %.0f s were.",
+            wallS, (unsigned long long)gaps, GAP_MS / 1000.0);
+        return true;
+    }
+
+    uint32_t window[BUCKET_COUNT];
+    for (int i = 0; i < BUCKET_COUNT; i++) window[i] = g_buckets[i] - g_benchBuckets[i];
+    static const double wanted[] = { 0.50, 0.95, 0.99, 0.999 };
+    double pct[4] = {};
+    ComputePercentiles(window, frames, g_benchMaxMs, wanted, pct, 4);
+
+    const double sumMs = g_sumMs - g_benchSumMs;
+    const double avg   = sumMs / (double)frames;
+    const double w33   = g_over33  - g_benchOver33;
+    const double w50   = g_over50  - g_benchOver50;
+    const double w100  = g_over100 - g_benchOver100;
+
+    Log("[FrameBench]   %llu frames, %.1f s of frame time in %.1f s of wall clock, "
+        "source %s, config %08X, build %s",
+        (unsigned long long)frames, sumMs / 1000.0, wallS, SourceName(g_source),
+        ConfigFingerprint(), WOW_OPTIMIZE_VERSION_STR);
+    Log("[FrameBench]   avg %.2f ms (%.1f fps)   p50 %.2f   p95 %.2f   p99 %.2f   "
+        "p99.9 %.2f   max %.2f",
+        avg, avg > 0.0 ? 1000.0 / avg : 0.0, pct[0], pct[1], pct[2], pct[3],
+        g_benchMaxMs);
+    Log("[FrameBench]   >33ms %.0f (%.2f%%)  >50ms %.0f (%.2f%%)  >100ms %.0f (%.2f%%)",
+        w33,  100.0 * w33  / (double)frames,
+        w50,  100.0 * w50  / (double)frames,
+        w100, 100.0 * w100 / (double)frames);
+    if (gaps > 0 || wallS - sumMs / 1000.0 > 1.0) {
+        Log("[FrameBench]   %.1f s of the wall clock is not in the frames above: "
+            "%llu gap(s) over %.0f s and any loading screen are left out. A window "
+            "with a gap in it is not comparable with one without.",
+            wallS - sumMs / 1000.0, (unsigned long long)gaps, GAP_MS / 1000.0);
+    }
+    Log("[FrameBench]   compare this with the same window from another build or "
+        "setting, from the same spot, with vsync off; a capped session measures "
+        "the cap.");
+    return true;
 }
 
 } // namespace FrameBench

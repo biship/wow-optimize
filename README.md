@@ -24,7 +24,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
-* [What's New in v3.19.2](#whats-new-in-v3192)
+* [What's New in v3.19.3](#whats-new-in-v3193)
 * [Send me your log](#send-me-your-log)
   * [Measuring rather than reporting](#if-you-want-to-measure-something-rather-than-report-a-bug)
 * [Reviews & Acknowledgments](#reviews)
@@ -39,137 +39,52 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
-## What's New in v3.19.2
-
-### New
-
-* **The launcher is two presets and a switch for bug reports.** MAX PERFORMANCE,
-  DEFAULT and EVERYTHING OFF set every switch at once. Save, load and copy-for-
-  the-dev move a whole configuration between machines. LOGGING: NORMAL / FULL
-  turns on the recorders when something is wrong and off again when it is not.
-
-  Every switch carries a mark and sits under a heading that says what the run
-  below it is for: makes it faster, not proven yet, stability and fixes, logging,
-  diagnostics that cost frames, changes how it looks or sounds, tried and didn't
-  help. Hover any of them to read what was measured.
-
-  MAX PERFORMANCE turns on everything that makes the game faster and leaves off
-  everything that only measures it, buys frames by changing how the game looks,
-  or was measured against the client and lost. Those are still yours to tick.
-* **A bug report is legible from its first screen.** Every report opens with
-  `[Wrong]`: the modules that were asked to run and did not, each with the line
-  it printed. A switch you left off is not counted there.
-* **Loading screens say where they went.** A load report ends with the addresses
-  the main thread was actually in during that load, so the time that is neither
-  reading, writing nor compiling has a name on it. Needs LOGGING: FULL.
-* **Reuse Compiled Scripts Between Sessions.** A measured loading screen spends
-  2128 ms inside the game's Lua compiler. Only 260 ms of that is text the session
-  had already compiled, which is what Reuse Compiled Scripts removes. The rest is
-  text this session had never seen - and saw the last time the game ran. This
-  writes the compiled form to `Cache\wow_optimize_bytecode.bin` and reads it back
-  on the next launch. Off by default.
-
-  The game can write that form and has no code to read it back, so the reading is
-  ours. Every script rebuilt from the file is compared against a real compile of
-  the same text, field by field, into every nested function, each constant by
-  type, value and addon ownership. That runs for the first 2000 of them and one
-  in every 256 after, and the whole store switches off for good the first time
-  two of them differ. The file is discarded whenever Wow.exe changes.
-* **Model Animation Stride** holds a distant model's skeleton for a frame instead
-  of re-solving every bone. Its materials, particles and attached items keep
-  animating, and nothing within 45 yards is ever held. The animation family is
-  about a fifth of the frame. Off by default.
-* **M2 Matrix Slot Copy (SSE2)** replaces three blocks in the model animation
-  update that move matrices one float at a time. No arithmetic, so the bytes
-  written are the bytes read. Off by default.
-* **Draw Call Merging** was built, measured and removed. 2.4% of 293 million draw
-  calls could be merged, merging exactly those worked, and the frame rate fell.
-  The census keeps its switch.
-
-### Faster
-
-* **Fourteen of the twenty Direct3D hooks stay out of the vtable.** Two of them
-  skip redundant work and are kept, along with the four the shadow fix and the
-  device lifecycle need. The rest could only count, and what they counted has
-  been answered on two clients: 430 million render states, 601 million sampler
-  states and 1.2 billion texture binds, none of them redundant. That is about
-  five thousand fewer detours a frame. Draw Call Census puts them all back when
-  you want the numbers.
-* **string.match decides on the pattern before it reads the string.** A pattern
-  none of the fast paths handles goes straight to the game, so the subject is no
-  longer walked byte by byte, up to four kilobytes of it, to reach a comparison
-  that was never going to match.
-* **Batch the Game's File Writes** and **Reuse Compiled Scripts** are on by
-  default. One measured loading screen ran 1576 ms with 49 ms of it reading
-  files; another spent 2470 ms inside 593,557 nine-byte writes, and 2128 ms
-  inside the Lua compiler.
-* Loading screens report how much of themselves went into compiling Lua, split
-  into source seen for the first time and source compiled again.
+## What's New in v3.19.3
 
 ### Fixed
 
-* **Three megabytes of address space came back.** The log ring reserved four
-  megabytes for lines that are measured at about a hundred and fifty characters.
-  It is sized to what is actually written now. That space sits in the low 2GB,
-  which is where the game allocates from, and where running out is what garbles
-  SavedVariables names.
-* **The matrix hook counter printed a negative number.** Fifteen counters were
-  signed 32-bit and the matrix multiply takes about four thousand calls a frame,
-  so one of them ran out inside the second hour and took the total with it. The
-  count that overflows carries a wrap counter now and the total is summed
-  without one.
-* **The fault list at the top of each report counted its own output** and called
-  two deliberate decisions failures. It also reported an unresolved draw entry
-  point on machines where Draw Call Census was simply switched off.
-* **The periodic report says which part of it is slow.** It pauses the main
-  thread for a tenth of a second on some machines, and could only report that
-  the cost was itself. Each of its seventy-odd sections is timed and the slowest
-  are named.
-* **GetItemInfo caching says why a miss missed** - an empty slot, a different
-  item in the slot, or the game returning nothing because the item is not in its
-  own cache yet. Only the middle one is a cache that is too small.
-* **Shadows that did not refresh and flickered**, reported by prince [SANC] and
-  Sicsoo. Setting a render target resets the viewport, and the render state cache
-  skipped the `SetViewport` that put it back, so the shadow pass drew into the
-  wrong rectangle. On by default, so this was everyone.
-* **Wrong vertex layout after a vertex declaration.** Setting a declaration clears
-  the FVF; the FVF cache kept skipping the call that put it back.
-* **The quality governor pulled your view distance down when you zoned.** It
-  read the end of a loading screen as slow gameplay, halved particle density and
-  cut farclip, then put both back a minute later. It ignores loading screens now
-  and waits for real frames before deciding anything. Off by default.
-* **The quality governor reports every interval**, with the values it is holding
-  against your own.
-* **Two threads could write into one log buffer.** A line would stop mid-message
-  with another thread's whole line inside it. A ring slot is claimed before it is
-  written now, and lines dropped to a full ring are counted in the report.
-* **Two worker threads started every session for a queue nothing writes to.**
-  Async Worker Pool checks whether an offload path is actually built in before
-  starting them. Each thread reserved a megabyte of stack in the low 2GB, which
-  is the half this client allocates from.
-* **The largest scripts reach the disk store.** The megabyte cap on the in-memory
-  copy of the source sat above the disk lookup, so GlobalStrings.lua, ChatFrame
-  and the rest were captured and could never be read back - and those are where
-  skipping a compile is worth ten milliseconds rather than twenty microseconds.
-* **Reuse Compiled Scripts Between Sessions understands addon ownership.** A
-  constant's ownership belongs to the compile that first created it and the
-  game's own dump format does not record it, so only scripts with no ownership on
-  any constant are kept, and they are served only into a context that has none.
-  The report counts what that leaves behind.
-* **The draw call census had never installed.** Its hooks came from a module
-  compiled out months ago, so ticking that box measured nothing.
-* **The animation census stood down whenever Animation LOD was on**, so neither of
-  the two numbers ever arrived. It counts from inside the other one now.
-* **Thirteen modules counted on hot paths and could not print the number**, seven
-  of them counting crashes they had averted.
-* **Five launcher options turned on features this build does not contain**, and two
-  more gated an install that always fails. All gone.
-* **Four of the six render state filters skipped nothing at all** over 206
-  million measured calls. They only count now.
-* **A locked 64-bit instruction on every Lua allocation the game makes.**
-* **The primitive count in the log went down between reports** and ended at 0.8 per
-  draw call, which cannot happen. It was a 32-bit counter holding a five billion
-  total.
+* **Entering the world with ReShade loaded.** The hook on
+  `InitializeCriticalSection` has its own switch, Critical Section Hook (All
+  Modules), and it is off. Reported by Hoshi [HSR].
+* **Hooks on Windows and CRT exports answer the game only.** ReShade, DXVK,
+  overlays and drivers get the real function. The switch is System Hooks: Game
+  Only.
+* **MAX PERFORMANCE leaves an unproven switch at its own default.** Anything
+  marked `[+]` or `[!]` is yours to tick.
+* **Quitting the game writes no access violation to the log.**
+* **Two clients started from one game folder** each get their own log file and
+  their own compiled-script store.
+* **Manual Lua collection survives a UI reload,** and with it the emergency
+  collection that starts at 300 MB of Lua memory.
+* **An intercepted Lua error keeps its traceback.**
+
+### Faster
+
+* **The game's string hash runs on an SSE2 replacement.** The game hashes
+  strings about twenty-seven million times an hour. The replacement is checked
+  against the game's own routine for its first 4096 calls and on one call in a
+  thousand after that; a single disagreement hands every later call back.
+* **Eight of the hottest replacements run without an exception frame** once a
+  million calls have gone by with nothing for the guard to catch.
+* **New SSE2 replacements,** each off by default and each checking itself
+  against the game's own routine before it is used: particle vertex fill, UI
+  batch fill, ray against triangle (1.89x), collision ray outcode (16.43x),
+  quaternion unpack (7.33x).
+
+### Reports
+
+* **A marked frame is in the dump it triggered.** The flight recorder keeps the
+  frames nearest the mark.
+* **A slow frame says what ran inside it:** a Lua compile over 20 ms, a change
+  in address-space pressure, a loading boundary, a lua_State swap. When several
+  slow frames share one report, the worst of them is named beside the one
+  written up.
+* **The packet-field fast path and the string-hash replacement report their
+  counters** in the periodic report, and say which of installed, idle and
+  switched off they are.
+* **A crash dump identifies the build it came from** without a log beside it.
+* **The periodic report times every part of itself** and prints what it cost.
+
 ---
 
 ## Send me your log
@@ -425,20 +340,18 @@ Every measured item in these notes came out of a log somebody sent in.
 
 ### Async loading and prefetching
 
-Features that use worker threads and lock-free queues. Status reflects the current public-safe configuration; individual toggles live in `src/version.h`.
+Features that use worker threads and lock-free queues. Every one of them is off unless its switch is ticked in the launcher; the key is named at the end of each line.
 
 - **Async spell data prefetching** - predictive spell data loading before cast completes, reduces spell cast lag, worker thread with lock-free queue (4096 entries) and cache (4096 entries) *(disabled — placeholder worker with no producers)*
 - **Multithreaded addon dispatcher** - parallelizes addon OnUpdate callbacks across worker thread pool (4 threads), reduces main thread CPU in addon-heavy setups, batch processing with lock-free queue (8192 entries) *(disabled - unsynchronized writes to WoW game state)*
-- **Predictive MPQ prefetching** - tracks zone transitions and predicts next zone, prefetches textures/models/WMOs into OS cache before teleport, reduces zone loading stutters, worker thread pool (2 threads) with lock-free queue (2048 entries) *(enabled)*
+- **Predictive MPQ prefetching** - tracks zone transitions and predicts the next zone, prefetching textures, models and WMOs into the OS cache before a teleport. Worker thread pool with a lock-free queue. `General/TerrainPrefetch`, off by default
 - **Multithreaded combat log parser** - offloads combat log parsing to worker thread, reduces main thread CPU in raids, lock-free queue with async processing *(disabled — placeholder worker with no producers)*
 - **Sound prefetching** - predicts and prefetches sound files based on spell casts, zone transitions, combat state, worker thread pool (2 threads) with lock-free queue (1024 entries) *(disabled — placeholder worker with no producers)*
 - **Async quest/achievement loading** - async quest log and achievement data loading, worker thread with lock-free queue (512 entries) *(disabled — placeholder worker with no producers)*
 - **Multithreaded nameplate renderer** - offloads nameplate rendering to worker threads, reduces main thread CPU in 25-man raids, priority system (Target > Focus > Nearby > Distant) *(disabled - unsynchronized writes to WoW game state)*
-- **Model/M2 caching** - synchronous LRU cache (1024 entries) for loaded models, eliminates redundant model loading *(enabled)*
-- **Asynchronous Texture Hot-Swapping & Storm VFS** *(enabled)* — detours TexCreateBLP to immediately return a placeholder white texture, background loads the real BLP data, and hot-swaps the underlying Direct3D 9 texture pointer and properties during frame boundaries (OnFrame) without visual stutters.
-- **Asynchronous Terrain Mesh Loader & Collision Decoupler** *(enabled)* — offloads ADT terrain file loading and geometry compiling to background threads, decoupling collision checks via player Z height fallback, and detouring CMapGrid::Update to prevent character-select crashes.
-- **RCU Client Object Manager Traverser** *(enabled)* — replaces linear linked-list entity traversals with lock-free atomic pointer flat mirror arrays updated on link/unlink events.
-- **Addon dispatcher** - lightweight event-driven addon update dispatch *(enabled)*
+- **Asynchronous Texture Hot-Swapping** — returns a placeholder texture from TexCreateBLP, loads the real BLP on a background thread, and swaps the Direct3D 9 texture pointer at a frame boundary. `Graphics_Sound/AsyncTexLoader`, off by default
+- **RCU Client Object Manager Traverser** — replaces the linear linked-list entity walk with a flat mirror array rebuilt on link and unlink. `UI_Lua/RcuObjMgr`, off by default
+- **Addon dispatcher** - event-driven addon update dispatch. `UI_Lua/AddonDispatcher`, off by default
 
 ### Other runtime optimizations
 - **Spread Model Animation** *(off by default, experimental)* — posing model skeletons measured at 3.68 ms of a 24.5 ms frame in raid content. Below 96 models on screen nothing changes; above it each model's pose refreshes every 2nd to 4th frame, never slower than a quarter of the frame rate, and never before its first pose. Cannot make animations run slow: the client derives animation time from a clock rather than by counting frames. `Graphics_Sound/AnimLod`
@@ -764,7 +677,7 @@ Recent events:
     -110351ms  TID=900   D3D9 device Reset (dev=0x0EB1AA90)
 ```
 
-The startup banner reports the exact build the log came from (`v3.19.1 (build abc1234)`), so please don't trim the first lines.
+The startup banner reports the exact build the log came from (`v3.19.3 (build abc1234)`), so please don't trim the first lines.
 
 If the complaint is stuttering rather than a crash, look for `slow frame` lines — each one names how far past your session's own median that frame ran, and what was happening during it:
 

@@ -1,9 +1,6 @@
 // ============================================================================
-// Module: lua_proto_cache.cpp
 // Description: Skips luaY_parser for source the client has already compiled.
-// Safety & Threading: Main thread only, alongside the Lua state.
 // ============================================================================
-//
 // The compile census answered this one with a number. Over txtsd's sessions:
 //
 //     43129 chunks compiled (447262 KB) - 38037 of them (88%) were source
@@ -15,7 +12,6 @@
 // the sampling profiler puts the Lua code generator (sub_862390, the ten
 // instructions that write an emitted opcode into fs->f->code) at 4.94% of
 // executing main-thread time.
-//
 // ---------------------------------------------------------------------------
 // Why the obvious route does not work here
 //
@@ -25,7 +21,6 @@
 // WoW's f_parser (0x00856190) has no lookahead and no undump call at all - it
 // goes straight to luaY_parser. Bytecode loading is gone from the client, so a
 // dumped chunk has nothing to load it.
-//
 // ---------------------------------------------------------------------------
 // What this does instead: keep the Proto, let the client build the closure
 //
@@ -53,7 +48,6 @@
 // Two closures over one Proto is what the client itself produces whenever the
 // same function is created twice at runtime. Sharing the compiled code shares
 // no ownership, no environment and no taint.
-//
 // ---------------------------------------------------------------------------
 // What the parser does besides parse, since skipping a call has gone wrong here
 // before
@@ -67,7 +61,6 @@
 //   - It can raise a syntax error. A hit is source that compiled cleanly once,
 //     so there is no error to raise.
 //   - It allocates, which is the point of not running it.
-//
 // ---------------------------------------------------------------------------
 // Keeping the Proto alive
 //
@@ -80,7 +73,6 @@
 // The anchoring happens in a second hook on luaL_loadbuffer, one level out,
 // where the closure is on the stack and we are at an API boundary rather than
 // halfway through a parse.
-//
 // ---------------------------------------------------------------------------
 // Identity
 //
@@ -200,6 +192,10 @@ inline void*    RDP (const void* p, unsigned off) { return *(void* const*)   ((c
 // while the whole session compiled 40 MB. Fourteen of those forty megabytes
 // were refused at the door, in thirty-six offers, before a key was even
 // recorded for them - so the repeat detection below never saw them either.
+// Raising the cap fixed the number and not that: the door still returned before
+// recording anything, and a later session at 1 MB turned away 27508 KB it
+// likewise could not describe. The door now records a key and a length before
+// it returns, so the report can say whether those offers repeat.
 //
 // What they are is not a mystery: the census in the same log names them.
 // GlobalStrings.lua, 985 KB over two compiles. ChatFrame.lua, 266 over two.
@@ -322,6 +318,9 @@ unsigned long g_tooBig = 0, g_notBuffer = 0, g_capped = 0, g_anchorFailed = 0;
 // Of the capped ones, those already known to repeat. See the capped branch.
 unsigned long      g_cappedRepeats     = 0;
 unsigned long long g_cappedRepeatBytes = 0;
+// The same two figures for the other door. See the size cap below.
+unsigned long      g_tooBigRepeats     = 0;
+unsigned long long g_tooBigRepeatBytes = 0;
 unsigned long g_verified = 0, g_firstSighting = 0, g_flushes = 0, g_onSight = 0;
 // Chunks large enough to be worth keeping the moment they are first seen. The
 // number that says whether raising the cap was the right call.
@@ -591,6 +590,29 @@ void* Classify(void* L, void* z, void* buff, const char* name, bool* checked) {
     if (srcLen > kMaxChunkBytes) {
         g_tooBig++;
         g_bytesTooBig += srcLen;
+
+        // Record the key anyway. Without it this early return is blind: a
+        // session that turns away 5 offers totalling 27508 KB cannot say whether
+        // they are five different files or one file compiled five times, and
+        // those are opposite answers about whether the cap costs anything.
+        //
+        // A key and a length are twelve bytes whatever the source weighs, no
+        // source is kept and nothing is cached. If the cap is raised later, a
+        // chunk already known to repeat is kept the first time it appears rather
+        // than the second.
+        std::unordered_map<uint64_t, uint32_t>::iterator bseen = g_seenOnce.find(key);
+        const bool bsecond = (bseen != g_seenOnce.end() &&
+                              bseen->second == (uint32_t)srcLen);
+        const bool bknown  = (g_knownRepeaters.find(key) != g_knownRepeaters.end());
+        if (bsecond || bknown) {
+            g_tooBigRepeats++;
+            g_tooBigRepeatBytes += srcLen;
+            if (bsecond) g_seenOnce.erase(bseen);
+            if (!bknown && g_knownRepeaters.size() < kMaxSeenKeys)
+                g_knownRepeaters.insert(key);
+        } else if (g_seenOnce.size() < kMaxSeenKeys) {
+            g_seenOnce[key] = (uint32_t)srcLen;
+        }
         return nullptr;
     }
 
@@ -918,6 +940,24 @@ void LogStats() {
         Log("[ProtoCache]   measured and zero: of the %lu chunk(s) the budget "
             "turned away, not one had repeated before. Raising it would have "
             "bought nothing this session.", g_capped);
+    }
+
+    // The size cap, asked the same question. Until now it could only say how
+    // many offers it refused and how many bytes, never whether any of them was
+    // the same file arriving twice - which is the only thing that decides
+    // whether the cap costs anything.
+    if (g_tooBig) {
+        if (g_tooBigRepeats) {
+            Log("[ProtoCache]   of those, %lu chunk(s) over the size cap had "
+                "been compiled before, %llu KB of source. Those are the largest "
+                "parses in the session and the cap is the only thing keeping "
+                "them out; it is the case for raising it.",
+                g_tooBigRepeats, g_tooBigRepeatBytes / 1024);
+        } else {
+            Log("[ProtoCache]   measured and zero: of the %lu chunk(s) over the "
+                "size cap, not one arrived twice. The cap cost nothing this "
+                "session.", g_tooBig);
+        }
     }
 
     if (Config::g_settings.OptLuaBytecodeStore) {

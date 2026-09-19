@@ -1,9 +1,7 @@
 // ============================================================================
-// Module: segment_aabb_sse2.cpp
 // Description: Replaces the segment/box test's x87 status-word round-trips.
 // Safety & Threading: Main thread; the function is pure.
 // ============================================================================
-//
 // sub_7F9480 tests a line segment against an axis-aligned box. It is 0.88% of
 // executing time in a tester's uncapped session, and the profile's weight sits
 // at 0x7F94FD - which is not arithmetic:
@@ -20,7 +18,6 @@
 // function. SSE2 has no status word in the path at all - comiss puts the answer
 // straight into EFLAGS - so what is being removed here is a mechanism, not a
 // calculation. The same shape of finding as the Lua pool's chunk walk.
-//
 // ---------------------------------------------------------------------------
 // Two tests decide by bits, and ten decide about NaN
 //
@@ -47,7 +44,6 @@
 // is not reproduced and the comparison is. This is the third time in this
 // project that an x87 value has been used at full width after being stored
 // narrower, and it is the detail that makes a naive rewrite wrong.
-//
 // ---------------------------------------------------------------------------
 // Why double, and why that is enough
 //
@@ -56,7 +52,6 @@
 // written in double - provided the roundings to float happen where the client
 // puts them, which is on the delta array and on the parameter array, and
 // nowhere else.
-//
 // ---------------------------------------------------------------------------
 // Verification
 //
@@ -78,6 +73,7 @@
 #include "config.h"
 #include "sampling_profiler.h"
 #include "ab_test.h"
+#include "self_bench.h"
 #include "session_verdict.h"
 
 extern "C" void Log(const char* fmt, ...);
@@ -102,10 +98,35 @@ bool g_armed     = false;
 // tests a plain bool instead of calling out on every invocation.
 bool g_abSubject = false;
 bool g_dead      = false;
+int  g_benchSlot = -1;
 
-unsigned long g_calls    = 0;
-unsigned long g_verified = 0;
-unsigned long g_hits     = 0;
+// Plain 32-bit, because a locked increment on a path this hot has eaten whole
+// optimisations in this project before. But 32 bits is not enough to divide by:
+// a field session has this counter at 1703651856 and climbing, against a wrap at 4294967296, and
+// the call counter always wraps before the hit counter because every call
+// increments it while only a hit increments the other. Past the wrap the report
+// divides a real count by a wrapped one.
+//
+// That is not hypothetical here. The sibling module frustum_aabb printed
+// "1496607690 visibility tests, 1691870587 came back visible (113.0%)" and once
+// 73322.0%, which is more things visible than tests run. Same shape, same fix:
+// each counter keeps its wraps and the report recombines them as a double.
+unsigned long g_calls     = 0;
+unsigned long g_callWraps = 0;
+unsigned long g_verified  = 0;
+unsigned long g_hits      = 0;
+unsigned long g_hitWraps  = 0;
+
+inline void Bump(unsigned long& low, unsigned long& wraps) {
+    const unsigned long before = low;
+    low = before + 1;
+    if (low < before) ++wraps;
+}
+
+inline double Total(unsigned long low, unsigned long wraps) {
+    return (double)low + (double)wraps * 4294967296.0;
+}
+
 
 constexpr unsigned long kVerifyFirst  = 20000;
 constexpr unsigned long kResampleMask = 4095;
@@ -119,6 +140,26 @@ inline uint32_t Bits(float f) {
     return b;
 }
 
+// The plane-coherency hint that frustum_aabb_sse2 uses was measured here too
+// and is deliberately not applied. Written down so it is not re-derived.
+//
+// The axis loop below qualifies for it. Each iteration touches only its own
+// index, `inside` is an AND across them, and an early return is an existential,
+// so any axis order gives the same answer - checked over 200000 cases against
+// all six permutations, with NaN, both infinities and both zeroes among the
+// generated components, zero disagreements.
+//
+// It is not worth doing. On a segment walked against boxes in grid order the
+// axes evaluated per call go from 1.336 to 1.004, and shuffled from 1.336 to
+// 1.040. The saving is a third of one axis test - two float comparisons - while
+// the cost is a global load on entry and a global store on every cull, on a path
+// that culls 91.8% of 1225134361 calls a session. The fixed order already stops
+// on the first axis most of the time, which is the whole reason the hint has
+// nothing left to win.
+//
+// The frustum test is the opposite case and that is why it got the hint: six
+// planes rather than three, the culling plane sits deeper in the fixed order,
+// and the measured drop there is 3.486 to 1.854.
 int Evaluate(const float* box, const float* start, const float* end) {
     const float* mn = box;
     const float* mx = box + 3;
@@ -175,19 +216,42 @@ int Evaluate(const float* box, const float* start, const float* end) {
 
 }  // namespace
 
-int __cdecl Hooked_TestBody(const float* box, const float* start, const float* end) {
-    g_calls++;
-    if (g_dead || !box || !start || !end) return orig_Test(box, start, end);
+// Faults the guard caught, while verifying or after. The fallback is the
+// client's own test, which reads the same box and segment, so a fault here is
+// one the fallback would take too; the armed path runs without an exception
+// frame once kVerifyFirst tests have run guarded and this is still zero. If it
+// ever is not, every test stays guarded.
+static unsigned long g_caught = 0;
 
+static __declspec(noinline) int TestGuarded(const float* box, const float* start,
+                                            const float* end) {
+    __try {
+        int r = Evaluate(box, start, end);
+        if (r) Bump(g_hits, g_hitWraps);
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++g_caught;
+        return orig_Test(box, start, end);
+    }
+}
 
-    if (!g_armed || (g_calls & kResampleMask) == 0) {
+static __declspec(noinline) int TestVerify(const float* box, const float* start,
+                                           const float* end) {
+    {
+        // The verification already runs both halves on the same input. Timing
+        // it is the only paired comparison this project gets without asking a
+        // tester to configure anything.
         int mine;
+        const uint64_t tA = SelfBench::Now();
         __try {
             mine = Evaluate(box, start, end);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ++g_caught;
             return orig_Test(box, start, end);
         }
+        const uint64_t tB = SelfBench::Now();
         int theirs = orig_Test(box, start, end);
+        SelfBench::Pair(g_benchSlot, tB - tA, SelfBench::Now() - tB);
         g_verified++;
 
         if (mine != theirs) {
@@ -206,17 +270,19 @@ int __cdecl Hooked_TestBody(const float* box, const float* start, const float* e
                 "answering directly and rechecking one in %lu.",
                 g_verified, kResampleMask + 1);
         }
-        if (theirs) g_hits++;
+        if (theirs) Bump(g_hits, g_hitWraps);
         return theirs;
     }
+}
 
-    __try {
-        int r = Evaluate(box, start, end);
-        if (r) g_hits++;
-        return r;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return orig_Test(box, start, end);
-    }
+int __cdecl Hooked_TestBody(const float* box, const float* start, const float* end) {
+    Bump(g_calls, g_callWraps);
+    if (g_dead || !box || !start || !end) return orig_Test(box, start, end);
+    if (!g_armed || (g_calls & kResampleMask) == 0) return TestVerify(box, start, end);
+    if (g_caught) return TestGuarded(box, start, end);
+    int r = Evaluate(box, start, end);
+    if (r) Bump(g_hits, g_hitWraps);
+    return r;
 }
 
 // The detour proper, kept apart from the body above for one reason: the
@@ -268,6 +334,7 @@ bool Init() {
     }
 
     g_abSubject = AbTest::IsSubject("SegmentAabb", &g_abSubject);
+    g_benchSlot = SelfBench::Register("SegmentAabb");
     if (g_abSubject) {
         Log("[SegmentAabb] under A/B test: it alternates on and off in stints "
             "and AbTest reports the frame times either way. The correctness "
@@ -296,13 +363,20 @@ void LogStats() {
     if (!Config::g_settings.OptSegmentAabb) return;
     if (!g_installed) { Log("[SegmentAabb] not installed - nothing measured"); return; }
     if (g_calls == 0) { Log("[SegmentAabb] installed but never called"); return; }
+    Log("[SegmentAabb]   exception guard: %lu fault(s) caught; the armed path runs %s.",
+        g_caught, !g_armed ? "guarded, still verifying"
+                  : (g_caught ? "guarded, because the guard has caught something"
+                              : "without an exception frame"));
 
-    Log("[SegmentAabb] %lu segment tests%s, %lu intersected (%.1f%%), %lu verified "
+    const double callsTotal = Total(g_calls, g_callWraps);
+    const double hitsTotal  = Total(g_hits, g_hitWraps);
+    Log("[SegmentAabb] %.0f segment tests%s, %.0f intersected (%.1f%%), %lu verified "
         "against the client. Counts are lower bounds.",
-        g_calls,
+        callsTotal,
         g_dead ? " - RETIRED on a disagreement"
                : (g_armed ? "" : " - still verifying, the client still answers every one"),
-        g_hits, 100.0 * (double)g_hits / (double)g_calls, g_verified);
+        hitsTotal, callsTotal > 0.0 ? 100.0 * hitsTotal / callsTotal : 0.0,
+        g_verified);
 }
 
 void Shutdown() {

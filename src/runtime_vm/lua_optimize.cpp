@@ -1,5 +1,4 @@
 // ============================================================================
-// Module: lua_optimize.cpp
 // Description: Lua garbage collection optimizer. Monitors and paces Lua GC cycles within the rendering loop to prevent garbage collection stalls.
 // Safety & Threading: Main render thread only. Disabling pacing will cause heap growth until memory is exhausted.
 // ============================================================================
@@ -42,8 +41,9 @@ extern "C" void ReleaseLoadingArena();
 #include "heap_compactor.h"
 
 extern bool g_isMultiClient;
+extern DWORD g_mainThreadId;
+extern bool g_processExiting;
 extern "C" void Log(const char* fmt, ...);
-extern "C" SIZE_T HeapCompactor_GetCachedLowHalf();
 
 // ================================================================
 // Lua 5.1 types and GC constants.
@@ -193,8 +193,10 @@ static bool CheckAndRestoreLuaInterface(lua_State* L) {
 
 
 // Thread-safe state flags for worker threads (atomic, no lock needed)
-static std::atomic<bool> g_isReloading{false};
-static std::atomic<bool> g_isSwapping{false};
+// Not static any more: lua_optimize.h reads these inline on the hot paths. See
+// the note on GuardActive there.
+std::atomic<bool> g_isReloading{false};
+std::atomic<bool> g_isSwapping{false};
 
 static double g_smoothedGcMs = 0.5;
 static LARGE_INTEGER g_gcPerfFreq = {};
@@ -293,10 +295,8 @@ static lua_State* ReadLuaState() {
     }
 }
 
-// ================================================================
 //  Lua Allocator Replacement - mimalloc for Lua VM
 //
-// ================================================================
 
 typedef void* (__cdecl *lua_Alloc_fn)(void* ud, void* ptr, size_t osize, size_t nsize);
 
@@ -628,7 +628,6 @@ static bool PreSizeStringTable(lua_State* L) {
 
 // ================================================================
 //  GC Optimization - 4-tier adaptive stepping
-//
 // ================================================================
 static bool OptimizeGC(lua_State* L) {
     if (!Api.lua_gc) return false;
@@ -905,27 +904,31 @@ static void StepGC(lua_State* L, double frameMs) {
         DWORD nowTick = GetTickCount();
         double memMB = State.luaMemoryKB / 1024.0;
 
-        // Loading mode: aggressive emergency GC (teleport/zone transition safety).
-        // During loading there is no rendering - we can collect hard without affecting FPS.
-        // This prevents M2 model allocation failures when memory is already high.
-        if (Config.isLoading) {
-            // 64 MB step every 2 seconds during loading - clear memory fast.
-            if (!Config.isLoading && memMB > g_lastEmergencyMem + 5.0 && (nowTick - g_lastEmergencyTick) > 10000) {
-                Api.lua_gc(L, LUA_GCSTEP, 16384);  // 16 MB step
-                State.fullCollects++;
-
-                int kb = Api.lua_gc(L, LUA_GCCOUNT, 0);
-                int b  = Api.lua_gc(L, LUA_GCCOUNTB, 0);
-                double afterMB = (kb + (b / 1024.0)) / 1024.0;
-
-                g_lastEmergencyMem = afterMB;
-                g_lastEmergencyTick = nowTick;
-
-                Log("[LuaOpt] EMERGENCY GC (incremental): %.1f MB -> %.1f MB", memMB, afterMB);
-            }
-        }
+        // There used to be a loading-mode branch here and it never ran, for two
+        // separate reasons, so it is gone rather than left looking like cover.
+        //
+        // Its own condition could not be true: inside `if (Config.isLoading)` it
+        // tested `if (!Config.isLoading && ...)`. And StepGC is not reached at
+        // all when a frame runs past 50 ms, which is every frame of a loading
+        // screen, so the branch was unreachable even with the test corrected.
+        //
+        // Its comment said it prevented M2 model allocation failures when memory
+        // is already high. A user has now hit exactly that - M2Shared.cpp line
+        // 267 refusing 8788240 bytes in Icecrown Citadel with the client
+        // reporting 1124989 KB of Lua memory - so the protection that was
+        // supposed to cover it has never existed.
+        //
+        // It is deliberately not revived. Collecting during a loading screen
+        // contradicts LoadingDefrag, which waits the screen out on the grounds
+        // that the client is allocating throughout it, and a manual GC step is
+        // already on record as the one tester crash with this DLL truly on the
+        // stack: the client's traversetable read through a null. Adding more
+        // stepping to the most allocation-heavy moment in the session is the
+        // wrong direction to take on a guess. What the crash needs is the arena
+        // ceiling, which is a separate and already committed change.
+        //
         // Normal/combat/idle mode: moderate emergency GC.
-        else if (memMB > g_lastEmergencyMem + 5.0 && (nowTick - g_lastEmergencyTick) > 10000) {
+        if (memMB > g_lastEmergencyMem + 5.0 && (nowTick - g_lastEmergencyTick) > 10000) {
             // Incremental step: 16 MB per trigger.
             Api.lua_gc(L, LUA_GCSTEP, 16384);  // 16 MB step
             State.fullCollects++;
@@ -1064,7 +1067,6 @@ static void TryTrimForLoadingScreen(lua_State* L) {
 
 // ================================================================
 //  Addon State Reader - reads globals set by !LuaBoost addon
-//
 // ================================================================
 static void ReadAddonStateFromLua(lua_State* L) {
     if (!Api.lua_getfield || !Api.lua_toboolean || !Api.lua_settop || !Api.lua_gettop) return;
@@ -1506,7 +1508,28 @@ static void ProcessLuaErrors(lua_State* L) {
             size_t len = 0;
             const char* report = Api.lua_tolstring(L, -1, &len);
             if (report && len > 0) {
-                LogEx(LOG_LEVEL_ERROR, "LUA_ERR", "Lua Runtime Error Intercepted:\n%s", report);
+                // One log line per line of the report, not one call carrying all
+                // of it. A ring slot holds about 970 characters after the
+                // timestamp and an addon's traceback runs past that, so the tail
+                // was being cut - and the tail is the traceback. A tester session
+                // counted two truncated lines and named this as the first.
+                LogEx(LOG_LEVEL_ERROR, "LUA_ERR", "Lua Runtime Error Intercepted:");
+                const char* p   = report;
+                const char* end = report + len;
+                int printed = 0;
+                while (p < end && printed < 40) {
+                    const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
+                    size_t n = nl ? (size_t)(nl - p) : (size_t)(end - p);
+                    if (n > 880) n = 880;   // a single line longer than a slot
+                    LogEx(LOG_LEVEL_ERROR, "LUA_ERR", "  %.*s", (int)n, p);
+                    ++printed;
+                    p = nl ? nl + 1 : end;
+                }
+                if (p < end) {
+                    LogEx(LOG_LEVEL_ERROR, "LUA_ERR",
+                          "  ... %u more character(s) of this report, not printed",
+                          (unsigned)(end - p));
+                }
 
                 // Walk C++ stack trace of the calling thread
                 void* stack[32];
@@ -2049,6 +2072,24 @@ void OnMainThreadSleep(DWORD mainThreadId, double frameMs) {
                 Log("[LuaOpt] Subsequent swap: interface verification failed, will retry");
             } else {
                 Log("[LuaOpt] Subsequent swap - caches cleared, interface re-setup");
+                // The new state gets the GC set up again, which it did not between
+                // fef87027 and now. gcOptimized is cleared above, StepGC returns on
+                // it, and nothing here ever set it back, so one /reload ended manual
+                // stepping for the rest of the session - and with it the 300 MB
+                // emergency collector, which lives inside StepGC behind the same
+                // test. A tester session sat at 257.5 MB of Lua memory with 6 MB as
+                // the largest free block below 2GB and that collector switched off
+                // by a UI reload it had no way to know about.
+                //
+                // If this fails the state is exactly what it was before: gcOptimized
+                // stays false and only the client's own collector runs.
+                if (OptimizeGC(Api.L)) {
+                    Log("[LuaOpt] GC set up again on the new state - stepping and the "
+                        "emergency collector are back for this session");
+                } else {
+                    Log("[LuaOpt] GC could not be set up on the new state; the client's "
+                        "own collector is what runs from here");
+                }
             }
         }
         g_addonReadCounter = 0;
@@ -2161,6 +2202,83 @@ void Shutdown() {
 
 void SetCombatMode(bool inCombat) {
     Config.inCombat = inCombat;
+}
+
+// Lua memory, from the periodic report.
+//
+// The only place this figure has ever been printed is once at install, as
+// "lua_gc verified OK: Lua memory = %d KB", on a state that has just been
+// created. It reads like a current measurement and is not one: a session that
+// climbs from that to a gigabyte says nothing at any point, and a reader
+// comparing the startup line against a crash dump concludes the two instruments
+// disagree by three orders of magnitude when they are simply hours apart.
+//
+// A user has now been dropped out of Icecrown Citadel by an allocation failure
+// with 1124989 KB of Lua memory in the client's own crash report, and nothing in
+// our log from that session mentions Lua memory at all after the first second.
+//
+// The figure it went on to print was not live either. State.luaMemoryKB is
+// refreshed inside StepGC, below the gcOptimized test at its top, and only
+// OptimizeGC sets gcOptimized. The install and the first swap call it; every
+// later swap clears it and does not, and entering the world from the login
+// screen is a later swap. A tester's two clients both logged "Subsequent swap"
+// at world entry and then "Lua memory 1.6 MB" with ElvUI and Cell loaded at
+// every report until they closed, beside a collection count that had stopped
+// at world entry and was described as runs of the emergency collector. That
+// count is fullCollects: completed incremental cycles, plus emergency and
+// loading-screen steps.
+//
+// So the count is read here, on the main thread the periodic report runs on,
+// and the line says whether it is fresh and whether this module is stepping the
+// collector at all.
+void LogStats() {
+    if (!State.initialized) {
+        Log("[LuaOpt] not measured: the Lua optimiser is not initialised.");
+        return;
+    }
+
+    bool fresh = false;
+    if (Api.L && Api.lua_gc && g_mainThreadId != 0 && !g_processExiting &&
+        GetCurrentThreadId() == g_mainThreadId &&
+        !g_isSwapping.load(std::memory_order_acquire) &&
+        !g_isReloading.load(std::memory_order_acquire)) {
+        __try {
+            RefreshLuaMemoryKB(Api.L);
+            fresh = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            fresh = false;
+        }
+    }
+
+    if (State.luaMemoryKB <= 0.0) {
+        Log("[LuaOpt] Lua memory not measured: no sample exists and this report "
+            "could not take one.");
+        return;
+    }
+    const double mb = State.luaMemoryKB / 1024.0;
+    Log("[LuaOpt] Lua memory %.1f MB (%s). Manual GC stepping is %s. Collection "
+        "counter %d (completed incremental cycles plus emergency and "
+        "loading-screen steps); the emergency collector starts at 300 MB and "
+        "runs only while stepping is on.",
+        mb,
+        fresh ? "read by this report"
+              : g_processExiting
+                  ? "last sample - not read at process exit, where the client "
+                    "may already have freed its Lua state"
+                  : "last sample - this report could not read it",
+        State.gcOptimized
+            ? "running"
+            : "OFF: the setup on this lua_State did not take, so only the "
+              "client's own collector runs and the emergency collector below "
+              "cannot fire. A swap re-runs the setup, so this means it failed "
+              "rather than that nobody tried",
+        State.fullCollects);
+    if (mb > 300.0) {
+        Log("[Wrong] [LuaOpt] Lua memory is past the 300 MB mark where the "
+            "client starts failing model allocations. This is addon memory, not "
+            "ours - the figure comes from the client's own lua_gc count - but it "
+            "is what precedes an out-of-memory exit.");
+    }
 }
 
 Stats GetStats() {

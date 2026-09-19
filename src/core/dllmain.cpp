@@ -1,5 +1,4 @@
 // ============================================================================
-// Module: dllmain.cpp
 // Description: Main DLL orchestration and initialization hub. Detours system APIs (GetSystemMetrics, sleep pacing, timeGetTime, and ReadFile) to establish frame pacing, timing, and I/O caching.
 // Safety & Threading: Main thread execution only. Sequence modifications can lead to system loader deadlocks.
 // ============================================================================
@@ -44,10 +43,21 @@
 #include "lua_undump.h"
 #include "anim_lod.h"
 #include "collision_outcode_sse2.h"
+#include "collision_ray_outcode_sse2.h"
+#include "high_tables.h"
+#include "x87_precision_check.h"
+#include "self_bench.h"
+#include "freeze_catcher.h"
+#include "ray_triangle_sse2.h"
 #include "bone_matrix_upload_sse2.h"
+#include "ui_batch_fill_sse2.h"
+#include "particle_fill_sse2.h"
 #include "m2_matrix_slot_sse2.h"
 #include "m2_anim_stride.h"
+#include "m2_anim_reuse.h"
 #include "mimalloc_high_arena.h"
+#include "high_placement.h"
+#include "camera_replay.h"
 #include "client_write_batch.h"
 #include "aabb_overlap_sse2.h"
 #include "anim_quat_unpack_sse2.h"
@@ -116,6 +126,11 @@ static volatile DWORD g_lastMainThreadTick = 0;
 static volatile bool  g_freezeWatchdogActive = false;
 static HANDLE         g_freezeWatchdogThread = NULL;
 DWORD          g_mainThreadId = 0;
+bool           g_processExiting = false;
+// The two images whose calls system hooks still answer; see version.h.
+uintptr_t      g_wowOptClientLo = 0, g_wowOptClientSize = 0;
+uintptr_t      g_wowOptSelfLo = 0, g_wowOptSelfSize = 0;
+bool           g_wowOptSystemHooksClientOnly = true;
 
 // Forward-declared here because the watchdog (below) is defined before
 // lua_optimize.h is included; definitions match that header.
@@ -380,14 +395,26 @@ static void FreezeDumpOtherThreads(DWORD mainTid) {
 // twelve-instruction leaf that cannot hang. The thread was running Lua the
 // whole time.
 //
-// Two hundred samples tell the two apart on their own. All landing in one place
-// means blocked. Spread across a range means spinning, and the spread names the
-// loop. Neither needs a debugger, which is what makes it useful to hand to
-// someone who cannot get symbols for the client.
+// Two hundred samples name where the thread is. Whether it is waiting there or
+// running there is a separate question, and the samples cannot answer it: this
+// used to call two or three distinct addresses "spinning", and a tester's client
+// that sat in its own out-of-memory dialog for thirteen seconds was reported as
+// a busy loop in win32u. A thread inside a modal MessageBoxA wakes for every
+// window message and lands on a handful of addresses while using no CPU at all.
+// So the thread's own CPU time across the window decides, and the address count
+// only describes the spread. Neither needs a debugger, which is what makes it
+// useful to hand to someone who cannot get symbols for the client.
 static void SampleFrozenThread(DWORD mainTid) {
     if (mainTid == 0) return;
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, mainTid);
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                          THREAD_QUERY_LIMITED_INFORMATION, FALSE, mainTid);
     if (!h) return;
+
+    FILETIME createT, exitT, kernel0, user0, kernel1, user1;
+    const bool haveCpu0 = GetThreadTimes(h, &createT, &exitT, &kernel0, &user0) != 0;
+    LARGE_INTEGER qpcFreq, qpc0, qpc1;
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&qpc0);
 
     constexpr int kSamples = 200;
     uintptr_t eips[kSamples];
@@ -399,8 +426,22 @@ static void SampleFrozenThread(DWORD mainTid) {
         ResumeThread(h);
         Sleep(5);                       // one second of wall clock in total
     }
+
+    QueryPerformanceCounter(&qpc1);
+    const bool haveCpu = haveCpu0 &&
+        GetThreadTimes(h, &createT, &exitT, &kernel1, &user1) != 0;
     CloseHandle(h);
     if (got < 8) return;
+
+    auto hundredNs = [](const FILETIME& f) {
+        return ((ULONGLONG)f.dwHighDateTime << 32) | (ULONGLONG)f.dwLowDateTime;
+    };
+    const double wallMs = (double)(qpc1.QuadPart - qpc0.QuadPart) * 1000.0 /
+                          (double)qpcFreq.QuadPart;
+    const double cpuMs = haveCpu
+        ? (double)((hundredNs(kernel1) + hundredNs(user1)) -
+                   (hundredNs(kernel0) + hundredNs(user0))) / 10000.0
+        : 0.0;
 
     // Distinct addresses first: that number alone answers the question.
     uintptr_t uniq[kSamples]; int uniqN = 0, counts[kSamples] = {};
@@ -410,11 +451,19 @@ static void SampleFrozenThread(DWORD mainTid) {
         if (j == uniqN) { uniq[uniqN] = eips[i]; counts[uniqN] = 1; uniqN++; }
     }
 
-    Log("!!! %d samples over one second landed on %d distinct addresses. %s",
-        got, uniqN,
-        uniqN <= 2 ? "That is a blocked thread: it is not executing."
-                   : "That is a running thread: it is spinning, not blocked, and "
-                     "the addresses below are the loop.");
+    if (haveCpu && wallMs > 0.0) {
+        const double pct = 100.0 * cpuMs / wallMs;
+        Log("!!! %d samples over %.0f ms landed on %d distinct addresses, and the "
+            "thread used %.0f ms of CPU in that time (%.0f%% of one core). %s",
+            got, wallMs, uniqN, cpuMs, pct,
+            pct < 10.0  ? "It is waiting, not running: the addresses below are where it waits."
+          : pct >= 50.0 ? "It is running: the addresses below are the loop."
+                        : "It is partly running, so the addresses below mix a loop and a wait.");
+    } else {
+        Log("!!! %d samples landed on %d distinct addresses. The thread's CPU time "
+            "could not be read, so this does not say whether it was waiting or "
+            "running.", got, uniqN);
+    }
 
     // Top five, largest first.
     for (int shown = 0; shown < 5; shown++) {
@@ -522,14 +571,11 @@ static DWORD WINAPI FreezeWatchdogProc(LPVOID) {
         DWORD elapsed = GetTickCount() - lastTick;
         if (elapsed <= 10000) { escalatedThisStall = false; locatedThisStall = false; }
         if (elapsed > 10000) {
-            // Loading screens, UI reloads and lua_State swaps legitimately block
-            // the main thread (cold MPQ asset loads + addon (re)load). That is NOT
-            // a hang the player feels -- it's a progress-bar load -- so don't spam
-            // the log with a full freeze report. Note it on one line and wait it
-            // out. This is the source of the "many FREEZE DETECTED" entries.
-            // Grace period: for 30s after a lua_State swap, treat main-thread silence
-            // as expected. WoW's addon loader runs synchronously after the swap completes
-            // (our IsReloading/IsSwapping flags clear before this begins).
+            // Loading screens, UI reloads and lua_State swaps block the main
+            // thread legitimately, so note them on one line rather than writing a
+            // full freeze report. The grace period runs 30s past a swap: the
+            // client's addon loader runs synchronously after it, by which point
+            // IsReloading and IsSwapping have already cleared.
             DWORD swapTick = LuaOpt::GetLastSwapTick();
             bool inPostSwapGrace = (swapTick != 0 && (GetTickCount() - swapTick) < 30000);
             bool expected = LuaOpt::IsLoadingMode() || LuaOpt::IsReloading() || LuaOpt::IsSwapping() || inPostSwapGrace;
@@ -649,7 +695,6 @@ static void StopFreezeWatchdog() {
 #include "combatlog_optimize.h"
 #include "combatlog_buffer.h"
 #include "addon_dispatcher.h"
-#include "mpq_async_decompress.h"
 #include "obj_vis_cache.h"
 #include "nameplate_batch.h"
 #include "addon_preload.h"
@@ -738,7 +783,6 @@ extern "C" void LuaOpt_GetVaSourceStats(unsigned long* fromMonitor,
 #include "loading_state.h"
 #include "diagnostics/frame_bench.h"
 #include "luaS_newlstr_sse2.h"
-#include "hot_patch.h"
 #include "wow_opt_hooks.h"
 #include "wow_perf_hooks.h"
 #include "wow_extended_hooks.h"
@@ -776,7 +820,8 @@ void ClearCombatLogCache();
 #include "font_glyph_cache.h"
 #include "async_sound_loader.h"
 #include "rcu_obj_mgr.h"
-#include "async_terrain_loader.h"
+#include "objmgr_enum_fast.h"
+#include "mpq_open_census.h"
 
 #include "d3d9_state_manager.h"
 #include "dxvk_bridge.h"
@@ -840,17 +885,12 @@ extern "C" void WowOpt_NoteClientPatchRefused(void) {
 #define CRASH_TEST_DISABLE_MPQ_MMAP        1   // MPQ memory mapping (ALREADY DISABLED - risky)
 #define CRASH_TEST_DISABLE_QPC_CACHE       1   // QPC coalescing cache (DISABLED to fix random stutters under DXVK)
 #define CRASH_TEST_DISABLE_TICK_COUNT      1   // GetTickCount/timeGetTime redirection to QPC (DISABLED to fix random stutters and CPU overhead)
-#define CRASH_TEST_DISABLE_LUA_INTERNALS   0   // Lua VM internals (concat hook)
 #define CRASH_TEST_DISABLE_THREAD_AFFINITY   0   // Thread core pinning (re-enabled - was disabled preemptively)
-#define CRASH_TEST_DISABLE_SHORT_WAIT_SPIN   1   // WaitSpin - tested bad. DEAD FLAG: no #if reads it.
 #ifndef CRASH_TEST_DISABLE_VA_ARENA
 #define CRASH_TEST_DISABLE_VA_ARENA          0   // VA Arena compiled in; activation is runtime opt-in via Config OptVaArena (default off). Set to 1 to hard-remove.
 #endif
 // DEAD FLAGS - no #if anywhere reads these three. The code they name is not in
 // the build; setting them to 0 puts none of it back. Kept for the note.
-#define CRASH_TEST_DISABLE_DISPATCH_POOL     1   // DispatchPool - tested bad
-#define CRASH_TEST_DISABLE_BGPRELOAD_CACHE   1   // bgpreloadsleep cache - 0 hits
-#define CRASH_TEST_DISABLE_SUBTASK_EVENTPOOL 1   // Subtask event pool - 0 hits
 
 // Feature toggles for hooks
 #ifndef CRASH_TEST_DISABLE_GETFILESIZE_CACHE
@@ -947,6 +987,10 @@ static void ShutdownVAArena();
 static void StartPriorityWatchdog();
 static void StopPriorityWatchdog();
 static volatile LONG g_priorityWatchdogRestores = 0;
+
+#if !CRASH_TEST_DISABLE_WOW_STRLEN
+void LogStrlen76GuardState();
+#endif
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -1264,6 +1308,29 @@ static long g_modHits = 0, g_modMisses = 0;
 static long g_lstrcmpHits = 0, g_lstrcmpFallbacks = 0;
 static long g_mbwcFastHits = 0, g_mbwcFallbacks = 0;
 static long g_wcmbFastHits = 0, g_wcmbFallbacks = 0;
+
+// Why a conversion left the fast path, rather than only that it did.
+//
+// The two directions share a codepage test, a flags test and the same shape of
+// length handling, and a field session has them at 83.6% and 0.1%:
+// MultiByteToWideChar 34975 fast against 6854 fallback, WideCharToMultiByte
+// 1309 against 1189883. Whatever rejects the wide-to-narrow direction cannot be
+// the codepage or the flags, because the other direction passes both, and one
+// counter for every exit cannot say which it is. A hook that runs 1.19 million
+// times and takes its fast path on one call in a thousand is either fixable or
+// pure overhead, and these counters decide which.
+struct ConvBail {
+    long flags;      // dwFlags was not 0
+    long codepage;   // not one of the ASCII-compatible pages
+    long nullIn;     // no input pointer
+    long badLen;     // zero or a negative length other than -1
+    long badOutLen;  // negative output size
+    long nonAscii;   // the content itself had a byte or unit above 0x7F
+    long nullOut;    // a non-zero output size with no buffer
+    long faulted;    // the SEH caught a read
+};
+static ConvBail g_mbwcBail = {};
+static ConvBail g_wcmbBail = {};
 static long g_profHits = 0, g_profMisses = 0;
 static long g_gpaHits = 0, g_gpaMisses = 0, g_gpaEvictions = 0, g_gpaBypasses = 0;
 static long g_envHits = 0, g_envMisses = 0;
@@ -1304,9 +1371,7 @@ static fn_ThreadWorker orig_ThreadWorker = nullptr;
 
 // WineSafe_CreateHook is now defined in version.h (shared across all TUs)
 
-// ================================================================
 // Global state
-// ================================================================
 bool   g_isMultiClient = false;         // Set by DetectMultiClient() via named mutex
 static HANDLE g_instanceMutex = NULL;   // "wow_optimize_instance_v2" mutex
 static DWORD  g_nextStatsDumpTick = 0;  // Next periodic stats dump (GetTickCount)
@@ -1314,10 +1379,8 @@ static DWORD  g_nextMiCollectTick = 0;  // Next mimalloc collect (multi-client o
 static void   DumpPeriodicStats(const char* why = "periodic",
                                 bool atProcessExit = false);
 
-// ================================================================
 // Logging - ring buffer + background thread
 //
-// ================================================================
 static FILE* g_log = nullptr;
 static FILE* g_sessionLog = nullptr;
 
@@ -1444,6 +1507,9 @@ static volatile LONG g_logDropped = 0;
 // Lines the formatter had to cut short. Zero on every log measured so far; if it
 // stops being zero, LOG_LINE_MAX is the thing to change.
 static volatile LONG g_logTruncated = 0;
+// The first truncated line's format string, so the report can name the caller
+// instead of printing a count nobody can trace.
+static char g_logTruncatedFirst[96] = {0};
 // For the per-reporter timing in the periodic dump.
 static LARGE_INTEGER g_statsFreq = {};
 static volatile LONG g_logReadPos = 0;
@@ -1555,7 +1621,26 @@ static void LogOpen() {
     CreateDirectoryA("Logs", NULL);
     
     // 1. Standard log (wow_optimize.log) always overwritten to keep latest easy to access
-    g_log = _fsopen("Logs\\wow_optimize.log", "w", _SH_DENYNO);
+    //
+    // Opened deny-write, and when another process already holds it, the next free
+    // numbered name instead. Without the sharing restriction two clients started
+    // from one folder write over each other for the whole session. The numbered
+    // names fall outside what PruneSessionLogs matches and are reused, so they
+    // cannot pile up.
+    char logNote[200] = "";
+    g_log = _fsopen("Logs\\wow_optimize.log", "w", _SH_DENYWR);
+    for (int slot = 2; slot <= 8 && !g_log; slot++) {
+        char alt[64];
+        _snprintf(alt, sizeof(alt), "Logs\\wow_optimize.%d.log", slot);
+        alt[sizeof(alt) - 1] = '\0';
+        g_log = _fsopen(alt, "w", _SH_DENYWR);
+        if (g_log) {
+            _snprintf(logNote, sizeof(logNote),
+                      "[Log] another client from this folder holds wow_optimize.log, "
+                      "so this one (PID %lu) writes %s", GetCurrentProcessId(), alt);
+            logNote[sizeof(logNote) - 1] = '\0';
+        }
+    }
     if (!g_log) {
         g_log = fopen("Logs\\wow_optimize.log", "w");
     }
@@ -1573,9 +1658,17 @@ static void LogOpen() {
         _snprintf(sessionPath, sizeof(sessionPath), "Logs\\wow_optimize_%04d-%02d-%02d_%02d-%02d-%02d.log",
                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         sessionPath[sizeof(sessionPath) - 1] = '\0';
-        g_sessionLog = _fsopen(sessionPath, "w", _SH_DENYNO);
+        g_sessionLog = _fsopen(sessionPath, "w", _SH_DENYWR);
         if (!g_sessionLog) {
-            g_sessionLog = fopen(sessionPath, "w");
+            // Two clients started within the same second. The process id goes
+            // after the time, so the name still starts with the date that
+            // PruneSessionLogs sorts on.
+            _snprintf(sessionPath, sizeof(sessionPath),
+                      "Logs\\wow_optimize_%04d-%02d-%02d_%02d-%02d-%02d_pid%lu.log",
+                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                      GetCurrentProcessId());
+            sessionPath[sizeof(sessionPath) - 1] = '\0';
+            g_sessionLog = _fsopen(sessionPath, "w", _SH_DENYWR);
         }
         PruneSessionLogs(Config::g_settings.SessionLogsToKeep);
     }
@@ -1593,6 +1686,7 @@ static void LogOpen() {
     g_logShutdown = false;
     g_logEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     g_logThread = CreateThread(NULL, 0, LogThreadProc, NULL, 0, NULL);
+    if (logNote[0]) Log("%s", logNote);
 }
 
 static void LogClose() {
@@ -1704,7 +1798,14 @@ void LogFlushImmediate() {
     va_end(args);
     if (msgLen < 0) {
         msgLen = LOG_LINE_MAX - 2 - offset;
-        InterlockedIncrement(&g_logTruncated);
+        // Keep the first one's format string. A count on its own cannot be acted
+        // on: a tester session reported sixteen truncated lines and the longest
+        // line in the file was 597 characters against a budget of about 970, so
+        // nothing in the log said which line had lost its tail.
+        if (InterlockedIncrement(&g_logTruncated) == 1) {
+            lstrcpynA(g_logTruncatedFirst, fmt ? fmt : "(null format)",
+                      (int)sizeof(g_logTruncatedFirst));
+        }
     }
     offset += msgLen;
 
@@ -2105,6 +2206,7 @@ static void MainThreadPump() {
         }
 #endif
         RcuObjMgr::OnFrame();
+        ObjMgrEnumFast::OnFrame();
 #if !TEST_DISABLE_TEXTURE_DECODE_MT
         AsyncTexLoader::OnFrame();
 #endif
@@ -2118,7 +2220,14 @@ static void MainThreadPump() {
 #endif
 
         // Enable D3D9 State Manager frame update
-        M2AnimStride::OnFrame();
+        //
+        // Anything that wants a FRAME does not belong here. This pump is reached
+        // from hooked_Sleep and from the frame limiter, behind an eight
+        // millisecond gate, so on a client running at seven milliseconds a frame
+        // it fires less than once a frame and on one that never sleeps it may
+        // not fire at all. Those callers moved to WowOpt_OnFrameBoundary, which
+        // both present paths reach exactly once. M2SortKey was moved out of here
+        // for the same reason and the note above it says so.
         OnFrameD3D9StateManager(g_mainThreadId);
         OnFrameRenderHooks(g_mainThreadId);
         OnFrameLogicHooks(g_mainThreadId);
@@ -2150,6 +2259,7 @@ extern "C" void WowOpt_MainThreadPump() {
 
 
 static void WINAPI hooked_Sleep(DWORD ms) {
+    if (WOWOPT_FOREIGN_CALLER()) { orig_Sleep(ms); return; }
     if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId) {
         MainThreadPump();
 
@@ -2299,6 +2409,7 @@ static void OptimizeSocket(SOCKET s, const char* trigger) {
 }
 
 static int WINAPI hooked_connect(SOCKET s, const struct sockaddr* name, int namelen) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_connect(s, name, namelen);
     int result = orig_connect(s, name, namelen);
     int savedError = WSAGetLastError();
 
@@ -2314,6 +2425,7 @@ static int WINAPI hooked_connect(SOCKET s, const struct sockaddr* name, int name
 }
 
 static int WINAPI hooked_send(SOCKET s, const char* buf, int len, int flags) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_send(s, buf, len, flags);
     if (RemovePendingSocket(s)) {
         int savedError = WSAGetLastError();
         OptimizeSocket(s, "send");
@@ -2324,7 +2436,6 @@ static int WINAPI hooked_send(SOCKET s, const char* buf, int len, int flags) {
 
 // ================================================================
 // 3b. recv / WSARecv - receive-side socket optimization
-//
 // ================================================================
 
 typedef int (WINAPI* recv_fn)(SOCKET, char*, int, int);
@@ -2345,6 +2456,7 @@ static unsigned long g_WSARecvBytesWraps = 0;
 static long g_WSARecvWouldBlock = 0;
 
 static int WINAPI hooked_recv(SOCKET s, char* buf, int len, int flags) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_recv(s, buf, len, flags);
     int result = orig_recv(s, buf, len, flags);
     if (result > 0) {
         g_recvCalls++;
@@ -2363,6 +2475,7 @@ static int WINAPI hooked_recv(SOCKET s, char* buf, int len, int flags) {
 static int WINAPI hooked_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
                                   LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags,
                                   LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_WSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpOverlapped, lpCompletionRoutine);
     int result = orig_WSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd,
                                lpFlags, lpOverlapped, lpCompletionRoutine);
     if (result == 0 && lpNumberOfBytesRecvd) {
@@ -2389,7 +2502,6 @@ static bool InstallNetworkHooks() {
 
 // ================================================================
 // 4. MPQ Handle Tracking (O(1) hash lookup)
-//
 // ================================================================
 
 static constexpr int MPQ_HASH_SIZE = 512; // power of 2, load factor < 0.5
@@ -2496,7 +2608,6 @@ static void UntrackMpqHandle(HANDLE h) {
 
 // ================================================================
 // 4b. Memory-Mapped MPQ Files
-//
 // ================================================================
 // MPQ map lock - always defined (used by scanner even when mmap disabled)
 static SRWLOCK g_mpqMapLock = SRWLOCK_INIT;
@@ -3076,7 +3187,6 @@ static bool InstallReadFileHook() {
 
 // ================================================================
 // 5b. Async MPQ Prefetch Queue - background overlapped reads
-//
 // ================================================================
 
 struct PrefetchSlot {
@@ -3207,7 +3317,6 @@ static BOOL CheckPrefetch(HANDLE hFile, LARGE_INTEGER offset, LPVOID lpBuffer, D
 
 // ================================================================
 // 6. GetTickCount - QPC Precision
-//
 // ================================================================
 typedef DWORD (WINAPI* GetTickCount_fn)(void);
 static GetTickCount_fn orig_GetTickCount = nullptr;
@@ -3215,6 +3324,7 @@ static LARGE_INTEGER g_qpcFreq, g_qpcStart;
 static DWORD g_tickStart;
 
 static DWORD WINAPI hooked_GetTickCount(void) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetTickCount();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     double elapsed = (double)(now.QuadPart - g_qpcStart.QuadPart) / g_qpcFreq.QuadPart;
@@ -3241,6 +3351,7 @@ typedef DWORD (WINAPI* timeGetTime_fn)(void);
 static timeGetTime_fn orig_timeGetTime = nullptr;
 
 static DWORD WINAPI hooked_timeGetTime(void) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_timeGetTime();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     double elapsed = (double)(now.QuadPart - g_qpcStart.QuadPart) / g_qpcFreq.QuadPart;
@@ -3271,6 +3382,7 @@ static EnterCS_fn orig_EnterCS = nullptr;
 static long g_csSpinHits = 0;
 
 static void WINAPI hooked_InitCS(LPCRITICAL_SECTION lpCS) {
+    if (WOWOPT_FOREIGN_CALLER()) { orig_InitCS(lpCS); return; }
 #if CRASH_TEST_DISABLE_CS_SPIN
     InitializeCriticalSection(lpCS);
 #else
@@ -3280,6 +3392,7 @@ static void WINAPI hooked_InitCS(LPCRITICAL_SECTION lpCS) {
 
 #if !CRASH_TEST_DISABLE_CS_ENTER
 static void WINAPI hooked_EnterCS(LPCRITICAL_SECTION lpCS) {
+    if (WOWOPT_FOREIGN_CALLER()) { orig_EnterCS(lpCS); return; }
     if (TryEnterCriticalSection(lpCS)) {
         InterlockedIncrement(&g_csSpinHits);
         return;
@@ -3327,7 +3440,6 @@ static bool InstallCriticalSectionHook() {
 
 // ================================================================
 // 7b. Heap Optimization - Low Fragmentation Heap
-//
 // ================================================================
 
 typedef HANDLE (WINAPI* HeapCreate_fn)(DWORD, SIZE_T, SIZE_T);
@@ -3342,6 +3454,7 @@ static void EnableLFH(HANDLE hHeap) {
 }
 
 static HANDLE WINAPI hooked_HeapCreate(DWORD flOptions, SIZE_T dwInitialSize, SIZE_T dwMaximumSize) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_HeapCreate(flOptions, dwInitialSize, dwMaximumSize);
     HANDLE h = orig_HeapCreate(flOptions, dwInitialSize, dwMaximumSize);
     if (h && dwMaximumSize == 0) {
         // LFH only works on growable heaps (dwMaximumSize == 0)
@@ -3519,7 +3632,6 @@ static bool InstallHeapRedirectToMimalloc() {
 
 // ================================================================
 // 7c. OutputDebugStringA - No-op when no debugger
-//
 // ================================================================
 
 typedef void (WINAPI* OutputDebugStringA_fn)(LPCSTR);
@@ -3527,6 +3639,7 @@ static OutputDebugStringA_fn orig_OutputDebugStringA = nullptr;
 static long g_debugStringSkipped = 0;
 
 static void WINAPI hooked_OutputDebugStringA(LPCSTR lpOutputString) {
+    if (WOWOPT_FOREIGN_CALLER()) { orig_OutputDebugStringA(lpOutputString); return; }
     if (!IsDebuggerPresent()) {
         InterlockedIncrement(&g_debugStringSkipped);
         return;
@@ -3545,7 +3658,6 @@ static bool InstallOutputDebugStringHook() {
 
 // ================================================================
 // 7d. CompareStringA - Fast ASCII Path
-//
 // ================================================================
 
 static const unsigned char g_asciiToUpper[256] = {
@@ -3581,6 +3693,7 @@ static long g_compareFallbacks = 0;
 static int WINAPI hooked_CompareStringA(LCID Locale, DWORD dwCmpFlags,
     LPCSTR lpString1, int cchCount1, LPCSTR lpString2, int cchCount2)
 {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_CompareStringA(Locale, dwCmpFlags, lpString1, cchCount1, lpString2, cchCount2);
     // Only fast-path for simple flags: none, case-insensitive, or string sort
     if ((dwCmpFlags & ~(NORM_IGNORECASE | SORT_STRINGSORT)) != 0)
         goto cmp_fallback;
@@ -3643,7 +3756,6 @@ static bool InstallCompareStringHook() {
 
 // ================================================================
 // 7e. GetFileAttributesA - Cache for MPQ paths
-//
 // ================================================================
 
 typedef DWORD (WINAPI* GetFileAttributesA_fn)(LPCSTR);
@@ -3676,6 +3788,7 @@ static uint32_t HashPathCI(const char* path) {
 }
 
 static DWORD WINAPI hooked_GetFileAttributesA(LPCSTR lpFileName) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetFileAttributesA(lpFileName);
     if (!lpFileName) return orig_GetFileAttributesA(lpFileName);
 
     // Strictly limit cache to Interface and Data directories (guaranteed static).
@@ -3751,7 +3864,6 @@ static bool InstallGetFileAttributesHook() {
 
 // ================================================================
 // 7g. SetFilePointer → SetFilePointerEx Redirect
-//
 // ================================================================
 
 typedef DWORD (WINAPI* SetFilePointer_fn)(HANDLE, LONG, PLONG, DWORD);
@@ -3801,7 +3913,6 @@ static bool InstallSetFilePointerHook() {
 
 // ================================================================
 // 7h. GlobalAlloc/GlobalFree - mimalloc for GMEM_FIXED
-//
 // ================================================================
 
 typedef HGLOBAL (WINAPI* GlobalAlloc_fn)(UINT, SIZE_T);
@@ -3876,7 +3987,6 @@ static bool InstallGlobalAllocHooks() {
 
 // ================================================================
 // 7f2. IsBadReadPtr / IsBadWritePtr - Fast Path
-//
 // ================================================================
 
 typedef BOOL (WINAPI* IsBadReadPtr_fn)(const void*, UINT_PTR);
@@ -3886,6 +3996,7 @@ static IsBadWritePtr_fn orig_IsBadWritePtr = nullptr;
 static long g_badPtrFastChecks = 0;
 
 static BOOL WINAPI hooked_IsBadReadPtr(const void* lp, UINT_PTR ucb) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_IsBadReadPtr(lp, ucb);
     if (!lp) return TRUE;
     if (ucb == 0) return FALSE;
     if ((uintptr_t)lp < 0x10000) return TRUE;
@@ -3900,6 +4011,7 @@ static BOOL WINAPI hooked_IsBadReadPtr(const void* lp, UINT_PTR ucb) {
 }
 
 static BOOL WINAPI hooked_IsBadWritePtr(void* lp, UINT_PTR ucb) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_IsBadWritePtr(lp, ucb);
     if (!lp) return TRUE;
     if (ucb == 0) return FALSE;
     if ((uintptr_t)lp < 0x10000) return TRUE;
@@ -3941,7 +4053,6 @@ static bool InstallBadPtrHooks() {
 
 // ================================================================
 // 7f. GetCurrentThreadId - TLS Cached
-//
 // ================================================================
 
 typedef DWORD (WINAPI* GetCurrentThreadId_fn)(void);
@@ -3953,6 +4064,7 @@ static __declspec(thread) DWORD t_cachedThreadId = 0;
 static long g_threadIdCacheHits = 0;
 
 static DWORD WINAPI hooked_GetCurrentThreadId(void) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetCurrentThreadId();
     DWORD id = t_cachedThreadId;
     if (id == 0) {
         id = orig_GetCurrentThreadId();
@@ -3962,6 +4074,7 @@ static DWORD WINAPI hooked_GetCurrentThreadId(void) {
 }
 
 static HANDLE WINAPI hooked_GetCurrentThread(void) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetCurrentThread();
     return (HANDLE)(LONG_PTR)-2;  // constant pseudo-handle
 }
 
@@ -3975,7 +4088,6 @@ static bool InstallThreadIdCacheHook() {
 
 // ================================================================
 // 7f3. QueryPerformanceCounter - Coalesced with RDTSC fast path
-//
 // ================================================================
 
 typedef BOOL (WINAPI* QueryPerformanceCounter_fn)(LARGE_INTEGER*);
@@ -3990,6 +4102,7 @@ static long g_qpcCacheMisses = 0;
 static uint64_t g_rdtscThreshold = 0;
 
 static BOOL WINAPI hooked_QPC(LARGE_INTEGER* lpPerformanceCount) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_QPC(lpPerformanceCount);
     if (!lpPerformanceCount)
         return orig_QPC(lpPerformanceCount);
 
@@ -4054,7 +4167,6 @@ static bool InstallQPCHook() {
 
 // ================================================================
 // 8. CreateFile - Sequential Scan + MPQ Tracking
-//
 // ================================================================
 typedef HANDLE (WINAPI* CreateFileA_fn)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 typedef HANDLE (WINAPI* CreateFileW_fn)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
@@ -4234,6 +4346,7 @@ static void NoteSavedVariablesWrite(const char* path) {
 static HANDLE WINAPI hooked_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare,
     LPSECURITY_ATTRIBUTES lpSA, DWORD dwDisposition, DWORD dwFlags, HANDLE hTemplate)
 {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_CreateFileA(lpFileName, dwAccess, dwShare, lpSA, dwDisposition, dwFlags, hTemplate);
     bool isMPQ = false;
     if (lpFileName && (dwAccess & GENERIC_READ)) {
         // Strip trailing backslash (folder paths like patch-Sunlight.MPQ\)
@@ -4298,6 +4411,7 @@ static HANDLE WINAPI hooked_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD
 static HANDLE WINAPI hooked_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwShare,
     LPSECURITY_ATTRIBUTES lpSA, DWORD dwDisposition, DWORD dwFlags, HANDLE hTemplate)
 {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_CreateFileW(lpFileName, dwAccess, dwShare, lpSA, dwDisposition, dwFlags, hTemplate);
     bool isMPQ = false;
     if (lpFileName && (dwAccess & GENERIC_READ)) {
         const wchar_t* ext = wcsrchr(lpFileName, L'.');
@@ -4355,7 +4469,6 @@ static bool InstallFileHooks() {
 
 // ================================================================
 // 9. CloseHandle - Cache Invalidation
-//
 // ================================================================
 typedef BOOL (WINAPI* CloseHandle_fn)(HANDLE);
 static CloseHandle_fn orig_CloseHandle = nullptr;
@@ -4536,7 +4649,6 @@ static void ScanExistingMpqHandles() {
 
 // ================================================================
 // 9b. FlushFileBuffers - Skip for MPQ (read-only)
-//
 // ================================================================
 
 typedef BOOL (WINAPI* FlushFileBuffers_fn)(HANDLE);
@@ -5020,15 +5132,21 @@ static void TryRemoveFPSCap() {
 // the worst few, so the next log says which rather than which half.
 namespace {
 struct StatTimeRec { const char* name; double ms; };
-StatTimeRec g_statTimes[96];
+// Room to spare, and the overflow is counted rather than dropped in silence.
+// The table held 96 while the dump called 93 reporters, so three more timers
+// would have been lost without a word and the total would have read low.
+constexpr int STAT_TIME_MAX = 160;
+StatTimeRec g_statTimes[STAT_TIME_MAX];
 int         g_statTimeCount = 0;
+int         g_statTimeLost  = 0;
 
 struct StatTimer {
     const char*   name;
     LARGE_INTEGER a;
     StatTimer(const char* n) : name(n) { QueryPerformanceCounter(&a); }
     ~StatTimer() {
-        if (g_statTimeCount >= 96 || !g_statsFreq.QuadPart) return;
+        if (g_statTimeCount >= STAT_TIME_MAX) { ++g_statTimeLost; return; }
+        if (!g_statsFreq.QuadPart) return;
         LARGE_INTEGER b;
         QueryPerformanceCounter(&b);
         g_statTimes[g_statTimeCount].name = name;
@@ -5045,6 +5163,15 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
 
     if (!g_statsFreq.QuadPart) QueryPerformanceFrequency(&g_statsFreq);
     g_statTimeCount = 0;
+    g_statTimeLost  = 0;
+
+    // The whole dump, against the sum of the timed reporters inside it. A field
+    // log carried "periodic stats dump took 91.5 ms" from the probe around this
+    // call and "90 reporter(s) took 7.1 ms" from the line at the end, and nothing
+    // said where the other 84 ms went. Two instruments disagreeing is
+    // information, so the difference is now printed rather than left implied.
+    LARGE_INTEGER dumpStart;
+    QueryPerformanceCounter(&dumpStart);
 
     // The first thing in the report, because it is the first thing anyone
     // reading a bug report needs and it used to be scattered over six thousand
@@ -5074,7 +5201,8 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
         LONG cut = g_logTruncated;
         if (cut > 0) {
             Log("[Wrong] %ld log line(s) were longer than a ring slot and lost "
-                "their tail.", (long)cut);
+                "their tail. The first was: %s", (long)cut,
+                g_logTruncatedFirst[0] ? g_logTruncatedFirst : "(not recorded)");
         }
         Log("========================================");
     }
@@ -5099,10 +5227,10 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     // Renderer line here too: DXVK's d3d9.dll can load after the startup probe,
     // so re-report it once detection has reliably latched. Makes any mid-session
     // log slice self-describing (GPU is static; logged once at startup).
-    // Three states. "native Direct3D 9" used to cover both "we looked and it is",
-    // and every way the look itself could fail - d3d9.dll not loaded yet, no
-    // version resource, our own version.dll proxy not forwarding. A tester on
-    // DXVK reading "native Direct3D 9" sends the wrong log to the wrong place.
+    // Three states: it is native, it is DXVK, or the look itself failed -
+    // d3d9.dll not loaded yet, no version resource, our proxy not forwarding.
+    // A tester on DXVK reading "native Direct3D 9" sends the log to the wrong
+    // place.
     {
         DXVKBridge::Stats dx = {};
         DXVKBridge::GetStats(&dx);
@@ -5263,6 +5391,24 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
         Log("[Stats] WideCharToMultiByte: %ld fast, %ld fallback (%.1f%%)",
             g_wcmbFastHits, g_wcmbFallbacks,
            (double)g_wcmbFastHits / (g_wcmbFastHits + g_wcmbFallbacks) * 100.0);
+    // Why each direction left the fast path. One counter for every exit could
+    // not say whether a 0.1% hit rate is a fixable predicate or a hook that
+    // should not be there, and these two lines print whichever reasons fired,
+    // including none.
+    if (g_mbwcFallbacks > 0)
+        Log("[Stats]   MultiByteToWideChar left the fast path: %ld flags, %ld "
+            "codepage, %ld no input, %ld input length, %ld output length, %ld "
+            "non-ASCII content, %ld no output buffer, %ld faulted",
+            g_mbwcBail.flags, g_mbwcBail.codepage, g_mbwcBail.nullIn,
+            g_mbwcBail.badLen, g_mbwcBail.badOutLen, g_mbwcBail.nonAscii,
+            g_mbwcBail.nullOut, g_mbwcBail.faulted);
+    if (g_wcmbFallbacks > 0)
+        Log("[Stats]   WideCharToMultiByte left the fast path: %ld flags, %ld "
+            "codepage, %ld no input, %ld input length, %ld output length, %ld "
+            "non-ASCII content, %ld no output buffer, %ld faulted",
+            g_wcmbBail.flags, g_wcmbBail.codepage, g_wcmbBail.nullIn,
+            g_wcmbBail.badLen, g_wcmbBail.badOutLen, g_wcmbBail.nonAscii,
+            g_wcmbBail.nullOut, g_wcmbBail.faulted);
     if (g_profHits + g_profMisses > 0)
         Log("[Stats] GetPrivateProfile: %ld hits, %ld misses (%.1f%%)",
             g_profHits, g_profMisses,
@@ -5454,6 +5600,11 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     if (g_priorityWatchdogRestores > 0)
         Log("[Stats] Priority watchdog: %ld restorations", (long)g_priorityWatchdogRestores);
 
+    STAT_TIME("LogLockTuningStats", LogLockTuningStats());
+#if !CRASH_TEST_DISABLE_WOW_STRLEN
+    LogStrlen76GuardState();
+#endif
+
     Log("[Stats] ====================================");
 
 #if !TEST_DISABLE_SAMPLING_PROFILER
@@ -5465,13 +5616,13 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     // hang a quitting process. Every other report below is a plain read of a
     // counter the main thread owns.
     if (Config::g_settings.OptSamplingProfiler && !atProcessExit) {
-        SamplingProfiler::DumpNow();
+        STAT_TIME("SamplingProfiler::DumpNow", SamplingProfiler::DumpNow());
     }
 #endif
-    CpuTopology::Report();
-    FrameBench::Report(why);
+    STAT_TIME("CpuTopology::Report", CpuTopology::Report());
+    STAT_TIME("FrameBench::Report", FrameBench::Report(why));
     STAT_TIME("CrashDumper::ReportFeatureActivity", CrashDumper::ReportFeatureActivity());
-    CrashDumper::ReportFirstChanceSummary();
+    STAT_TIME("CrashDumper::FirstChanceSummary", CrashDumper::ReportFirstChanceSummary());
     STAT_TIME("PerfDiagnostics::LogStats", PerfDiagnostics::LogStats());
     STAT_TIME("LuaGCGovernor::LogStats", LuaGCGovernor::LogStats());
     STAT_TIME("LuaMemPoolFast::LogStats", LuaMemPoolFast::LogStats());
@@ -5483,13 +5634,25 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("LuaProtoCache::LogStats", LuaProtoCache::LogStats());
     STAT_TIME("LuaBytecodeStore::LogStats", LuaBytecodeStore::LogStats());
     STAT_TIME("LuaUndump::LogStats", LuaUndump::LogStats());
-    LuaBytecodeStore::SaveIfDirty();
+    STAT_TIME("LuaBytecodeStore::SaveIfDirty", LuaBytecodeStore::SaveIfDirty());
     STAT_TIME("AnimLod::LogStats", AnimLod::LogStats());
     STAT_TIME("CollisionOutcode::LogStats", CollisionOutcode::LogStats());
+    STAT_TIME("CollisionRayOutcode::LogStats", CollisionRayOutcode::LogStats());
+    STAT_TIME("HighTables::LogStats", HighTables::LogStats());
+    STAT_TIME("X87Precision::LogStats", X87Precision::LogStats());
+    STAT_TIME("SelfBench::LogStats", SelfBench::LogStats());
+    STAT_TIME("FreezeCatcher::LogStats", FreezeCatcher::LogStats());
+    STAT_TIME("RayTriangle::LogStats", RayTriangle::LogStats());
+    STAT_TIME("ObjMgrEnumFast::LogStats", ObjMgrEnumFast::LogStats());
+    STAT_TIME("MpqOpenCensus::LogStats", MpqOpenCensus::LogStats());
     STAT_TIME("BoneMatrixUpload::LogStats", BoneMatrixUpload::LogStats());
+    STAT_TIME("UiBatchFill::LogStats", UiBatchFill::LogStats());
+    STAT_TIME("ParticleFill::LogStats", ParticleFill::LogStats());
     STAT_TIME("M2MatrixSlot::LogStats", M2MatrixSlot::LogStats());
     STAT_TIME("M2AnimStride::LogStats", M2AnimStride::LogStats());
+    STAT_TIME("M2AnimReuse::LogStats", M2AnimReuse::LogStats());
     STAT_TIME("MimallocHighArena::LogStats", MimallocHighArena::LogStats());
+    STAT_TIME("HighPlacement::LogStats", HighPlacement::LogStats());
     STAT_TIME("ClientWriteBatch::LogStats", ClientWriteBatch::LogStats());
     STAT_TIME("AabbOverlap::LogStats", AabbOverlap::LogStats());
     STAT_TIME("AnimQuatUnpack::LogStats", AnimQuatUnpack::LogStats());
@@ -5500,6 +5663,18 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("LuaHGetDispatch::LogStats", LuaHGetDispatch::LogStats());
     STAT_TIME("LuaPoolFast::LogStats", LuaPoolFast::LogStats());
     STAT_TIME("CombatLogFilter::LogStats", CombatLogFilter::LogStats());
+    STAT_TIME("EventCoalescer::LogStats", EventCoalescer::LogStats());
+    STAT_TIME("LuaOpt::LogStats", LuaOpt::LogStats());
+    STAT_TIME("StallProbe_LogStats", StallProbe_LogStats());
+    STAT_TIME("RenderStateDedup_LogStats", RenderStateDedup_LogStats());
+    // Three whole subsystems whose counters were dumped only from their own
+    // ShutdownAll, which this DLL never reaches. Between them that is around
+    // twenty installed hooks on client functions - W1 to W16 among them -
+    // that have never shown a single number in a field log. Some of those
+    // hooks do work and some are passthroughs that only count, and without
+    // these lines there is no way to tell which is which.
+    STAT_TIME("WowOptHooks::DumpStats", WowOptHooks::DumpStats());
+    STAT_TIME("WowExtendedHooks::DumpStats", WowExtendedHooks::DumpStats());
     STAT_TIME("LuaThisCache_LogStats", LuaThisCache_LogStats());
     STAT_TIME("LuaAllocCensus::LogStats", LuaAllocCensus::LogStats());
 
@@ -5515,13 +5690,14 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("LuaGetTableSafety_LogStats", LuaGetTableSafety_LogStats());
     STAT_TIME("LuaNewKeySafety_LogStats", LuaNewKeySafety_LogStats());
     STAT_TIME("LuaGetStrInline_LogStats", LuaGetStrInline_LogStats());
+    STAT_TIME("LuaSNewlstr::LogStats", LuaSNewlstr::LogStats());
     STAT_TIME("LuaRawGetInline_LogStats", LuaRawGetInline_LogStats());
     STAT_TIME("LuaRawGetIInline_LogStats", LuaRawGetIInline_LogStats());
     STAT_TIME("LuaTobooleanInline_LogStats", LuaTobooleanInline_LogStats());
     STAT_TIME("StrtodFast_LogStats", StrtodFast_LogStats());
     STAT_TIME("RegexCache_LogStats", RegexCache_LogStats());
     STAT_TIME("MatrixCopySSE2_LogStats", MatrixCopySSE2_LogStats());
-    ReportCrtFreeStats();
+    STAT_TIME("ReportCrtFreeStats", ReportCrtFreeStats());
     if (g_spinTaken > 0 || g_spinSkipped > 0) {
         Log("[SleepPrecision] busy-wait taken %ld, handed back %ld (frames over "
             "%.0f ms give the time to the scheduler instead)",
@@ -5530,8 +5706,13 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("LuaFastPath::LogStats", LuaFastPath::LogStats());
     STAT_TIME("ObjVisCache::LogStats", ObjVisCache::LogStats());
     STAT_TIME("FontGlyphCache::LogStats", FontGlyphCache::LogStats());
-    WowOpt_ReportForeignDetours();
+    STAT_TIME("WowOpt_ReportForeignDetours", WowOpt_ReportForeignDetours());
     STAT_TIME("ApiCache::LogStats", ApiCache::LogStats());
+    // Both of these used to print only from their own Shutdown, which this
+    // process never reaches, so two modules that hook seven client functions
+    // between them had never put a number in any log.
+    STAT_TIME("LogDataStoreStats", LogDataStoreStats());
+    STAT_TIME("DumpStringOpsStats", DumpStringOpsStats());
     STAT_TIME("TextureUnloadDelay::LogStats", TextureUnloadDelay::LogStats());
     STAT_TIME("Verdict::LogStats", Verdict::LogStats());
     STAT_TIME("NetDiag::LogStats", NetDiag::LogStats());
@@ -5548,6 +5729,7 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("DbcLookupCache_LogStats", DbcLookupCache_LogStats());
     STAT_TIME("LuaCompileCensus::LogStats", LuaCompileCensus::LogStats());
     STAT_TIME("FlightRecorder::LogStats", FlightRecorder::LogStats());
+    STAT_TIME("CameraReplay::LogStats", CameraReplay::LogStats());
     STAT_TIME("AbTest::LogStats", AbTest::LogStats());
     STAT_TIME("AnimCensus::LogStats", AnimCensus::LogStats());
     STAT_TIME("PredictivePrefetch::LogStats", PredictivePrefetch::LogStats());
@@ -5564,7 +5746,6 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("VertexBufferPrealloc::LogStats", VertexBufferPrealloc::LogStats());
     STAT_TIME("LuaBytecodeCache::LogStats", LuaBytecodeCache::LogStats());
     STAT_TIME("CombatLogBuffer::LogStats", CombatLogBuffer::LogStats());
-    STAT_TIME("MpqAsyncDecompress::LogStats", MpqAsyncDecompress::LogStats());
 
     // Last, so it covers everything above it. The report is the only thing in
     // this DLL that reliably costs the player a visible pause, and it costs it
@@ -5592,9 +5773,22 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
             worst[at] = i;
         }
 
-        Log("[Report] %d reporter(s) took %.1f ms of main thread between them. "
-            "That is a pause the player sees, so the slowest are named:",
-            g_statTimeCount, sum);
+        LARGE_INTEGER dumpEnd;
+        QueryPerformanceCounter(&dumpEnd);
+        double dumpMs = g_statsFreq.QuadPart
+            ? (double)(dumpEnd.QuadPart - dumpStart.QuadPart) * 1000.0 /
+              (double)g_statsFreq.QuadPart
+            : 0.0;
+
+        Log("[Report] this report has taken %.1f ms of main thread so far, of which "
+            "%d timed reporter(s) account for %.1f ms and %.1f ms is everything "
+            "else in the dump - the log lines it writes directly and the work not "
+            "wrapped in a timer.", dumpMs, g_statTimeCount, sum, dumpMs - sum);
+        if (g_statTimeLost)
+            Log("[Report]   %d more timer(s) had nowhere to be recorded, so the "
+                "figure above is short by their cost.", g_statTimeLost);
+        Log("[Report] That is a pause the player sees, so the slowest reporters are "
+            "named:");
         for (int i = 0; i < found; i++) {
             if (g_statTimes[worst[i]].ms < 0.5) break;
             Log("[Report]   %-38s %6.1f ms", g_statTimes[worst[i]].name,
@@ -5609,7 +5803,6 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
 
 // ================================================================
 // 19. sub_869E00 - Zero-Message Frame Continue (disabled)
-//
 // ================================================================
 
 typedef int (__cdecl* MsgPump_fn)(void*, int*, DWORD*, void*, void*);
@@ -5683,7 +5876,6 @@ static bool InstallMsgPumpHook() {
 
 // ================================================================
 // 20. sub_69E220 - Swap/Present Optimization (Vulkan/D3D9)
-//
 // ================================================================
 
 typedef void (__cdecl* SubFn)();
@@ -5804,12 +5996,10 @@ static bool InstallSwapPresentHook() {
 // Frame-boundary timing detour (used only when the optimizing swap
 // hook above is not installed)
 // ================================================================
-//
 // sub_69E220 is the only true frame boundary available: reached solely through
 // the render vtable, exactly once per presented frame. The optimizing hook above
-// already reports each frame to FrameBench, but it is gated behind OptVulkanDXVK,
-// which is off by default - so without this the benchmark would silently record
-// nothing for most users, which is worse than having no benchmark at all.
+// reports frames too, but it is gated behind OptVulkanDXVK, which is off by
+// default, so without this the benchmark records nothing for most users.
 //
 // Deliberately thin: report the frame, call the original, nothing else. It adds
 // no behaviour of its own, so it cannot influence what it is measuring.
@@ -5851,7 +6041,10 @@ extern "C" void WowOpt_OnFrameBoundary() {
     // The per-frame ring, and the key that dumps it. Both are one presented
     // frame apart by construction, which is the resolution the ring is for.
     FlightRecorder::OnFrame();
+    // After the ring has this frame, so a dump of a slow frame contains it.
+    FrameBench::FlushAutoMark();
     FlightRecorder::PollHotkey();
+    CameraReplay::OnFrame();
     AbTest::OnFrame();
 
     // A presented frame is the honest proof that the main thread is alive.
@@ -5873,15 +6066,19 @@ extern "C" void WowOpt_OnFrameBoundary() {
     CpuTopology::NoteFrame();
 
     // The animation census divides models counted by frames counted, so it has to
-    // close its frame here and nowhere else. It used to close it on the hooked
-    // Sleep tick, which is throttled to a few milliseconds and only runs when the
-    // client sleeps at all - and a CPU-bound client barely does. Everything the
-    // hook counted between two sleeps was then charged to one frame. The reported
-    // rate tracked how CPU-bound the session was rather than how many models were
-    // on screen: one log climbed 860, 906, 1092, 1909 models per frame as the main
-    // thread went 85.9%, 91.3%, 95.5%, 99.0% executing, and ended up claiming
-    // 72 ms of animation inside a 53 ms frame.
+    // close its frame here and nowhere else. Closing it on the hooked Sleep tick
+    // charges everything between two sleeps to one frame, and a CPU-bound client
+    // barely sleeps.
     AnimCensus::OnFrame();
+
+    // These need a real frame too. M2AnimReuse counts a repeat only when the same
+    // model is asked for the same pose in a LATER frame, and the freeze catcher
+    // measures how long the current frame has been running, so a clock that ticks
+    // on Sleep would arm it on frames that never happened.
+    X87Precision::Sample("with frames running");
+    FreezeCatcher::OnFrame();
+    M2AnimStride::OnFrame();
+    M2AnimReuse::OnFrame();
     AnimLod::OnFrame();
 
     FlushFieldUpdates();
@@ -5954,7 +6151,6 @@ static inline uint64_t ComputeCStringHash(const char* s) {
 
 // ================================================================
 // 21f. sub_84E670 - lua_rawgeti Fast Path (integer-key cache)
-//
 // ================================================================
 
 #define RAWGETI_CACHE_SIZE 2048
@@ -6015,7 +6211,6 @@ static bool InstallLuaRawGetICache() {
 
 // ================================================================
 // 21e. sub_84E350 - lua_pushstring Fast Path (TString* intern cache)
-//
 // ================================================================
 
 #define PUSHSTR_CACHE_SIZE 4096
@@ -6174,7 +6369,6 @@ static bool InstallLuaPushStringCache() {
 
 // ================================================================
 // 21c. sub_851C30 - table.concat Fast Path (Direct Array + Inline Nums)
-//
 // ================================================================
 
 #define TABLE_CONCAT_BUF_SIZE 8192
@@ -6319,7 +6513,6 @@ static bool InstallTableConcatFastPath() {
 
 // ================================================================
 // 21b. sub_85C430 - Lua Table String-Key Lookup Fast Path (enabled)
-//
 // ================================================================
 
 typedef void* (__cdecl* luaH_getstr_fn)(int table, int tstring);
@@ -6456,7 +6649,6 @@ static bool InstallLuaHGetStrCache() {
 
 // ================================================================
 // 21c. sub_74E290 - CombatLog Event Full Cache
-//
 // ================================================================
 
 #define COMBATLOG_CACHE_SIZE 256
@@ -6699,7 +6891,6 @@ static bool InstallCombatLogFullCache() {
 
 // ================================================================
 // 21. sub_85C6F0 - Lua Table Rehash Prevention (enabled)
-//
 // ================================================================
 
 static inline int luaTable_nextPow2(int n) {
@@ -6836,6 +7027,7 @@ static Memcpy_fn orig_Memcpy = nullptr;
 long g_tvalueMemcpyHits = 0;
 
 static void* __cdecl hooked_Memcpy_TValue(void* dst, const void* src, size_t n) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_Memcpy(dst, src, n);
     if (n == 16) {
         uint64_t* d = (uint64_t*)dst;
         const uint64_t* s = (const uint64_t*)src;
@@ -6874,6 +7066,7 @@ static bool g_sysInfoCached = false;
 long g_sysInfoHits = 0;
 
 static void WINAPI hooked_GetSystemInfo(LPSYSTEM_INFO lpSI) {
+    if (WOWOPT_FOREIGN_CALLER()) { orig_GetSystemInfo(lpSI); return; }
     if (g_sysInfoCached && lpSI) {
         memcpy(lpSI, &g_cachedSysInfo, sizeof(SYSTEM_INFO));
         InterlockedIncrement(&g_sysInfoHits);
@@ -6914,6 +7107,7 @@ long g_regCacheHits = 0, g_regCacheMisses = 0;
 static LONG WINAPI hooked_RegQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved,
     LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData)
 {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_RegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
     if (!lpValueName || !lpType || !lpcbData) goto fallback;
 
     uint32_t hash = 0x811C9DC5;
@@ -6976,6 +7170,7 @@ static inline bool IsScreenDimMetric(int idx) {
 }
 
 static int WINAPI hooked_GetSystemMetrics(int nIndex) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetSystemMetrics(nIndex);
     if (nIndex >= 0 && nIndex < 128 && !IsScreenDimMetric(nIndex)) {
         if (g_smInited[nIndex]) {
             return g_smCache[nIndex];
@@ -7016,7 +7211,7 @@ static IsDebuggerPresent_fn orig_IsDebuggerPresent = nullptr;
 // fix. It is not a performance hook, it never was, and it is not evidence of one
 // - said plainly so the next reader does not have to guess, and so nobody counts
 // it among the optimizations.
-static BOOL WINAPI hooked_IsDebuggerPresent() { return FALSE; }
+static BOOL WINAPI hooked_IsDebuggerPresent() { if (WOWOPT_FOREIGN_CALLER()) return orig_IsDebuggerPresent(); return FALSE; }
 
 static bool InstallNoDebuggerPresent() {
     void* p = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsDebuggerPresent");
@@ -7035,6 +7230,7 @@ static OSVERSIONINFOA g_cachedVersion = {};
 static bool g_verCached = false;
 
 static BOOL WINAPI hooked_GetVersionExA(LPOSVERSIONINFOA lpVI) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetVersionExA(lpVI);
     if (g_verCached && lpVI) {
         DWORD sz = lpVI->dwOSVersionInfoSize;
         if (sz > sizeof(OSVERSIONINFOA)) sz = sizeof(OSVERSIONINFOA);
@@ -7067,6 +7263,7 @@ static Memcmp_fn orig_Memcmp = nullptr;
 static long g_memcmpFast = 0;
 
 static int __cdecl hooked_Memcmp_Fast(const void* a, const void* b, size_t n) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_Memcmp(a, b, n);
     if (n == 4) {
         uint32_t va = *(const uint32_t*)a, vb = *(const uint32_t*)b;
         InterlockedIncrement(&g_memcmpFast);
@@ -7136,6 +7333,7 @@ static WaitForMultipleObjects_fn orig_WFMO = nullptr;
 static long g_wfmoFast = 0;
 
 static DWORD WINAPI hooked_WFMO(DWORD nCount, const HANDLE* lpHandles, BOOL bWaitAll, DWORD dwMs) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_WFMO(nCount, lpHandles, bWaitAll, dwMs);
     if (nCount == 1 && !bWaitAll) {
         InterlockedIncrement(&g_wfmoFast);
         return WaitForSingleObject(lpHandles[0], dwMs);
@@ -7203,9 +7401,7 @@ extern "C" void ReleaseLoadingArena() {
     TextureUnloadDelay::Flush();
 }
 
-// ================================================================
 // Batch optimizations: kernel caches and fast paths
-// ================================================================
 
 // #1: GetSystemTimeAsFileTime → cached QPC. Timestamps used for profiling.
 typedef void (WINAPI* GSTAFT_fn)(LPFILETIME);
@@ -7215,6 +7411,7 @@ static LARGE_INTEGER g_gstaftBase = {};
 static bool g_gstaftInit = false;
 
 static void WINAPI hooked_GSTAFT(LPFILETIME lpFT) {
+    if (WOWOPT_FOREIGN_CALLER()) { orig_GSTAFT(lpFT); return; }
     // Return cached QPC-based time with 1ms refresh
     if (!g_gstaftInit) {
         QueryPerformanceFrequency(&g_gstaftFreq);
@@ -7240,6 +7437,7 @@ static GetACP_fn orig_GetACP = nullptr;
 static UINT g_cachedACP = 0;
 
 static UINT WINAPI hooked_GetACP() {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetACP();
     if (!g_cachedACP) g_cachedACP = orig_GetACP();
     return g_cachedACP;
 }
@@ -7250,6 +7448,7 @@ static GetUserDefaultLangID_fn orig_GetUDLI = nullptr;
 static LANGID g_cachedLang = 0;
 
 static LANGID WINAPI hooked_GetUDLI() {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetUDLI();
     if (!g_cachedLang) g_cachedLang = orig_GetUDLI();
     return g_cachedLang;
 }
@@ -7260,6 +7459,7 @@ static GetProcessHeap_fn orig_GetProcessHeap = nullptr;
 static HANDLE g_cachedHeap = NULL;
 
 static HANDLE WINAPI hooked_GetProcessHeap() {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetProcessHeap();
     if (!g_cachedHeap) g_cachedHeap = orig_GetProcessHeap();
     return g_cachedHeap;
 }
@@ -7269,6 +7469,7 @@ typedef char* (WINAPI* CharUpperA_fn)(char*);
 static CharUpperA_fn orig_CharUpperA = nullptr;
 
 static char* WINAPI hooked_CharUpperA(char* str) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_CharUpperA(str);
     if (str) {
         for (char* p = str; *p; p++)
             if (*p >= 'a' && *p <= 'z') *p -= 32;
@@ -7281,6 +7482,7 @@ typedef char* (WINAPI* CharLowerA_fn)(char*);
 static CharLowerA_fn orig_CharLowerA = nullptr;
 
 static char* WINAPI hooked_CharLowerA(char* str) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_CharLowerA(str);
     if (str) {
         for (char* p = str; *p; p++)
             if (*p >= 'A' && *p <= 'Z') *p += 32;
@@ -7298,6 +7500,7 @@ static MapVirtualKeyA_fn orig_MapVirtualKeyA = nullptr;
 static UINT g_mvkCache[256][4] = {};  // [code][mapType]
 
 static UINT WINAPI hooked_MapVirtualKeyA(UINT code, UINT mapType) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_MapVirtualKeyA(code, mapType);
     if (code < 256 && mapType < 4) {
         UINT& cached = g_mvkCache[code][mapType];
         if (!cached) cached = orig_MapVirtualKeyA(code, mapType);
@@ -7312,6 +7515,7 @@ static GetThreadPriority_fn orig_GetThreadPriority = nullptr;
 static int g_threadPrio[256] = {};  // simple per-handle cache
 
 static int WINAPI hooked_GetThreadPriority(HANDLE h) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetThreadPriority(h);
     DWORD idx = (DWORD)(uintptr_t)h & 255;
     int& c = g_threadPrio[idx];
     if (c) return c;
@@ -7369,17 +7573,18 @@ static bool InstallBatchOpt10() {
 // #11: GetOEMCP
 typedef UINT (WINAPI* GetOEMCP_fn)();
 static GetOEMCP_fn orig_GetOEMCP = nullptr; static UINT g_oemcp = 0;
-static UINT WINAPI hooked_GetOEMCP() { if (!g_oemcp) g_oemcp = orig_GetOEMCP(); return g_oemcp; }
+static UINT WINAPI hooked_GetOEMCP() { if (WOWOPT_FOREIGN_CALLER()) return orig_GetOEMCP(); if (!g_oemcp) g_oemcp = orig_GetOEMCP(); return g_oemcp; }
 
 // #12: GetDoubleClickTime
 typedef UINT (WINAPI* GetDoubleClickTime_fn)();
 static GetDoubleClickTime_fn orig_GetDoubleClickTime = nullptr; static UINT g_dct = 0;
-static UINT WINAPI hooked_GetDoubleClickTime() { if (!g_dct) g_dct = orig_GetDoubleClickTime(); return g_dct; }
+static UINT WINAPI hooked_GetDoubleClickTime() { if (WOWOPT_FOREIGN_CALLER()) return orig_GetDoubleClickTime(); if (!g_dct) g_dct = orig_GetDoubleClickTime(); return g_dct; }
 
 // #13: GetCursorPos - DISABLED (breaks hardware cursor with RTSSHooks.dll)
 typedef BOOL (WINAPI* GetCursorPos_fn)(LPPOINT);
 static GetCursorPos_fn orig_GetCursorPos = nullptr;
 static BOOL WINAPI hooked_GetCursorPos(LPPOINT lp) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetCursorPos(lp);
     return orig_GetCursorPos(lp);
 }
 
@@ -7387,6 +7592,7 @@ static BOOL WINAPI hooked_GetCursorPos(LPPOINT lp) {
 typedef DWORD (WINAPI* GetSysColor_fn)(int);
 static GetSysColor_fn orig_GetSysColor = nullptr; static DWORD g_sysColors[32] = {};
 static DWORD WINAPI hooked_GetSysColor(int idx) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetSysColor(idx);
     if (idx < 32) { if (!g_sysColors[idx]) g_sysColors[idx] = orig_GetSysColor(idx); return g_sysColors[idx]; }
     return orig_GetSysColor(idx);
 }
@@ -7394,27 +7600,27 @@ static DWORD WINAPI hooked_GetSysColor(int idx) {
 // #15: GetKeyboardLayout
 typedef HKL (WINAPI* GetKeyboardLayout_fn)(DWORD);
 static GetKeyboardLayout_fn orig_GetKeyboardLayout = nullptr; static HKL g_kbl = 0;
-static HKL WINAPI hooked_GetKeyboardLayout(DWORD id) { if (!g_kbl) g_kbl = orig_GetKeyboardLayout(id); return g_kbl; }
+static HKL WINAPI hooked_GetKeyboardLayout(DWORD id) { if (WOWOPT_FOREIGN_CALLER()) return orig_GetKeyboardLayout(id); if (!g_kbl) g_kbl = orig_GetKeyboardLayout(id); return g_kbl; }
 
 // #16: GetKeyboardLayoutNameA
 typedef BOOL (WINAPI* GetKeyboardLayoutNameA_fn)(char*);
 static GetKeyboardLayoutNameA_fn orig_GetKeyboardLayoutNameA = nullptr; static char g_kbln[9] = {};
-static BOOL WINAPI hooked_GetKeyboardLayoutNameA(char* buf) { if (g_kbln[0]) { memcpy(buf, g_kbln, 9); return TRUE; } BOOL r = orig_GetKeyboardLayoutNameA(g_kbln); memcpy(buf, g_kbln, 9); return r; }
+static BOOL WINAPI hooked_GetKeyboardLayoutNameA(char* buf) { if (WOWOPT_FOREIGN_CALLER()) return orig_GetKeyboardLayoutNameA(buf); if (g_kbln[0]) { memcpy(buf, g_kbln, 9); return TRUE; } BOOL r = orig_GetKeyboardLayoutNameA(g_kbln); memcpy(buf, g_kbln, 9); return r; }
 
 // #17: GetCaretBlinkTime
 typedef UINT (WINAPI* GetCaretBlinkTime_fn)();
 static GetCaretBlinkTime_fn orig_GetCaretBlinkTime = nullptr; static UINT g_cbt = 0;
-static UINT WINAPI hooked_GetCaretBlinkTime() { if (!g_cbt) g_cbt = orig_GetCaretBlinkTime(); return g_cbt; }
+static UINT WINAPI hooked_GetCaretBlinkTime() { if (WOWOPT_FOREIGN_CALLER()) return orig_GetCaretBlinkTime(); if (!g_cbt) g_cbt = orig_GetCaretBlinkTime(); return g_cbt; }
 
 // #18: IsWindow
 typedef BOOL (WINAPI* IsWindow_fn)(HWND);
 static IsWindow_fn orig_IsWindow = nullptr; static HWND g_lastIW = NULL; static BOOL g_lastIWRes = TRUE;
-static BOOL WINAPI hooked_IsWindow(HWND h) { if (h == g_lastIW) return g_lastIWRes; g_lastIWRes = orig_IsWindow(h); g_lastIW = h; return g_lastIWRes; }
+static BOOL WINAPI hooked_IsWindow(HWND h) { if (WOWOPT_FOREIGN_CALLER()) return orig_IsWindow(h); if (h == g_lastIW) return g_lastIWRes; g_lastIWRes = orig_IsWindow(h); g_lastIW = h; return g_lastIWRes; }
 
 // #19: GetDesktopWindow
 typedef HWND (WINAPI* GetDesktopWindow_fn)();
 static GetDesktopWindow_fn orig_GetDesktopWindow = nullptr; static HWND g_desktop = NULL;
-static HWND WINAPI hooked_GetDesktopWindow() { if (!g_desktop) g_desktop = orig_GetDesktopWindow(); return g_desktop; }
+static HWND WINAPI hooked_GetDesktopWindow() { if (WOWOPT_FOREIGN_CALLER()) return orig_GetDesktopWindow(); if (!g_desktop) g_desktop = orig_GetDesktopWindow(); return g_desktop; }
 
 // #20: GetFocus - DISABLED (breaks hardware cursor with RTSSHooks.dll)
 typedef HWND (WINAPI* GetFocus_fn)();
@@ -7445,6 +7651,7 @@ static bool InstallBatchOpt20() {
 typedef ULONGLONG (WINAPI* GetTickCount64_fn)();
 static GetTickCount64_fn orig_GetTickCount64 = nullptr;
 static ULONGLONG WINAPI hooked_GetTickCount64() {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetTickCount64();
     LARGE_INTEGER qpc;
     QueryPerformanceCounter(&qpc);
     static LARGE_INTEGER freq;
@@ -7458,6 +7665,7 @@ typedef BOOL (WINAPI* GetClientRect_fn)(HWND, LPRECT);
 static GetClientRect_fn orig_GetClientRect = nullptr;
 static HWND g_crHwnd = NULL; static RECT g_crCache = {};
 static BOOL WINAPI hooked_GetClientRect(HWND h, LPRECT r) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetClientRect(h, r);
     if (h == g_crHwnd) { *r = g_crCache; return TRUE; }
     BOOL res = orig_GetClientRect(h, r);
     if (res) { g_crHwnd = h; g_crCache = *r; }
@@ -7469,6 +7677,7 @@ typedef BOOL (WINAPI* GetWindowRect_fn)(HWND, LPRECT);
 static GetWindowRect_fn orig_GetWindowRect = nullptr;
 static HWND g_wrHwnd = NULL; static RECT g_wrCache = {};
 static BOOL WINAPI hooked_GetWindowRect(HWND h, LPRECT r) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetWindowRect(h, r);
     if (h == g_wrHwnd) { *r = g_wrCache; return TRUE; }
     BOOL res = orig_GetWindowRect(h, r);
     if (res) { g_wrHwnd = h; g_wrCache = *r; }
@@ -7482,6 +7691,7 @@ static BOOL WINAPI hooked_GetWindowRect(HWND h, LPRECT r) {
 typedef int (WINAPI* ShowCursor_fn)(BOOL);
 static ShowCursor_fn orig_ShowCursor = nullptr; static int g_showCount = -1;
 static int WINAPI hooked_ShowCursor(BOOL show) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_ShowCursor(show);
     if (show) { if (g_showCount < 0) g_showCount = orig_ShowCursor(TRUE); g_showCount++; return g_showCount; }
     else { if (g_showCount > 0) g_showCount--; return g_showCount; }
 }
@@ -7513,6 +7723,7 @@ typedef BOOL (WINAPI* GetComputerNameA_fn)(LPSTR, LPDWORD);
 static GetComputerNameA_fn orig_GetComputerNameA = nullptr;
 static char g_computerName[64] = {};
 static BOOL WINAPI hooked_GetComputerNameA(LPSTR buf, LPDWORD nSize) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetComputerNameA(buf, nSize);
     if (g_computerName[0]) { DWORD len = (DWORD)strlen(g_computerName) + 1; if (*nSize >= len) { memcpy(buf, g_computerName, len); return TRUE; } }
     BOOL r = orig_GetComputerNameA(g_computerName, nSize); memcpy(buf, g_computerName, (size_t)*nSize + 1); return r;
 }
@@ -7522,6 +7733,7 @@ typedef BOOL (WINAPI* GetUserNameA_fn)(LPSTR, LPDWORD);
 static GetUserNameA_fn orig_GetUserNameA = nullptr;
 static char g_userName[64] = {};
 static BOOL WINAPI hooked_GetUserNameA(LPSTR buf, LPDWORD nSize) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetUserNameA(buf, nSize);
     if (g_userName[0]) { DWORD len = (DWORD)strlen(g_userName) + 1; if (*nSize >= len) { memcpy(buf, g_userName, len); return TRUE; } }
     BOOL r = orig_GetUserNameA(g_userName, nSize); memcpy(buf, g_userName, (size_t)*nSize + 1); return r;
 }
@@ -7531,6 +7743,7 @@ typedef UINT (WINAPI* GetSystemDirectoryA_fn)(LPSTR, UINT);
 static GetSystemDirectoryA_fn orig_GetSystemDirectoryA = nullptr;
 static char g_sysDir[MAX_PATH] = {};
 static UINT WINAPI hooked_GetSystemDirectoryA(LPSTR buf, UINT nSize) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetSystemDirectoryA(buf, nSize);
     if (g_sysDir[0]) { UINT len = (UINT)strlen(g_sysDir) + 1; if (nSize >= len) { memcpy(buf, g_sysDir, len); return len - 1; } }
     UINT r = orig_GetSystemDirectoryA(g_sysDir, MAX_PATH); if (buf != g_sysDir) memcpy(buf, g_sysDir, (size_t)r + 1); return r;
 }
@@ -7540,6 +7753,7 @@ typedef UINT (WINAPI* GetWindowsDirectoryA_fn)(LPSTR, UINT);
 static GetWindowsDirectoryA_fn orig_GetWindowsDirectoryA = nullptr;
 static char g_winDir[MAX_PATH] = {};
 static UINT WINAPI hooked_GetWindowsDirectoryA(LPSTR buf, UINT nSize) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetWindowsDirectoryA(buf, nSize);
     if (g_winDir[0]) { UINT len = (UINT)strlen(g_winDir) + 1; if (nSize >= len) { memcpy(buf, g_winDir, len); return len - 1; } }
     UINT r = orig_GetWindowsDirectoryA(g_winDir, MAX_PATH); if (buf != g_winDir) memcpy(buf, g_winDir, (size_t)r + 1); return r;
 }
@@ -7549,6 +7763,7 @@ typedef DWORD (WINAPI* GetTempPathA_fn)(DWORD, LPSTR);
 static GetTempPathA_fn orig_GetTempPathA = nullptr;
 static char g_tempPath[MAX_PATH] = {};
 static DWORD WINAPI hooked_GetTempPathA(DWORD nSize, LPSTR buf) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetTempPathA(nSize, buf);
     if (g_tempPath[0]) { DWORD len = (DWORD)strlen(g_tempPath) + 1; if (nSize >= len) { memcpy(buf, g_tempPath, len); return len - 1; } }
     DWORD r = orig_GetTempPathA(MAX_PATH, g_tempPath); if (buf != g_tempPath) memcpy(buf, g_tempPath, (size_t)r + 1); return r;
 }
@@ -7575,6 +7790,7 @@ typedef HANDLE (WINAPI* GetCurrentProcess_fn)();
 static GetCurrentProcess_fn orig_GetCurrentProcess = nullptr;
 static HANDLE g_hProc = NULL;
 static HANDLE WINAPI hooked_GetCurrentProcess() {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetCurrentProcess();
     if (g_hProc) return g_hProc;
     g_hProc = orig_GetCurrentProcess(); return g_hProc;
 }
@@ -7583,6 +7799,7 @@ typedef BOOL (WINAPI* GetCPInfo_fn)(UINT, LPCPINFO);
 static GetCPInfo_fn orig_GetCPInfo = nullptr;
 static CPINFO g_cpInfo[4] = {}; static BOOL g_cpValid[4] = {};
 static BOOL WINAPI hooked_GetCPInfo(UINT cp, LPCPINFO lp) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetCPInfo(cp, lp);
     int idx = (cp == CP_ACP) ? 0 : (cp == CP_OEMCP) ? 1 : (cp == CP_THREAD_ACP) ? 2 : 3;
     if (idx < 3 && g_cpValid[idx]) { *lp = g_cpInfo[idx]; return TRUE; }
     BOOL r = orig_GetCPInfo(cp, &g_cpInfo[idx]); if (r && lp) *lp = g_cpInfo[idx]; g_cpValid[idx] = r; return r;
@@ -7666,6 +7883,14 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     // Load runtime configuration from wow_opt.ini
     Config::Load();
+    // Read before any system hook is installed, which is all further down.
+    g_wowOptSystemHooksClientOnly = Config::g_settings.OptSystemHooksClientOnly;
+    Log("[Hooks] hooks on system functions answer %s",
+        g_wowOptSystemHooksClientOnly
+            ? "only calls from WoW.exe and this DLL; every other module in the "
+              "process gets the real function"
+            : "every module in the process, overlays and drivers included "
+              "(SystemHooksClientOnly=0)");
 
     // --- Early allocator redirect ---
     // Install mimalloc BEFORE the 5s Sleep so it captures EVERY allocation during
@@ -7696,6 +7921,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     if (MH_Initialize() != MH_OK) { Log("FATAL: MinHook initialization failed"); LogClose(); return 1; }
     Log("MinHook initialized");
+
+    // Before the allocator is configured, so its arena reservations and the
+    // pre-warm below are recorded under this tool's name like everyone else's.
+    HighPlacement::Init();
 
     ConfigureMimalloc();
     TryEnableLargePages();
@@ -7913,9 +8142,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #else
     Log("[HeapRedirect] DISABLED via TEST_DISABLE_HEAP_REDIRECT");
 #endif
-    // Retrofits spin counts onto fifteen of the client's critical sections and
-    // hooks InitializeCriticalSection. Took no setting until 3.18.2.
-    if (Config::g_settings.OptLockTuning) InstallLockTuning();   // self-logs
+    // Retrofits spin counts onto fifteen of the client's critical sections and,
+    // on its own switch, hooks InitializeCriticalSection. Took no setting until
+    // 3.18.2.
+    if (Config::g_settings.OptLockTuning || Config::g_settings.OptLockTuningInitHook)
+        InstallLockTuning(Config::g_settings.OptLockTuning,
+                          Config::g_settings.OptLockTuningInitHook);   // self-logs
     Log("--- Texture Cache Budget ---");
     if (Config::g_settings.OptMemoryPressure) {
         InitTexCacheTuning();  // self-logs; single-client only
@@ -8067,7 +8299,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
     // memset hook - 1108 callers
     bool hotFuncOk = Config::g_settings.OptFastMemsetOpt && InstallHotFunctionOptimizations();
 
-    bool memcpyFastOk = false; // Config::g_settings.OptStrStrSse2 && InstallMemcpyFast();
+    // FastMemcpy stays off. Commit 6d71ec19 disabled it "to prevent
+    // uninitialized object corruptions and crashes in combat", and the reason is
+    // now written at the top of crt_memcpy_fast.cpp as well. The gate it used to
+    // hang off was OptStrStrSse2, which names strstr and not memcpy, so restoring
+    // this line as it stood would also restore a switch reading the wrong key.
+    bool memcpyFastOk = false;
 
     // FrameScript hash dispatch - 18 handlers, O(1) vs O(n)
 #if !TEST_DISABLE_FRAME_SCRIPT_DISPATCH
@@ -8200,13 +8437,20 @@ static DWORD WINAPI MainThread(LPVOID param) {
     LuaBytecodeStore::Init();
     AnimLod::Init();
     CollisionOutcode::Init();
+    X87Precision::Sample("at DLL init");
+    CollisionRayOutcode::Init();
+    RayTriangle::Init();
     BoneMatrixUpload::Init();
+    UiBatchFill::Init();
+    ParticleFill::Init();
 
     Log("--- M2 Matrix Slot Copy (SSE2) ---");
     M2MatrixSlot::Install();
 
     Log("--- M2 Animation Stride ---");
     M2AnimStride::Install();
+    M2AnimReuse::Init();
+    CameraReplay::Init();
     AabbOverlap::Init();
     AnimQuatUnpack::Init();
     AnimVec3Track::Init();
@@ -8341,7 +8585,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("--- Render State Deduplication ---");
 #if !TEST_DISABLE_RENDER_STATE_DEDUP
-    bool renderDedupOk = (Config::g_settings.OptVulkanDXVK || Config::g_settings.OptD3d9RenderThread) && InstallRenderStateDedup();
+    bool renderDedupOk = Config::g_settings.OptRenderStateDedup && InstallRenderStateDedup();
 #else
     Log("[RenderDedup] DISABLED via TEST_DISABLE_RENDER_STATE_DEDUP");
     bool renderDedupOk = false;
@@ -8392,7 +8636,12 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool eventDispatchOk = InstallEventDispatchCache();
 #else
     bool eventDispatchOk = false;
-    Log("[EventDispatchCache] DISABLED via TEST_DISABLE_UNIT_API_FASTPATH");
+    // The guard above is a plain #if 0, not a flag. It named
+    // TEST_DISABLE_UNIT_API_FASTPATH, which gates something else entirely, so a
+    // bisection that set that flag either way would have seen no change here and
+    // drawn the wrong conclusion from it.
+    Log("[EventDispatchCache] not installed: the call is compiled out with #if 0 "
+        "and no switch or flag turns it back on.");
 #endif
 
 
@@ -8767,10 +9016,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #endif
 
     Log("");
-    Log("--- Memory-Mapped MPQ VFS & Parallel Decompressor ---");
-    if (Config::g_settings.OptMpqAsyncDecompress) MpqAsyncDecompress::Init();
-
-    Log("");
     Log("--- Object Visibility Cache ---");
 #if TEST_DISABLE_OBJ_VIS_CACHE
     // Compiled out, so the launcher no longer offers a checkbox for it. It had
@@ -9048,7 +9293,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
 #endif
 
     Log("--- Hot Patch ---");
-    if (Config::g_settings.OptLuaTypeFast) HotPatch::InstallAll();
+    // hot_patch.cpp is gone. It hooked lua_type at 0x0084DEB0, which
+    // wow_perf_hooks P5 already owns, so it lost the race every session and
+    // logged MH_CreateHook FAILED while the feature ran anyway under another
+    // switch. OptLuaTypeFast now gates P5 itself, where the work is.
 
     Log("--- WoW.exe Optimization Hooks (20 hooks) ---");
     bool wowOptOk = Config::g_settings.OptWowOptHooks && WowOptHooks::InstallAll();
@@ -9286,20 +9534,14 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- Async Sound FX Loader ---");
     if (Config::g_settings.OptAudioDecodeMt && !RunningUnderTranslation()) AsyncSoundLoader::Init();
 
-    // A "Lua VM Bytecode JIT Compiler" banner used to print here with nothing
-    // under it - no Init, no module, no such feature anywhere in the source. The
-    // README described it in detail, down to a detour of sub_856370 and a
-    // lock-free cache called g_protoCache, neither of which has ever existed.
-    // This client's Lua has no JIT and no bytecode loader at all; that is why the
-    // chunk cache had to keep Proto objects instead. Removed from both.
+    // No JIT here, and no bytecode loader: this client's Lua has neither, which
+    // is why the chunk cache keeps Proto objects instead.
 
     Log("");
     Log("--- RCU Object Manager Traverser ---");
     if (Config::g_settings.OptRcuObjMgr) RcuObjMgr::Init();
-
-    Log("");
-    Log("--- Asynchronous Terrain Mesh Loader ---");
-    if (Config::g_settings.OptAsyncTerrainLoader && !RunningUnderTranslation()) AsyncTerrainLoader::Init();
+    ObjMgrEnumFast::Init();
+    MpqOpenCensus::Init();
 
     Log("");
     Log("--- M2 LOD Bias Control ---");
@@ -9434,6 +9676,19 @@ static DWORD WINAPI MainThread(LPVOID param) {
             if (SamplingProfiler::Init(hMain))
                 CrashDumper::FeatureSetActive("SamplingProfiler", true);
             CloseHandle(hMain);
+        }
+    }
+
+    // The freeze catcher wants the same access and is deliberately separate: it
+    // samples only inside a frame that has already overrun, so it can be on in
+    // a session where the profiler is not.
+    if (Config::g_settings.OptFreezeCatcher) {
+        HANDLE hFreeze = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, g_mainThreadId);
+        if (hFreeze) {
+            FreezeCatcher::Init(hFreeze);
+            CloseHandle(hFreeze);
+        } else {
+            Log("[FreezeCatcher] NOT active: could not open the main thread.");
         }
     }
 #endif
@@ -9662,7 +9917,6 @@ static bool InstallStreamBufferFastPath() {
 
 // ================================================================
 // 17. GetFileSize / GetFileSizeEx - Cache
-//
 // ================================================================
 
 static constexpr int FSIZE_CACHE_SIZE = 256;
@@ -9695,13 +9949,13 @@ static bool InstallGetFileSizeCache() {
 
 // ================================================================
 // 18. WaitForSingleObject - Spin-First for Short Waits
-//
 // ================================================================
 
 typedef DWORD (WINAPI* WaitForSingleObject_fn)(HANDLE, DWORD);
 static WaitForSingleObject_fn orig_WaitForSingleObject = nullptr;
 
 static DWORD WINAPI hooked_WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_WaitForSingleObject(hHandle, dwMilliseconds);
     if (dwMilliseconds <= 1) {
         for (int i = 0; i < 32; i++) {
             DWORD result = WaitForSingleObject(hHandle, 0);
@@ -9734,7 +9988,6 @@ static bool InstallWaitForSingleObjectHook() {
 
 // ================================================================
 // 19. GetModuleHandleA - Cache
-//
 // ================================================================
 
 static constexpr int MOD_CACHE_SIZE = 1024;
@@ -9753,6 +10006,7 @@ typedef HMODULE (WINAPI* GetModuleHandleA_fn)(LPCSTR);
 static GetModuleHandleA_fn orig_GetModuleHandleA = nullptr;
 
 static HMODULE WINAPI hooked_GetModuleHandleA(LPCSTR lpModuleName) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetModuleHandleA(lpModuleName);
     if (!lpModuleName) return orig_GetModuleHandleA(lpModuleName);
 
     uint32_t hash = 0x811C9DC5;
@@ -9804,7 +10058,6 @@ static bool InstallGetModuleHandleCache() {
 
 // ================================================================
 // 20. lstrcmpA / lstrcmpiA - Fast Path
-//
 // ================================================================
 
 typedef int (WINAPI* lstrcmpA_fn)(LPCSTR, LPCSTR);
@@ -9813,6 +10066,7 @@ static lstrcmpA_fn  orig_lstrcmpA  = nullptr;
 static lstrcmpiA_fn orig_lstrcmpiA = nullptr;
 
 static int WINAPI hooked_lstrcmpA(LPCSTR lpString1, LPCSTR lpString2) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_lstrcmpA(lpString1, lpString2);
     if (!lpString1 || !lpString2) return orig_lstrcmpA(lpString1, lpString2);
 
     const unsigned char* s1 = (const unsigned char*)lpString1;
@@ -9841,6 +10095,7 @@ static int WINAPI hooked_lstrcmpA(LPCSTR lpString1, LPCSTR lpString2) {
 }
 
 static int WINAPI hooked_lstrcmpiA(LPCSTR lpString1, LPCSTR lpString2) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_lstrcmpiA(lpString1, lpString2);
     if (!lpString1 || !lpString2) return orig_lstrcmpiA(lpString1, lpString2);
 
     const unsigned char* s1 = (const unsigned char*)lpString1;
@@ -9902,7 +10157,6 @@ static bool InstallLstrcmpHook() {
 
 // ================================================================
 // 21. GetPrivateProfileStringA - Cache
-//
 // ================================================================
 
 static constexpr int PROF_CACHE_SIZE = 128;
@@ -9924,6 +10178,7 @@ static GetPrivateProfileStringA_fn orig_GetPrivateProfileStringA = nullptr;
 static DWORD WINAPI hooked_GetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName,
     LPCSTR lpDefault, LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName)
 {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetPrivateProfileStringA(lpAppName, lpKeyName, lpDefault, lpReturnedString, nSize, lpFileName);
     if (!lpAppName || !lpKeyName || !lpReturnedString || nSize == 0)
         return orig_GetPrivateProfileStringA(lpAppName, lpKeyName, lpDefault, lpReturnedString, nSize, lpFileName);
 
@@ -9989,10 +10244,8 @@ static bool InstallGetPrivateProfileCache() {
 #endif
 }
 
-// ================================================================
 // lstrlenA/W - fast inline string length
 //
-// ================================================================
 
 typedef int (WINAPI* lstrlenA_fn)(LPCSTR);
 typedef int (WINAPI* lstrlenW_fn)(LPCWSTR);
@@ -10005,6 +10258,7 @@ static long g_lstrlenWHits   = 0;
 static long g_lstrlenFallbacks = 0;
 
 static int WINAPI hooked_lstrlenA(LPCSTR lpString) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_lstrlenA(lpString);
     if (!lpString) { g_lstrlenFallbacks++; return 0; }
     __try {
         const char* p = lpString;
@@ -10019,6 +10273,7 @@ static int WINAPI hooked_lstrlenA(LPCSTR lpString) {
 }
 
 static int WINAPI hooked_lstrlenW(LPCWSTR lpString) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_lstrlenW(lpString);
     if (!lpString) { g_lstrlenFallbacks++; return 0; }
     __try {
         const wchar_t* p = lpString;
@@ -10066,48 +10321,97 @@ static bool InstallLStrLenHooks() {
 typedef unsigned int (__stdcall* strlen76_fn)(const char* str);
 static strlen76_fn orig_strlen76 = nullptr;
 
+// Scan must be 16-byte aligned. An unaligned _mm_loadu_si128 can straddle a
+// page boundary; when a valid string terminates within 15 bytes of the end
+// of a committed page and the next page is unmapped/decommitted, the load
+// faults reading bytes past the terminator. That overrun is what crashed at
+// RVA 0xA980 during login/logout/char-swap, when heavy string churn (300+
+// callers) coincides with the heap committing/decommitting pages.
+//
+// Aligning the base down to 16 bytes guarantees every _mm_load_si128 stays
+// inside one 4 KiB page (4096 % 16 == 0), so the scan never reads into a
+// page that the string itself does not occupy — exactly as safe as the
+// byte-by-byte function it replaces. The first chunk's leading bytes (those
+// before str) are masked out so they cannot produce a false terminator.
+static __forceinline unsigned int Strlen76Scan(const char* str) {
+    const __m128i zero = _mm_setzero_si128();
+    uintptr_t   addr = (uintptr_t)str;
+    const char* base = (const char*)(addr & ~(uintptr_t)15);
+    unsigned    off  = (unsigned)(addr & 15);
+
+    int mask = _mm_movemask_epi8(
+        _mm_cmpeq_epi8(_mm_load_si128((const __m128i*)base), zero)) >> off;
+    if (mask) {
+        unsigned long idx;
+        _BitScanForward(&idx, (unsigned long)mask);
+        return (unsigned int)idx;
+    }
+
+    for (const char* p = base + 16; ; p += 16) {
+        mask = _mm_movemask_epi8(
+            _mm_cmpeq_epi8(_mm_load_si128((const __m128i*)p), zero));
+        if (mask) {
+            unsigned long idx;
+            _BitScanForward(&idx, (unsigned long)mask);
+            return (unsigned int)((size_t)(p - str) + idx);
+        }
+    }
+}
+
+// The guard, and why it is only a learning phase now.
+//
+// The scan used to run inside __try on every call, which put an SEH frame and
+// a stack cookie into the prologue of a function with more than three hundred
+// callers. The handler fell back to the client's own strlen, and that reads
+// the same bytes: the aligned scan touches only the pages the string and its
+// terminator occupy, which are the pages the byte loop touches, so any fault
+// here is a fault the fallback would take too. A guard whose fallback reads
+// the same bytes recovers nothing.
+//
+// That is an argument, and this project removes guards on evidence rather
+// than on arguments. So the first kStrlenLearnCalls calls still run guarded
+// and count what the handler caught. If it caught nothing the hot path drops
+// the frame; if it ever caught anything the guard stays for the session and
+// the report says so.
+static constexpr unsigned kStrlenLearnCalls = 1u << 20;
+static unsigned g_strlenGuardedCalls = 0;
+static unsigned g_strlenCaught = 0;
+static bool     g_strlenArmed = false;
+
+static __declspec(noinline) unsigned int Strlen76Guarded(const char* str) {
+    __try {
+        return Strlen76Scan(str);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ++g_strlenCaught;
+        return orig_strlen76(str);
+    }
+}
+
 static unsigned int __stdcall hooked_strlen76(const char* str) {
     if (!str) {
         return orig_strlen76(str); // NULL → error handler (0x57)
     }
+    if (g_strlenArmed) return Strlen76Scan(str);
 
-    __try {
-        // Scan must be 16-byte aligned. An unaligned _mm_loadu_si128 can straddle a
-        // page boundary; when a valid string terminates within 15 bytes of the end
-        // of a committed page and the next page is unmapped/decommitted, the load
-        // faults reading bytes past the terminator. That overrun is what crashed at
-        // RVA 0xA980 during login/logout/char-swap, when heavy string churn (300+
-        // callers) coincides with the heap committing/decommitting pages.
-        //
-        // Aligning the base down to 16 bytes guarantees every _mm_load_si128 stays
-        // inside one 4 KiB page (4096 % 16 == 0), so the scan never reads into a
-        // page that the string itself does not occupy — exactly as safe as the
-        // byte-by-byte function it replaces. The first chunk's leading bytes (those
-        // before str) are masked out so they cannot produce a false terminator.
-        const __m128i zero = _mm_setzero_si128();
-        uintptr_t   addr = (uintptr_t)str;
-        const char* base = (const char*)(addr & ~(uintptr_t)15);
-        unsigned    off  = (unsigned)(addr & 15);
+    if (++g_strlenGuardedCalls >= kStrlenLearnCalls && g_strlenCaught == 0)
+        g_strlenArmed = true;
+    return Strlen76Guarded(str);
+}
 
-        int mask = _mm_movemask_epi8(
-            _mm_cmpeq_epi8(_mm_load_si128((const __m128i*)base), zero)) >> off;
-        if (mask) {
-            unsigned long idx;
-            _BitScanForward(&idx, (unsigned long)mask);
-            return (unsigned int)idx;
-        }
-
-        for (const char* p = base + 16; ; p += 16) {
-            mask = _mm_movemask_epi8(
-                _mm_cmpeq_epi8(_mm_load_si128((const __m128i*)p), zero));
-            if (mask) {
-                unsigned long idx;
-                _BitScanForward(&idx, (unsigned long)mask);
-                return (unsigned int)((size_t)(p - str) + idx);
-            }
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return orig_strlen76(str);
+void LogStrlen76GuardState() {
+    if (!orig_strlen76) {
+        Log("[Strlen76] not measured: the hook on sub_76EE30 is not installed.");
+        return;
+    }
+    if (g_strlenArmed) {
+        Log("[Strlen76] %u call(s) ran guarded and the handler caught nothing, so the "
+            "scan now runs without an exception frame.", g_strlenGuardedCalls);
+    } else if (g_strlenCaught) {
+        Log("[Strlen76] the guard caught %u fault(s) in %u guarded call(s) and stays "
+            "on for this session.", g_strlenCaught, g_strlenGuardedCalls);
+    } else {
+        Log("[Strlen76] %u of %u guarded call(s) so far, nothing caught; the "
+            "exception frame is still on.", g_strlenGuardedCalls, kStrlenLearnCalls);
     }
 }
 
@@ -10123,10 +10427,8 @@ static bool InstallWowStrlenHook() {
 static bool InstallWowStrlenHook() { return false; }
 #endif
 
-// ================================================================
 // MultiByteToWideChar / WideCharToMultiByte - ASCII fast path
 //
-// ================================================================
 
 typedef int (WINAPI* MultiByteToWideChar_fn)(UINT, DWORD, LPCCH, int, LPWSTR, int);
 typedef int (WINAPI* WideCharToMultiByte_fn)(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
@@ -10210,11 +10512,12 @@ static int WINAPI hooked_MultiByteToWideChar(
     LPCCH lpMultiByteStr, int cbMultiByte,
     LPWSTR lpWideCharStr, int cchWideChar)
 {
-    if (dwFlags != 0)                        goto mbt_fallback;
-    if (!IsAsciiCompatibleCp(CodePage))      goto mbt_fallback;
-    if (!lpMultiByteStr)                     goto mbt_fallback;
-    if (cbMultiByte == 0 || cbMultiByte < -1) goto mbt_fallback;
-    if (cchWideChar < 0)                     goto mbt_fallback;
+    if (WOWOPT_FOREIGN_CALLER()) return orig_MultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
+    if (dwFlags != 0)                        { g_mbwcBail.flags++;     goto mbt_fallback; }
+    if (!IsAsciiCompatibleCp(CodePage))      { g_mbwcBail.codepage++;  goto mbt_fallback; }
+    if (!lpMultiByteStr)                     { g_mbwcBail.nullIn++;    goto mbt_fallback; }
+    if (cbMultiByte == 0 || cbMultiByte < -1) { g_mbwcBail.badLen++;   goto mbt_fallback; }
+    if (cchWideChar < 0)                     { g_mbwcBail.badOutLen++; goto mbt_fallback; }
 
     __try {
         size_t inLen;
@@ -10229,7 +10532,7 @@ static int WINAPI hooked_MultiByteToWideChar(
             includeNull = false;
         }
 
-        if (!AllAsciiBytes(lpMultiByteStr, inLen)) goto mbt_fallback;
+        if (!AllAsciiBytes(lpMultiByteStr, inLen)) { g_mbwcBail.nonAscii++; goto mbt_fallback; }
 
         size_t outLen = inLen + (includeNull ? 1 : 0);
 
@@ -10238,7 +10541,7 @@ static int WINAPI hooked_MultiByteToWideChar(
             return (int)outLen;
         }
 
-        if (!lpWideCharStr) goto mbt_fallback;
+        if (!lpWideCharStr) { g_mbwcBail.nullOut++; goto mbt_fallback; }
 
         if ((int)outLen > cchWideChar) {
             SetLastError(ERROR_INSUFFICIENT_BUFFER);
@@ -10253,6 +10556,7 @@ static int WINAPI hooked_MultiByteToWideChar(
         return (int)outLen;
     }
     __except(EXCEPTION_EXECUTE_HANDLER) {
+        g_mbwcBail.faulted++;
     }
 
 mbt_fallback:
@@ -10266,11 +10570,12 @@ static int WINAPI hooked_WideCharToMultiByte(
     LPSTR lpMultiByteStr, int cbMultiByte,
     LPCCH lpDefaultChar, LPBOOL lpUsedDefaultChar)
 {
-    if (dwFlags != 0)                         goto wcmb_fallback;
-    if (!IsAsciiCompatibleCp(CodePage))       goto wcmb_fallback;
-    if (!lpWideCharStr)                       goto wcmb_fallback;
-    if (cchWideChar == 0 || cchWideChar < -1) goto wcmb_fallback;
-    if (cbMultiByte < 0)                      goto wcmb_fallback;
+    if (WOWOPT_FOREIGN_CALLER()) return orig_WideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar, lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
+    if (dwFlags != 0)                         { g_wcmbBail.flags++;     goto wcmb_fallback; }
+    if (!IsAsciiCompatibleCp(CodePage))       { g_wcmbBail.codepage++;  goto wcmb_fallback; }
+    if (!lpWideCharStr)                       { g_wcmbBail.nullIn++;    goto wcmb_fallback; }
+    if (cchWideChar == 0 || cchWideChar < -1) { g_wcmbBail.badLen++;    goto wcmb_fallback; }
+    if (cbMultiByte < 0)                      { g_wcmbBail.badOutLen++; goto wcmb_fallback; }
 
     __try {
         size_t inLen;
@@ -10285,7 +10590,7 @@ static int WINAPI hooked_WideCharToMultiByte(
             includeNull = false;
         }
 
-        if (!AllAsciiWide(lpWideCharStr, inLen)) goto wcmb_fallback;
+        if (!AllAsciiWide(lpWideCharStr, inLen)) { g_wcmbBail.nonAscii++; goto wcmb_fallback; }
 
         size_t outLen = inLen + (includeNull ? 1 : 0);
 
@@ -10295,7 +10600,7 @@ static int WINAPI hooked_WideCharToMultiByte(
             return (int)outLen;
         }
 
-        if (!lpMultiByteStr) goto wcmb_fallback;
+        if (!lpMultiByteStr) { g_wcmbBail.nullOut++; goto wcmb_fallback; }
 
         if ((int)outLen > cbMultiByte) {
             SetLastError(ERROR_INSUFFICIENT_BUFFER);
@@ -10311,6 +10616,7 @@ static int WINAPI hooked_WideCharToMultiByte(
         return (int)outLen;
     }
     __except(EXCEPTION_EXECUTE_HANDLER) {
+        g_wcmbBail.faulted++;
     }
 
 wcmb_fallback:
@@ -10346,7 +10652,6 @@ static bool InstallMBWCHooks() {
 // ================================================================
 // GetProcAddress - 4-way set-associative cache (strcmp-based,
 // Wine security-module bypass)
-//
 // ================================================================
 
 typedef FARPROC (WINAPI* GetProcAddress_fn)(HMODULE, LPCSTR);
@@ -10449,6 +10754,7 @@ static inline uintptr_t HashPtr(const void* p, size_t len) {
 }
 
 static FARPROC WINAPI hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetProcAddress(hModule, lpProcName);
     // Ordinal lookup - no caching
     if ((uintptr_t)lpProcName < 0x10000) {
         return orig_GetProcAddress(hModule, lpProcName);
@@ -10542,10 +10848,8 @@ static bool InstallGetProcAddressCache() {
 #endif
 }
 
-// ================================================================
 // GetModuleFileNameA/W - cache
 //
-// ================================================================
 
 typedef DWORD (WINAPI* GetModuleFileNameA_fn)(HMODULE, LPSTR, DWORD);
 typedef DWORD (WINAPI* GetModuleFileNameW_fn)(HMODULE, LPWSTR, DWORD);
@@ -10560,6 +10864,7 @@ static DWORD g_gmfPathLenW = 0;
 static bool g_gmfInitialized = false;
 
 static DWORD WINAPI hooked_GetModuleFileNameA(HMODULE hModule, LPSTR lpFilename, DWORD nSize) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetModuleFileNameA(hModule, lpFilename, nSize);
     static HMODULE mainMod = GetModuleHandleA(nullptr);
     if ((hModule == NULL || hModule == mainMod) && g_gmfInitialized) {
         if (g_gmfPathLenA < nSize) {
@@ -10573,6 +10878,7 @@ static DWORD WINAPI hooked_GetModuleFileNameA(HMODULE hModule, LPSTR lpFilename,
 }
 
 static DWORD WINAPI hooked_GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename, DWORD nSize) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetModuleFileNameW(hModule, lpFilename, nSize);
     static HMODULE mainMod = GetModuleHandleA(nullptr);
     if ((hModule == NULL || hModule == mainMod) && g_gmfInitialized) {
         if (g_gmfPathLenW < nSize) {
@@ -10617,10 +10923,8 @@ static bool InstallGetModuleFileNameCache() {
 #endif
 }
 
-// ================================================================
 // GetEnvironmentVariableA - cache
 //
-// ================================================================
 
 typedef DWORD (WINAPI* GetEnvironmentVariableA_fn)(LPCSTR, LPSTR, DWORD);
 
@@ -10643,6 +10947,7 @@ static inline uint32_t HashNameLower(LPCSTR name) {
 }
 
 static DWORD WINAPI hooked_GetEnvironmentVariableA(LPCSTR lpName, LPSTR lpBuffer, DWORD nSize) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_GetEnvironmentVariableA(lpName, lpBuffer, nSize);
     // NULL checks: lpName or lpBuffer can be NULL (size query)
     if (!lpName || !lpBuffer) return orig_GetEnvironmentVariableA(lpName, lpBuffer, nSize);
 
@@ -10692,10 +10997,8 @@ static bool InstallEnvironmentVariableCache() {
 #endif
 }
 
-// ================================================================
 //  Thread Affinity - Background Worker CPU Pinning
 //
-// ================================================================
 
 static int __cdecl Hooked_ThreadWorker(void* outHandle, LPTHREAD_START_ROUTINE start, LPVOID param, int priority, int a5, int a6, HMODULE hMod) {
     int ret = orig_ThreadWorker(outHandle, start, param, priority, a5, a6, hMod);
@@ -11066,6 +11369,22 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         case DLL_PROCESS_ATTACH:
             DisableThreadLibraryCalls(hModule);
 
+            // The two images whose calls system hooks still answer (version.h).
+            // From the loaded headers, before any hook exists.
+            {
+                HMODULE exe = GetModuleHandleA(NULL);
+                if (exe) {
+                    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((char*)exe +
+                        ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+                    g_wowOptClientLo   = (uintptr_t)exe;
+                    g_wowOptClientSize = nt->OptionalHeader.SizeOfImage;
+                }
+                IMAGE_NT_HEADERS* selfNt = (IMAGE_NT_HEADERS*)((char*)hModule +
+                    ((IMAGE_DOS_HEADER*)hModule)->e_lfanew);
+                g_wowOptSelfLo   = (uintptr_t)hModule;
+                g_wowOptSelfSize = selfNt->OptionalHeader.SizeOfImage;
+            }
+
             // Pin the DLL to prevent crashes on process exit if OS unloads DLLs in bad order
             {
                 HMODULE hDummy;
@@ -11151,19 +11470,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
                     // Best-effort - if unhooking fails, the process is terminating anyway
                 }
 
-                // MinHook is not the only thing pointing at this module. The D3D9
-                // state manager writes sixteen of its own function pointers
-                // directly into the device vtable, which lives inside d3d9.dll -
-                // and this path used to break out before ShutdownD3D9StateManager
-                // ever ran, so those sixteen entries survived our unload. d3d9
-                // then releases the device through a vtable still calling into an
-                // unmapped module, on the way out of the process, which is where a
-                // crash lands after the player has already quit and is the hardest
-                // kind to attribute.
+                // MinHook is not the only thing pointing at this module: the D3D9
+                // state manager writes sixteen of its own function pointers into
+                // the device vtable inside d3d9.dll. Left in place, d3d9 releases
+                // the device through a vtable calling into an unmapped module,
+                // after the player has already quit.
                 //
-                // Restoring them is cheap and self-checking: each slot is put back
-                // only if it still holds our hook, so a third-party hook layered on
-                // top is left alone, and the whole walk is inside SEH.
+                // Each slot is put back only if it still holds our hook, so a
+                // third-party hook layered on top is left alone, and the whole
+                // walk is inside SEH.
                 //
                 // The process-exit variant, not the ordinary one: every other
                 // thread is already dead here, possibly holding the vtable lock,
@@ -11187,6 +11502,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
                 // nothing after it. Emit it here or it is lost on every normal
                 // exit, since this process leaves through TerminateProcess and
                 // Shutdown() never runs.
+                //
+                // By now the client may have freed what our reporters point at.
+                // A tester's normal quit logged a first-chance access violation
+                // in lua_gc reading l_G of the lua_State the report still held,
+                // from an address that was reserved but no longer committed. The
+                // guard caught it, and the log still showed a fault to a player
+                // who had only closed the game. Reporters that would call into
+                // the client check this flag and print their last sample instead.
+                g_processExiting = true;
                 __try {
                     DumpPeriodicStats("session end", true);
                 } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -11209,8 +11533,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             // first, which is why every other flush point exists.
             ClientWriteBatch::FlushAll("process detach");
             BoneMatrixUpload::Shutdown();
+            UiBatchFill::Shutdown();
+            ParticleFill::Shutdown();
+            CollisionRayOutcode::Shutdown();
+            RayTriangle::Shutdown();
             M2MatrixSlot::Shutdown();
             M2AnimStride::Shutdown();
+            M2AnimReuse::Shutdown();
             SamplingProfiler::Shutdown();
 #endif
             TextureUnloadDelay::Shutdown();
@@ -11293,13 +11622,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             SoundVolumeLimit::Shutdown();
             TerrainHeightCache::Shutdown();
             QualityGovernor::Shutdown();
-            HotPatch::ShutdownAll();
             ReportHotFunctionStats();
             CrashDumper::ReportFeatureActivity();
             LoadingState::ReportLoadTimes();
             AsyncSoundLoader::Shutdown();
             RcuObjMgr::Shutdown();
-            AsyncTerrainLoader::Shutdown();
+            ObjMgrEnumFast::Shutdown();
+            MpqOpenCensus::Shutdown();
             AsyncTexLoader::Shutdown();
             MipBiasGovernor::Shutdown();
             PerfDiagnostics::Shutdown();

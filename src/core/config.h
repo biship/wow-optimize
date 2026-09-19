@@ -41,13 +41,11 @@ namespace Config {
         bool OptDefragLf = false;
         bool OptVulkanDXVK = false;
         bool OptTimingFix = false;
-        // Six crash guards, not one, and the key is named after the first of
-        // them: the CVar null write. It also gates the Lua table read guard, the
-        // GUID type check that crashes on battleground load, the object reaper's
-        // null write on unlink, and two more null and bounds checks. The launcher
-        // entry says so now - it used to read "Null Pointer CVar Safeguard", and a
-        // tester turning that off to isolate something would have lost five
-        // unrelated crash fixes without being told.
+        // Six crash guards, not one, and named after the first: the CVar null
+        // write. It also gates the Lua table read guard, the GUID type check that
+        // crashes on battleground load, the object reaper's null write on unlink,
+        // and two more null and bounds checks. Turning this off to isolate one of
+        // them loses the other five.
         bool OptCvarNullGuard = true; // Safe default: enabled
         // Null-callback crash in the client's device callback list. On by
         // default: on a healthy client it is one read-only pointer walk per
@@ -78,6 +76,14 @@ namespace Config {
         // run, so they default on, and turning them off is what the vanilla
         // button needs in order to mean anything.
         bool OptLockTuning        = true;   // retrofits spin counts onto 15 client locks
+        // The InitializeCriticalSection hook that used to ride on LockTuning.
+        // It patches ntdll for every module in the process, it kept a player
+        // with ReShade out of the world, and nothing has ever measured a gain
+        // from it, so it is off unless asked for.
+        bool OptLockTuningInitHook = false;
+        // Hooks on system DLL exports answer only calls from wow.exe and this
+        // DLL; every other module gets the real function.
+        bool OptSystemHooksClientOnly = true;
         bool OptAsyncMpqIo        = true;   // spawns a background I/O worker thread
         bool OptThreadIdCache     = true;   // hooks GetCurrentThreadId
         bool OptPriorityGuard     = true;   // hooks SetPriorityClass to block downgrades
@@ -131,17 +137,19 @@ namespace Config {
         // clock read a frame.
         bool OptFlightRecorder = true;
         int  FlightRecorderKey = 0x91;   // VK_SCROLL
-        // Frustum culling and quaternion normalise, in SSE2. These used to hang
-        // off OptStrStrSse2 - a switch named after a string search - so anyone who
-        // left "SSE2 Boyer-Moore strstr" off, which is its default, silently lost
-        // both. Inherits that switch when its own key is absent.
+        // Records the camera's view values every frame on one key press and plays
+        // them back on another, with FrameBench measuring the playback as its own
+        // window, so two builds or two settings are compared over the same camera
+        // motion from the same spot. Hooks one wow.exe function; off by default.
+        bool OptCameraReplay = false;
+        int  CameraReplayKey = 0x13;     // VK_PAUSE: press to play, Shift+press to record
+        // Frustum culling and quaternion normalise, in SSE2. Inherits
+        // OptStrStrSse2 when its own key is absent, which is where it used to be
+        // gated.
         bool OptSimdGeometry = false;
-        // Two things the Lock-Free Heap Defragmenter switch used to gate that have
-        // nothing to do with defragmenting a heap. Each inherits DefragLf when its
-        // own key is absent, so nobody loses a feature they were already running by
-        // updating. A third, RenderHooks, was split out with them and then removed:
-        // the function it gated installs nothing, so the key decided only whether a
-        // log line appeared.
+        // Neither has anything to do with defragmenting a heap. Each inherits
+        // DefragLf when its own key is absent, so an existing ini keeps what it
+        // was already running.
         bool OptAsyncWorkerPool = false;
         bool OptThreadAffinity = false;
         // Alternates one feature on and off inside a session, so its frame times can
@@ -165,8 +173,11 @@ namespace Config {
         bool OptLuaGetTimeFast = false;
         bool OptSimdMatrixTransform = false;
         bool OptAsyncTexLoader = false;
-        bool OptAsyncTerrainLoader = false;
         bool OptRcuObjMgr = false;
+        bool OptObjMgrEnumFast = false;
+        bool OptFreezeCatcher = false;
+        bool OptMpqOpenCensus = false;
+        bool OptMpqNegativeCache = false;
         bool OptMipBiasGovernor = false;
         
         // Combat & Network
@@ -287,16 +298,13 @@ namespace Config {
         // Caches over Win32 calls that answer the same thing every time:
         // GetSystemInfo, GetSystemMetrics, GetVersionEx, RegQueryValueEx,
         // GetProcAddress, GetModuleFileName, GetEnvironmentVariable and
-        // GetPrivateProfile. They hung off OptTimingFix, which is described as
-        // a timing fix and should own the clock hooks, not eight lookups that
-        // have nothing to do with time.
+        // GetPrivateProfile. Inherits OptTimingFix, which owns the clock hooks
+        // and nothing else.
         bool OptWin32ApiCaches = false;
-        // The debug-family Win32 hooks: IsBadReadPtr / IsBadWritePtr answered
-        // from VirtualQuery, OutputDebugString turned into a no-op, and
-        // IsDebuggerPresent forced to false. They hung off OptCvarNullGuard,
-        // which declines CVar writes through uninitialised objects and is
-        // unrelated to any of them.
-        // Defaults on, matching CvarNullGuard, which is what it used to run under.
+        // The debug-family Win32 hooks: IsBadReadPtr and IsBadWritePtr answered
+        // from VirtualQuery, OutputDebugString made a no-op, IsDebuggerPresent
+        // forced to false. Defaults on, matching CvarNullGuard, which it
+        // inherits.
         bool OptDebugApiHooks = true;
         // Spin counts retrofitted onto CriticalSection and WaitForSingleObject.
         // They hung off OptDefragLf, the lock-free heap defragmenter, which is
@@ -377,6 +385,8 @@ namespace Config {
         // applied, so this is bit-exact rather than close. Opt-in, and it
         // predicts the client's whole output and compares before trusting itself.
         bool OptCollisionOutcode = false;
+        bool OptCollisionRayOutcode = false;
+        bool OptRayTriangleSse2 = false;
         // The bone matrix upload loop inside sub_829BA0, 3.35% of executing
         // time and the largest entry in the corrected profile with nothing
         // shipped against it. Twelve x87 load/store pairs a bone transpose a
@@ -384,6 +394,11 @@ namespace Config {
         // the same. No arithmetic anywhere in it, so bit-exact by construction.
         // Opt-in, and it does the first bones both ways and compares.
         bool OptBoneMatrixUpload = false;
+        // The per-vertex and per-index fill in the client's UI batch draw,
+        // sub_484B00. Off by default and experimental; it predicts batches and
+        // compares them with what the client writes before it takes over.
+        bool OptUiBatchFill = false;
+        bool OptParticleFill = false;
         // Hands mimalloc a block of address space above 2GB so it grows there
         // instead of into the half a 32-bit client allocates from. Two tester
         // sessions ended with the low half down to a megabyte while the working
@@ -404,7 +419,26 @@ namespace Config {
         // allocator has used it, it reserves from the OS again and the low half
         // starts filling as before.
         int  MimallocHighArenaMB = 256;
-        int  MimallocHighArenaMaxMB = 1024;
+        // Must match the default in Config::Load's GetPrivateProfileIntA for
+        // this key. It did not: this read 1024 while the ini default said 2048,
+        // so the ceiling depended on whether Load had run - and the whole point
+        // of this number is that the allocator ran out of arena at 1023 MB and
+        // spent the rest of the session shredding the low 2GB.
+        int  MimallocHighArenaMaxMB = 2048;
+        // Records every private address-space reservation by the module that
+        // asked for it, so the occupancy dump can name who holds the low 2GB
+        // instead of calling it "private". Hooks ntdll's NtAllocateVirtualMemory
+        // and NtFreeVirtualMemory. Off by default and experimental.
+        bool OptVaCensus = false;
+        // MEM_TOP_DOWN for large reservations, by class of caller. Modules is
+        // everything that is neither wow.exe, this tool nor a system DLL: DXVK,
+        // the GPU driver, other injected DLLs. Client is wow.exe itself, whose
+        // handling of pointers above 2GB nobody has verified. Both off by
+        // default and experimental; HighPlacementMinKB is the smallest request
+        // either moves.
+        bool OptHighPlacementModules = false;
+        bool OptHighPlacementClient = false;
+        int  HighPlacementMinKB = 1024;
         // The box-overlap predicate (sub_78F370) that seventeen culling and
         // pick functions call once per scene node per pass. Six x87 compares,
         // each leaving the FPU through fnstsw and a data-dependent branch,
@@ -466,6 +500,9 @@ namespace Config {
         bool OptMatrixVectorSse2 = false;
         bool OptWorldStateCoalesce = false;
         bool OptD3d9RenderThread = false;
+        // Redundant D3D9 state removal. Inherits from the pair it used to hang
+        // off, so writing no key changes nothing; see Config::Load.
+        bool OptRenderStateDedup = false;
 
         // 10 new features
         // Off by default. It drops events by affiliation, not by subscription, so
@@ -477,7 +514,6 @@ namespace Config {
 
         bool OptTextureUnloadDelay = false;
         bool OptM2MatrixSimd = false;
-        bool OptMpqAsyncDecompress = false;
         bool OptSpellEffectCulling = false;
         // Read-only watch on the client's own shadow state, for the flicker seen
         // below extShadowQuality 5. Not our bug - a tester reproduced it with
@@ -536,6 +572,7 @@ namespace Config {
         // client's own no-bones branch out of the bone loop. The tail still
         // runs, so materials and attachments keep animating.
         bool OptM2AnimStride = false;
+        bool OptM2AnimReuse = false;
         // Counts Lua VM allocations by size through G->frealloc. A measurement,
         // like the draw census - it decides whether a dedicated Lua arena is
         // worth building.

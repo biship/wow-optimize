@@ -1,5 +1,4 @@
 // ============================================================================
-// Module: crash_dumper.cpp
 // Description: Monitors game exception handlers and outputs minidump diagnostic logs on crash.
 // Safety & Threading: Safe across all threads. Do not allocate heap memory inside exception callbacks.
 // ============================================================================
@@ -29,9 +28,7 @@ static LPTOP_LEVEL_EXCEPTION_FILTER s_prevFilter = nullptr;
 // One-shot: only dump the first crash
 static volatile LONG s_dumped = 0;
 
-// ================================================================
 // Feature Registry - tracks all active optimizations
-// ================================================================
 static FeatureState s_features[MAX_TRACKED_FEATURES] = {};
 static volatile LONG s_featureCount = 0;
 static SRWLOCK s_featureLock = SRWLOCK_INIT;
@@ -82,9 +79,7 @@ static void WriteHookTrace(HANDLE hFile);
 static void WriteEventTrace(HANDLE hFile);
 static void WriteMemoryInfo(HANDLE hFile);
 
-// ================================================================
 // Exception code → human-readable name
-// ================================================================
 static const char* ExceptionName(DWORD code) {
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:        return "ACCESS_VIOLATION";
@@ -111,9 +106,7 @@ static const char* ExceptionName(DWORD code) {
     }
 }
 
-// ================================================================
 // EBP-chain stack walk (user-mode, no dbghelp)
-// ================================================================
 static void WriteStackWalk(HANDLE hFile, CONTEXT* ctx) {
     char buf[128];
     DWORD written;
@@ -159,9 +152,7 @@ static void WriteStackWalk(HANDLE hFile, CONTEXT* ctx) {
     }
 }
 
-// ================================================================
 // Raw ESP stack scan (user-mode, no dbghelp)
-// ================================================================
 static void WriteRawStackScan(HANDLE hFile, CONTEXT* ctx) {
     char buf[256];
     DWORD written;
@@ -208,9 +199,7 @@ static void WriteRawStackScan(HANDLE hFile, CONTEXT* ctx) {
     }
 }
 
-// ================================================================
 // Instructions at EIP (user-mode, no dbghelp)
-// ================================================================
 static void WriteInstructions(HANDLE hFile, CONTEXT* ctx) {
     char buf[128];
     DWORD written;
@@ -238,9 +227,7 @@ static void WriteInstructions(HANDLE hFile, CONTEXT* ctx) {
     }
 }
 
-// ================================================================
 // Loaded module enumeration (user-mode, no dbghelp)
-// ================================================================
 static void WriteModuleMap(HANDLE hFile) {
     char buf[256];
     DWORD written;
@@ -264,9 +251,7 @@ static void WriteModuleMap(HANDLE hFile) {
     CloseHandle(hSnap);
 }
 
-// ================================================================
 // Register dump
-// ================================================================
 static void WriteRegisters(HANDLE hFile, CONTEXT* ctx) {
     char buf[512];
     DWORD written;
@@ -336,9 +321,7 @@ static void WriteTextReport(EXCEPTION_POINTERS* ep) {
         code, ExceptionName(code), addr, filename);
 }
 
-// ================================================================
 // Windows minidump (no ScanMemory to avoid loader-lock slowness)
-// ================================================================
 // MiniDumpWriteDump is resolved from the copy of dbghelp.dll in System32, never
 // from whatever sits next to Wow.exe.
 //
@@ -416,9 +399,7 @@ static void WriteMinidump(EXCEPTION_POINTERS* ep) {
         code, ExceptionName(code), addr, filename);
 }
 
-// ================================================================
 // Write Feature States to crash report
-// ================================================================
 static void WriteFeatureStates(HANDLE hFile) {
     char buf[512];
     DWORD written;
@@ -457,9 +438,7 @@ static void WriteFeatureStates(HANDLE hFile) {
     }
 }
 
-// ================================================================
 // Write Hook Call Trace to crash report
-// ================================================================
 static void WriteHookTrace(HANDLE hFile) {
     char buf[256];
     DWORD written;
@@ -517,9 +496,7 @@ static void WriteEventTrace(HANDLE hFile) {
     }
 }
 
-// ================================================================
 // Write Process Memory Info to crash report
-// ================================================================
 static void WriteMemoryInfo(HANDLE hFile) {
     char buf[512];
     DWORD written;
@@ -641,13 +618,67 @@ static void __cdecl Hooked_WowAssert(const char* msg, int arg1, int arg2) {
 typedef BOOL (WINAPI *TerminateProcess_fn)(HANDLE hProcess, UINT uExitCode);
 static TerminateProcess_fn orig_TerminateProcess = nullptr;
 
+// The client's own fatal-error reporter, sub_771D10.
+//
+// It formats its dialog into the global buffer at 0x00CADBE0, shows it with
+// MessageBoxA, and then calls TerminateProcess itself at 0x0077263F, returning
+// to 0x00772645. Every formatting call in it is bounded by the end pointer held
+// at 0x00ADE880. A tester's client ran out of address space, showed that dialog
+// for thirteen seconds, and this hook reported the exit as a "silent kill" and
+// printed hook calls from twenty-five seconds earlier. The text it had just
+// shown the player, which names the error, was in memory the whole time.
+static constexpr uintptr_t kClientFatalErrorFn         = 0x00771D10;
+static constexpr uintptr_t kClientFatalErrorFnEnd      = 0x00771D10 + 0x946;
+static constexpr uintptr_t kClientFatalErrorText       = 0x00CADBE0;
+static constexpr uintptr_t kClientFatalErrorTextEndPtr = 0x00ADE880;
+
+static void LogClientFatalErrorText() {
+    __try {
+        const uintptr_t end = *(uintptr_t*)kClientFatalErrorTextEndPtr;
+        SIZE_T cap = 4096;
+        if (end > kClientFatalErrorText && end - kClientFatalErrorText < cap)
+            cap = (SIZE_T)(end - kClientFatalErrorText);
+
+        const char* text = (const char*)kClientFatalErrorText;
+        char line[512];
+        SIZE_T n = 0;
+        unsigned printed = 0;
+        for (SIZE_T i = 0; i < cap && text[i] != '\0' && printed < 40; i++) {
+            const char c = text[i];
+            if (c == '\r') continue;
+            if (c != '\n') {
+                line[n++] = c;
+                if (n < sizeof(line) - 1) continue;
+            }
+            line[n] = '\0';
+            if (n > 0) { Log("!!!   | %s", line); printed++; }
+            n = 0;
+        }
+        if (n > 0 && printed < 40) {
+            line[n] = '\0';
+            Log("!!!   | %s", line);
+            printed++;
+        }
+        if (printed == 0) Log("!!!   the client's error text buffer was empty");
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log("!!!   the client's error text could not be read");
+    }
+}
+
 static BOOL WINAPI Hooked_TerminateProcess(HANDLE hProcess, UINT uExitCode) {
     __try {
         // Only log if it's our own process being terminated
         if (hProcess == GetCurrentProcess() || (hProcess && GetProcessId(hProcess) == GetCurrentProcessId())) {
             LogFlushImmediate();
-            Log("!!! TERMINATE PROCESS (code=%u) — silent kill detected !!!", uExitCode);
-            Log("!!!   TID=%lu  Caller=0x%08X", GetCurrentThreadId(), (unsigned)(uintptr_t)_ReturnAddress());
+            const uintptr_t caller = (uintptr_t)_ReturnAddress();
+            if (caller >= kClientFatalErrorFn && caller < kClientFatalErrorFnEnd) {
+                Log("!!! TERMINATE PROCESS (code=%u) from the client's own fatal-error "
+                    "handler, after its error dialog. The dialog said:", uExitCode);
+                LogClientFatalErrorText();
+            } else {
+                Log("!!! TERMINATE PROCESS (code=%u) - silent kill detected !!!", uExitCode);
+            }
+            Log("!!!   TID=%lu  Caller=0x%08X", GetCurrentThreadId(), (unsigned)caller);
 
             // Log last hook calls for context
             LONG hpos = InterlockedCompareExchange(&s_hookTracePos, 0, 0);
@@ -670,9 +701,7 @@ static BOOL WINAPI Hooked_TerminateProcess(HANDLE hProcess, UINT uExitCode) {
     return orig_TerminateProcess(hProcess, uExitCode);
 }
 
-// ================================================================
 // ExitProcess Hook (fallback for any abnormal exit)
-// ================================================================
 typedef void (WINAPI *ExitProcess_fn)(UINT uExitCode);
 static ExitProcess_fn orig_ExitProcess = nullptr;
 
@@ -700,9 +729,7 @@ static void WINAPI Hooked_ExitProcess(UINT uExitCode) {
 // Forward declaration
 static LONG WINAPI WowOpt_UnhandledExceptionFilter(EXCEPTION_POINTERS* ep);
 
-// ================================================================
 // SetUnhandledExceptionFilter Hook (prevents overriding our handler)
-// ================================================================
 typedef LPTOP_LEVEL_EXCEPTION_FILTER (WINAPI *SetUnhandledExceptionFilter_fn)(LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter);
 static SetUnhandledExceptionFilter_fn orig_SetUnhandledExceptionFilter = nullptr;
 
@@ -721,9 +748,7 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Hooked_SetUnhandledExceptionFilter(LP
     return old;
 }
 
-// ================================================================
 // Top-level unhandled exception filter
-// ================================================================
 // For an access violation the exception record carries the two facts that actually
 // identify the bug: whether the faulting instruction was reading or writing, and
 // which address it touched. Only the instruction pointer was ever logged, so a
@@ -1038,9 +1063,7 @@ static LONG WINAPI WowOpt_UnhandledExceptionFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// ================================================================
 // Public API
-// ================================================================
 namespace CrashDumper {
 
 bool Init() {
@@ -1203,10 +1226,29 @@ void ReportFeatureActivity() {
     }
 
     Log("");
-    Log("[Features] === WHAT ACTUALLY RAN THIS SESSION ===");
+    // The heading used to be "WHAT ACTUALLY RAN THIS SESSION" and the line
+    // saying how much of the DLL this counter cannot see came after the lists.
+    // A field log then reads "Did work (4)" while LayoutRelink reports 68
+    // million invocations, GetStrInline 11.5 billion calls and StormHash 4.3
+    // billion lookups in the same file - and the reader has already concluded
+    // that four features work and the rest are dead before reaching the
+    // sentence that says otherwise. That misreading is on record twice in this
+    // project's own notes.
+    //
+    // So the denominator goes first and the heading claims only what this
+    // counter measures. Nothing about the measurement changes; it was never
+    // wrong, only framed as an answer to a larger question than it can answer.
+    Log("[Features] === FEATURES THAT REPORT THROUGH THIS COUNTER (%d of %d) ===",
+        ran + silent, ran + silent + uncounted);
+    if (uncounted > 0) {
+        Log("[Features] %d enabled feature(s) do not report here at all and are "
+            "not judged below - most of them print their own counts elsewhere in "
+            "this log, so a name missing from these lists means nothing either "
+            "way.", uncounted);
+    }
 
     if (ran > 0) {
-        Log("[Features] Did work (%d):", ran);
+        Log("[Features] Did work (%d of the %d counted here):", ran, ran + silent);
         for (int i = 0; i < count; i++) {
             if (s_features[i].active && s_features[i].counted && s_features[i].hits > 0) {
                 unsigned stride = s_features[i].hitStride ? s_features[i].hitStride : 1;
@@ -1235,9 +1277,8 @@ void ReportFeatureActivity() {
         }
     }
 
-    // Said plainly, because the alternative is a reader assuming these did nothing.
-    Log("[Features] %d enabled features do not report activity and are not judged"
-        " here; %d are disabled.", uncounted, disabled);
+    if (disabled > 0)
+        Log("[Features] %d feature(s) are switched off.", disabled);
 }
 
 void FeatureCall(const char* name) {
@@ -1385,6 +1426,68 @@ LARGE_INTEGER StallProbeBegin() {
     return t;
 }
 
+// Every stall the probes have seen, kept so a session can report them.
+//
+// StallProbeEnd wrote only to the crash ring, which reaches a log exactly once:
+// in our own crash dump. A user whose client dies through its own error handler,
+// or who simply plays for three hours and reports a stutter, produces no record
+// of main-thread stalls at all, even though nine places measure them.
+//
+// Keyed on the literal's address rather than its text. Every call site passes a
+// string literal, so the pointer identifies the site and costs a compare.
+namespace {
+struct StallSite {
+    const char*   what;
+    unsigned long hits;
+    double        worstMs;
+    double        totalMs;
+};
+constexpr int kMaxStallSites = 16;
+StallSite s_stallSite[kMaxStallSites] = {};
+int       s_stallSiteCount = 0;
+unsigned long s_stallOverflow = 0;   // more distinct sites than the table holds
+
+void NoteStall(const char* what, double ms) {
+    for (int i = 0; i < s_stallSiteCount; ++i) {
+        if (s_stallSite[i].what == what) {
+            ++s_stallSite[i].hits;
+            s_stallSite[i].totalMs += ms;
+            if (ms > s_stallSite[i].worstMs) s_stallSite[i].worstMs = ms;
+            return;
+        }
+    }
+    if (s_stallSiteCount >= kMaxStallSites) { ++s_stallOverflow; return; }
+    StallSite& s = s_stallSite[s_stallSiteCount++];
+    s.what = what; s.hits = 1; s.worstMs = ms; s.totalMs = ms;
+}
+}  // namespace
+
+void StallProbe_LogStats() {
+    if (s_stallSiteCount == 0) {
+        Log("[Stalls] measured and zero: the probes ran and nothing they cover "
+            "went past its threshold.");
+        return;
+    }
+    Log("[Stalls] main-thread work that went past its own threshold, worst "
+        "first. These are cumulative for the session:");
+    bool printed[kMaxStallSites] = {};
+    for (int n = 0; n < s_stallSiteCount; ++n) {
+        int best = -1;
+        for (int i = 0; i < s_stallSiteCount; ++i) {
+            if (printed[i]) continue;
+            if (best < 0 || s_stallSite[i].worstMs > s_stallSite[best].worstMs) best = i;
+        }
+        if (best < 0) break;
+        printed[best] = true;
+        Log("[Stalls]   %-34s %lu time(s), worst %.1f ms, %.1f ms in total",
+            s_stallSite[best].what, s_stallSite[best].hits,
+            s_stallSite[best].worstMs, s_stallSite[best].totalMs);
+    }
+    if (s_stallOverflow)
+        Log("[Stalls]   %lu stall(s) came from more distinct places than this "
+            "table holds and are not broken out.", s_stallOverflow);
+}
+
 void StallProbeEnd(const char* what, const LARGE_INTEGER& start, double thresholdMs) {
     static LARGE_INTEGER freq = {};
     if (freq.QuadPart == 0) {
@@ -1396,6 +1499,7 @@ void StallProbeEnd(const char* what, const LARGE_INTEGER& start, double threshol
     double ms = (double)(end.QuadPart - start.QuadPart) * 1000.0 / (double)freq.QuadPart;
     if (ms >= thresholdMs) {
         CrashDumper::Trace("STALL %s took %.1f ms", what, ms);
+        NoteStall(what, ms);   // so a session can report it, not only a dump
     }
 }
 

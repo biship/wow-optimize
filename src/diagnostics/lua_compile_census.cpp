@@ -1,6 +1,4 @@
 // ============================================================================
-// Module: lua_compile_census.cpp
-//
 // About 5% of executing main-thread time in a real session is inside the Lua
 // code generator. The profiler points straight at it: sub_862390, ten
 // instructions that write an emitted instruction back into fs->f->code, at
@@ -45,6 +43,7 @@ namespace LoadingState {
 #include "config.h"
 #include "flight_recorder.h"
 #include "session_verdict.h"
+#include "crash_dumper.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -257,6 +256,17 @@ static void NoteCompileTime(const LARGE_INTEGER& a, bool repeat, const char* lab
         g_msWorst = ms;
         lstrcpynA(g_worstName, label && *label ? label : "(unnamed)",
                   (int)sizeof(g_worstName));
+    }
+    // A compile long enough to be a visible hitch goes into the event trace, so
+    // the slow-frame report can name it. That report printed "(nothing traced in
+    // this window)" under 63 of 65 spikes in a tester session, because the only
+    // things tracing were loading screens, device resets and Lua state swaps -
+    // none of which happens during play. This one does: the same session's worst
+    // single compile was 164.9 ms, and nothing connected it to a frame.
+    if (ms >= 20.0) {
+        CrashDumper::Trace("LUA compile %.0f ms (%s%s)", ms,
+                                repeat ? "repeat of " : "",
+                                label && *label ? label : "unnamed");
     }
 }
 

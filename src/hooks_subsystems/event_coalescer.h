@@ -1,14 +1,13 @@
 #pragma once
 
-// ============================================================================
-// Module: event_coalescer.h
-// ============================================================================
-
 extern "C" void EventCoalescer_Flush();
 
 namespace EventCoalescer {
     bool Init();
     void Shutdown();
+    // Printed from the periodic report. This used to be logged only from
+    // Shutdown, which this DLL never reaches.
+    void LogStats();
 
     // True once Init() has armed the frame-scoped dedup queue. The detour itself
     // lives in LoadingState, which only routes events here while this is true.

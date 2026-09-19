@@ -1,18 +1,5 @@
 #pragma once
 
-// ============================================================================
-// Module: heap_compactor.h
-// ============================================================================
-
-
-
-
-
-
-
-
-
-
 #include "version.h"
 
 #if TEST_DISABLE_HEAP_COMPACTOR == 0
@@ -20,19 +7,20 @@
 bool HeapCompactor_Init();
 void HeapCompactor_Shutdown();
 
-// Diagnostic queries
-extern "C" SIZE_T HeapCompactor_GetLargestFreeBlock();
-// The low half on its own. The client allocates from below 2GB, so a caller
-// describing how much room was left at some moment wants this, not the total.
-extern "C" SIZE_T HeapCompactor_GetLargestFreeLowHalf();
-// The same figure from the monitor thread's last walk, with its age. No
-// VirtualQuery, so it is safe to call from inside a frame. Age 0 with a result
-// of 0 means the monitor has not run yet, not that nothing is free.
+// Each of these returns the monitor thread's last walk and never walks on the
+// caller's thread: that walk is VirtualQuery over all of user address space.
+// For a fresher figure, change the monitor's interval.
+
+// Largest free run below 2GB, and the age of the walk it came from. Age 0 with
+// a result of 0 means the monitor has not run yet.
 extern "C" SIZE_T HeapCompactor_GetLastLowHalf(unsigned long* ageMsOut);
 
-// The largest free run below 2GB and the sum of all free space there, from the
-// same cached walk. False when the monitor has not run yet, which is not the
-// same as nothing being free.
+// The same two figures with no age. Zero means the monitor has not walked yet.
+extern "C" SIZE_T HeapCompactor_GetCachedLargestBlock();
+extern "C" SIZE_T HeapCompactor_GetCachedLowHalf();
+
+// Largest free run below 2GB and the total free there, from the same walk.
+// False when the monitor has not run yet.
 extern "C" bool HeapCompactor_GetLowHalfSnapshot(SIZE_T* largestOut,
                                                  SIZE_T* totalOut,
                                                  unsigned long* ageMsOut);
@@ -55,9 +43,7 @@ inline bool HeapCompactor_Init() { return true; }
 inline void HeapCompactor_Shutdown() {}
 inline void HeapCompactor_RunPendingWork() {}
 inline void HeapCompactor_LogStats() {}
-// Compiled out, so nothing has walked and there is nothing to hand back. The
-// callers already print "not measured" for a false return, which is the truth
-// here as much as it is before the monitor thread's first pass.
+// Compiled out: nothing has walked, so there is nothing to hand back.
 inline SIZE_T HeapCompactor_GetLastLowHalf(unsigned long* ageMsOut) {
     if (ageMsOut) *ageMsOut = 0;
     return 0;
@@ -68,5 +54,8 @@ inline bool HeapCompactor_GetLowHalfSnapshot(SIZE_T*, SIZE_T*, unsigned long*) {
 inline bool HeapCompactor_GetLastLargestFree(SIZE_T*, unsigned long*) {
     return false;
 }
+// Defined on both sides of the #if in heap_compactor.cpp, so declared not stubbed.
+extern "C" SIZE_T HeapCompactor_GetCachedLargestBlock();
+extern "C" SIZE_T HeapCompactor_GetCachedLowHalf();
 
 #endif

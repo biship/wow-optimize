@@ -1,5 +1,4 @@
 // ============================================================================
-// Module: hooks_simd.cpp
 // Description: Replaces legacy x87 FPU mathematics with vectorized SSE2 logic. Accelerates frustum culling (0x009839E0), quaternion slerp (0x00982460), normalization (0x00979110), and raycasting (0x009836B0).
 // Safety & Threading: Main render thread. Staging inputs and outputs through local floats prevents memory aliasing under Release optimizations.
 // ============================================================================
@@ -205,9 +204,7 @@ void SSE2_Vec3Normalize(float* __restrict v) {
     v[2] = out_z;
 }
 
-// ================================================================
 // Frustum Culling SIMD Implementation
-// ================================================================
 struct SSEPlane {
     __m128 normal_d; // nx, ny, nz, d
 };
@@ -265,9 +262,7 @@ int SSE2_FrustumCull6(const float aabbMin[3], const float aabbMax[3],
     return SSE2_FrustumCull4(&aabb, planes2);
 }
 
-// ================================================================
 // Color/Alpha Batch SIMD Conversion
-// ================================================================
 void SSE2_BGRAtoARGB_Batch(const uint8_t* __restrict src,
                            uint8_t* __restrict dst,
                            size_t pixelCount) {
@@ -383,9 +378,7 @@ void SSE2_Vec3Cross(const float* __restrict a,
 #define ADDR_WOW_RAY_TRIANGLE_16BIT 0x00983490
 #endif
 
-// ================================================================
 // Statistics & Active State
-// ================================================================
 // Plain, not Interlocked. By this file's own comment the frustum test takes
 // boxes "by the thousand a frame", and a locked read-modify-write sat at the top
 // of it and of the matrix, quaternion and ray-triangle hooks. They are
@@ -402,9 +395,7 @@ static long g_frustumCulled  = 0;
 static long g_rayTriangleCalls = 0;
 static long g_rayTriangleIntersects = 0;
 
-// ================================================================
 // Public APIs
-// ================================================================
 
 int SSE2_IsAABBVisible(const float* planes, const float* bounds) {
     __try {
@@ -1159,14 +1150,10 @@ static float* __cdecl Hooked_QuatSlerp(float* result, float t, float* q1, float*
 
 // Self-test against the function being replaced, on the machine it will run on.
 //
-// It used to accept a tolerance of 1e-5, because the implementation it guarded
-// was packed single and could not do better. That tolerance is gone: the
-// replacement now reproduces the client's width and its summation order, so the
-// only acceptable answer is the same bits. Checked offline against the 36
-// instructions transcribed verbatim as inline asm - 4,000,000 quaternions, zero
-// differing - and the packed-single version it replaces differed on 1,535,779 of
-// the roughly two million that actually normalise. Three quarters of them, under
-// a comment that called it one ULP.
+// No tolerance: the replacement reproduces the client's width and summation
+// order, so the only acceptable answer is the same bits. Checked offline against
+// the 36 instructions transcribed verbatim as inline asm, 4,000,000 quaternions,
+// zero differing.
 //
 // That is still a test of my reading of the disassembly rather than of the client
 // sitting in memory right now. This calls the real function at the real address,

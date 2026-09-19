@@ -1,10 +1,7 @@
 // ============================================================================
-// Module: lua_bytecode_store.cpp
 // Description: Keeps compiled Lua chunks on disk so the next session skips the
 //              parse as well as the repeat.
-// Safety & Threading: Main thread only, alongside the Lua state.
 // ============================================================================
-//
 // The proto cache next door removes the second and later compiles of a chunk
 // within one session. It measured what that leaves behind: a loading screen
 // that spends 2128 ms in the Lua compiler, of which only 260 ms is source the
@@ -20,7 +17,6 @@
 // chunk, and it already owns the two hooks - luaY_parser, where a Proto is
 // returned, and luaL_loadbuffer, where the finished closure is on the stack and
 // can be dumped.
-//
 // ---------------------------------------------------------------------------
 // Nothing is trusted until it has been proved, chunk by chunk
 //
@@ -37,7 +33,6 @@
 //
 // The first disagreement retires the store for the rest of the session and says
 // which field differed. There is no second chance and no repair.
-//
 // ---------------------------------------------------------------------------
 // Identity
 //
@@ -52,7 +47,6 @@
 // defence against someone constructing one on purpose, and the file lives in
 // the user's own game folder, where anything that could write it could write
 // the addons instead.
-//
 // ---------------------------------------------------------------------------
 // Two files, because this client is killed rather than closed
 //
@@ -61,21 +55,15 @@
 //   bytecode.idx   the same header plus how far into the blob file it vouches
 //                  for, then one record per chunk, rewritten whole
 //
-// The index started out as a trailer inside the one file, which does not
-// survive this client: it exits through TerminateProcess, so a session always
-// ends between a capture and a save, and the next capture after a save would
-// have been written over the index that save had just put there. The reader
-// would then be pointed at blob bytes and would throw the whole store away.
-// Every session would have lost it.
-//
-// Split, that cannot happen. The blob file only grows, the index names the
-// prefix of it that has been vouched for, and a kill loses the captures made
-// since the last save and nothing else.
+// Two files, not an index trailing the blob in one. This client exits through
+// TerminateProcess, so a session always ends between a capture and a save, and a
+// capture after a save would land on the index that save had just written. Split,
+// the blob only grows, the index names the prefix vouched for, and a kill loses
+// the captures made since the last save and nothing else.
 //
 // A pair whose header does not match this build of the DLL, or whose Wow.exe
 // stamp has changed, is discarded and started again. Patching the client
 // changes the compiler, so bytecode from before the patch has to go.
-//
 // ---------------------------------------------------------------------------
 // The index is in memory, the bytecode is not
 //
@@ -406,28 +394,37 @@ bool Init() {
         return false;
     }
 
-    std::string binPath = StorePath(".bin");
-    std::string idxPath = StorePath(".idx");
-    if (binPath.empty()) {
-        Log("[BytecodeStore] NOT active: could not work out where Wow.exe lives.");
-        return false;
-    }
-
-    // No write sharing. A second client started against the same game folder
-    // fails to open these and runs without a store, which is the right outcome:
-    // two processes appending to one blob file would interleave.
-    g_bin = CreateFileA(binPath.c_str(), GENERIC_READ | GENERIC_WRITE,
-                        FILE_SHARE_READ, NULL, OPEN_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL, NULL);
-    g_idx = CreateFileA(idxPath.c_str(), GENERIC_READ | GENERIC_WRITE,
-                        FILE_SHARE_READ, NULL, OPEN_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL, NULL);
-    if (g_bin == INVALID_HANDLE_VALUE || g_idx == INVALID_HANDLE_VALUE) {
-        DWORD err = GetLastError();
+    // No write sharing: two processes appending to one blob file would
+    // interleave. A second client started against the same game folder used to
+    // fail here and run the whole session without a store, which a tester's
+    // two-client log shows on every report. It takes the next numbered pair
+    // instead, the way the log files do, and keeps it for its next session.
+    std::string binPath, idxPath;
+    DWORD err = 0;
+    for (int slot = 1; slot <= 8; ++slot) {
+        const std::string tag = slot == 1 ? std::string() : "." + std::to_string(slot);
+        binPath = StorePath((tag + ".bin").c_str());
+        idxPath = StorePath((tag + ".idx").c_str());
+        if (binPath.empty()) {
+            Log("[BytecodeStore] NOT active: could not work out where Wow.exe lives.");
+            return false;
+        }
+        g_bin = CreateFileA(binPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ, NULL, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+        const DWORD binErr = GetLastError();
+        g_idx = CreateFileA(idxPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ, NULL, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+        const DWORD idxErr = GetLastError();
+        if (g_bin != INVALID_HANDLE_VALUE && g_idx != INVALID_HANDLE_VALUE) break;
+        err = g_bin == INVALID_HANDLE_VALUE ? binErr : idxErr;
         if (g_bin != INVALID_HANDLE_VALUE) { CloseHandle(g_bin); g_bin = INVALID_HANDLE_VALUE; }
         if (g_idx != INVALID_HANDLE_VALUE) { CloseHandle(g_idx); g_idx = INVALID_HANDLE_VALUE; }
-        Log("[BytecodeStore] NOT active: could not open %s (error %lu). Another "
-            "client running from the same folder already holds it.",
+    }
+    if (g_bin == INVALID_HANDLE_VALUE || g_idx == INVALID_HANDLE_VALUE) {
+        Log("[BytecodeStore] NOT active: every numbered store up to %s is held by "
+            "another client or cannot be opened (last error %lu).",
             binPath.c_str(), err);
         return false;
     }

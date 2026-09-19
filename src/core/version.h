@@ -1,19 +1,20 @@
 #pragma once
 
-// ============================================================================
-// Module: version.h
-// ============================================================================
-
-
-
-
-
 #define WOW_OPTIMIZE_VERSION_MAJOR  3
 #define WOW_OPTIMIZE_VERSION_MINOR  19
-#define WOW_OPTIMIZE_VERSION_PATCH  1
+#define WOW_OPTIMIZE_VERSION_PATCH  3
 #define WOW_OPTIMIZE_VERSION_BUILD  0
 
-#define WOW_OPTIMIZE_VERSION_STR    "3.19.2"
+// Built from the numbers above rather than written out again. They had drifted:
+// the string said 3.19.2 while FILEVERSION in the resource still said 3.19.1, so
+// every crash dump from every 3.19.2 build reported 3.19.1 in the one field a
+// minidump carries that can identify a build. Working out which build a tester
+// was on took a comparison of image sizes instead.
+#define WOWOPT_VER_STR2(x)          #x
+#define WOWOPT_VER_STR1(x)          WOWOPT_VER_STR2(x)
+#define WOW_OPTIMIZE_VERSION_STR    WOWOPT_VER_STR1(WOW_OPTIMIZE_VERSION_MAJOR) "." \
+                                    WOWOPT_VER_STR1(WOW_OPTIMIZE_VERSION_MINOR) "." \
+                                    WOWOPT_VER_STR1(WOW_OPTIMIZE_VERSION_PATCH)
 #define WOW_OPTIMIZE_AUTHOR         "SUPREMATIST"
 
 #ifndef CRASH_TEST_DISABLE_PHASE2
@@ -39,9 +40,6 @@
 // use-after-free in code that had already been deleted. A flag that says 1 and
 // decides nothing is worse than no flag: it answers a bisection question
 // falsely.
-// ================================================================
-
-// ================================================================
 // PRODUCTION FLAGS - stable configuration
 // ================================================================
 
@@ -128,14 +126,12 @@
 #define TEST_DISABLE_HOOK_MATH_SQRT     0
 
 // string.rep
-#define TEST_DISABLE_HOOK_STRING_REP    0
 
 // string.gsub plain-literal fast path (plain pattern + literal replacement only;
 // falls back to the engine for magic patterns, capture refs, function/table repl)
 #define TEST_DISABLE_HOOK_STR_GSUB      0
 
 // string.find (plain mode)
-#define TEST_DISABLE_HOOK_STRING_FIND   0
 
 // ================================================================
 // WIN32 HOOK TOGGLES
@@ -207,15 +203,11 @@
 // Critical fields (fieldId < 0x40) bypass queue for gameplay correctness.
 #define TEST_DISABLE_DEFERRED_FIELD_UPDATES 1
 
-// Hardware cursor fix (ShowCursor + ClipCursor(NULL), no hooks, no WoW memory
-// writes). The diagnosed crash cause was two direct byte patches (0xCABCDD/
-// CABCDE forcing gxCursor=0 + gxFixLag=1) that activated an uninitialized
-// cursor rendering path on private servers (Circle/Warmane) -> NULL deref.
-// Those two patch lines are already commented out in dllmain.cpp; the only
-// code left in this path is ShowCursor(TRUE) and ClipCursor(NULL) (releases
-// any clip region, does not add one — distinct from CONTEXT lesson 13's
-// mouselook-clipping bug, which is about actively clipping the cursor).
-// RE-ENABLED: the actual crash cause is gone from the code.
+// Hardware cursor fix: ShowCursor(TRUE) and ClipCursor(NULL), no hooks and no
+// writes to client memory. ClipCursor(NULL) releases a clip region rather than
+// adding one. Do not reinstate the byte patches at 0xCABCDD/0xCABCDE forcing
+// gxCursor=0 and gxFixLag=1: they reach an uninitialised cursor path on private
+// servers and deref null.
 #define TEST_DISABLE_HARDWARE_CURSOR    0
 
 // Lua VM gettable cache - primitives only (safe), GC-objects pass through
@@ -251,7 +243,6 @@
 #define TEST_DISABLE_CRASH_DUMPER       1
 
 // Lua require/loadfile cache (skip disk I/O + parsing on repeat loads)
-#define TEST_DISABLE_LUA_FILE_CACHE         0
 
 // C-Level Combat Log Parser (bypasses Lua string parsing)
 #define TEST_DISABLE_COMBATLOG_PARSER   0
@@ -267,7 +258,6 @@
 
 // UI Frame Update Batching - batch OnUpdate callbacks for addons
 // Reduces CPU overhead by 30-50% in raids with DBM/Skada/ElvUI
-#define TEST_DISABLE_UI_FRAME_BATCH     0
 
 // Frame Script Throttling
 // PERMANENTLY DISABLED: Fundamental design flaws prevent safe re-enable:
@@ -279,13 +269,11 @@
 // Would need complete rewrite with different hook target and proper addon compat.
 // DEAD FLAG - no #if reads it. The feature described above was never written,
 // so this decides nothing and setting it to 0 puts nothing back.
-#define TEST_DISABLE_FRAME_THROTTLE     1
 
 // Tooltip String Caching - cache formatted tooltip strings by item/spell ID
 // Reduces tooltip rendering overhead by 40-60% (sub_6277F0 is 24KB of code)
 // LRU cache with 1000 entry limit, cleared on UI reload
 // Corrected calling convention from __stdcall to __thiscall
-#define TEST_DISABLE_TOOLTIP_CACHE      0
 
 // Lua bytecode cache - WoW modified Lua bytecode incompatible
 #define TEST_DISABLE_LUA_BYTECODE_CACHE         1  // DISABLED: WoW modified Lua bytecode incompatible
@@ -482,7 +470,6 @@
 #define TEST_DISABLE_LOADING_DEFRAG     0
 
 // Async Visual Frustum Culling Cache
-#define TEST_DISABLE_ASYNC_CULLING      0
 
 // D3D9 Render State Redundancy Cache
 #define TEST_DISABLE_D3D9_STATE_CACHE   0
@@ -494,7 +481,6 @@
 #define TEST_DISABLE_RENDER_STATE_DEDUP 1
 
 // Lock-Free Addon SavedVariables Incremental Serializer
-#define TEST_DISABLE_SAVED_VARS_SERIALIZER 0
 
 // Parallel Network Packet Deserialization Offloader
 #define TEST_DISABLE_NET_PACKET_OFFLOAD 0
@@ -588,18 +574,13 @@
 // ================================================================
 // 10 Extended Performance Optimization Features
 // ================================================================
-#define TEST_DISABLE_GUID_MAP_LF                0
 #define TEST_DISABLE_SIMD_MATH_FAST             0
-#define TEST_DISABLE_COMBATLOG_INCREMENTAL      0
-#define TEST_DISABLE_LUA_POOL_LF                0
 #define TEST_DISABLE_D3D_STATE_CACHE            0
 #define TEST_DISABLE_DBC_LOOKUP_CACHE           0
-#define TEST_DISABLE_SAVEDVARS_ASYNC            0
 #define TEST_DISABLE_WORLD_STATE_COALESCE       1
 #define TEST_DISABLE_SOUND_MIXER_OPT           0  // enabled: sound mixer thread scheduling tuning
 #define TEST_DISABLE_FONT_METRICS_LOCK_FREE    0  // enabled: lock-free font metrics cache
 #define TEST_DISABLE_NET_PACKET_COALESCE       0  // enabled: coalesced network packet dispatch
-#define TEST_DISABLE_AUDIO_DECODE_MT           0  // enabled: parallel sound wave pre-decoding and cache
 #define TEST_DISABLE_DEFRAG_LF                 0  // enabled: lock-free main thread heap defragmentation
 #define TEST_DISABLE_LUA_GC_GOVERNOR            0  // enabled: adaptive Lua GC governor
 #define TEST_DISABLE_LUA_GETTIME_FAST           0  // disabled by default: Lua GetTime Frame Cache
@@ -608,25 +589,18 @@
 // removed in v3.16.3 for breaking server connections ("unable to connect"). The
 // opt-in large-allocation redirect (OptMimallocLarge) is the safe replacement.
 #define TEST_DISABLE_CRT_MIMALLOC               1  // disabled: CRT Allocator Redirect (connection breaker)
-#define TEST_DISABLE_MPQ_ASYNC_DECOMPRESS       0  // enabled: Asynchronous MPQ File Decompressor
-#define TEST_DISABLE_RCU_OBJ_MGR                0  // enabled: Lock-Free Read-Copy-Update (RCU) Object Manager
 #define TEST_DISABLE_D3D9_VB_CACHE              1  // disabled: D3D9 VB Shadow Cache
-#define TEST_DISABLE_ADDON_TICK_GOVERNOR        0  // enabled: Addon Tick Governor
 #define TEST_DISABLE_D3D9_VS_CONSTANT_CACHE     1  // disabled: D3D9 VS Constant Cache
-#define TEST_DISABLE_SAVED_VARS_PRETOKEN        0  // enabled: SavedVariables Preloader
 #define TEST_DISABLE_ADAPTIVE_FARCLIP           0  // enabled: dynamic adaptive farclip controller
 #define TEST_DISABLE_NET_ADDON_COALESCER        0  // enabled: Net Addon Message Coalescer
 #define TEST_DISABLE_MIP_BIAS_GOVERNOR          0  // enabled: Dynamic Mipmap Bias Governor
-#define TEST_DISABLE_SPATIAL_CULLING            0  // enabled: Spatial Culling Grid
 #define TEST_DISABLE_PERF_DIAGNOSTICS           0  // enabled: Performance Diagnostics Monitor
-#define TEST_DISABLE_ASYNC_TERRAIN              0  // enabled: Asynchronous Terrain Loader
 
 // DEAD FLAG — not referenced by any #if anywhere in src/. The G1/G2/G2AL/
 // G2AI/G2B/G2C/G3 sub-flags below are the actual, independent gates for
 // these hooks (all already 0/enabled — verified by grep, they are live).
 // Kept only so the historical bisection notes below aren't lost; setting
 // this to 0 or 1 has no effect on anything. Do not "fix" by flipping it.
-#define TEST_DISABLE_LUA_INLINE_BATCH_SAFE       1
 // History: checknumber/str, optnum/str, tolstr, argcheck, typename (G1),
 // getlocal, getinfo, ErrorFast, lessthan, gc, xpcall (G2),
 // metafield, where, checktype, getupval, bufinit, prepbuf, iscfunc, rawequal (G3)
@@ -735,15 +709,10 @@
 // Sound system protection guards — SEH-wrapped crash protection for
 // sound driver init (sub_508260), emitter registration (sub_5093F0),
 // buffer/update ops (sub_508320). Default ENABLED (0 = active).
-#define TEST_DISABLE_SOUND_DRIVER_GUARD    0
-#define TEST_DISABLE_SOUND_EMITTER_GUARD   0
-#define TEST_DISABLE_SOUND_BUFFER_GUARD    0
-#define TEST_DISABLE_SOUND_UPDATE_GUARD    0
 
 // ================================================================
 // New Extended Hooks (commit 670012c) — disassembly-verified + gated
 // ================================================================
-//
 // SIMD geometry hooks (hooks_simd.cpp):
 //  Vec3Cross 0x5FEC70, IsSphereVisible 0x983D20, FromAngleAxis 0x982400,
 //  QuatSlerp 0x982460. IsSphereVisible + FromAngleAxis had __fastcall→__thiscall
@@ -861,6 +830,33 @@ static inline bool WowOpt_InsideClientImage(const void* addr) {
     uintptr_t a = (uintptr_t)addr;
     return a >= base && a < end;
 }
+
+// Who called a hooked system function. A hook on a kernel32, user32, advapi32
+// or CRT export sits in front of every module in the process, not only the
+// client: ReShade, DXVK, overlays, drivers. Most of these hooks cache an answer
+// or change what the function does, and none has a measured gain for any caller
+// but the client. A tester running ReShade could not enter the world until one
+// of them, the InitializeCriticalSection hook, was switched off.
+//
+// So a hook answers in its own way only when the return address lies in
+// wow.exe or in this DLL, and calls the real function for everyone else. Both
+// ranges are filled in at DLL_PROCESS_ATTACH, before any hook exists; until
+// then the sizes are zero and every caller counts as foreign. Nothing here may
+// call an API a hook is on, which is why it does not use the lazy lookup above:
+// the GetModuleHandleA hook itself asks this question.
+extern uintptr_t g_wowOptClientLo, g_wowOptClientSize, g_wowOptSelfLo, g_wowOptSelfSize;
+extern bool      g_wowOptSystemHooksClientOnly;
+
+static inline bool WowOpt_CallerIsForeign(const void* ret) {
+    if (!g_wowOptSystemHooksClientOnly) return false;
+    uintptr_t a = (uintptr_t)ret;
+    if (a - g_wowOptClientLo < g_wowOptClientSize) return false;
+    if (a - g_wowOptSelfLo < g_wowOptSelfSize) return false;
+    return true;
+}
+
+// Expanded inside the hook, where _ReturnAddress() is the caller of the API.
+#define WOWOPT_FOREIGN_CALLER() WowOpt_CallerIsForeign(_ReturnAddress())
 
 // The same refusal for a write this project performs itself rather than through
 // MinHook. Returns true when the write may go ahead. Call it with the address

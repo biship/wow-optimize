@@ -1,12 +1,9 @@
-// ============================================================================
-// Module: gettime_fast.cpp
-// ============================================================================
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <cstdint>
+#include <intrin.h>
 #include "MinHook.h"
 #include "version.h"
 
@@ -27,6 +24,7 @@ static GetTickCount_fn g_orig_GetTickCount = nullptr;
 
 // Hooked GetTickCount - returns cached value within same frame
 static DWORD WINAPI Hooked_GetTickCount(void) {
+    if (WOWOPT_FOREIGN_CALLER()) return g_orig_GetTickCount();
     ++g_gettime_calls;
     
     DWORD cached = g_cachedTickCount;

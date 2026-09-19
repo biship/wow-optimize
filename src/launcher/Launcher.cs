@@ -8,6 +8,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 using System.Reflection;
+using Microsoft.Win32;
 
 namespace WowOptimizeLauncher {
 
@@ -40,13 +41,22 @@ namespace WowOptimizeLauncher {
             "MatrixVectorSse2",    // 3.3 ns a call against the client's 2.5
             "TextureUnloadDelay",  // 0.4% and 0.2% of held textures ever reused
             "UIFrameBatch",        // switches nothing any more
-            "LuaGcCoalesce"        // the one tester crash with us truly in the stack
+            "LuaGcCoalesce",       // the one tester crash with us truly in the stack
+            // Both hold a skeleton and pick what to hold by distance. Reported
+            // visibly stuttering on environment animation - lava in Ironforge
+            // for the stride, the Deeprun Tram tunnels for the crowd throttle -
+            // and neither has ever produced a measured frame gain to weigh
+            // against it. Distance is a poor stand-in for whether a held
+            // skeleton is seen: a large animation fills the screen at any range.
+            "AnimLod",
+            "M2AnimStride"
         };
 
         private static readonly string[] DiagKeys = new string[] {
             "AbTest", "SamplingProfiler", "AddonProfiler", "LuaAddonProfile",
             "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
             "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
+            "VaCensus", "CameraReplay",
         };
         private static readonly string[] LogKeys = new string[] {
             "SessionLogs", "FlightRecorder", "NetDiag", "CpuTopology",
@@ -65,7 +75,7 @@ namespace WowOptimizeLauncher {
             // waitable-timer and spin hybrid, which changes when a frame is
             // handed over and nothing about what is in it.
             "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
-            "AnimLod", "M2AnimStride", "SoundVolumeLimit",
+            "SoundVolumeLimit",
         };
 
         private static bool In(string[] set, string key) {
@@ -97,6 +107,7 @@ namespace WowOptimizeLauncher {
             "AbTest", "SamplingProfiler", "AddonProfiler", "LuaAddonProfile",
             "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
             "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
+            "VaCensus", "CameraReplay",
 
             // Buys frames by making the game look or sound different. That is a
             // real trade and it is the player's to make, not this button's. A
@@ -105,6 +116,13 @@ namespace WowOptimizeLauncher {
             // say that something was wrong with the graphics.
             "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
             "AnimLod", "M2AnimStride", "SoundVolumeLimit",
+
+            // Keeps a player out of the world. The hook it installs sits in front
+            // of InitializeCriticalSection for every module in the process, and a
+            // tester bisected his failure to enter the world with ReShade down to
+            // this one switch. It is a compatibility hook, not a speed switch, and
+            // this button must never turn it on.
+            "LockTuningInitHook",
 
             // Left off because something measured them and the answer was no.
             "CompatMode",          // slower on purpose; it repairs a broken connection
@@ -396,7 +414,7 @@ namespace WowOptimizeLauncher {
         // remote version.txt to decide whether to show the update notification,
         // and shown in the version label. Keep in sync with version.txt and
         // src/core/version.h on every release.
-        private const string APP_VERSION = "3.19.2";
+        private const string APP_VERSION = "3.19.3";
 
         private string iniPath;
         private Dictionary<string, SettingItem> settingsMap;
@@ -457,6 +475,94 @@ namespace WowOptimizeLauncher {
             return Directory.Exists(wtfDir) ? wtfPath : rootPath;
         }
 
+        // version.dll existing is not the same as version.dll being ours.
+        // ReShade and several other mods install their own proxy under that
+        // exact filename, and whichever one is written last wins. Everything
+        // here used to read the file's presence as the optimizer being active,
+        // so a folder whose version.dll belongs to another mod reported ACTIVE
+        // while nothing ever loaded wow_optimize.dll. The marker is a string
+        // only our proxy carries.
+        private const int ProxyUnknown = -1;
+        private const int ProxyForeign = 0;
+        private const int ProxyOurs = 1;
+        private const string ProxyMarker = "wow_optimize_proxy.log";
+
+        private static int ProxyIdentity(string path) {
+            byte[] data;
+            try {
+                data = File.ReadAllBytes(path);
+            } catch {
+                return ProxyUnknown;
+            }
+            byte[] want = Encoding.ASCII.GetBytes(ProxyMarker);
+            int last = data.Length - want.Length;
+            for (int i = 0; i <= last; i++) {
+                int j = 0;
+                while (j < want.Length && data[i + j] == want[j]) j++;
+                if (j == want.Length) return ProxyOurs;
+            }
+            return ProxyForeign;
+        }
+
+        // Our proxy writes this file on every launch of the game, with OK and
+        // the path it loaded or with the Win32 error that stopped it. Nothing
+        // read it, so a payload that failed to load looked from the outside
+        // exactly like the optimizer being switched off.
+        private static string LastProxyResult(string baseDir) {
+            try {
+                string p = Path.Combine(Path.Combine(baseDir, "Logs"), "wow_optimize_proxy.log");
+                if (!File.Exists(p)) return null;
+                string[] lines = File.ReadAllLines(p);
+                for (int i = 0; i < lines.Length; i++) {
+                    string t = lines[i].Trim();
+                    if (t.Length > 0) return t;
+                }
+            } catch {
+            }
+            return null;
+        }
+
+        // Windows compatibility settings on an executable in this folder.
+        //
+        // The README has said for a long time that "Disable fullscreen
+        // optimizations" on Wow.exe stops the proxy from loading. A user found
+        // that only after moving every other mod out of the folder, because
+        // nothing here looked. Windows keeps those settings per executable path
+        // under AppCompatFlags\Layers, in the user's hive and in the machine's.
+        // Every exe in this folder is matched rather than Wow.exe alone, because
+        // private-server clients get renamed.
+        private static string CompatLayersInFolder(string baseDir) {
+            const string layersKey = @"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers";
+            string dir = baseDir.TrimEnd('\\', '/');
+            RegistryHive[] hives = new RegistryHive[] { RegistryHive.CurrentUser, RegistryHive.LocalMachine };
+            RegistryView[] views = new RegistryView[] { RegistryView.Registry64, RegistryView.Registry32 };
+            foreach (RegistryHive hive in hives) {
+                foreach (RegistryView view in views) {
+                    try {
+                        using (RegistryKey root = RegistryKey.OpenBaseKey(hive, view))
+                        using (RegistryKey key = root.OpenSubKey(layersKey)) {
+                            if (key == null) continue;
+                            foreach (string exe in key.GetValueNames()) {
+                                try {
+                                    if (!exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) continue;
+                                    string exeDir = Path.GetDirectoryName(exe);
+                                    if (exeDir == null) continue;
+                                    if (!string.Equals(exeDir.TrimEnd('\\', '/'), dir, StringComparison.OrdinalIgnoreCase)) continue;
+                                    string flags = key.GetValue(exe) as string;
+                                    if (string.IsNullOrEmpty(flags)) continue;
+                                    return Path.GetFileName(exe) + " (" + flags.Trim() + ")";
+                                } catch {
+                                }
+                            }
+                        }
+                    } catch {
+                    }
+                }
+            }
+            return null;
+        }
+
+
         public MainForm() {
             // Setup Paths
             iniPath = ResolveIniPath();
@@ -495,6 +601,7 @@ namespace WowOptimizeLauncher {
                 { "Async Worker Pool", new SettingItem("General", "AsyncWorkerPool", false, null, "Background worker threads used by the async subsystems. Also gated by the Lock-Free Heap Defragmenter until now, for no reason anyone recorded. Inherits that setting when its own key is absent. Forced off under Wine and Rosetta, where the workers blocked the main thread.") },
                 { "Thread Affinity", new SettingItem("General", "ThreadAffinity", false, null, "Pins client threads to cores chosen from the CPU topology. The third thing the Lock-Free Heap Defragmenter used to gate. Inherits that setting when absent, and Compatibility Mode still overrides it off.") },
                 { "D3D9Ex Vulkan DXVK Support", new SettingItem("General", "VulkanDXVK", false, null, "Optimizes DLL hook integration to work cleanly with DXVK (requires placing a d3d9.dll Vulkan wrapper in the game folder).") },
+                { "Skip Redundant Graphics State", new SettingItem("Graphics_Sound", "RenderStateDedup", false, null, "The game sets the same graphics state over and over: the same blend mode, the same texture stage settings, the same sampler filters, thousands of times a frame, most of them changing nothing. Each one is still a call into the graphics driver, and under a Vulkan wrapper it is a translation on top of that. This remembers what the state already is and drops the calls that would not change it. It used to be switched on only if you had ticked DXVK support, which has nothing to do with it, so a player on plain Direct3D could not have it; it has its own switch now and keeps whatever it was doing for you before. The log reports how many calls it removed.") },
                 { "Windows API Caches", new SettingItem("General", "TimingFix", false, null, "Caches the answers to Windows calls the client repeats constantly and that never change during a session: GetProcAddress, the module file name, environment variables, registry reads, system metrics, the OS version, system info and INI reads. Pure lookups, no game code touched.\n\nThis switch used to be called \"High-Precision Timing Fix\" and its description said it redirected GetTickCount and timeGetTime to the performance counter. It does not, and has not for some time - those three timer hooks, and the QPC coalescing cache with them, are compiled out of the build entirely after they were found to cause random stutters under DXVK. What was left behind the switch was these eight caches, which have nothing to do with timing, so a player chasing a timing bug turned off eight caches instead and a player wanting smoothness turned eight caches on. Reported by biship in #50, who read the code and was right about all of it.") },
                 { "Timing CVar Pin", new SettingItem("General", "TimingCvarPin", true, null, "Pins timingMethod to 2 and timingTestError to 0 whatever the client asks for. This has been on for everyone for a long time with no switch, buried inside the CVar safeguard; it now has its own. Leave it on unless you want the client's own timer choice back.") },
                 { "Client Crash Guards", new SettingItem("General", "CvarNullGuard", true, null, "Six guards against known client crashes, not one. It declines CVar writes through an object that looks uninitialised - which is what the option used to be named after - and it also wraps the Lua table read at 0x84x, the GUID type check that crashes on battleground load, the object reaper's null write on unlink, and two more null and bounds checks. Turning it off turns off all six, which the old name did not say. On by default. The timing CVar pin that used to ride along inside this feature has its own switch above.") },
@@ -503,7 +610,9 @@ namespace WowOptimizeLauncher {
                 { "WoW.exe Hooks: Extended (40)", new SettingItem("General", "WowExtendedHooks", true, null, "Forty further hooks into the client. Your log reports how many of them actually installed, as \"[EXTENDED] N/40\". Default on.") },
                 { "WoW.exe Hooks: Subsystem (100)", new SettingItem("General", "WowSubsystemHooks", true, null, "The largest batch: a hundred hooks across file loading, DBC reading, models and the rest of the client's subsystems. Your log reports how many installed, as \"[SUBSYSTEM] N/100\". If you are trying to work out whether this DLL is behind something, this is the biggest single thing to turn off. Default on.") },
                 { "D3D9 Render State Dedup", new SettingItem("Graphics_Sound", "D3d9StateManager", true, null, "Patches sixteen entries of the Direct3D 9 device's function table so repeated render-state changes with the same value are dropped instead of going to the driver. Like the groups above it had no switch until 3.18.2 and patched the vtable on every install. Default on. Turn it off if you are testing whether this DLL interacts with an overlay, a capture tool or DXVK.") },
-                { "Critical Section Spin Tuning", new SettingItem("General", "LockTuning", true, null, "Gives fifteen of the client's own locks a spin count before they fall back to the kernel, and hooks InitializeCriticalSection so new ones get it too. Like the four groups above, this had no switch at all until 3.18.2 and ran on every install regardless of what you set. Default on.") },
+                { "Critical Section Spin Tuning", new SettingItem("General", "LockTuning", true, null, "Gives fifteen of the client's own locks a spin count before they fall back to the kernel. Like the four groups above, this had no switch at all until 3.18.2 and ran on every install regardless of what you set. The hook that does the same for locks created later is the next switch. Default on.") },
+                { "Critical Section Hook (All Modules)", new SettingItem("General", "LockTuningInitHook", false, null, "Hooks InitializeCriticalSection in ntdll so every lock created after startup gets a spin count. Every module in the process goes through that hook, overlays and ReShade included, and No Client Patches does not stop it because it is outside WoW.exe. With it on, a player running ReShade could not enter the world; with it off and Critical Section Spin Tuning still on, he could. No session has measured any gain from it. Default off.") },
+                { "System Hooks: WoW Only", new SettingItem("General", "SystemHooksClientOnly", true, null, "Many of this DLL's hooks sit on Windows functions (timers, Sleep, window and cursor queries, registry and file lookups, string conversion) and every module in the process calls through them, ReShade, DXVK and overlays included. Most cache an answer or change what the function does. With this on they do that only for WoW.exe and this DLL, and every other module gets the real Windows function. Default on. Turning it off restores the old behaviour, where every module got the cached answers.") },
                 { "Background MPQ I/O Worker", new SettingItem("General", "AsyncMpqIo", true, null, "Starts a background thread that reads MPQ data ahead of the main thread. This one is worth knowing about because it is a worker thread, and worker threads are where this project's freezes have come from. It also had no switch until 3.18.2. Default on.") },
                 { "Process Priority Guard", new SettingItem("General", "PriorityGuard", true, null, "Hooks SetPriorityClass so nothing can quietly drop the game's process priority back down after it has been raised. No switch until 3.18.2. Default on.") },
                 { "Device Callback List Guard", new SettingItem("General", "DeviceCbGuard", true, null, "Fixes a crash where the game executes address 0 and dies instantly. Two people reported it independently - one swapping warrior stances, one alt-tabbing - and both logs land on the same instruction, a call through a callback pointer the client stores in a list and never checks for null. This looks at that list before the client walks it. On a healthy client that is one read-only pointer walk each time the graphics device is torn down, and nothing else happens; if it ever does find a bad entry it writes the whole entry to your log, which is the first time anyone will have seen one. Leave it on.") },
@@ -513,8 +622,10 @@ namespace WowOptimizeLauncher {
                 { "Mouse Clip Release on Alt-Tab", new SettingItem("General", "MouseClipRelease", false, null, "Frees the mouse cursor whenever WoW loses window focus, so it is never trapped inside the game window after alt-tab. Polls focus each frame and only ever RELEASES the clip (never applies one), so it cannot cause cursor/camera issues.") },
                 { "SavedVariables Backup on Startup", new SettingItem("General", "SavedVarsBackup", false, null, "At startup, copies each WTF\\Account SavedVariables .lua to a .lua.bak so you have the last-good config if a session corrupts it. Runs once on a background thread; only ever copies existing files, never modifies your live SavedVariables.") },
                 { "Sampling Profiler (diagnostic)", new SettingItem("General", "SamplingProfiler", false, null, "Developer tool: a background thread samples the main-thread instruction pointer ~1000x/sec and logs the top 50 hot functions on exit. Read-only, no gameplay effect. Leave off for normal play. Skipped by Enable All: it is a diagnostic and it costs frames. One reporter traced their long loading screens to leaving it on.", true) },
+                { "Catch Freezes", new SettingItem("General", "FreezeCatcher", false, null, "The game sometimes stops for a moment - a tester session has a frame that took nearly two seconds, and a hundred and forty over a tenth of a second - and nothing in the log can say what it was doing. The recorder tracks file reads, archive opens and network traffic, and during that two-second frame not one of them moved, so whatever it was, it was the processor working on something nobody is watching. The full profiler could answer it but costs too much to leave on, and one reporter traced longer loading screens to having it enabled. This watches instead: a background thread glances at the clock a few times a millisecond and does nothing at all unless the frame already in progress has run past a sixteenth of a second. Only then does it start looking, and only until that frame ends. A frame that behaves costs nothing. Turn it on if you get freezes and send the log.", true) },
                 { "No Client Patches (diagnostic)", new SettingItem("General", "NoClientPatches", false, null, "Writes nothing into WoW.exe, which turns every optimization off. Fixes the WoWCircle disconnects: two players ran it and the drops stopped. It is a trade, not a fix - you keep your connection and lose the performance work.", true) },
                 { "Flight Recorder (mark a moment)", new SettingItem("General", "FlightRecorder", true, null, "Keeps the last 512 frames and writes 240 of them to the log when you press Scroll Lock. Press it the moment you see something wrong. Nothing is written until you do, and it also marks itself for a disconnect, a freeze and a bad SavedVariables filename. Change the key with FlightRecorderKey in wow_opt.ini.") },
+                { "Camera Replay Benchmark", new SettingItem("General", "CameraReplay", false, null, "Measurement only. Stand still somewhere, press Shift+Pause, move the camera around, and press Shift+Pause again: the camera's motion is saved. Press Pause to play it back while the log measures every frame of the playback on its own. Run it once per build or setting from the same spot, facing the same way, with vsync off, and compare the BENCHMARK WINDOW blocks. Only the camera is replayed; other players and NPCs still move, so repeat each side. Hooks one wow.exe function, so leave it off on servers that kick for client patches. Change the key with CameraReplayKey in wow_opt.ini.", true) },
                 { "A/B Test a Feature", new SettingItem("General", "AbTest", false, null, "Turns one feature on and off in stints while you play and compares the two halves. It can only measure features you have switched on. Tick the features you want compared as well, or it has nothing to measure. Play at least 45 minutes.", true) },
 
                 // UI & Lua
@@ -524,6 +635,7 @@ namespace WowOptimizeLauncher {
                 { "Lua Number Conversion Fast Path", new SettingItem("UI_Lua", "LuaNumConvFast", false, null, "Inlines common Lua stack value queries (tonumber, gettop, settop) to bypass stack checking overhead.") },
                 { "Lua GetTime Frame Cache", new SettingItem("UI_Lua", "LuaGetTimeFast", false, null, "Caches the GetTime() Lua API value within a single frame tick to avoid redundant OS-level high-precision timer calls.") },
                 { "UI Layout Relink Shortcut", new SettingItem("UI_Lua", "LayoutRelinkFast", false, null, "The biggest single thing left. When the game re-anchors a UI frame it searches the entire global layout list, dereferencing up to nine pointers per frame, looking for anything anchored to the one that moved. In a 28 minute session with ElvUI that search was 9.06% of all main-thread CPU time, first place by more than double, and it gets worse the more frames your addons create.\n\nThe game already keeps the answer: each frame has a list of what is anchored to it. If that list is empty the search cannot possibly find anything, and empty is the expensive case, because finding nothing means having walked everything.\n\nOff by default and it earns its way on: for the first 20,000 calls it changes nothing, it only predicts and then checks what the client actually did. It starts taking the shortcut after 20,000 agreements, keeps checking one call in 1024, and switches itself off for the session on a single disagreement. An earlier attempt at this crashed on login; that one wrote to a client global, this one does not.", true) },
+                { "Object List Walk", new SettingItem("UI_Lua", "ObjMgrEnumFast", false, null, "Twenty-five places in the game ask what objects are nearby - targeting, nameplates, threat, spell visuals - and each one walks the whole object list, calling back once per object. For every single object on that walk the game rebuilds the address it needs to find the next one, two memory reads that have to finish before the read that fetches the next object can even start, for an answer that is the same for the entire walk. This works it out once. The list itself is walked live, exactly as the game walks it, in the same order - nothing is cached or copied, so nothing can go stale. It also counts what the walk costs: how many times a frame it runs, how many objects each one visits, and the longest. Those numbers are the point as much as the saving is, because nobody has ever measured this.", true) },
                 { "Lua VM Optimizer", new SettingItem("UI_Lua", "LuaVmOpt", true, null, "Replaces the Lua VM's own allocator with mimalloc, pre-sizes its string table and retunes its garbage collector. This is one of the largest things this DLL does to the game and it had no switch at all until 3.18.2 - it ran on every install regardless of the launcher, including with everything turned off. Default on, because that is what everyone has been running.") },
                 { "Lua VM: stop the automatic GC", new SettingItem("UI_Lua", "LuaGcManual", true, null, "Part of the optimizer above, split out because it is the part worth testing on its own: it stops the VM's automatic collector and steps it by hand instead. That changes when memory is reclaimed, which is the first thing to suspect for a session that gets progressively worse the longer it runs. Turn this off to hand collection back to the VM while leaving the rest of the optimizer alone.", true) },
                 { "Lua C-API Inline Cache Suite", new SettingItem("UI_Lua", "LuaOpcache", false, null, "Master switch for the Lua C-API fast paths. Off by default. It gates fifty-five separate hooks, which is why the four switches below exist: a tester reported that this suite corrupts ElvUI - addon names come out wrong in the addon list, the options panel reports itself missing, and a /reload drops you to the default Blizzard UI - and with everything behind one checkbox there was no way for them or for me to narrow it to one hook. Turn this on, then turn the groups below off one at a time until the corruption stops, and send the log. Leaving all four on is identical to how this switch behaved before. Skipped by Enable All: issue #37 reported it lengthening load times and producing Lua errors.", true) },
@@ -555,6 +667,8 @@ namespace WowOptimizeLauncher {
                 { "Parallel Sound Wave Decoding", new SettingItem("Graphics_Sound", "AudioDecodeMt", false, null, "Decodes sound assets in background threads to eliminate latency when playing fresh audio clips.") },
                 { "DBC Data Lookup Cache", new SettingItem("Graphics_Sound", "DbcLookupCache", false, null, "Speeds up data reading from internal database files (.dbc) for models, items, and spells. Skipped by Enable All: issue #35 reported it crashing the client during a loading screen, and that has not been re-tested since the file hooks were split out of it, so it is not known which half was at fault.", true) },
                 { "File I/O Hooks", new SettingItem("General", "FileIoHooks", false, null, "Everything this tool does to Windows file calls: sequential-scan hints on open, the adaptive read cache for MPQ archives, handle cleanup, a skipped buffer flush, and caches for file attributes, seeks and sizes. These used to be switched by the DBC cache above, which meant clearing that one to test it also removed the whole file layer, silently. Turn this off if loading, streaming or disk behaviour looks wrong. Skipped by Enable All for the same reason as the DBC cache it was split from: the crash reported in issue #35 could have come from either half.", true) },
+                { "Loading Screen Breakdown", new SettingItem("General", "MpqOpenCensus", false, null, "Answers where a loading screen actually goes. One session in the field took forty-five seconds to load, of which the game spent 89 milliseconds reading from disk and 97 compiling Lua - everything else, over ninety-nine percent of the wait, is unaccounted for, and the data was already in Windows' own file cache so it was not the drive. This counts and times the call the game uses to open a file inside its archives by name, and separates three cases: the file was found, the name was searched for and not there, and the name had already been searched for and was still not there. Only that third case is work something could remove, so it is the number that says whether a fix is worth building. It also names the files asked for most often and never found. Nothing is cached and no call is skipped - this only counts.", true) },
+                { "Skip Repeated Missing-File Lookups", new SettingItem("General", "MpqNegativeCache", false, null, "Removes a specific piece of loading-screen work rather than measuring it. The game looks for files inside its archives by name, and a name that is not there is searched for in every archive it has open - base game, every patch, and whatever your server added. It asks for files that do not exist constantly: optional textures, per-race variants, sounds an effect may not have. Asking a second time for a name already searched for and not found is the one part of that which is pure waste, and this answers those without going back to the game. It is awake only while a loading screen is up, and forgets everything when the next one starts, because what exists can only change between loads and not during one. Before it skips a single call it lets the game answer two thousand of them and checks it agrees every time; afterwards one in every 256 is still checked. One disagreement and it stops for the session. Turn on Loading Screen Breakdown with it to see what it saved.", true) },
                 { "UI Frame Batch (parent switch)", new SettingItem("UI_Lua", "UIFrameBatch", false, null, "The setting the two below inherit from when they are absent from the file. It used to be read by the tool with no entry here at all, so it could only be changed by editing the ini by hand, and it has been off for everyone since issue #36 reported flickering. It no longer switches anything by itself: the two halves it really controlled have their own entries, and the other two things it appeared to control are compiled out of the build. Leave it off and use the two below.", true) },
                 { "Table Emptiness Census", new SettingItem("UI_Lua", "LuaTableCensus", false, null, "Diagnostic, not an optimization. The garbage collector walks every slot of every table it visits, including the empty ones, and a table that once held a thousand entries keeps a thousand slots for as long as nothing new is inserted into it. That function is the most expensive Lua thing in every profile taken so far. This samples one table in five hundred of the collector's walk and reports how many of the slots it stepped over were empty. It only counts and never changes anything. The answer decides whether a compactor is worth writing.", true) },
                 { "Leave Lua Garbage Collection Alone", new SettingItem("UI_Lua", "LuaGcStockPace", false, null, "The garbage collector governor normally makes Lua collect more eagerly than it would on its own, to keep memory down and avoid a large pause later. That eagerness has a price the tool has never measured: it is paid inside the game's own collector, and in profiled sessions those two functions are the two most expensive Lua things running, ahead of the script interpreter itself. Tick this to leave the collector exactly as the game sets it and step nothing by hand. Run one session each way and compare the two lines the log prints; that is the entire experiment.", true) },
@@ -568,10 +682,18 @@ namespace WowOptimizeLauncher {
                 { "Reuse Compiled Scripts", new SettingItem("UI_Lua", "LuaProtoCache", true, null, "Interface scripts written inside XML templates are recompiled from scratch every time a frame is built from that template. Counted on real sessions: 88 out of every 100 chunks the game compiled were text it had already compiled that same session, 332 MB of repeated work. This keeps the compiled form and reuses it when the text and the chunk name are both identical, checked byte for byte rather than by a hash. The game still builds the function itself, so its environment and its addon ownership are unchanged. It compares the first 2000 reuses against a fresh compile and switches off if any of them differ.", true) },
                 { "Reuse Compiled Scripts Between Sessions", new SettingItem("UI_Lua", "LuaBytecodeStore", false, null, "Reuse Compiled Scripts only helps the second time the game compiles something in one sitting. On a measured loading screen that was 260 of the 2128 milliseconds spent compiling; the other 1868 were scripts the session had never seen, which nothing running inside the game can avoid. This writes the compiled form to Cache\\wow_optimize_bytecode.bin and reads it back on the next launch, so a script compiled yesterday is not compiled again today. The game can write that form but has no code to read it, so the reading is ours: every script rebuilt from the file is compared against a real compile of the same text, field by field and constant by constant, for the first 2000 of them and one in every 256 after that, and the whole store switches off for good the first time two of them differ. The file is discarded automatically if Wow.exe changes.", true) },
                 { "Collision Box Test (SSE2)", new SettingItem("Graphics_Sound", "CollisionOutcode", false, null, "Every line-of-sight check, every mouse click on the world and every projectile path makes the game sort the corners of a collision model against a box, one corner at a time on the old floating-point stack - six comparisons per corner. A corrected profile puts that single function at 3.8% of main-thread time, the largest one left outside model animation. This does four corners per instruction. Unlike the other maths replacements in this tool it is exact rather than close: the box bounds are read as plain numbers with no arithmetic done to them, so the vector comparison gives the same answer as the game's for every possible input. Before it changes anything it works out what the game is about to produce - which corners are outside and which triangles get queued - lets the game run, and compares the two lists. Three thousand of those have to match before it takes over.", true) },
+                { "Collision Ray Test (SSE2)", new SettingItem("Graphics_Sound", "CollisionRayOutcode", false, null, "The other half of the same collision work. A line-of-sight check or a mouse click on the world casts a ray, and before the ray meets a single triangle the game sorts every corner of the model against a box and compares each one six times on the old floating-point stack. Each of those comparisons is a branch on whether a corner is outside one face, which is a coin toss, so a model of a few hundred corners costs a few hundred mispredicted branches. A corrected profile puts the function at 2.6% of main-thread time. This does four corners at a time with no branch in it. The box here is nudged outward by a hundredth of a yard and the game keeps that nudge at a wider precision than a normal number, so the comparisons are done at that wider precision too and give the game's own answer for every possible input. Before it changes anything it computes the whole classification alongside the game's, lets the game run, and compares. Three thousand calls have to match before it takes over.", true) },
+                { "Ray vs Triangle Test (SSE2)", new SettingItem("Graphics_Sound", "RayTriangleSse2", false, null, "The third and last piece of the collision work. Once the game has narrowed a ray down to the handful of triangles it might actually touch, it tests each one, and that test is shared by every collision path in the game - line of sight, mouse clicks on the world, projectiles, footing. A corrected profile puts the whole collision family at 6.4% of main-thread time and this is the part of it doing the real arithmetic: 231 old floating-point-stack instructions with five round trips through the status register, each one feeding a branch on whether the ray missed, which the processor cannot predict. This carries the same numbers at the same width and compares them directly. It is a transcription rather than a tidy-up: wherever the game narrows an intermediate value to a smaller number this narrows it too, because writing the same formula cleanly gives a different distance on more than a quarter of hits. Before it answers anything it computes the result alongside the game twenty thousand times and compares the answer and every number written; one call in four thousand keeps checking afterwards.", true) },
                 { "Bone Matrix Upload (SSE2)", new SettingItem("Graphics_Sound", "BoneMatrixUpload", false, null, "Replaces the bone matrix transpose in the draw path with SSE2. 3.35% of main-thread time in the profile. Nothing is computed, only copied, so the result is identical bit for bit; it still checks the first 20000 bones against the client and backs out if they differ.", true) },
+                { "Particle Vertex Fill (SSE2)", new SettingItem("Graphics_Sound", "ParticleFill", false, null, "Replaces the per-particle vertex fill in the client's particle emitter (2.5% of self time in a combat profile). For every particle the client calls a getter and adds the offset on the x87 stack; this reads the getter once per fill and does the add with SSE, writing the same bytes. It first predicts 4096 fills and compares each byte for byte with what the client itself wrote, keeps comparing one in 1024 after that, and switches itself off for the session at the first difference.", true) },
+                { "UI Batch Fill (SSE2)", new SettingItem("Graphics_Sound", "UiBatchFill", false, null, "Replaces the per-vertex fill in the client's UI batch draw (UI_BatchDraw, 2.3% of executing time in a combat profile with a busy interface). For every vertex the client calls a getter and reloads six values; this reads them once per batch and writes the same bytes. It first predicts 4096 batches and compares each byte for byte with what the client itself wrote, keeps comparing one in 1024 after that, and switches itself off for the session at the first difference.", true) },
                 { "M2 Matrix Slot Copy (SSE2)", new SettingItem("Graphics_Sound", "M2MatrixSlotSse2", false, null, "Replaces the two places in the model animation update that copy a finished bone matrix into the model one float at a time - sixteen x87 moves each - with four SSE2 moves. There is no arithmetic in either, so the bytes written are the bytes read. The animation family is about a fifth of the frame. Experimental.", true) },
-                { "Model Animation Stride (experimental)", new SettingItem("Graphics_Sound", "M2AnimStride", false, null, "Holds a distant model's skeleton for a frame instead of re-solving every bone. Its materials, particles and attached items keep animating - only the bones pause. Nothing within 45 yards is ever held; past that a model updates every 2nd, 3rd or 4th frame by distance, and each one is on its own phase so they do not all update together. The animation family is about a fifth of the frame. Experimental.", true) },
+                { "Model Animation Stride (experimental)", new SettingItem("Graphics_Sound", "M2AnimStride", false, null, "Holds a distant model's skeleton for a frame instead of re-solving every bone. Its materials, particles and attached items keep animating - only the bones pause. Nothing within 45 yards is ever held; past that a model updates every 2nd, 3rd or 4th frame by distance, and each one is on its own phase so they do not all update together. The animation family is about a fifth of the frame.\r\n\r\nReported stuttering visibly on environment animation, the lava in Ironforge among it. Distance is a poor stand-in for whether a held skeleton is seen: a large animation fills the screen at any range. No measured frame gain stands against that yet - the sessions that showed the stutter were frame capped, where a saving inside the frame changes no frame time. It is an A/B subject; that run has not happened.", true) },
+                { "Reuse Repeated Animation Poses", new SettingItem("Graphics_Sound", "M2AnimReuse", false, null, "A model's skeleton is rebuilt from scratch every frame, and in one measured session nine times out of ten the game asked for a pose it had already worked out - same model, same animation, same moment - while the game's own check that is meant to catch that fired for none of a quarter million rebuilds. This keeps the pose when the question is word for word the same one, so what you see is the pose the game would have recalculated, not an old one. Everything after the skeleton still runs, so weapons, particles, lights and texture animation carry on. Models whose skeleton carries a running clock are left alone. Before it holds anything it fingerprints the skeleton the game produced and waits for five thousand of those to come out identical; one hold in four thousand keeps checking afterwards. Turn Model Animation Stride off to use this - they cut the game at the same instruction, and that one decides by distance, which is why it stuttered.", true) },
                 { "Keep the Allocator Above 2GB", new SettingItem("General", "MimallocHighArena", false, null, "A 32-bit client can only allocate from the low 2GB, and this tool's allocator grows into the same half. Three sessions ran out of it, and one had a SavedVariables file written under a garbage name. This reserves address space above 2GB and hands it to the allocator, which uses memory it is given before asking the OS - and hands over more as it fills, so the allocator never has a reason to come back down. Needs a large-address-aware client. It releases any block Windows places below 2GB rather than use it. Sizes are MimallocHighArenaMB and MimallocHighArenaMaxMB in wow_opt.ini.", true) },
+                { "Address Space Census", new SettingItem("General", "VaCensus", false, null, "Measurement only. Records every private address-space reservation by the module that made it - wow.exe, DXVK, the GPU driver, this tool - so the low-2GB dump in the log names who holds that half instead of calling it \"private\". Every out-of-memory report so far has said how much private memory sits below 2GB and never whose it is. Hooks two ntdll allocation entry points; nothing is placed or freed differently.", true) },
+                { "Large Reservations Above 2GB: Other Modules", new SettingItem("General", "HighPlacementModules", false, null, "Asks Windows to place reservations of HighPlacementMinKB or more (1024 KB unless set in wow_opt.ini) from DXVK, the GPU driver and other DLLs above 2GB, so they stop using up the contiguous space the client allocates from. Placement only: nothing is redirected. Needs a large-address-aware client. A heap segment it moves up is afterwards used by everything that shares that heap, wow.exe included.", true) },
+                { "Large Reservations Above 2GB: wow.exe", new SettingItem("General", "HighPlacementClient", false, null, "The same for wow.exe's own reservations and heap growth. Riskier: the client's large-address-aware flag comes from a community patch, and nobody has checked that every path in it handles pointers above 2GB. If the game misbehaves with this on and not with it off, that is what it found.", true) },
                 { "Batch the Game's File Writes", new SettingItem("General", "ClientWriteBatch", true, null, "The game writes SavedVariables about nine bytes at a time. One tester's loading screen spent 2470 ms of 16828 inside 593557 of those calls, for 5.6 MB. This gathers them into 64KB pieces, so the same work is about ninety system calls. It buffers one file at a time, flushes on every close, seek, read and flush, and checks each closed file's size against what the game handed over - if a byte ever goes missing it switches itself off and says so. Needs File I/O Hooks.", true) },
                 { "Box Overlap Test (SSE2)", new SettingItem("Graphics_Sound", "AabbOverlap", false, null, "Before drawing anything the game asks, for every object in the scene and for every visibility pass over it, whether that object's box overlaps the one being tested. Seventeen different parts of the engine ask it. The test itself is six number comparisons, but each one is moved off the old floating-point stack through the slowest instruction available for that, and each is followed by a branch the scene data decides - so a walk over a mixed set of objects guesses wrong on most of them. This answers all six at once. Nothing is added or multiplied anywhere in the test, only compared, so the vector version gives the identical answer for every possible input rather than a close one. It checks itself against the game's own answer twenty thousand times before it starts answering alone, and keeps rechecking one call in four thousand after that.", true) },
                 { "Lua Pool Shortcuts", new SettingItem("UI_Lua", "LuaPoolFast", false, null, "The game keeps its own pool of memory for the interface scripting language, carved into chunks. Every time it hands a block back, it has to work out which chunk that block came from, and it does that by checking every chunk in turn, following a pointer to each one before it can even compare. This remembers the last few chunks along with their boundaries, so the usual answer is a couple of comparisons instead of a walk through scattered memory. The block is always re-checked against the chunk's own record before anything is written, so a stale entry costs a little time and can never put memory in the wrong place. It also tells the separate 'Lua Pool Allocation Hint' feature which chunk just got a block back, which is the one thing that feature could not know on its own: a measurement of a tester's session showed three quarters of allocations finding room immediately but nearly a fifth still searching through thirty-three chunks or more, and that tail is exactly memory freed into a chunk the search had already passed. Two testers' freeze reports have pointed at this code.", true) },
@@ -583,7 +705,7 @@ namespace WowOptimizeLauncher {
                 { "Model Draw Order Key Cache", new SettingItem("Graphics_Sound", "M2SortKey", false, null, "Before drawing a model the game sorts its pieces into the right order, and the routine that decides which of two pieces comes first spends almost all its time chasing pointers through memory to look up a single number - five hops, each waiting on the one before it. In a profile of a tester's session this one routine was 2.44 percent of all the time the game spent working, ahead of every scripting entry. This remembers that number for the length of a single frame, which removes three of the five hops. The comparison itself is unchanged and does not alter anything, so the result is simply checked against the game's own answer, twenty thousand times at first and regularly afterwards.", true) },
                 { "Bone Movement Track (SSE2)", new SettingItem("Graphics_Sound", "AnimVec3Track", false, null, "Alongside a rotation, every animated bone carries a position, and the game works out where it should be by interpolating between two keyframes one number at a time. This does all three at once. It runs more often than the rotation work does - the same routine handles every three-number track in a model, and the animation code calls it eight times over against once for rotations. The tricky part is that the game rounds the result to lower precision in one place and deliberately does not in another, so both are reproduced exactly where they happen and the position that comes out is identical bit for bit, not merely close. It checks itself against the game's own answer for the first thirty thousand bones and keeps rechecking afterwards.", true) },
                 { "Bone Rotation Unpack (SSE2)", new SettingItem("Graphics_Sound", "AnimQuatUnpack", false, null, "Posing a skeleton means reading a rotation for every bone of every animated thing on screen, every frame - and each rotation is stored packed into four small integers that have to be expanded back into real numbers. A 32-bit processor has no direct route from an integer to the old floating-point unit, so the game writes each number to memory and immediately reads it back again, four times per rotation and up to sixteen times per bone. This converts two at a time inside the processor with no memory in the way. The maths is done at the same width the game uses and rounded at the same points, so the pose that comes out is identical bit for bit, not merely close. It compares all its output against the game's own for the first thirty thousand bones and keeps rechecking afterwards.", true) },
-                { "Spread Model Animation (crowd throttle)", new SettingItem("Graphics_Sound", "AnimLod", false, null, "Posing the skeletons of everything on screen is the single largest block of frame time the game spends: measured on real sessions at 3.68 milliseconds out of a 24.5 millisecond frame in a raid, across 114 models averaging 31 bones each. No one function inside it is worth optimising - the cost is spread across dozens - so the only way to reach it is to do less of it. Below 96 models on screen this changes nothing at all. Above that, each model has its pose refreshed every second, third or fourth frame instead of every frame, never less often than a quarter of your frame rate, and a model is never skipped before its first pose. It cannot make animations run slow or drift: the game works out where an animation should be from the clock each time rather than by counting frames, so a skipped update only delays when a pose is refreshed. What you may notice in a packed city is slightly steppier movement on some characters.", true) },
+                { "Spread Model Animation (crowd throttle)", new SettingItem("Graphics_Sound", "AnimLod", false, null, "Posing the skeletons of everything on screen is the single largest block of frame time the game spends: measured on real sessions at 3.68 milliseconds out of a 24.5 millisecond frame in a raid, across 114 models averaging 31 bones each. No one function inside it is worth optimising - the cost is spread across dozens - so the only way to reach it is to do less of it. Below 96 models on screen this changes nothing at all. Above that, each model has its pose refreshed every second, third or fourth frame instead of every frame, never less often than a quarter of your frame rate, and a model is never skipped before its first pose. It cannot make animations run slow or drift: the game works out where an animation should be from the clock each time rather than by counting frames, so a skipped update only delays when a pose is refreshed.\r\n\r\nReported stuttering visibly on environment animation, the Deeprun Tram tunnels among them. Its guard protects models whose materials or attachments still need work; it does not protect the skeleton, which is the thing being held. No measured frame gain stands against that yet - the sessions that showed the stutter were frame capped, where a saving inside the frame changes no frame time.", true) },
                 { "UI Method Object Lookup", new SettingItem("UI_Lua", "LuaThisFast", false, null, "Every call an addon makes into a frame - SetText, GetWidth, Show, all 674 of them - starts by fetching the frame object out of a table slot, and the game does that through four separate script-engine calls plus a push and a pop. This reads it directly instead. The one thing those calls do besides fetch is carry addon ownership between values, which decides what is allowed to touch protected actions, and that is reproduced exactly rather than skipped. Anything out of the ordinary is handed straight back to the game. It compares the first 20000 lookups against the game's own answer and switches off if any of them differ.", true) },
                 { "Hash Lookup Chains", new SettingItem("General", "ObjMgrFindFast", false, null, "The game looks things up by id constantly - creatures, spells, items, database rows - through one search routine the compiler copied into the client eleven times. Every copy re-reads the table header and recomputes where the next link lives for each step of the search, although none of it can change during one lookup. This works it out once instead, on the three copies that are actually used heavily (one of them has 184 call sites). Each runs alongside the game's own routine at first and compares every answer; a single difference switches that one off for the session and says so in the log.", true) },
                 { "Vertex Colour Format Inline", new SettingItem("Graphics_Sound", "VertexFmtInline", false, null, "The game asks \"does this colour need its bytes swapped for my graphics card\" once for every single vertex it builds, in both the interface batcher and the particle system. The answer is a property of your graphics device and cannot change between two vertices. Those two functions were 5% of CPU time in a profile. This computes the answer in place instead of calling out for it, using the same fourteen bytes of machine code, so nothing else shifts. It checks the client byte for byte first and does nothing if it does not match. EXPERIMENTAL: it patches game code.", true) },
@@ -916,17 +1038,83 @@ namespace WowOptimizeLauncher {
             statusTitle.BackColor = Color.Transparent;
             statusCard.Controls.Add(statusTitle);
 
-            bool dllActive = File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "version.dll"));
+            // Say which file is missing and where it was looked for.
+            //
+            // This tested version.dll alone and, when it was absent, said
+            // "NOT LOADED / MISSING DLLs". A user who has wow_optimize.dll but
+            // not version.dll, or who runs this from anywhere other than the
+            // folder holding WoW.exe, gets a message naming neither the file nor
+            // the directory and has nothing to act on. That is what "the new one
+            // doesn't detect the .dll" looks like from the other side.
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            bool haveLoader = File.Exists(Path.Combine(baseDir, "version.dll"));
+            bool havePayload = File.Exists(Path.Combine(baseDir, "wow_optimize.dll"));
+            int proxyId = haveLoader
+                ? ProxyIdentity(Path.Combine(baseDir, "version.dll"))
+                : ProxyUnknown;
+            bool foreignLoader = (proxyId == ProxyForeign);
+            bool dllActive = haveLoader && havePayload && !foreignLoader;
+            string missing;
+            if (haveLoader && havePayload) missing = "";
+            else if (!haveLoader && !havePayload) missing = "version.dll and wow_optimize.dll";
+            else if (!haveLoader) missing = "version.dll";
+            else missing = "wow_optimize.dll";
+
+            // A compatibility setting on the client's executable stops the proxy
+            // loading while both files sit exactly where they should, so it is
+            // looked for once they do.
+            string compatLayers = dllActive ? CompatLayersInFolder(baseDir) : null;
+
+            string statusText;
+            if (foreignLoader) statusText = "NOT LOADED - version.dll belongs to another mod";
+            else if (!dllActive) statusText = "NOT LOADED - missing " + missing;
+            else if (compatLayers != null) statusText = "MAY NOT LOAD - compatibility setting";
+            else statusText = "OPTIMIZER ACTIVE (version.dll)";
+
             Label statusVal = new Label();
-            statusVal.Text = dllActive ? "OPTIMIZER ACTIVE (version.dll)" : "NOT LOADED / MISSING DLLs";
+            statusVal.Text = statusText;
             statusVal.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
-            statusVal.ForeColor = dllActive ? Color.FromArgb(0, 230, 118) : Color.FromArgb(255, 82, 82);
+            if (!dllActive) statusVal.ForeColor = Color.FromArgb(255, 82, 82);
+            else if (compatLayers != null) statusVal.ForeColor = Color.FromArgb(255, 193, 7);
+            else statusVal.ForeColor = Color.FromArgb(0, 230, 118);
             statusVal.AutoSize = true;
             statusVal.Location = new Point(10, 26);
             statusVal.BackColor = Color.Transparent;
             statusCard.Controls.Add(statusVal);
+
+            // The second line carries whatever the first one cannot act on: the
+            // folder that was searched when a file is missing, the collision
+            // when version.dll is someone else's, the compatibility setting and
+            // where to clear it, and otherwise the result the proxy recorded on
+            // the last launch. Both files being present is not evidence that
+            // the payload loaded.
+            string detail;
+            if (foreignLoader) {
+                detail = "that version.dll has no optimizer loader in it - ReShade and other mods use the same filename";
+            } else if (!dllActive) {
+                detail = "looked in " + baseDir;
+            } else if (compatLayers != null) {
+                detail = compatLayers + " - untick \"Disable fullscreen optimizations\" in its Properties > Compatibility";
+            } else {
+                string lastRun = LastProxyResult(baseDir);
+                detail = (lastRun != null && lastRun.StartsWith("ERROR")) ? "last launch: " + lastRun : null;
+            }
+
+            if (detail != null) {
+                statusCard.Size = new Size(btnWidth, 72);
+                Label statusWhere = new Label();
+                statusWhere.Text = detail;
+                statusWhere.Font = new Font("Segoe UI", 7f, FontStyle.Regular);
+                statusWhere.ForeColor = Color.FromArgb(150, 163, 178);
+                statusWhere.AutoSize = false;
+                statusWhere.Size = new Size(btnWidth - 20, 28);
+                statusWhere.Location = new Point(10, 42);
+                statusWhere.BackColor = Color.Transparent;
+                statusCard.Controls.Add(statusWhere);
+            }
+
             leftPanel.Controls.Add(statusCard);
-            y += 62;
+            y += (detail != null) ? 80 : 62;
 
             activeCountLabel = new Label();
             activeCountLabel.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
@@ -1405,10 +1593,23 @@ namespace WowOptimizeLauncher {
         // an A/B harness rotating eighteen features every twenty seconds. That
         // button is gone; this one is what it was being mistaken for.
         private void SetUpMaxPerformance() {
-            int on = 0, off = 0;
+            int on = 0, off = 0, left = 0;
             foreach (SettingItem item in settingsMap.Values) {
                 if (item.Ctrl == null) continue;
-                bool want = Kinds.HelpsSpeed(item.Key);
+                bool want;
+                if (item.Experimental) {
+                    // Its own default, whichever way that points. This button
+                    // used to turn every one of these on - forty-eight of them,
+                    // including replacements that are off because nobody has run
+                    // them in a game yet. A switch that exists to be left off has
+                    // to survive the button that turns everything on, and the six
+                    // that are on by default have to survive it too, so neither is
+                    // decided here.
+                    want = item.DefaultVal;
+                    left++;
+                } else {
+                    want = Kinds.HelpsSpeed(item.Key);
+                }
                 item.Ctrl.Checked = want;
                 if (want) on++; else off++;
             }
@@ -1419,6 +1620,9 @@ namespace WowOptimizeLauncher {
                 + "Off: everything that measures the game, everything that buys "
                 + "frames by changing how it looks or sounds, and the few that "
                 + "were measured against the client and lost.\r\n\r\n"
+                + left.ToString() + " switch(es) marked [+] or [!] were left at "
+                + "their own default, because an unproven replacement should not "
+                + "be turned on by a button that says performance.\r\n\r\n"
                 + "Saved. Launch when ready.",
                 "Max Performance", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -1516,6 +1720,22 @@ namespace WowOptimizeLauncher {
             InheritIfAbsent(present, "AsyncWorkerPool", "DefragLf");
             InheritIfAbsent(present, "ThreadAffinity", "DefragLf");
             InheritIfAbsent(present, "SimdGeometry", "StrStrSse2");
+            // Render state dedup used to be gated on EITHER of two switches, so
+            // an absent key has to resolve to their OR, exactly as Config::Load
+            // resolves it. InheritIfAbsent assigns rather than ORs, so calling it
+            // twice would let the second parent switch off what the first
+            // switched on, and the first Save would then take the feature away
+            // from everyone who had it through the other one.
+            if (!present.ContainsKey("RenderStateDedup")) {
+                SettingItem dedup = FindByKey("RenderStateDedup");
+                SettingItem dxvk  = FindByKey("VulkanDXVK");
+                SettingItem rthr  = FindByKey("D3d9RenderThread");
+                if (dedup != null && dedup.Ctrl != null) {
+                    bool on = (dxvk != null && dxvk.Ctrl != null && dxvk.Ctrl.Checked)
+                           || (rthr != null && rthr.Ctrl != null && rthr.Ctrl.Checked);
+                    dedup.Ctrl.Checked = on;
+                }
+            }
             InheritIfAbsent(present, "LuaAddonProfile", "SamplingProfiler");
             // UiScriptHandlerCache and UnitApiFastPath used to inherit UIFrameBatch
             // here. Their checkboxes are gone because both gate an install that

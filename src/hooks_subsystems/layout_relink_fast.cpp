@@ -45,7 +45,6 @@
 // is `test eax, eax` at the top of the inner anchor loop, right after
 // `mov eax, [edx-4]`. That is inside the scan, not in the early-out at 0x489726
 // that this module leaves to the client. The target is the right one.
-//
 // ---------------------------------------------------------------------------
 // Why the case where a dependant IS found cannot be shortcut too
 //
@@ -72,63 +71,49 @@
 // reorders the list on every call, so any key it maintained would be invalidated
 // by the next relink - including its own.
 //
-// There is a second reason, and it is stronger because it needs no argument about
-// ordering at all: an anchor cannot name the node that owns it.
+// Note that a node carries no owner field: sub_489C30 allocates sixteen bytes
+// with `.?AUFRAMENODE@CLayoutFrame@@` and fills two link words, a frame at +8
+// and a word at +12. That is about the node, not the anchor. Two different
+// sixteen-byte objects in this cluster have a frame at +8 and a word at +0x0C.
+// The anchor is a CFramePoint, built by sub_49CA40, sitting in one of nine slots
+// at frame+0x0C..0x2C; its +8 is the frame it points at. The FRAMENODE is the
+// dependants-index entry, chained off frame+0x38; its +8 is the DEPENDENT frame,
+// which is precisely the owner the paragraph said did not exist. sub_48A260
+// writes the anchor into `*(this + a2 + 3)` and then calls
+// `sub_489C30(a3, this, 1 << a2)`, so the frame it hands the index is the frame
+// whose slot it just filled.
 //
-// If exactly one node in the whole list carried an accepting anchor to `this`,
-// that node would be the match whatever order the list is in, and the ordering
-// objection above would not bite. Answering it needs the owning node of an
-// anchor. sub_489C30 allocates each one with
-// `sub_76E540(16, ".?AUFRAMENODE@CLayoutFrame@@", -2, 8)` - sixteen bytes off the
-// heap, not a field inside the frame - and assigns all four of its dwords: two
-// link words, the frame at +8, and the flags at +12. There is no fifth word and
-// no owner pointer, and because the allocation is separate the offset from an
-// anchor to the node that references it is not a constant either.
+// The found case is left to the client and counted as `deferred`; the counters
+// below measure how often the single-candidate case arises.
 //
-// So the found case is left to the client, and the counters below separate it as
-// `deferred`. This is settled from the disassembly rather than open; a
-// measurement of anchor-minus-node offsets was written and then removed, because
-// its answer was already on the page above.
+// The word at the index entry's +0x0C is the point mask, not the anchor flags:
+// sub_48A260 passes `1 << a2` for a point index in 0..8 and sub_48A3E0 passes
+// 0x101, so the mask cannot exceed 0x1FF and bit 11 is unreachable through it.
 //
+// NoDependantCanMatch below does what that predicate was meant to do. For each
+// frame the index names it applies the scan's own three tests to that frame's
+// nine slots, and answers not-found when none of them holds an anchor the scan
+// would accept. The field said how much is waiting: of 62782 verified calls in
+// one session, 24691 - 39.3% - had a non-empty +0x38 and the client still found
+// nothing. Those are 25.4 million deferred calls a session, each one walking an
+// average of 43.3 nodes at nine dereferences apiece.
 // ---------------------------------------------------------------------------
-// The scan skips any anchor whose word at +0x0C has 0x800 set, while sub_489C30
-// registers a dependant regardless of it - the point mask it ORs into that same
-// word occupies the low bits. A dependants list holding only entries the scan
-// would reject is therefore a real state, and it is the state behind every
-// "something at +0x38 but the client found nothing".
-//
-// That extension is implemented: AllDependantsRejected below walks the list and
-// answers not-found when every entry carries 0x800. It is not a guess. On the
-// deferred path the client averages 73 to 93 nodes at nine dereferences each and
-// finds nothing 91.6% of the time, sampled one call in 256 over 154566 of them,
-// and the module's own verification agrees independently at 89.9%.
-//
-// ---------------------------------------------------------------------------
-// This is the second attempt. The first one crashed the game on login and is
-// worth writing down.
-//
-// It made the original take its own not-found path by setting dword_AC1020 to 0
-// for the duration of the call and restoring it afterwards, reasoning that
-// sub_489710 contains no call instructions so nothing could observe the global
-// inside that window. Nothing reads it, true. But off_AC101C at 0xAC101C and
-// dword_AC1020 at 0xAC1020 are adjacent dwords forming ONE link pair - the root
-// node of the list - and the not-found path *writes* to the second of them:
+// Do not force the not-found path by zeroing dword_AC1020 for the duration of
+// the call. Nothing reads it inside sub_489710, but off_AC101C at 0xAC101C and
+// dword_AC1020 at 0xAC1020 are adjacent dwords forming one link pair - the root
+// node of the list - and the not-found path writes to the second of them:
 //
 //     489827  mov esi, offset off_AC101C
 //     48982c  mov edx, [esi]          ; edx = off_AC101C
 //     489836  mov [edx+4], ecx        ; <-- when edx is the root, this IS AC1020
 //
-// So the restore clobbered the client's own write and the layout list lost a
-// link. EIP 0x00489873, `mov [ebx], esi` with EBX = 0, on the next relink.
+// Restoring afterwards clobbers the client's own write and the layout list loses
+// a link: EIP 0x00489873, `mov [ebx], esi` with EBX = 0, on the next relink.
 //
-// I had checked that nothing reads the global. I had not checked that something
-// writes it.
-//
-// This version writes to no client global. It reads one word to decide, and
-// when it decides yes it performs the same pointer surgery the client would
-// have performed, transcribed instruction by instruction from the tail below.
+// So this writes to no client global. It reads one word to decide, and when it
+// decides yes it performs the same pointer surgery the client would have,
+// transcribed instruction by instruction from the tail below.
 // ---------------------------------------------------------------------------
-//
 // And it does not believe itself. For the first calls of every session it takes
 // no shortcut at all: it makes its prediction, calls the original, and then
 // checks what the original actually did. The not-found tail ends with
@@ -136,7 +121,6 @@
 // path ran, which is a one-word test. Only after a run of agreements does the
 // fast path switch on, and one in every 1024 calls stays in shadow mode
 // afterwards so a late divergence still gets caught.
-//
 // ---------------------------------------------------------------------------
 // The check is deliberately one-sided, and the first version of it was not.
 //
@@ -153,14 +137,10 @@
 //                                              correct. We merely paid for a
 //                                              scan we could have skipped.
 //
-// The original check was `actualNotFound != predictNotFound`, which retired on
-// both. A tester's log (nobus, v3.18.2) shows the cost: the module disabled
-// itself three seconds into the session on the *second* kind, having taken zero
-// shortcuts, and the client's 9%-of-profile scan ran unaided for the rest of the
-// session. A divergence that cannot produce a wrong answer must not be able to
-// switch the module off. It is counted instead, because a high count means the
-// dependants list holds entries the scan rejects and there is more win available
-// than we are taking.
+// So retire on the first only. A divergence that cannot produce a wrong answer
+// must not be able to switch the module off; it is counted instead, and a high
+// count means the dependants list holds entries the scan rejects, which is win
+// still on the table.
 // ---------------------------------------------------------------------------
 // ============================================================================
 
@@ -194,6 +174,17 @@ constexpr long kResampleMask = 1023;   // one in 1024
 // how many dependants were examined to reach them.
 unsigned long g_rejectShortcut = 0;
 double        g_rejectWalked   = 0.0;
+// Of the calls that still defer, how many frames in the index actually carry an
+// anchor the scan would accept. Exactly one is the interesting case: a single
+// candidate is the match whatever order the global list is in, so this is the
+// number that says whether the found path is worth answering from the index too.
+unsigned long g_oneQualifier   = 0;
+// Of the single-qualifier calls, the ones where that frame is actually in the
+// global list. That is the population a found-path shortcut could serve, and it
+// is smaller than g_oneQualifier by however many frames hold an anchor while
+// unlinked.
+unsigned long g_oneQualifierLinked = 0;
+unsigned long g_manyQualifiers = 0;
 
 unsigned long g_scanSample   = 0;
 unsigned long g_scansSeen    = 0;
@@ -275,14 +266,35 @@ inline void     Wr(uintptr_t p, uint32_t v) { *(volatile uint32_t*)p = v; }
 // with the low bit set.
 inline bool IsEmptyLink(uint32_t v) { return v == 0 || (v & 1) != 0; }
 
-// Anchors the scan refuses to match on. sub_489710 tests each of the nine slots
-// with `!(*(a + 0x0C) & 0x800)` before comparing the frame, so an anchor with
-// that bit set can never satisfy it. sub_489C30 registers a dependant whatever
-// the bit says, because the point mask it ORs into the same word lives in the
-// low bits, and a dependants list holding only rejected anchors is therefore a
-// real and common state.
-constexpr unsigned kFN_flags   = 0x0C;   // the word the scan masks with 0x800
+// Two different objects, both sixteen bytes, both with a frame at +8 and a word
+// at +0x0C. Conflating them is what made the second predicate dead code.
+//
+// An ANCHOR is a CFramePoint. It lives in one of nine slots at frame+0x0C..0x2C
+// and the scan tests it with `a && !(*(a+0x0C) & 0x800) && *(a+8) == this`, so
+// its +8 is the frame it points AT and its +0x0C is a packed word whose low
+// byte is the relative point (sub_48A260 compares `*(char *)(v9+12) != a4`) and
+// whose bit 11 is the reject flag.
+//
+// A DEPENDANTS ENTRY is the FRAMENODE sub_489C30 allocates,
+// `sub_76E540(16, ".?AUFRAMENODE@CLayoutFrame@@", -2, 8)`. It is chained off
+// frame+0x38 and sub_489C30 ends with `v6[2] = a2; v6[3] = a3`, so its +8 is the
+// DEPENDENT frame and its +0x0C is the point mask.
+//
+// Both registrars call it as sub_489C30(target, dependent, mask):
+// sub_48A260 passes `1 << a2` for a point index a2 in 0..8, and sub_48A3E0
+// passes 0x101, which is points 0 and 8. The mask therefore cannot exceed
+// 0x1FF, and bit 11 is not reachable through it at all.
+//
+// The old predicate read 0x800 out of the entry's +0x0C - the point mask - and
+// so answered true only for a bit the registrar cannot set. It never fired once
+// in a field session, and the line that would have said so was written behind
+// `if (g_rejectShortcut > 0)`, which is how a dead predicate stayed invisible.
+constexpr unsigned kAnchor0    = 0x0C;   // first of nine anchor slots in a frame
+constexpr unsigned kAnchorCount= 9;
+constexpr unsigned kAnchorTgt  = 0x08;   // the frame an anchor points at
+constexpr unsigned kAnchorFlag = 0x0C;   // the word the scan masks with 0x800
 constexpr unsigned kFN_next    = 0x04;   // dependants are chained through here
+constexpr unsigned kFN_frame   = 0x08;   // the dependent frame
 constexpr unsigned kScanReject = 0x800;
 
 // How far to walk a dependants list before giving up and deferring. The list is
@@ -290,27 +302,63 @@ constexpr unsigned kScanReject = 0x800;
 // shortcut into an unbounded walk.
 constexpr unsigned kMaxDependants = 64;
 
-// True when every dependant carries 0x800, so the client's scan cannot match
-// any of them and will walk the whole list for nothing.
+// Does this frame carry an anchor the scan would accept, pointing at `self`?
+// The same three tests sub_489710 applies to each of the nine slots, in the same
+// order, on one frame instead of every frame in the list.
+inline bool FrameAnchorsTo(uint32_t frame, uint32_t self) {
+    for (unsigned s = 0; s < kAnchorCount; ++s) {
+        const uint32_t a = Rd(frame + kAnchor0 + 4 * s);
+        if (!a) continue;
+        if (Rd(a + kAnchorFlag) & kScanReject) continue;
+        if (Rd(a + kAnchorTgt) == self) return true;
+    }
+    return false;
+}
+
+// What a walk of the dependants index found.
+struct DepScan {
+    unsigned entries;      // dependants examined
+    unsigned qualifying;   // of those, frames that really do anchor to self
+    uint32_t only;         // that frame, when there was exactly one
+};
+
+// True when no frame in the index carries an anchor the scan would accept, so
+// the client is about to walk the whole global list and find nothing.
 //
-// This is what the measurement said was worth doing. On the deferred path the
-// client averages 73 to 93 nodes at nine dereferences each and finds nothing
-// 91.6% of the time, sampled one call in 256 over 154566 of them. The module's
-// own verification agrees independently: 43398 of 48265 checked calls, 89.9%,
-// had something at +0x38 and the client still found nothing.
+// This is the same premise the empty case already rests on - sub_489C30 and
+// sub_489D70 are the only registrar and de-registrar, their five call sites are
+// all in SetPoint, sub_48A200 and the frame destructor, and nothing sets an
+// anchor without registering the frame that owns it. The empty case says the
+// index names no frames; this says the frames it names do not, on inspection,
+// hold a matching anchor.
+//
+// It reads all nine slots rather than only the ones the point mask names. The
+// mask would usually save eight reads, but trusting it adds a second premise -
+// that the mask is never stale - whose failure would point this at the wrong
+// slot and produce a wrong not-found. Nine reads on a handful of frames against
+// nine reads on 43 of them is not a trade worth another assumption.
 //
 // Read-only, bounded, and inside the caller's SEH. Anything unreadable or
 // longer than the cap answers false, which defers exactly as before.
-bool AllDependantsRejected(uint32_t head, unsigned* outCount) {
-    unsigned n = 0;
+bool NoDependantCanMatch(uint32_t head, uint32_t self, DepScan* out) {
+    unsigned n = 0, q = 0;
+    uint32_t first = 0;
     uint32_t e = head;
     while (!IsEmptyLink(e)) {
-        if (++n > kMaxDependants) return false;
-        if ((Rd(e + kFN_flags) & kScanReject) == 0) { *outCount = n; return false; }
+        if (++n > kMaxDependants) {
+            out->entries = n; out->qualifying = 2; out->only = 0;
+            return false;
+        }
+        const uint32_t d = Rd(e + kFN_frame);
+        if (d && (d & 1) == 0 && FrameAnchorsTo(d, self)) {
+            if (++q == 1) first = d;
+        }
         e = Rd(e + kFN_next);
     }
-    *outCount = n;
-    return n > 0;
+    out->entries    = n;
+    out->qualifying = q;
+    out->only       = (q == 1) ? first : 0;
+    return n > 0 && q == 0;
 }
 
 // The not-found tail of sub_489710, transcribed from 0x004897CE to 0x0048983D.
@@ -398,10 +446,35 @@ uint32_t* __fastcall Hooked_RelinkBody(void* self, void* edx) {
             predictNotFound = true;
         } else {
             // The list is not empty, which used to end the matter. Ask whether
-            // any of it could match instead.
-            unsigned k = 0;
-            predictNotFound = AllDependantsRejected(head, &k);
-            if (predictNotFound) { ++g_rejectShortcut; g_rejectWalked += k; }
+            // any of the frames it names could match instead.
+            DepScan ds = { 0, 0, 0 };
+            predictNotFound = NoDependantCanMatch(head, (uint32_t)This, &ds);
+            if (predictNotFound) {
+                ++g_rejectShortcut;
+                g_rejectWalked += (double)ds.entries;
+            } else if (ds.qualifying == 1) {
+                ++g_oneQualifier;
+                // Is that one frame in the list the client is about to walk?
+                //
+                // The client's own membership test is in this function's
+                // not-found tail: before unlinking itself it does `if (*result)`
+                // on `result = frame + dword_AC1018`, so a non-zero first link
+                // word is what "in the list" means here. It is one load.
+                //
+                // This is read-only and counts only. With exactly one frame in
+                // the index carrying an anchor the scan would accept, and that
+                // frame in the list, the client's loop must stop at it whatever
+                // order the list is in - which is the case a found-path shortcut
+                // would answer. Whether that case is common enough to be worth
+                // the pointer surgery is what this counts, and the surgery is
+                // not written until it says so: this module crashed the game on
+                // login once already, doing exactly that kind of work on a
+                // premise that had not been measured.
+                const uint32_t linkOff = Rd(kNodeOffsetVar);
+                if (Rd((uintptr_t)ds.only + linkOff) != 0) ++g_oneQualifierLinked;
+            } else {
+                ++g_manyQualifiers;
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return orig_Relink(self, edx);
@@ -573,14 +646,27 @@ void LogStats() {
             g_dead ? "; the remaining invocations came after this module retired"
                    : "");
     }
-    if (g_rejectShortcut > 0) {
-        Log("[LayoutRelink] %lu shortcuts came from the second test - a dependants "
-            "list where every entry carries 0x800, so the scan could not have "
-            "matched any of them - after looking at %.1f entries on average. "
-            "Before this test those all deferred and the client walked the whole "
-            "list for nothing.",
-            g_rejectShortcut, g_rejectWalked / (double)g_rejectShortcut);
-    }
+    // Printed whether or not it fired. The previous version of this test was
+    // dead - it masked 0x800 against a point mask that cannot exceed 0x1FF - and
+    // the reason nobody saw that for a whole field session is that this line was
+    // behind `if (g_rejectShortcut > 0)`. A zero here is a measurement.
+    Log("[LayoutRelink] %lu shortcuts came from the second test - a dependants "
+        "index naming frames that hold no anchor the scan would accept - after "
+        "looking at %.1f entries on average. Those calls used to defer and the "
+        "client walked the whole global list for nothing.",
+        g_rejectShortcut,
+        g_rejectShortcut ? g_rejectWalked / (double)g_rejectShortcut : 0.0);
+    Log("[LayoutRelink] of the calls that still defer, %lu had exactly one frame "
+        "in the index carrying an accepting anchor and %lu had more than one. A "
+        "single candidate is the match whatever order the global list is in, so "
+        "the first of those two numbers is what answering the found path from "
+        "the index would be worth.",
+        g_oneQualifier, g_manyQualifiers);
+    Log("[LayoutRelink]   %lu of those single candidates were themselves in the "
+        "global list, which is the population a found-path shortcut could serve. "
+        "The client's own test for that is `if (*result)` on frame+dword_AC1018 "
+        "in its not-found tail, so this is the same question it asks.",
+        g_oneQualifierLinked);
     if (g_scansSeen > 0) {
         double avgLen   = g_nodesTotal / (double)g_scansSeen;
         unsigned long matched = g_scansSeen - g_scanNoMatch;

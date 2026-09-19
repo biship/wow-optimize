@@ -1,9 +1,3 @@
-// ============================================================================
-// Module: strstr_fast.cpp
-// Description: SSE2 vectorized replacement for legacy CRT function `strstr_fast.cpp`.
-// Safety & Threading: Concurrent execution safe. Ensure page boundary alignment checks are active.
-// ============================================================================
-
 #include "strstr_fast.h"
 #include "version.h"
 #include "MinHook.h"
@@ -20,6 +14,7 @@ static strstr_fn orig_strstr = nullptr;
 static volatile LONG64 g_calls = 0, g_fast = 0;
 
 static const char* __cdecl Hooked_strstr(const char* haystack, const char* needle) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_strstr(haystack, needle);
     if (!haystack || !needle) return nullptr;
     if (!*needle) return haystack;
 

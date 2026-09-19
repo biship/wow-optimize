@@ -1,7 +1,3 @@
-// ============================================================================
-// Module: matrix_copy_sse2.cpp
-// ============================================================================
-
 #include <windows.h>
 #include <MinHook.h>
 #include <cstdint>
@@ -83,6 +79,52 @@ static const __m128 kIdentityRow3 = { 0.0f, 0.0f, 0.0f, 1.0f };
 // for frame time on its own to separate.
 static bool g_abSubject = false;
 
+// The guard these two hooks were paying for, and why it comes off.
+//
+// A field session takes 8570603116 calls through the multiply and 4043060417
+// through the copy. Each body wrapped its work in __try, and a __try region on
+// 32-bit MSVC costs a prologue on every call whether anything faults or not -
+// measured at 2.48 ns elsewhere in this project. Twelve and a half billion of
+// those is most of a minute of main thread.
+//
+// What the guard buys is nothing, and that is an argument about memory rather
+// than about probability. Both bodies check their pointers for range first, and
+// the only risk left is a pointer in range but unmapped. When the __except
+// fires, control falls through to the client's own routine with the same
+// pointers - and the client's routine reads exactly the same bytes: sixty-four
+// from the source in the copy, and the same two matrices in the multiply. It
+// cannot succeed where ours faulted. The guard does not recover a fault, it
+// moves it a few instructions later into the client's code.
+//
+// So the guard is kept only until it has proven that, and then dropped. Every
+// call runs under it for the first kMatProve calls; if it ever catches
+// anything, that is written into the log and this stays guarded for the rest of
+// the session. Once armed, the hot path is a range check and the arithmetic,
+// with no exception frame at all.
+constexpr unsigned long kMatProve = 200000;
+volatile LONG g_matArmed   = 0;    // 1 once the guard has caught nothing
+unsigned long g_matProved  = 0;    // calls completed under the guard
+unsigned long g_matFaults  = 0;    // times it actually caught something
+volatile LONG g_matLogged  = 0;
+
+// Kept out of line so the callers below carry no exception frame of their own.
+__declspec(noinline) static bool CopyGuarded(float* self, float* src) {
+    __try {
+        _mm_storeu_ps(self,      _mm_loadu_ps(src));
+        _mm_storeu_ps(self + 4,  _mm_loadu_ps(src + 4));
+        _mm_storeu_ps(self + 8,  _mm_loadu_ps(src + 8));
+        _mm_storeu_ps(self + 12, _mm_loadu_ps(src + 12));
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ++g_matFaults;
+        if (InterlockedCompareExchange(&g_matLogged, 1, 0) == 0)
+            Log("[MatrixSSE2] the pointer guard caught a fault in the copy. It "
+                "stays on for the rest of this session, and the reasoning that "
+                "it never fires is wrong - the module's own note says so.");
+        return false;
+    }
+}
+
 static float* __fastcall HookMatrixCopyBody(float* self, void* /*edx*/, float* src) {
     ++g_matcopy_calls;
 
@@ -90,14 +132,18 @@ static float* __fastcall HookMatrixCopyBody(float* self, void* /*edx*/, float* s
     uintptr_t p = (uintptr_t)src;
     if (s > 0x10000 && s < 0xFFE00000 &&
         p > 0x10000 && p < 0xFFE00000) {
-        __try {
+        if (g_matArmed) {
+            // No exception frame on this path. See the note above CopyGuarded.
             _mm_storeu_ps(self,      _mm_loadu_ps(src));
             _mm_storeu_ps(self + 4,  _mm_loadu_ps(src + 4));
             _mm_storeu_ps(self + 8,  _mm_loadu_ps(src + 8));
             _mm_storeu_ps(self + 12, _mm_loadu_ps(src + 12));
             return self;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Bad pointer during load/store (e.g. unmapped page)
+        }
+        if (CopyGuarded(self, src)) {
+            if (++g_matProved >= kMatProve && g_matFaults == 0)
+                InterlockedExchange(&g_matArmed, 1);
+            return self;
         }
     }
 
@@ -255,6 +301,29 @@ static bool SelfTestMatrixMultiply() {
     return true;
 }
 
+// The multiply's guarded probe, kept out of line for the same reason as the
+// copy's. safebuffers as well: out_val is sixteen floats written by
+// MatMul4x4_PackedDouble and by nothing else, with no index anywhere near it
+// that comes from the client, so the /GS cookie this function would otherwise
+// carry guards nothing that can happen - on 8570603116 calls a session.
+__declspec(noinline) __declspec(safebuffers)
+static bool MultiplyGuarded(float* result, float* a, float* b) {
+    __try {
+        float out_val[16];
+        MatMul4x4_PackedDouble(out_val, a, b);
+        _ReadWriteBarrier();
+        memcpy(result, out_val, 16 * sizeof(float));
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ++g_matFaults;
+        if (InterlockedCompareExchange(&g_matLogged, 1, 0) == 0)
+            Log("[MatrixSSE2] the pointer guard caught a fault in the multiply. "
+                "It stays on for the rest of this session.");
+        return false;
+    }
+}
+
+__declspec(safebuffers)
 static float* __cdecl HookMatrixMultiplyBody(float* result, float* a, float* b) {
     // A field log printed "multiply -199339142". A negative call count is not a
     // number, and the only reason it was readable at all is that the arithmetic
@@ -272,14 +341,18 @@ static float* __cdecl HookMatrixMultiplyBody(float* result, float* a, float* b) 
     if (r > 0x10000 && r < 0xFFE00000 &&
         pa > 0x10000 && pa < 0xFFE00000 &&
         pb > 0x10000 && pb < 0xFFE00000) {
-        __try {
+        if (g_matArmed) {
+            // No exception frame and no stack cookie on this path.
             float out_val[16];
             MatMul4x4_PackedDouble(out_val, a, b);
             _ReadWriteBarrier();
             memcpy(result, out_val, 16 * sizeof(float));
             return result;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Unmapped page mid-op — fall through to the original.
+        }
+        if (MultiplyGuarded(result, a, b)) {
+            if (++g_matProved >= kMatProve && g_matFaults == 0)
+                InterlockedExchange(&g_matArmed, 1);
+            return result;
         }
     }
     return pOrigMatMul(result, a, b);
@@ -949,16 +1022,10 @@ static float* __cdecl Hooked_PointXformInPlace(float* a1, float* a2, float* a3) 
 // r2*(-tz) lands (out12,out13,out14,0). All reads stay inside the 64-byte input
 // matrix; the full 16-float output is written exactly as the original.
 //
-// This used to carry the line "only x87 80-bit vs SSE 32-bit intermediates
-// differ (sub-ULP, invisible for a rigid transform)". Both halves of that are
-// wrong. The CRT runs x87 at 53-bit, not 80, so the original accumulates in
-// double; and the gap between a double accumulation and a single one over three
-// products is not sub-ULP - it is the same divergence found in the matrix
-// multiply, the quaternion normalise and both vector normalises in this same
-// tree, each of which had a comment saying much the same thing. This one builds
-// the inverse of a view transform, which is to say it feeds the camera, and a
-// wrong camera matrix is precisely the artifact this project has already shipped
-// once.
+// The client runs x87 at 53 bits, so the original accumulates in double, and the
+// gap between a double accumulation and a single one over three products is far
+// wider than a ULP. This one builds the inverse of a view transform, so it feeds
+// the camera, where a wrong matrix is a visible artifact.
 //
 // The three dot products now accumulate in double, which removes the width
 // difference. What is not proven here is the order of the three terms: the
@@ -1212,9 +1279,7 @@ static float* __fastcall Hooked_MatTranslateLocal(float* self, void* edx, float*
 }
 #endif
 
-// ================================================================
 // Install hooks
-// ================================================================
 bool InstallMatrixCopySSE2() {
     g_abSubject = AbTest::IsSubject("M2MatrixSimd", &g_abSubject);
     if (g_abSubject) {
@@ -1432,9 +1497,7 @@ bool InstallMatrixCopySSE2() {
 #endif
 }
 
-// ================================================================
 // Statistics
-// ================================================================
 //
 // Fifteen counters, printed only from ShutdownMatrixCopySSE2 until now, which
 // nothing calls - the DLL leaves through TerminateProcess and the linker had
@@ -1480,6 +1543,18 @@ void MatrixCopySSE2_LogStats(void) {
         total, g_matcopy_calls, g_matident_calls, mul,
         g_matvec3_calls, g_matvec4_calls, g_quat2mat_calls,
         g_quat2matfull_calls, g_vec3norm_calls);
+    // The pointer guard, printed whether or not it ever fired. The copy and the
+    // multiply are 12.6 billion calls between them in a field session, and each
+    // was carrying an exception frame for a fault that has never been seen; a
+    // non-zero catch count here means that reasoning is wrong and the guard is
+    // back on for good.
+    Log("[MatrixSSE2]   pointer guard: %lu call(s) ran under it, it caught %lu, "
+        "and it is %s. Armed means the copy and multiply carry no exception "
+        "frame - the fallback they used to reach reads the same bytes that just "
+        "faulted, so it could never have recovered one.",
+        g_matProved, g_matFaults,
+        g_matArmed ? "armed" : (g_matFaults ? "held on by a catch"
+                                            : "still proving"));
     Log("[MatrixSSE2]   transpose %lu, scale3x3 %lu, from3x3 %lu, "
         "pointxform-in-place %lu, invert-rigid %lu",
         g_mattranspose_calls, g_scale3x3_calls, g_matfrom3x3_calls,
@@ -1494,9 +1569,7 @@ void MatrixCopySSE2_LogStats(void) {
 #endif
 }
 
-// ================================================================
 // Cleanup
-// ================================================================
 void ShutdownMatrixCopySSE2() {
     MH_DisableHook((void*)0x00407F80);
     MH_DisableHook((void*)0x00407F40);

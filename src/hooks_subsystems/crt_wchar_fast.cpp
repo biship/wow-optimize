@@ -1,9 +1,3 @@
-// ============================================================================
-// Module: crt_wchar_fast.cpp
-// Description: SSE2 vectorized replacement for legacy CRT function `crt_wchar_fast.cpp`.
-// Safety & Threading: Concurrent execution safe. Ensure page boundary alignment checks are active.
-// ============================================================================
-
 #include "crt_wchar_fast.h"
 #include "version.h"
 #include "MinHook.h"
@@ -25,6 +19,7 @@ typedef size_t (__cdecl* wcslen_fn)(const wchar_t*);
 static wcslen_fn orig_wcslen = nullptr;
 
 static size_t __cdecl Hooked_wcslen(const wchar_t* s) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_wcslen(s);
     if (!orig_wcslen) goto fallback;
     WCHAR_ENTER();
     if (!s) { WCHAR_LEAVE(); goto fallback; }
@@ -55,6 +50,7 @@ typedef wchar_t* (__cdecl* wcscpy_fn)(wchar_t*, const wchar_t*);
 static wcscpy_fn orig_wcscpy = nullptr;
 
 static wchar_t* __cdecl Hooked_wcscpy(wchar_t* dst, const wchar_t* src) {
+    if (WOWOPT_FOREIGN_CALLER()) return orig_wcscpy(dst, src);
     if (!orig_wcscpy) goto fallback;
     WCHAR_ENTER();
     if (!dst || !src) { WCHAR_LEAVE(); goto fallback; }

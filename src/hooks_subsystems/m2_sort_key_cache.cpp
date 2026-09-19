@@ -1,9 +1,7 @@
 // ============================================================================
-// Module: m2_sort_key_cache.cpp
 // Description: Caches the sort key a render-batch comparator re-derives.
 // Safety & Threading: Main thread, inside the model render sort.
 // ============================================================================
-//
 // sub_824B70 is 2.44% of executing time in a tester's uncapped, CPU-bound
 // session - ninth in the profile, above every Lua entry. It is eighty-one
 // instructions and does no arithmetic worth the name. It is a comparator.
@@ -27,7 +25,6 @@
 //
 // So the derived descriptor is remembered per (object, submesh index) and the
 // key read straight out of it. Three of the five links go away.
-//
 // ---------------------------------------------------------------------------
 // What the comparator actually says
 //
@@ -39,7 +36,6 @@
 // all unsigned. Worth writing out because the disassembly expresses it as nested
 // `>=` tests with fallthrough, which reads as though the equal cases go
 // somewhere else, and they do not.
-//
 // ---------------------------------------------------------------------------
 // Staleness, which is the whole risk
 //
@@ -53,7 +49,6 @@
 // Within a single frame the material a submesh points at does not move - the
 // animation pass has finished before the render sort begins - so a hit inside
 // the generation is answering with data derived this frame.
-//
 // ---------------------------------------------------------------------------
 // Verification
 //
@@ -77,6 +72,7 @@
 #include "sampling_profiler.h"
 #include "ab_test.h"
 #include "session_verdict.h"
+#include "high_tables.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -110,21 +106,57 @@ bool g_dead      = false;
 // Plain 32-bit on a comparator's path. Lower bounds, and the report says so.
 unsigned long g_calls    = 0;
 unsigned long g_verified = 0;
+// Comparisons where the two answers agree in AL and differ above it. That is
+// the shape of a bool-returning client leaving its scratch in the register, and
+// counting it is what keeps "only the low byte is the answer" a measurement
+// rather than an assumption: if this stays at zero over a session, the high
+// bits were never garbage and the reading is wrong.
+unsigned long g_highBitsDiffered = 0;
 unsigned long g_hits     = 0;
 unsigned long g_misses   = 0;
 
 constexpr unsigned long kVerifyFirst  = 20000;
 constexpr unsigned long kResampleMask = 4095;
 
-constexpr unsigned kSlots = 256;   // power of two; direct-mapped
+// Geometry, from the field rather than from a round number.
+//
+// This was 256 slots, direct-mapped, indexed by `((obj >> 4) ^ idx) & 255`, and
+// it hits 62.5% - 575885710 lookups a session take the five dependent loads
+// this module exists to avoid, and the profile's weight is on the second of
+// them.
+//
+// Neither half of that index was doing much. A raw xor of a pointer field with
+// a small submesh index preserves whatever structure the allocator gave the
+// pointers, and `obj >> 4` under an 8-bit mask keeps only bits 4 to 11, so
+// objects a few kilobytes apart contribute nothing to distinguish themselves.
+//
+// The size was the larger problem. A session runs 2056719638 key lookups at a
+// 7.65 ms median frame, which is about 6500 a frame, and the generation counter
+// empties the cache every frame - so the table has to hold one frame's distinct
+// (object, submesh) pairs and nothing longer. A comparator revisits the same
+// pairs many times over a sort, so the distinct count is well under the lookup
+// count, but 256 is under it too, and that is what 62.5% means.
+//
+// A slot is sixteen bytes, so this is the cheapest table in the project to get
+// wrong and the cheapest to fix: 8192 sets of 2 ways is 16384 entries and
+// 256 KB. Two ways sit in the same cache line, so probing the second costs
+// nothing a miss would not have cost anyway. It moves out of this DLL's image
+// at the same time - 256 KB of static array would otherwise sit in the low half
+// of the address space, which is the half the client allocates from.
+constexpr unsigned kSets  = 8192;  // power of two
+constexpr unsigned kWays  = 2;
+constexpr unsigned kSlots = kSets * kWays;
 struct Slot {
     uint32_t obj;
     uint32_t idx;
     uint32_t gen;
     uint32_t desc;
 };
-Slot     g_slot[kSlots] = {};
+Slot*    g_slot = nullptr;
 uint32_t g_gen = 1;                // never 0, so a zeroed slot cannot match
+// Inserts that landed on a slot still live in this frame. Read against the
+// misses, this says whether the geometry holds a frame's working set.
+unsigned long g_conflict = 0;
 
 // The client's derivation, verbatim. Returns 0 if it cannot be followed.
 inline uint32_t DeriveDesc(uint32_t obj, uint32_t idx) {
@@ -142,14 +174,54 @@ inline uint32_t DeriveDesc(uint32_t obj, uint32_t idx) {
     return base + kDescStride * sub;
 }
 
-inline uint32_t DescFor(uint32_t obj, uint32_t idx) {
-    unsigned h = (unsigned)(((obj >> 4) ^ idx) & (kSlots - 1));
-    Slot& s = g_slot[h];
-    if (s.gen == g_gen && s.obj == obj && s.idx == idx) { g_hits++; return s.desc; }
-    uint32_t d = DeriveDesc(obj, idx);
+// The miss, kept out of line on purpose.
+//
+// The comparator runs 3175843467 times a session and asks for two descriptors
+// each time, so whether the lookup inlines decides whether six billion calls
+// happen. Growing this function for the set-associative table is exactly what
+// stops the compiler inlining it - and the growth is all in the half that
+// almost never runs once the cache is sized properly.
+//
+// So the hit stays in the caller and the miss becomes a call, the same split
+// lua_getstr_inline uses for its chain walk. A call on the miss path costs
+// nothing next to the five dependent loads it is about to do.
+__declspec(noinline) uint32_t DescForMiss(uint32_t obj, uint32_t idx, Slot* set) {
+    const uint32_t d = DeriveDesc(obj, idx);
     g_misses++;
+
+    // Take a way that this frame has not claimed; only when both are live does
+    // anything get displaced, and that is the number the report prints.
+    unsigned pick = 0;
+    for (unsigned w = 0; w < kWays; ++w) {
+        if (set[w].gen != g_gen) { pick = w; break; }
+        if (w == kWays - 1) { pick = (obj >> 2) & (kWays - 1); ++g_conflict; }
+    }
+    Slot& s = set[pick];
     s.obj = obj; s.idx = idx; s.desc = d; s.gen = g_gen;
     return d;
+}
+
+// __forceinline, not inline: plain inline is a request and MSVC declined it,
+// leaving two calls per comparison on a path taken 3175843467 times a
+// session. Verified in the object after changing it - the comparator now
+// contains no call to this, only one to the miss.
+__forceinline uint32_t DescFor(uint32_t obj, uint32_t idx) {
+    // Knuth's constant on each half and a shift down, so neither the pointer's
+    // low bits nor a small index decides the set on its own.
+    uint32_t h = (obj >> 4) * 2654435761u;
+    h ^= idx * 2246822519u;
+    h ^= h >> 15;
+    const unsigned base = (unsigned)((h >> 8) & (kSets - 1)) * kWays;
+
+    Slot* set = &g_slot[base];
+    for (unsigned w = 0; w < kWays; ++w) {
+        Slot& s = set[w];
+        if (s.gen == g_gen && s.obj == obj && s.idx == idx) {
+            g_hits++;
+            return s.desc;
+        }
+    }
+    return DescForMiss(obj, idx, set);
 }
 
 // Lexicographic less-than over the four keys, in the client's order.
@@ -176,30 +248,64 @@ inline int Compare(void* a, void* b) {
 
 }  // namespace
 
-int __stdcall Hooked_CompareBody(void* a, void* b) {
-    g_calls++;
-    if (g_dead || !a || !b) return orig_Compare(a, b);
+// Faults the guard caught, while verifying or after. The fallback is the
+// client's own comparator, which reads the same two objects and the same
+// descriptor chain, so a fault here is one the fallback would take too; the
+// armed path runs without an exception frame once kVerifyFirst comparisons
+// have run guarded and this is still zero. If it ever is not, every comparison
+// stays guarded.
+static unsigned long g_caught = 0;
 
+static __declspec(noinline) int CompareGuarded(void* a, void* b) {
+    __try {
+        return Compare(a, b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++g_caught;
+        return orig_Compare(a, b);
+    }
+}
 
-    if (!g_armed || (g_calls & kResampleMask) == 0) {
+static __declspec(noinline) int CompareVerify(void* a, void* b) {
+    {
         int mine;
         __try {
             mine = Compare(a, b);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ++g_caught;
             return orig_Compare(a, b);
         }
         int theirs = orig_Compare(a, b);
         g_verified++;
 
-        if ((mine != 0) != (theirs != 0)) {
+        // The client's comparator is a bool-returning predicate. Both of its
+        // exits write one byte and neither clears the rest:
+        //
+        //     0x00824C26  pop edi ; pop esi ; mov al, 1  ; pop ebx ; pop ebp
+        //     0x00824C56  pop edi ; pop esi ; xor al, al ; pop ebx ; pop ebp
+        //
+        // so the upper three bytes of EAX are whatever the compare chain last
+        // put there. On the false exit that is a pointer - the paths into it
+        // arrive from mov eax,[edi+2D0h] and mov eax,[edi+2Ch] - with its low
+        // byte cleared by the xor.
+        //
+        // Reading all thirty-two bits reads that. Two field sessions retired
+        // this module on its very first comparison, against 0x33C60000 and
+        // 0x32A00000; the low byte of each is zero, so the client answered
+        // false both times and so did this.
+        if (mine != theirs && ((mine & 0xFF) != 0) == ((theirs & 0xFF) != 0))
+            ++g_highBitsDiffered;
+
+        if (((mine & 0xFF) != 0) != ((theirs & 0xFF) != 0)) {
             g_dead = true;
             Verdict::Add(Verdict::Bad,
                          "M2SortKey disagreed with the client and retired itself for "
                          "this session");
             Log("[M2SortKey] DISAGREED with the client after %lu comparisons - "
                 "retired for this session, every comparison now goes to the "
-                "client's own code. It answered %d and this answered %d.",
-                g_verified, theirs, mine);
+                "client's own code. It answered 0x%08X and this answered "
+                "0x%08X; only the low byte of each is the answer, the rest is "
+                "whatever the client left in the register.",
+                g_verified, (unsigned)theirs, (unsigned)mine);
             return theirs;
         }
         if (!g_armed && g_verified >= kVerifyFirst) {
@@ -211,12 +317,14 @@ int __stdcall Hooked_CompareBody(void* a, void* b) {
         }
         return theirs;
     }
+}
 
-    __try {
-        return Compare(a, b);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return orig_Compare(a, b);
-    }
+int __stdcall Hooked_CompareBody(void* a, void* b) {
+    g_calls++;
+    if (g_dead || !a || !b) return orig_Compare(a, b);
+    if (!g_armed || (g_calls & kResampleMask) == 0) return CompareVerify(a, b);
+    if (g_caught) return CompareGuarded(a, b);
+    return Compare(a, b);
 }
 
 // The detour proper, kept apart from the body above for one reason: the
@@ -239,6 +347,14 @@ int __stdcall Hooked_Compare(void* a, void* b) {
 
 bool Init() {
     if (!Config::g_settings.OptM2SortKey) return true;
+
+    g_slot = (Slot*)HighTables::Reserve("m2_sort_key", sizeof(Slot) * kSlots);
+    if (!g_slot) {
+        Log("[M2SortKey] no table - not installing. Without it every comparison "
+            "takes the five dependent loads this module exists to avoid, which "
+            "is slower than leaving the client alone.");
+        return false;
+    }
 
     if (IsBadReadPtr((void*)kCompare, 16)) {
         Log("[M2SortKey] 0x%08X unreadable - not installing", (unsigned)kCompare);
@@ -295,6 +411,10 @@ void LogStats() {
     if (!Config::g_settings.OptM2SortKey) return;
     if (!g_installed) { Log("[M2SortKey] not installed - nothing measured"); return; }
     if (g_calls == 0) { Log("[M2SortKey] installed but never called"); return; }
+    Log("[M2SortKey]   exception guard: %lu fault(s) caught; the armed path runs %s.",
+        g_caught, !g_armed ? "guarded, still verifying"
+                  : (g_caught ? "guarded, because the guard has caught something"
+                              : "without an exception frame"));
 
     unsigned long looked = g_hits + g_misses;
     Log("[M2SortKey] %lu comparisons%s, %lu verified against the client. Key "
@@ -306,6 +426,30 @@ void LogStats() {
         g_verified, g_hits,
         looked ? 100.0 * (double)g_hits / (double)looked : 0.0,
         g_misses);
+    // Printed whether or not it fired. The cache is emptied every frame by the
+    // generation counter, so a miss is either a pair this frame has not asked
+    // for yet - unavoidable - or one displaced by another pair landing on the
+    // same set. Only the second is something the geometry can fix, and a figure
+    // near zero says the table now holds a frame and the remaining misses are
+    // the floor.
+    Log("[M2SortKey]   %lu of those misses displaced a pair this frame was still "
+        "using, across %u sets of %u ways. Near zero means the table holds a "
+        "frame's working set and what is left is the first look at each pair.",
+        g_conflict, kSets, kWays);
+
+    if (g_verified > 0) {
+        if (g_highBitsDiffered > 0)
+            Log("[M2SortKey]   %lu of those %lu agreed in the low byte and "
+                "differed above it. That is the client leaving its scratch in "
+                "the register above a one-byte answer, and reading the whole "
+                "register is what retired this module in the field.",
+                g_highBitsDiffered, g_verified);
+        else
+            Log("[Wrong] [M2SortKey] %lu comparisons and not one had garbage "
+                "above the low byte. This module only compares the low byte "
+                "because the client's answer was read as one; if that never "
+                "happens the reading needs checking again.", g_verified);
+    }
 }
 
 void Shutdown() {

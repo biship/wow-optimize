@@ -1,9 +1,7 @@
 // ============================================================================
-// Module: anim_lod.cpp
 // Description: Spreads M2 model animation across frames when the scene is crowded.
 // Safety & Threading: Main thread, alongside the render loop.
 // ============================================================================
-//
 // Animating models is the largest single block of frame time this client spends,
 // and it is the one place where no amount of instruction-level work can reach it.
 // Measured on txtsd's sessions with a fixed census:
@@ -16,7 +14,6 @@
 // AnimateModel 0.30, Interp 0.27. The cost is spread so thin that vectorising any
 // one of them buys about two tenths of a percent. The only way to reach it is to
 // do less of it.
-//
 // ---------------------------------------------------------------------------
 // Why skipping a call is safe, which was the open question
 //
@@ -30,7 +27,6 @@
 // time, never accumulated, so a call that does not happen delays when a pose
 // refreshes and cannot make an animation drift, stall or run at the wrong rate.
 // The next call lands on the correct pose for the current time.
-//
 // ---------------------------------------------------------------------------
 // What a skip has to look like
 //
@@ -47,7 +43,6 @@
 // on the stack and it ends in `retn 14h`, so the callee cleans them. IDA reports
 // it as __cdecl with five arguments and misses the object entirely, which is why
 // its callers appear to pass inconsistent first arguments.
-//
 // ---------------------------------------------------------------------------
 // The policy, and why it is not distance
 //
@@ -68,7 +63,6 @@
 // A model is never skipped the first time it is seen. Its bone matrices are
 // whatever the allocation happened to contain until the first evaluation writes
 // them, and rendering that is not a stutter, it is garbage.
-//
 // ---------------------------------------------------------------------------
 // The table is keyed by a pointer the engine can free and reuse
 //
@@ -135,25 +129,15 @@ constexpr unsigned kM_stamp     = 0x3C;
 // it maintains bit 0x400 of the flags. Skip the call and every one of those
 // tracks freezes at its last value.
 //
-// A tester saw exactly that on 2026-08-22: characters glowing, shoulder pads and
-// weapons glowing, then snapping back to normal. Turning this feature off stopped
-// it. Emissive and alpha tracks stuck bright until the model was posed again.
+// A tester saw exactly that on 2026-08-22: characters, shoulder pads and weapons
+// glowing, emissive and alpha tracks stuck bright until the model was posed
+// again. Turning this feature off stopped it.
 //
-// The rule in CLAUDE.md is "before skipping an engine call, establish what else
-// that call does", and it records three features that shipped on "skipping this
-// only skips work" and were wrong. This was the fourth. What was established was
-// that skipping cannot affect animation *timing* - true, and beside the point.
-//
-// sub_82E550 is the attachment pass, and it accounts for the rest of the report.
-// Its first loop runs [data+0F0h] attachment points; its second walks the list
-// of attached models at [esi+58h], linked through +60h, and calls sub_82F0F0 on
-// each one. A weapon and a shoulder pad are attached models. Skipping a
-// character skipped its whole attached chain with it.
-//
-// The rule in CLAUDE.md is "before skipping an engine call, establish what else
-// that call does", and it records three features that shipped on "skipping this
-// only skips work" and were wrong. This was the fourth. What was established was
-// that skipping cannot affect animation *timing* - true, and beside the point.
+// sub_82E550 is the attachment pass. Its first loop runs [data+0F0h] attachment
+// points; its second walks the attached models at [esi+58h], linked through
+// +60h, calling sub_82F0F0 on each. A weapon and a shoulder pad are attached
+// models, so skipping a character skipped its whole chain with it. Skipping
+// cannot affect animation timing, which is true and beside the point.
 //
 // So a model is now skipped only when the tail would have done nothing. The test
 // is not the client's own two `cmp` guards above: those over-approximate, and
