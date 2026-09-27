@@ -1369,11 +1369,11 @@ namespace WowOptimizeLauncher {
             tabs = new DarkTabControl();
             tabs.Location = new Point(rightX, 44);
             tabs.Size = new Size(rightW, ClientSize.Height - 59);
-            tabs.SelectedIndexChanged += delegate {
-                if (searchBox != null) {
-                    FilterFeatures(searchBox.Text);
-                }
-            };
+            // Nothing happens on a tab switch. It used to run the whole search
+            // rebuild - clear all seven tabs, throw away and remake every group
+            // heading, add all two hundred rows back one by one - although what
+            // that builds does not depend on which tab is showing. That is what
+            // made a tab appear half drawn and finish a moment later.
 
             // Create tab pages
             // The four areas hold what is known to work. Everything not yet
@@ -1425,6 +1425,19 @@ namespace WowOptimizeLauncher {
 
             Controls.Add(tabs);
             ResumeLayout(false);
+
+            // A tab page nobody has opened has no windows for its rows yet, so
+            // the first time it is shown Windows creates a hundred of them and
+            // the page fills in over a visible moment - measured at 40 ms for
+            // the NOT PROVEN tab against 15 ms on a return visit. Selecting
+            // every page once in Load, when the form has a window but is not
+            // yet on screen, makes WinForms build each page's contents then,
+            // where nobody sees it. Asking each row for its handle in Shown was
+            // tried first and did not do it: the window count at start rose by
+            // the pages and their panels, not by the rows.
+            Load += delegate {
+                for (int i = tabs.TabPages.Count - 1; i >= 0; i--) tabs.SelectedIndex = i;
+            };
         }
 
         private void FilterFeatures(string query) {
@@ -1459,6 +1472,10 @@ namespace WowOptimizeLauncher {
                 generalFlow, uiLuaFlow, combatNetFlow, graphicsSoundFlow,
                 notProvenFlow, triedFlow, diagFlow
             };
+            // Laid out once at the end. Without this every row added repositioned
+            // every row already there, which on a tab of a hundred rows is ten
+            // thousand placements for one keystroke in the search box.
+            for (int i = 0; i < flows.Length; i++) flows[i].SuspendLayout();
             // The checkboxes are made once and reused, so they are only removed.
             // The group headings are made fresh every time this runs, which is
             // every keystroke in the search box, so they have to be disposed or
@@ -1505,6 +1522,7 @@ namespace WowOptimizeLauncher {
                     }
                 }
             }
+            for (int i = 0; i < flows.Length; i++) flows[i].ResumeLayout(true);
         }
 
         // The order areas are listed in on the NOT PROVEN tab, and what each
