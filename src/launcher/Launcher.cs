@@ -57,6 +57,10 @@ namespace WowOptimizeLauncher {
             "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
             "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
             "VaCensus", "CameraReplay", "SkyCloudTexels", "LuaGcPace",
+            // Both only measure. They were filed as unproven replacements because
+            // they are experimental, which put them on the NOT PROVEN tab beside
+            // things that change what the game does.
+            "FreezeCatcher", "MpqOpenCensus",
         };
         private static readonly string[] LogKeys = new string[] {
             "SessionLogs", "FlightRecorder", "NetDiag", "CpuTopology",
@@ -116,6 +120,10 @@ namespace WowOptimizeLauncher {
             "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
             "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
             "VaCensus", "CameraReplay", "SkyCloudTexels", "LuaGcPace",
+            // Both only measure. They were filed as unproven replacements because
+            // they are experimental, which put them on the NOT PROVEN tab beside
+            // things that change what the game does.
+            "FreezeCatcher", "MpqOpenCensus",
 
             // Buys frames by making the game look or sound different. That is a
             // real trade and it is the player's to make, not this button's. A
@@ -179,9 +187,8 @@ namespace WowOptimizeLauncher {
         public CheckBox Ctrl;
         public string Tooltip;
 
-        // Marks a switch that has not been proven. It used to decide which tab the
-        // row appeared on, which put nearly half of them on one tab; now it only
-        // decides whether the row is marked [+] or [!]. A tester was
+        // Marks a switch that has not been proven in a game. A replacement with
+        // this set appears on the NOT PROVEN tab rather than its area's. A tester was
         // asked to leave one of these off so we could tell whether it caused their
         // addon errors; they pressed Enable All, it went on with everything else,
         // and the comparison measured nothing. A switch that exists to be left off
@@ -368,7 +375,8 @@ namespace WowOptimizeLauncher {
 
                 Color textColor = selected ? CyanAccent : TabIdle;
                 using (Font tabFont = new Font("Segoe UI", 8f, FontStyle.Bold)) {
-                    TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter;
+                    TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter
+                                          | TextFormatFlags.EndEllipsis;
                     TextRenderer.DrawText(g, TabPages[i].Text, tabFont, tabRect, textColor,
                                           flags | TextFormatFlags.NoPrefix);
                 }
@@ -444,6 +452,7 @@ namespace WowOptimizeLauncher {
         // the game it touches. Everything the preset buttons deliberately leave
         // off used to be scattered across the four section tabs, so "why is this
         // one still off" had no place to be answered.
+        private FlowLayoutPanel notProvenFlow;
         private FlowLayoutPanel triedFlow;
         private FlowLayoutPanel diagFlow;
         private TextBox searchBox;
@@ -812,7 +821,7 @@ namespace WowOptimizeLauncher {
             Text = "WoW-Optimize Launcher";
             // The background is scaled to the client area and covered with a
             // near-opaque wash, so the height is free to change.
-            ClientSize = new Size(920, 772);
+            ClientSize = new Size(1000, 772);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None;
             BackColor = DarkBg;
@@ -1048,8 +1057,8 @@ namespace WowOptimizeLauncher {
             btnProve.Location = new Point(15, y);
             btnProve.Click += delegate { SetUpProvingRun(); };
             toolTip.SetToolTip(btnProve,
-                "Everything MAX PERFORMANCE leaves on, plus every replacement "
-                + "marked [!] - the ones nobody has run in a game yet - and the "
+                "Everything MAX PERFORMANCE turns on, plus everything on the "
+                + "NOT PROVEN tab that replaces something the game does, plus the "
                 + "sampling profiler.\r\n\r\n"
                 + "Each of those replacements checks its own answers against the "
                 + "game's for thousands of calls before it answers anything, keeps "
@@ -1061,27 +1070,6 @@ namespace WowOptimizeLauncher {
                 + "send Logs\\wow_optimize.log. Press MAX PERFORMANCE or DEFAULT "
                 + "afterwards to put it back.");
             leftPanel.Controls.Add(btnProve);
-            y += 40;
-
-            DarkButton btnMeasure = new DarkButton(Color.FromArgb(90, 160, 235), false);
-            btnMeasure.Text = "ANSWER THE OPEN QUESTIONS";
-            btnMeasure.Size = new Size(btnWidth, 32);
-            btnMeasure.Location = new Point(15, y);
-            btnMeasure.Click += delegate { SetUpMeasuringRun(); };
-            toolTip.SetToolTip(btnMeasure,
-                "Switches on the instruments that answer what is currently "
-                + "unknown, and leaves everything else exactly as you have it.\r\n\r\n"
-                + "Right now that is four things: what the Lua clean-up pacing "
-                + "costs in frames against what it saves in memory, what a freeze "
-                + "is doing while it freezes, what the cloud texture costs per "
-                + "frame, and whether our own cloud maths matches the game's byte "
-                + "for byte.\r\n\r\n"
-                + "These cost frames on purpose - that is the trade for numbers. "
-                + "Play about ten minutes including a city, a fight and some open "
-                + "ground under sky - or until it crashes - then send "
-                + "Logs\\wow_optimize.log and press "
-                + "MAX PERFORMANCE or DEFAULT to put it back.");
-            leftPanel.Controls.Add(btnMeasure);
             y += 40;
 
             y += AddSectionLabel(leftPanel, "WHEN SOMETHING IS WRONG", y);
@@ -1189,11 +1177,26 @@ namespace WowOptimizeLauncher {
             // looked for once they do.
             string compatLayers = dllActive ? CompatLayersInFolder(baseDir) : null;
 
+            // Opened straight out of a zip, Windows runs the launcher from a
+            // throwaway copy under the temp folder, where neither DLL nor the
+            // game can be. A screenshot of exactly that - "looked in
+            // ...\AppData\Local\Temp\48c71ee" - is what the old message
+            // produced, naming the folder without saying why it was wrong.
+            // Both sides in their long form. The temp path usually comes back
+            // in 8.3 form (C:\Users\ALEKSA~1\...) and the folder the launcher
+            // runs from in the long one (C:\Users\Aleksander\...). Compared as
+            // they are, the two never match, which is how the first version of
+            // this check missed the very case it was written for.
+            string tempRoot = LongPath(Path.GetTempPath());
+            bool inTemp = !string.IsNullOrEmpty(tempRoot) &&
+                          LongPath(baseDir).StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase);
+
+            // The headline is one or two words so it never runs past the card;
+            // the reason goes on the line below, where it can wrap.
             string statusText;
-            if (foreignLoader) statusText = "NOT LOADED - version.dll belongs to another mod";
-            else if (!dllActive) statusText = "NOT LOADED - missing " + missing;
-            else if (compatLayers != null) statusText = "MAY NOT LOAD - compatibility setting";
-            else statusText = "OPTIMIZER ACTIVE (version.dll)";
+            if (dllActive && compatLayers != null) statusText = "MAY NOT LOAD";
+            else if (dllActive) statusText = "READY";
+            else statusText = "NOT LOADED";
 
             Label statusVal = new Label();
             statusVal.Text = statusText;
@@ -1202,7 +1205,7 @@ namespace WowOptimizeLauncher {
             else if (compatLayers != null) statusVal.ForeColor = Color.FromArgb(255, 193, 7);
             else statusVal.ForeColor = Color.FromArgb(0, 230, 118);
             statusVal.AutoSize = true;
-            statusVal.Location = new Point(10, 26);
+            statusVal.Location = new Point(10, 24);
             statusVal.BackColor = Color.Transparent;
             statusCard.Controls.Add(statusVal);
 
@@ -1214,31 +1217,39 @@ namespace WowOptimizeLauncher {
             // the payload loaded.
             string detail;
             if (foreignLoader) {
-                detail = "that version.dll has no optimizer loader in it - ReShade and other mods use the same filename";
+                detail = "The version.dll here belongs to another mod. ReShade and others use the same file name.";
+            } else if (!dllActive && inTemp) {
+                detail = "Running from inside a zip. Extract every file into the folder with the game's .exe and start the launcher from there.";
             } else if (!dllActive) {
-                detail = "looked in " + baseDir;
+                detail = "Missing " + missing + " in " + ShortPath(baseDir) + ".";
             } else if (compatLayers != null) {
                 detail = compatLayers + " - untick \"Disable fullscreen optimizations\" in its Properties > Compatibility";
             } else {
                 string lastRun = LastProxyResult(baseDir);
-                detail = (lastRun != null && lastRun.StartsWith("ERROR")) ? "last launch: " + lastRun : null;
+                detail = (lastRun != null && lastRun.StartsWith("ERROR")) ? "Last launch: " + lastRun : "Loads when the game starts.";
             }
 
-            if (detail != null) {
-                statusCard.Size = new Size(btnWidth, 72);
-                Label statusWhere = new Label();
-                statusWhere.Text = detail;
-                statusWhere.Font = new Font("Segoe UI", 7f, FontStyle.Regular);
-                statusWhere.ForeColor = Color.FromArgb(150, 163, 178);
-                statusWhere.AutoSize = false;
-                statusWhere.Size = new Size(btnWidth - 20, 28);
-                statusWhere.Location = new Point(10, 42);
-                statusWhere.BackColor = Color.Transparent;
-                statusCard.Controls.Add(statusWhere);
-            }
+            // Up to three wrapped lines, measured rather than assumed, so a long
+            // reason makes the card taller instead of running out of it. The full
+            // folder is on the tooltip for when the shortened one is not enough.
+            Label statusWhere = new Label();
+            statusWhere.Text = detail;
+            statusWhere.Font = new Font("Segoe UI", 7.5f, FontStyle.Regular);
+            statusWhere.ForeColor = Color.FromArgb(150, 163, 178);
+            statusWhere.AutoSize = false;
+            statusWhere.AutoEllipsis = true;
+            int detailH = Math.Min(42, TextRenderer.MeasureText(detail, statusWhere.Font,
+                new Size(btnWidth - 20, 1000), TextFormatFlags.WordBreak).Height);
+            statusWhere.Size = new Size(btnWidth - 20, detailH);
+            statusWhere.Location = new Point(10, 44);
+            statusWhere.BackColor = Color.Transparent;
+            statusCard.Controls.Add(statusWhere);
+            statusCard.Size = new Size(btnWidth, 44 + detailH + 8);
+            toolTip.SetToolTip(statusWhere, "Folder: " + baseDir);
+            toolTip.SetToolTip(statusVal, "Folder: " + baseDir);
 
             leftPanel.Controls.Add(statusCard);
-            y += (detail != null) ? 80 : 62;
+            y += statusCard.Height + 8;
 
             activeCountLabel = new Label();
             activeCountLabel.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
@@ -1320,29 +1331,16 @@ namespace WowOptimizeLauncher {
             int rightX = 300;
             int rightW = ClientSize.Width - rightX - 10;
 
-            // Tip label
+            // One plain line where a seven-mark legend used to be. The marks
+            // ([+], [!], [=] and the rest) were how a search told rows apart once
+            // it had dropped the group headings; the headings now stay during a
+            // search, so there is nothing left for a legend to decode.
             Label tipLabel = new Label();
-            // Two lines. It was one line 20 pixels tall holding six marks and a
-            // sentence, so it showed three of the marks and cut the third in half.
-            // The headings inside a tab carry this. The marks come back
-            // onto the rows only while a search has flattened the groups.
-            tipLabel.Text = "[+] faster   [!] not proven   [=] fixes   [.] logging\r\n"
-                          + "[?] diagnostics   [-] changes the look   [x] didn't help";
-            tipLabel.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
-            tipLabel.ForeColor = CyanAccent;
-            tipLabel.AutoSize = false;
-            tipLabel.Size = new Size(rightW - 270, 30);
-            tipLabel.Location = new Point(rightX, 8);
-            toolTip.SetToolTip(tipLabel,
-                "[+] makes the game faster, and something measured it.\r\n"
-                + "[!] should make it faster; not measured yet. Turn one on, "
-                + "play, and the log says what it did.\r\n"
-                + "[=] protects or repairs something; no speed claim.\r\n"
-                + "[?] measures the game, and costs frames to produce the number.\r\n"
-                + "[-] buys frames by changing how the game looks or sounds.\r\n"
-                + "[x] was measured against the client and lost; hover it to read what.\r\n"
-                + "[.] writes a log; negligible cost.\r\n\r\n"
-                + "Hover any feature for what it does.");
+            tipLabel.Text = "Hover a switch to read what it does.";
+            tipLabel.Font = new Font("Segoe UI", 8.5f, FontStyle.Regular);
+            tipLabel.ForeColor = Color.FromArgb(130, 142, 158);
+            tipLabel.AutoSize = true;
+            tipLabel.Location = new Point(rightX, 16);
             tipLabel.BackColor = Color.Transparent;
             Controls.Add(tipLabel);
 
@@ -1378,25 +1376,38 @@ namespace WowOptimizeLauncher {
             };
 
             // Create tab pages
+            // The four areas hold what is known to work. Everything not yet
+            // proven in a game has its own tab, and so do the two kinds every
+            // preset leaves off, so a person looking for "what is still unticked
+            // and why" has three named places to look instead of seven headings
+            // spread over four tabs.
             TabPage tpGeneral = CreateTabPage("GENERAL");
             TabPage tpUiLua = CreateTabPage("UI & LUA");
             TabPage tpCombatNet = CreateTabPage("COMBAT & NET");
-            TabPage tpGraphicsSound = CreateTabPage("GRAPHICS & SOUND");
-            TabPage tpTried = CreateTabPage("TRIED, DIDN'T HELP");
+            TabPage tpGraphicsSound = CreateTabPage("GFX & SOUND");
+            TabPage tpNotProven = CreateTabPage("NOT PROVEN");
+            TabPage tpTried = CreateTabPage("DIDN'T HELP");
             TabPage tpDiag = CreateTabPage("DIAGNOSTICS");
 
             tabs.TabPages.Add(tpGeneral);
             tabs.TabPages.Add(tpUiLua);
             tabs.TabPages.Add(tpCombatNet);
             tabs.TabPages.Add(tpGraphicsSound);
+            tabs.TabPages.Add(tpNotProven);
             tabs.TabPages.Add(tpTried);
             tabs.TabPages.Add(tpDiag);
+
+            // Every tab the same width and all of them on screen. At a fixed 110
+            // pixels six tabs needed 660 of the 610 available and the last ones
+            // sat behind scroll arrows most people never noticed.
+            tabs.ItemSize = new Size(Math.Max(80, (tabs.Width - 6) / tabs.TabPages.Count), 28);
 
             // Get the scroll panels from each tab page
             generalFlow = (FlowLayoutPanel)((Panel)tpGeneral.Controls[0]).Controls[0];
             uiLuaFlow = (FlowLayoutPanel)((Panel)tpUiLua.Controls[0]).Controls[0];
             combatNetFlow = (FlowLayoutPanel)((Panel)tpCombatNet.Controls[0]).Controls[0];
             graphicsSoundFlow = (FlowLayoutPanel)((Panel)tpGraphicsSound.Controls[0]).Controls[0];
+            notProvenFlow = (FlowLayoutPanel)((Panel)tpNotProven.Controls[0]).Controls[0];
             triedFlow = (FlowLayoutPanel)((Panel)tpTried.Controls[0]).Controls[0];
             diagFlow = (FlowLayoutPanel)((Panel)tpDiag.Controls[0]).Controls[0];
 
@@ -1437,7 +1448,7 @@ namespace WowOptimizeLauncher {
         private void Rebuild(string query) {
             if (generalFlow == null || uiLuaFlow == null ||
                 combatNetFlow == null || graphicsSoundFlow == null ||
-                triedFlow == null || diagFlow == null) {
+                notProvenFlow == null || triedFlow == null || diagFlow == null) {
                 return;
             }
 
@@ -1446,7 +1457,7 @@ namespace WowOptimizeLauncher {
 
             FlowLayoutPanel[] flows = new FlowLayoutPanel[] {
                 generalFlow, uiLuaFlow, combatNetFlow, graphicsSoundFlow,
-                triedFlow, diagFlow
+                notProvenFlow, triedFlow, diagFlow
             };
             // The checkboxes are made once and reused, so they are only removed.
             // The group headings are made fresh every time this runs, which is
@@ -1467,26 +1478,65 @@ namespace WowOptimizeLauncher {
                     !hasSearch || pair.Key.ToLower().Contains(query);
             }
 
+            // Headings stay while searching. They used to be dropped and each
+            // row prefixed with a mark instead - [+], [!], [=] - which then
+            // needed a legend at the top of the window to be read at all. A
+            // heading over the matches says the same thing in words.
             for (int f = 0; f < flows.Length; f++) {
-                for (int k = 0; k < Kinds.Order.Length; k++) {
-                    string kind = Kinds.Order[k];
+                bool byArea = (flows[f] == notProvenFlow);
+                string[] groups = byArea ? AreaOrder : Kinds.Order;
+                for (int k = 0; k < groups.Length; k++) {
                     bool headed = false;
 
                     foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
                         SettingItem data = pair.Value;
                         if (data.Ctrl == null || !data.Ctrl.Visible) continue;
                         if (FlowFor(data) != flows[f]) continue;
-                        if (Kinds.Of(data.Key, data.Experimental) != kind) continue;
+                        string group = byArea ? data.Section : Kinds.Of(data.Key, data.Experimental);
+                        if (group != groups[k]) continue;
 
-                        if (!headed && !hasSearch) {
-                            flows[f].Controls.Add(MakeGroupHeader(Kinds.Heading(kind)));
+                        if (!headed) {
+                            flows[f].Controls.Add(MakeGroupHeader(
+                                byArea ? AreaHeading(groups[k]) : Kinds.Heading(groups[k])));
                             headed = true;
                         }
-                        data.Ctrl.Text = hasSearch ? (kind + " " + pair.Key) : pair.Key;
+                        data.Ctrl.Text = pair.Key;
                         flows[f].Controls.Add(data.Ctrl);
                     }
                 }
             }
+        }
+
+        // The order areas are listed in on the NOT PROVEN tab, and what each
+        // is called there. The keys are the ini sections.
+        private static readonly string[] AreaOrder = new string[] {
+            "General", "UI_Lua", "Combat_Net", "Graphics_Sound"
+        };
+
+        private static string AreaHeading(string section) {
+            if (section == "General")        return "GENERAL";
+            if (section == "UI_Lua")         return "UI AND LUA";
+            if (section == "Combat_Net")     return "COMBAT AND NETWORK";
+            if (section == "Graphics_Sound") return "GRAPHICS AND SOUND";
+            return section.ToUpper();
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetLongPathName(string shortPath, StringBuilder longPath, int size);
+
+        private static string LongPath(string path) {
+            if (string.IsNullOrEmpty(path)) return path;
+            StringBuilder sb = new StringBuilder(1024);
+            int n = GetLongPathName(path, sb, sb.Capacity);
+            return (n > 0 && n < sb.Capacity) ? sb.ToString() : path;
+        }
+
+        private static string ShortPath(string dir) {
+            string d = dir.TrimEnd(Path.DirectorySeparatorChar);
+            string[] parts = d.Split(Path.DirectorySeparatorChar);
+            if (parts.Length <= 3) return d;
+            return "..." + Path.DirectorySeparatorChar + parts[parts.Length - 2]
+                 + Path.DirectorySeparatorChar + parts[parts.Length - 1];
         }
 
         private Label MakeGroupHeader(string text) {
@@ -1541,20 +1591,23 @@ namespace WowOptimizeLauncher {
         // filter route through here, because they are the two places that have
         // already drifted apart once and emptied a tab between them.
         //
-        // There is no Experimental tab any more. It was a maturity axis wearing
-        // a category tab's clothes, and it held nearly half the switches, so
-        // the four real categories were half empty and nothing could be found
-        // where its name said it would be. Maturity is a property of a switch,
-        // not a place to keep it, so it is a mark on the row instead - [!] for
-        // what should help and has not been proven.
         // What a switch is decides its tab before which part of the game it
-        // touches does. The two kinds below are the ones every preset button
-        // leaves off, and a tester who presses one and then looks for what is
-        // still unticked has one place to look instead of four.
+        // touches does. The four area tabs hold what has been shown to work;
+        // anything not yet proven in a game, anything measured and lost, and
+        // anything that only measures has a tab of its own.
+        //
+        // An Experimental tab existed once and was removed because it held
+        // nearly half the switches and left the area tabs thin. It is back, on
+        // purpose, for the same reason it was removed: more than half of the
+        // switches are still unproven, and mixing them into the area tabs made
+        // a tab that looked like a list of things that work into mostly things
+        // nobody has run. Inside it they are grouped by area, so the areas are
+        // still findable.
         private FlowLayoutPanel FlowFor(SettingItem data) {
             string kind = Kinds.Of(data.Key, data.Experimental);
             if (kind == Kinds.Lost) return triedFlow;
             if (kind == Kinds.Diag || kind == Kinds.Log) return diagFlow;
+            if (kind == Kinds.Unproven) return notProvenFlow;
             switch (data.Section) {
                 case "General":        return generalFlow;
                 case "UI_Lua":         return uiLuaFlow;
@@ -1772,9 +1825,9 @@ namespace WowOptimizeLauncher {
                 + "Off: everything that measures the game, everything that buys "
                 + "frames by changing how it looks or sounds, and the few that "
                 + "were measured against the client and lost.\r\n\r\n"
-                + left.ToString() + " switch(es) marked [+] or [!] were left at "
-                + "their own default, because an unproven replacement should not "
-                + "be turned on by a button that says performance.\r\n\r\n"
+                + left.ToString() + " experimental switch(es) were left at their "
+                + "own default. Nobody has run them in a game yet, and a button "
+                + "called performance should not be the thing that turns them on.\r\n\r\n"
                 + "Saved. Launch when ready.",
                 "Max Performance", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -1785,91 +1838,9 @@ namespace WowOptimizeLauncher {
         
         
 
-        // The session that answers the questions already on the table.
-        //
-        // Different from the proving run above, and the difference is what each
-        // is allowed to cost. That one arms replacements and must not disturb the
-        // frame time it is judging, so every census stays off. This one exists to
-        // produce numbers, and the instruments that produce them cost frames on
-        // purpose.
-        //
-        // The 2026-09-20 session is why it exists. It ran for eighteen minutes
-        // with the sampling profiler on and answered none of three open questions,
-        // because the switches that would have answered them were at zero and
-        // nothing in this tool asked for them: the freeze catcher, during a
-        // twenty-four second stall at four frames a second; the A/B subject that
-        // weighs the Lua collector's pacing, which is the top two entries of that
-        // very profile; and the two that time the cloud texture. A tester cannot
-        // be expected to know that list, and the last time this happened the
-        // answer was a button.
-        //
-        // What the tester already chose is left alone. The thing being measured
-        // is their own configuration, not a preset nobody plays on.
-        private void SetUpMeasuringRun() {
-            string[] wanted = new string[] {
-                "SamplingProfiler",       // where the main thread went
-                "FreezeCatcher",          // what a stall was doing while it stalled
-                "AbTest",                 // frame times split by stint
-                "LuaGcPace",              // the collector's pacing, ours against the client's
-                "SkyTextureReuse",        // owns the hook the next one needs
-                "SkyCloudTexels",         // our cloud texel loops against the client's
-                "HorizonOcclusionSse2"    // written, never once run in a game
-            };
-            string[] unwanted = new string[] {
-                // A run that spends its frames waiting measures nothing.
-                "FrameLimiter",
-                // It rewrites the pause and step multiplier every frame, and
-                // LuaGcPace refuses to install while it does.
-                "LuaGcCoalesce",
-                // It stops the automatic collector and steps it by hand, so
-                // the pause the A/B alternates has nothing to pace. A
-                // three-hour run with it on measured only the step
-                // multiplier and could not say so.
-                "LuaGcManual"
-            };
-
-            int turnedOn = 0, alreadyOn = 0, missing = 0;
-            for (int i = 0; i < wanted.Length; i++) {
-                SettingItem it = FindByKey(wanted[i]);
-                if (it == null || it.Ctrl == null) { missing++; continue; }
-                if (it.Ctrl.Checked) alreadyOn++; else turnedOn++;
-                it.Ctrl.Checked = true;
-            }
-            for (int i = 0; i < unwanted.Length; i++) {
-                SettingItem it = FindByKey(unwanted[i]);
-                if (it != null && it.Ctrl != null) it.Ctrl.Checked = false;
-            }
-
-            unownedOverrides["AbTestSubject"] = new string[] { "General", "LuaGcPace" };
-
-            UpdateActiveModulesCount();
-            SaveSettings();
-
-            string note = turnedOn.ToString() + " instrument(s) switched on, "
-                + alreadyOn.ToString() + " already on";
-            if (missing > 0) {
-                note += ", and " + missing.ToString() + " asked for but not present "
-                    + "in this build - tell whoever sent you here";
-            }
-
-            MessageBox.Show(
-                note + ".\r\n\r\n"
-                + "The A/B subject is set to the Lua clean-up pacing, which is the "
-                + "largest single thing in the last profile. Everything else you "
-                + "had ticked is untouched, so what gets measured is your own "
-                + "setup.\r\n\r\n"
-                + "Play for about ten minutes: a city, a fight, and some flying "
-                + "or riding in the open so the sky and the horizon are on "
-                + "screen. If the game crashes or freezes, that log is the most "
-                + "useful one there is - send it as it is.\r\n\r\n"
-                + "Then send Logs\\wow_optimize.log. These cost frames, so press "
-                + "MAX PERFORMANCE or DEFAULT when you are done.",
-                "Measuring Run", MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-
         // The session that turns an unproven replacement into a proven one.
         //
-        // Every [!] switch is one that was written against the disassembly,
+        // Every switch on the NOT PROVEN tab was written against the disassembly,
         // verified offline where the maths allows it, and never run in a game.
         // They stay off for everyone until a log says otherwise, and nothing in
         // this launcher asked for that log: MAX PERFORMANCE deliberately leaves
@@ -2051,14 +2022,6 @@ namespace WowOptimizeLauncher {
             // branch and turns on nothing.
         }
 
-        // Values for keys this launcher has no tickbox for, to be written on the
-        // next save. AbTestSubject is the one that matters: it names the feature
-        // an A/B run measures, it has no control here, and its own tooltip used to
-        // tell a tester to edit the file by hand. Nobody does, so every A/B run
-        // measured whatever was in the file already.
-        private Dictionary<string, string[]> unownedOverrides =
-            new Dictionary<string, string[]>();
-
         private void SaveSettingsToPath(string path) {
             try {
                 string dir = Path.GetDirectoryName(path);
@@ -2106,9 +2069,6 @@ namespace WowOptimizeLauncher {
                             if (eq <= 0) continue;
                             string key = line.Substring(0, eq).Trim();
                             if (FindByKey(key) != null) continue;
-                            // Replaced below rather than carried, so a preset that
-                            // sets one of these wins over what the file had.
-                            if (unownedOverrides.ContainsKey(key)) continue;
                             if (!sections.ContainsKey(current)) continue;
                             sections[current].Add(key + "=" + line.Substring(eq + 1).Trim());
                         }
@@ -2117,11 +2077,6 @@ namespace WowOptimizeLauncher {
                     // An unreadable existing file must not stop the save. The owned
                     // keys are still written; only the carry-over is lost, which is
                     // what every save did before this.
-                }
-
-                foreach (KeyValuePair<string, string[]> ov in unownedOverrides) {
-                    if (!sections.ContainsKey(ov.Value[0])) continue;
-                    sections[ov.Value[0]].Add(ov.Key + "=" + ov.Value[1]);
                 }
 
                 using (StreamWriter sw = new StreamWriter(path, false, Encoding.UTF8)) {
