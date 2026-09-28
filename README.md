@@ -186,7 +186,7 @@ See what other players say: [Reviews and Testimonials](https://github.com/suprep
 This project wouldn't exist without the community. Every crash report, every bisection test, every "hey this broke my addon" message directly shaped the release. 
 
 Special thanks to:
-Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude, Houmbro
+Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude, Houmbro, Feles Noctis
 
 ### Code contributions
 
@@ -224,6 +224,10 @@ Every measured item in these notes came out of a log somebody sent in.
 - **[biship](https://github.com/suprepupre/wow-optimize/issues/50)** — read the
   timing switch's code and reported that it gated twelve unrelated things and
   described none of them.
+- **Feles Noctis** — QuestHelper printing `no nod :(` several times a minute,
+  with the lines of its router that produced it. That was enough to trace it
+  to this tool's `math.random` returning exactly 1.0, and from there to the
+  unseeded generator behind it.
 
 </details>
 
