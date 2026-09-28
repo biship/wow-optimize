@@ -28,7 +28,11 @@ static bool ResolveVersionApi(VersionApi& api) {
     char sys[MAX_PATH];
     UINT n = GetSystemDirectoryA(sys, MAX_PATH);
     if (n == 0 || n >= MAX_PATH - 16) return false;
-    lstrcatA(sys, "\version.dll");
+    // Two backslashes. With one, "\v" is the vertical-tab escape, the path
+    // became system32 followed by 0x0B and "ersion.dll", LoadLibraryA failed
+    // on every call since this was written, and the compiler says nothing
+    // because \v is a legal escape.
+    lstrcatA(sys, "\\version.dll");
 
     HMODULE v = LoadLibraryA(sys);
     if (!v) return false;

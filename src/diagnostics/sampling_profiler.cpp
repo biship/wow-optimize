@@ -11,6 +11,7 @@
 #include <tlhelp32.h>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include "sampling_profiler.h"
 #include "session_verdict.h"
@@ -173,6 +174,8 @@ static void BuildKnownFuncTable() {
 
         // --- Math / transform library ---
         { 0x004C1B30,    90, "CMatrix::TranslateLocal" },
+        { 0x004C1B90,    86, "CMatrix::ScaleLocal" },
+        { 0x004C1BF0,    80, "CMatrix::Scale3x3" },
         { 0x004C1C40,   170, "CMatrix::FromQuaternion" },
         { 0x004C1F00,   533, "CMatrix::Multiply" },
         { 0x004C2120,   140, "CMatrix::ScalarMul" },
@@ -180,9 +183,16 @@ static void BuildKnownFuncTable() {
         { 0x004C2210,    93, "RowAffinePoint" },
         { 0x004C2270,   140, "sub_4C2270_vec4_x_mat4" },
         { 0x004C2300,   111, "InPlacePointXform" },
+        { 0x004C2370,    43, "CMatrix::MultiplyInPlace" },
         { 0x004C23D0,   104, "CMatrix::Transpose" },
         { 0x004C2440,  2892, "CMatrix_AdjugateDet" },
         { 0x004C2FC0,   212, "CMatrix::InvertRigid" },
+        { 0x004C31B0,   103, "CMatrix::CreateRotateX" },
+        { 0x004C3220,   103, "CMatrix::CreateRotateY" },
+        { 0x004C3290,   103, "CMatrix::CreateRotateZ" },
+        { 0x004C3300,    60, "CMatrix::RotateX" },
+        { 0x004C3340,    60, "CMatrix::RotateY" },
+        { 0x004C3380,    60, "CMatrix::RotateZ" },
         { 0x004C3420,    53, "C3Vector::Normalize" },
         { 0x004C3600,    67, "C3Vector::NormalizeGuarded" },
 
@@ -249,6 +259,7 @@ static void BuildKnownFuncTable() {
         // accessor it called, and the wrappers behind the CriticalSection time
         // that shows up as ntdll in every profile.
         { 0x00484B00,  1597, "UI_BatchDraw" },
+        { 0x0048BD20,   186, "Color_PackBGRA" },
         { 0x00490770,   193, "UIFrame_OnUpdateTree" },
         { 0x00532AF0,     7, "Renderer_GetColorFmtBlock" },
         { 0x006C4440,   877, "Particle_FillVertices" },
@@ -257,14 +268,12 @@ static void BuildKnownFuncTable() {
         { 0x00817DB0,     6, "GetLuaState" },
         { 0x008B7DA0,     3, "ReturnThis" },
         { 0x00855670,   102, "LuaMemPool_Free" },
-        // Hot in a CPU-bound profile but not yet understood. Named by address so
-        // a repeat appearance is recognisable rather than looking like noise.
-        { 0x00494A10,   214, "Hot_494A10" },
-        { 0x007A50C0,   384, "Hot_7A50C0" },
+        // UI frame hierarchy update and culling traversal
+        { 0x00494A10,   214, "CFrameManager::OnUpdate" },
+        { 0x00495320,   230, "CFrameStrataManager::OnUpdate" },
+        { 0x007A50C0,   384, "Scene_VisibilityTraverse" },
         { 0x007C6D50,  1166, "Collision_ClipVertsToBox" },
-        // Seventeen callers, once per scene node per culling pass. Its samples
-        // used to be attributed to whichever named function preceded it.
-        { 0x0078F370,    97, "AABB_Overlap" },
+        { 0x0078F370,    39, "AABB_Overlap" },
         // Classifies every vertex of a collision model against the query box
         // as a six-bit outcode, four vertices per unrolled pass, then tests
         // each triangle by ANDing its three. Called once per line-of-sight or
@@ -272,8 +281,9 @@ static void BuildKnownFuncTable() {
         // the whole loop, which is why 158 of its 418 instructions are x87.
         // Named from a profile before anyone had read it. It contains the same
         // bone matrix transpose as sub_829BA0, in a second draw path, and
-        // BoneMatrixUpload patches both.
+        // BoneMatrixUpload patches all three (sub_829BA0, sub_8203B0, sub_820AE0).
         { 0x008203B0,   872, "M2_BoneMatrixUploadB" },
+        { 0x00820AE0,  1109, "M2_BoneMatrixUploadC" },
         { 0x00857CA0,  5151, "luaV_execute" },
         // The Lua bytecode dispatch loop, and the client has two of them.
         // luaD_call at 0x00856760 picks by the byte at G(L)+20 - the script
@@ -316,7 +326,7 @@ static void BuildKnownFuncTable() {
         // Each holds a run of pure fld/fstp with no arithmetic between - the one
         // shape that vectorises with no precision argument at all. See
         // m2_matrix_slot_sse2.cpp for what claiming one looks like.
-        { 0x00823130,  2909, "PureFloatMove_sub823130" },   // 32/32 block at 0x008236B3
+        { 0x00823130,  2909, "PureFloatMove_sub823130" },   // 32/32 block at 0x008236B3 (vectorized by m2_batch_matrix_sse2.cpp)
         { 0x008EDFC0,  2410, "PureFloatMove_sub8EDFC0" },   // 24/24 at 0x008EE463, 0x008EE746
         { 0x007762A0,  1303, "PureFloatMove_sub7762A0" },   // 20/20 at 0x00776448
         { 0x0094A440,   785, "PureFloatMove_sub94A440" },   // 21/21 at 0x0094A649
@@ -335,8 +345,18 @@ static void BuildKnownFuncTable() {
         // the caller's last index, with a binary search for a jump over 500ms
         // and a double division for the interpolation factor at the end.
         { 0x0082B0A0,   450, "M2_AnimTrackInterp" },
-        { 0x0082AF40,   345, "M2_AnimTrackScalar" },
-        { 0x0082B340,   273, "M2_AnimTrackColor" },
+        { 0x0082AF40,   345, "M2_AnimTrackScalar" },        // packed int16 scalar (vectorized by anim_scalar_track_sse2.cpp)
+        { 0x0082B340,   273, "M2_AnimTrackColor" },         // float scalar (vectorized by anim_scalar_track_sse2.cpp)
+        { 0x0082B460,  1081, "M2_AnimTrackSpline" },        // 3D vector cubic spline (vectorized by anim_spline_track_sse2.cpp)
+        { 0x0082B8A0,   681, "M2_AnimTrackSplineScalar" },  // scalar cubic spline (vectorized by anim_spline_track_sse2.cpp)
+        { 0x007F9430,    66, "AABB_Transform" },             // 4x4 matrix * AABB (vectorized by aabb_transform_sse2.cpp)
+        { 0x007F93D0,    91, "AABB_Transform3x3" },          // 3x3 matrix * AABB (vectorized by aabb_transform_sse2.cpp)
+        { 0x007F9320,   171, "AABB_TransformCore_Arvo" },     // Arvo bounding box transformation core
+        { 0x00714D10,    78, "Vec3_Min" },
+        { 0x00714D70,    78, "Vec3_Max" },
+        { 0x00715130,   100, "CAxisAlignedBox::Union" },
+        { 0x007CCE00,   403, "Occluder_TestSphere" },        // sphere occluder culling (vectorized by occluder_sphere_sse2.cpp)
+        { 0x007CCFA0,   404, "Occluder_TestPolygon" },       // polygon/mesh occluder culling (vectorized by occluder_sphere_sse2.cpp)
         { 0x007BCC00,   796, "World_VisibilityTraverse" },  // 64x64 tiles, 16x16 cells
         { 0x0078F6A0,   601, "Terrain_HorizonOcclusionBuild" },
         { 0x00861D90,   235, "luaK_patchlistaux" },      // Lua code generator jump patching
@@ -348,14 +368,57 @@ static void BuildKnownFuncTable() {
         // execution. A candidate for an index rather than a search, but it is
         // pointer surgery with side effects and wants a careful sitting.
         { 0x00489710,   408, "Node_FindOwnerAndRelink" },
+        { 0x004C1B30,    90, "CMatrix::TranslateLocal" },
+        { 0x004C1B90,    86, "CMatrix::ScaleLocal" },
+        { 0x004C1BF0,    80, "CMatrix::Scale3x3" },
+        { 0x004C1C40,   170, "QuatToMatrix" },
+        { 0x004C1F00,   533, "CMatrix::Multiply" },
+        { 0x004C21B0,    93, "CMatrix::MatVec3Mul" },
+        { 0x004C2270,   140, "CMatrix::MatVec4Mul" },
+        { 0x004C2300,   111, "CMatrix::PointTransformInPlace" },
+        { 0x004C2370,    43, "CMatrix::MultiplyInPlace" },
+        { 0x004C2FC0,   212, "CMatrix::InvertRigid" },
+        { 0x004C31B0,   103, "CMatrix::CreateRotateX" },
+        { 0x004C3220,   103, "CMatrix::CreateRotateY" },
+        { 0x004C3290,   103, "CMatrix::CreateRotateZ" },
+        { 0x004C3300,    60, "CMatrix::RotateX" },
+        { 0x004C3340,    60, "CMatrix::RotateY" },
+        { 0x004C3380,    60, "CMatrix::RotateZ" },
+        { 0x004C33C0,    82, "CMatrix::RotateQuat" },
+        { 0x004C3420,    53, "Vec3_Normalize" },
+        { 0x004C3460,   307, "CMatrix::CreateRotateAxisAngle" },
+        { 0x004C35A0,    34, "Vec3_Scale" },
+        { 0x004C35D0,    34, "Vec3_InvScale" },
+        { 0x004C3600,    67, "Vec4_Normalize" },
+        { 0x005FEC70,    60, "C3Vector::Cross" },
+        { 0x005FECB0,    58, "CBox::Scale" },
+        { 0x005FED20,    84, "VectorMatrixRotate" },
         { 0x00821A20,  5658, "M2_DrawBatchBuilder" },
         { 0x00960D20,   154, "Lua_Model_SetLight" },
         { 0x00979110,    84, "CQuaternion::Normalize" },
         { 0x00981D40,   936, "ParticleSpawn_Init" },
+        { 0x00982400,    85, "CQuaternion::FromAngleAxis" },
+        { 0x00982460,   268, "CQuaternion::Slerp" },
+        { 0x00982630,   111, "Quat_Lerp" },
+        { 0x00982970,    61, "Color_UnpackBGR" },
+        { 0x009829B0,    61, "Vec3_DominantAxis" },
+        { 0x009829F0,    67, "Vec3_RecessiveAxis" },
+        { 0x00982FB0,   283, "RayPlaneIntersect" },
+        { 0x009830D0,   957, "PointInPolygon2D" },
         { 0x00983490,   537, "RayTriIntersect16" },
         { 0x009836B0,   535, "RayTriIntersect32" },
+        { 0x00983990,    67, "CFrustum::GetAABB" },
         { 0x009839E0,   124, "CFrustum::IsAABBVisible" },
-        { 0x00983D70,   241, "CFrustum::IsPointVisible" },
+        { 0x00983A60,   124, "CFrustum::IsAABBInside" },
+        { 0x00983AE0,   560, "CFrustum::Translate" },
+        { 0x00983D20,    79, "CFrustum::IsSphereVisible" },
+        { 0x00983D70,   241, "CFrustum::IsPointVisible" },  // vectorized by frustum_aabb_sse2.cpp
+        { 0x00984860,   198, "AABB_TransformAffine" },
+        { 0x00984930,   829, "AABB_FromVertices" },
+        { 0x00984C90,    76, "Color_UnpackBGRA" },
+        { 0x00984F60,   193, "Color_RGBToHSV" },
+        { 0x00985030,   334, "Color_HSVToRGB" },
+        { 0x009851A0,    91, "Color_PackBGR" },
 
         // --- CRT string/memory (static) ---
         { 0x0076E5A0,    36, "free_wrapper" },
@@ -795,13 +858,145 @@ extern "C" void WowOpt_NoteDetour(uintptr_t target, const void* detour) {
     RegisterSelfSymbol(n, detour);
 }
 
+// Every function in this DLL, read from wow_optimize.sym beside the DLL.
+//
+// The registered symbols below are entry points with no size, which is why a
+// sample landing in an unregistered neighbour used to be printed under the name
+// above it. The linker map has every function and its address; the build turns
+// it into this file. With it loaded, a symbol owns the bytes up to the next
+// one, so an address resolves to exactly one function or to nothing.
+//
+// The file is optional. Without it everything below works as it did, and the
+// profile header says which of the two it is.
+struct MapSym { uint32_t rva; const char* name; };
+static MapSym*  g_mapSyms = nullptr;
+static int      g_mapSymCount = 0;
+static char*    g_mapText = nullptr;
+static bool     g_mapTried = false;
+static char     g_mapWhy[160] = "";
+
+static int __cdecl MapSymLess(const void* a, const void* b) {
+    const uint32_t ra = ((const MapSym*)a)->rva, rb = ((const MapSym*)b)->rva;
+    return ra < rb ? -1 : (ra > rb ? 1 : 0);
+}
+
+static void LoadMapSymbols() {
+    if (g_mapTried) return;
+    g_mapTried = true;
+    if (!g_selfBase) { lstrcpynA(g_mapWhy, "our own module was not identified", sizeof(g_mapWhy)); return; }
+
+    char path[MAX_PATH];
+    if (!GetModuleFileNameA((HMODULE)g_selfBase, path, sizeof(path))) {
+        lstrcpynA(g_mapWhy, "the DLL's own path could not be read", sizeof(g_mapWhy));
+        return;
+    }
+    int n = lstrlenA(path);
+    while (n > 0 && path[n - 1] != '.') --n;
+    if (n == 0 || n + 4 >= MAX_PATH) { lstrcpynA(g_mapWhy, "the DLL's path has no extension", sizeof(g_mapWhy)); return; }
+    lstrcpyA(path + n, "sym");
+
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        snprintf(g_mapWhy, sizeof(g_mapWhy), "no symbol file beside the DLL (%s)", path);
+        return;
+    }
+    DWORD size = GetFileSize(h, nullptr);
+    if (size == INVALID_FILE_SIZE || size == 0 || size > (16u << 20)) {
+        CloseHandle(h);
+        lstrcpynA(g_mapWhy, "the symbol file is empty or implausibly large", sizeof(g_mapWhy));
+        return;
+    }
+    g_mapText = (char*)VirtualAlloc(nullptr, size + 1, MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN,
+                                    PAGE_READWRITE);
+    DWORD got = 0;
+    if (!g_mapText || !ReadFile(h, g_mapText, size, &got, nullptr) || got != size) {
+        CloseHandle(h);
+        if (g_mapText) { VirtualFree(g_mapText, 0, MEM_RELEASE); g_mapText = nullptr; }
+        lstrcpynA(g_mapWhy, "the symbol file could not be read", sizeof(g_mapWhy));
+        return;
+    }
+    CloseHandle(h);
+    g_mapText[size] = 0;
+
+    int lines = 0;
+    for (DWORD i = 0; i < size; ++i) if (g_mapText[i] == '\n') ++lines;
+    g_mapSyms = (MapSym*)VirtualAlloc(nullptr, (SIZE_T)(lines + 1) * sizeof(MapSym),
+                                      MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
+    if (!g_mapSyms) {
+        VirtualFree(g_mapText, 0, MEM_RELEASE); g_mapText = nullptr;
+        lstrcpynA(g_mapWhy, "the symbol table could not be committed", sizeof(g_mapWhy));
+        return;
+    }
+
+    char* p = g_mapText;
+    while (*p) {
+        char* line = p;
+        while (*p && *p != '\n') ++p;
+        if (*p) *p++ = 0;
+        int len = lstrlenA(line);
+        if (len && line[len - 1] == '\r') line[len - 1] = 0;
+        if (line[0] != '0' || line[1] != 'x') continue;
+        uint32_t rva = 0;
+        char* q = line + 2;
+        while (*q && *q != ' ') {
+            const char c = *q;
+            uint32_t d;
+            if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+            else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+            else break;
+            rva = rva * 16 + d;
+            ++q;
+        }
+        if (*q != ' ') continue;
+        ++q;
+        if (!*q) continue;
+        g_mapSyms[g_mapSymCount].rva = rva;
+        g_mapSyms[g_mapSymCount].name = q;
+        ++g_mapSymCount;
+    }
+    qsort(g_mapSyms, (size_t)g_mapSymCount, sizeof(MapSym), MapSymLess);
+    if (g_mapSymCount == 0) lstrcpynA(g_mapWhy, "the symbol file held no usable lines", sizeof(g_mapWhy));
+}
+
+// The function that owns this address, bounded by the next symbol, or null.
+static const char* ResolveMapSymbol(uintptr_t addr, uintptr_t* outDelta) {
+    if (!g_mapSymCount || !g_selfBase || addr < g_selfBase || addr >= g_selfEnd) return nullptr;
+    const uint32_t rva = (uint32_t)(addr - g_selfBase);
+    int lo = 0, hi = g_mapSymCount - 1, best = -1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) / 2;
+        if (g_mapSyms[mid].rva <= rva) { best = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    if (best < 0) return nullptr;
+    // Several names can share an address after identical code folding; the
+    // first of them is as good an answer as any, and the bound is the next
+    // address that differs.
+    int next = best;
+    while (next < g_mapSymCount && g_mapSyms[next].rva == g_mapSyms[best].rva) ++next;
+    const uint32_t end = (next < g_mapSymCount) ? g_mapSyms[next].rva : 0xFFFFFFFFu;
+    if (rva >= end) return nullptr;
+    if (outDelta) *outDelta = rva - g_mapSyms[best].rva;
+    return g_mapSyms[best].name;
+}
+
 // Nearest registered symbol at or below addr, within a sane distance. The bound
 // matters: without it every unregistered hot spot would be attributed to whichever
 // registered function happens to sit lowest in the image, which is worse than
 // admitting we do not know.
 static const char* ResolveSelfSymbol(uintptr_t addr, uintptr_t* outDelta = nullptr) {
+    // The map, when it is there, answers exactly; the entry points are the
+    // fallback and are a guess past the first few hundred bytes.
+    if (const char* exact = ResolveMapSymbol(addr, outDelta)) return exact;
     const char* best = nullptr;
-    uintptr_t bestDelta = 0x4000;   // 16 KB
+    // Was 16 KB. Nothing here knows a detour's size, so every byte of that
+    // distance is a chance to name an unregistered neighbour instead: a tester
+    // profile put "wowopt!hook@00875F80+0x1AD0" ninth in its top fifty, and
+    // 6.8 KB past an entry point is not that entry point. Four KB is still
+    // generous for one function and is as far as a guess is worth making.
+    uintptr_t bestDelta = 0x1000;   // 4 KB
     for (int i = 0; i < g_selfSymbolCount; i++) {
         if (g_selfSymbols[i].addr > addr) continue;
         uintptr_t d = addr - g_selfSymbols[i].addr;
@@ -981,14 +1176,23 @@ static void DumpFineHistogram(const uint32_t* counts, int slots, int shift,
     Log("[SamplingProfiler] === %s ===", title);
     for (int i = 0; i < found; i++) {
         uint32_t c = SlotAt(counts, baseline, idx[i]);
-        char addr[32];
+        // 48, and bounded. It was 32 and written with wsprintfA, which takes no
+        // size: "wowopt+0x%X after %.12s" reaches 37 bytes with its terminator,
+        // so every label that took that branch ran five bytes past the end and
+        // over the stack cookie. The check at the return then failed and the CRT
+        // ended the process through __fastfail, which runs no exception filter
+        // and no exit hook - two tester sessions died thirty seconds in, inside
+        // the first report, with nothing in the log to say why.
+        char addr[48];
         uintptr_t slotAddr = addrBase + ((uintptr_t)idx[i] << shift);
         uintptr_t delta = 0;
         const char* sym = (addrBase == 0)
                         ? ResolveSelfSymbol(g_selfBase + slotAddr, &delta) : nullptr;
-        if (sym && delta < kSelfSymbolTrusted) wsprintfA(addr, "wowopt!%.20s", sym);
-        else if (sym) wsprintfA(addr, "wowopt!%.14s+0x%X", sym, (unsigned)delta);
-        else          wsprintfA(addr, addrFormat, (unsigned)slotAddr);
+        if (sym && delta < kSelfSymbolTrusted) snprintf(addr, sizeof(addr), "wowopt!%.20s", sym);
+        // Past the trusted distance the address is the fact and the name is a
+        // neighbourhood, so the address leads and the name follows it.
+        else if (sym) snprintf(addr, sizeof(addr), "wowopt+0x%X after %.20s", (unsigned)slotAddr, sym);
+        else          snprintf(addr, sizeof(addr), addrFormat, (unsigned)slotAddr);
         Log("[SamplingProfiler]   %-14s %8u samples (%5.2f%%)",
             addr, c, 100.0 * (double)c / (double)total);
     }
@@ -1184,6 +1388,7 @@ static void DumpResults() {
 
     // Snapshot loaded modules so system samples can be attributed to a DLL.
     BuildModuleTable();
+    LoadMapSymbols();
     BuildNtFuncTable();
 
     // Buckets: one per named function, one "system_dll", plus one per non-empty
@@ -1430,8 +1635,22 @@ static void DumpResults() {
     // timer around the same call reads as large - which is how M2_AnimateModel
     // came to be 0.17% in this table and 2.47 ms of a 23.4 ms frame in the
     // animation census on the same day. Neither instrument was wrong.
+    if (g_mapSymCount)
+        Log("[SamplingProfiler] our own addresses are resolved against %d function(s) "
+            "read from wow_optimize.sym, so a name below means the address is inside "
+            "that function and not merely after it.", g_mapSymCount);
+    else
+        Log("[SamplingProfiler] wow_optimize.sym was not loaded (%s), so our own "
+            "addresses fall back to the hooks registered at runtime - those are entry "
+            "points with no size, and a name is only trustworthy within the first few "
+            "hundred bytes.", g_mapWhy[0] ? g_mapWhy : "reason not recorded");
+
     Log("[SamplingProfiler] === TOP %d HOT FUNCTIONS/REGIONS - self time, whole "
-        "function; a +0xNNN suffix is where the weight sits, not a split "
+        "function; a +0xNNN suffix on a client function is where the weight sits "
+        "inside it, not a split, because those have known sizes. A line reading "
+        "\"wowopt+0xNNN after <name>\" is the other case: our own symbols are "
+        "entry points with no size, so that address is somewhere past that one "
+        "and may be in an unregistered neighbour "
         "(shares of the %llu most recent samples, %llu idle ticks during "
         "loading/warmup where the main thread was left alone) ===",
         TOP_N, (unsigned long long)n, (unsigned long long)g_skippedSamples);
@@ -1467,8 +1686,8 @@ static void DumpResults() {
             // a symbol whose samples are in its own prologue needs no comment.
             if (domIdx > 0 && histTotal > 0 &&
                 buckets[i].offHist[0] * 2u < histTotal) {
-                wsprintfA(label, "%.20s+0x%03X", buckets[i].name,
-                          (unsigned)(domIdx << 8));
+                snprintf(label, sizeof(label), "%.20s+0x%03X", buckets[i].name,
+                         (unsigned)(domIdx << 8));
                 name = label;
             }
         } else if (g_selfBase && buckets[i].addr >= g_selfBase && buckets[i].addr < g_selfEnd) {
@@ -1476,9 +1695,12 @@ static void DumpResults() {
             // maps directly to wow_optimize.map (which of our hooks costs time).
             uintptr_t delta = 0;
             const char* sym = ResolveSelfSymbol(buckets[i].addr, &delta);
-            if (sym && delta < kSelfSymbolTrusted) wsprintfA(label, "wowopt!%.24s", sym);
-            else if (sym) wsprintfA(label, "wowopt!%.16s+0x%X", sym, (unsigned)delta);
-            else     wsprintfA(label, "wowopt+0x%05X", (unsigned)(buckets[i].addr - g_selfBase));
+            // Bounded. The middle one reached 39 bytes into this 40 - correct
+            // by one byte, which is not the same as correct.
+            if (sym && delta < kSelfSymbolTrusted) snprintf(label, sizeof(label), "wowopt!%.24s", sym);
+            else if (sym) snprintf(label, sizeof(label), "wowopt+0x%05X after %.14s",
+                                   (unsigned)(buckets[i].addr - g_selfBase), sym);
+            else     snprintf(label, sizeof(label), "wowopt+0x%05X", (unsigned)(buckets[i].addr - g_selfBase));
             name = label;
         } else {
             // Unlisted WoW code region. Labelling it by page base alone was not

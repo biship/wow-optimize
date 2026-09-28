@@ -2623,17 +2623,114 @@ static int __cdecl Hooked_RawEqual(lua_State* L) {
 }
 
 // ================================================================
-// Hooked_Math_Random — math.random fast path
-// Direct stack access: zero Lua VM calls on the fast path.
-// The old hook paid lua_gettop + lua_type per arg + lua_tonumber
-// per arg + lua_pushnumber (up to 5 VM calls per random). Now we
-// read L+0x0C/L+0x10 directly and write the result TValue inline.
-// SEH-guarded + pointer-validated; any fault falls back to the engine.
+// Hooked_Math_Random - math.random without the Lua API calls
+//
+// The client's math.random is sub_851640, stock Lua 5.1:
+//
+//     r = (double)(rand() % 0x7FFF) * dbl_A47720      // dbl_A47720 = 1/32767
+//     0 args:  r
+//     1 arg:   floor(u * r) + 1                        u = luaL_checkint(1)
+//     2 args:  floor((u - l + 1) * r) + l
+//
+// This fast path used to compute r as rand() / RAND_MAX, which is 1.0 whenever
+// rand() returns 32767 - once in 32768 calls. The modulo in the client's
+// version exists to exclude exactly that. QuestHelper's router picks a node by
+// drawing r * total weight and subtracting weights until it goes negative; at
+// r == 1.0 it never does, and a tester on 3.19.3 got "no nod :(" several times
+// a minute with the remainder printed as 0.000000 every time, which is that.
+//
+// It also drew from the wrong generator. rand() here is this DLL's CRT, which
+// keeps its own state and was never seeded - there is no srand anywhere in
+// this tree - so every addon calling math.random() got the same sequence in
+// every session. The client's _rand at 0x0088B867 is the MSVC linear
+// congruential generator in the client's own CRT, seeded by the client. This
+// calls that one, so the state advances exactly as it would have if the client
+// had run math.random itself, and every other caller of the client's rand()
+// sees the same sequence it always did.
+//
+// With the client's generator, the client's scale read from its own code, and
+// the client's formula, the result is the client's to the last bit: the only
+// floating point is one multiply of an exact integer by a double, rounded once
+// the same way in SSE2 as in x87 at 53 bits, and floor, which is exact.
+//
+// Measured, not argued. An offline harness ran the client's arithmetic as a
+// verbatim x87 transcription - fild, fmul by the constant read from
+// 0x00A47720, fstp; fild/fmul, floor, fadd/fiadd, fstp - against this code:
+//
+//     0 args   32768 draws, every value rand() can return   0 differing
+//     1 arg    524288 cases, u from 1 to 2^29               0 differing
+//     2 args   294966 cases, l from -2^29, spans to 2^29-1  0 differing
+//     draws giving r >= 1.0:   old formula 1 of 32768,   this one 0
+//     results outside [1,u] or [l,u]:                    0
+//
+// The tester's log on 55f49522 shows the hook live on exactly this function,
+// "math.random 0x00851640 [OK]", with 106538 calls through the old formula.
+//
+// What is still handed to the client: anything other than 0, 1 or 2 numeric
+// arguments; any argument that is not already an exact integer, because the
+// client converts with luaL_checkint and this does not guess how that rounds;
+// arguments outside +/-2^29, so the range arithmetic cannot overflow; and the
+// empty-interval cases, where the client raises the error.
 // ================================================================
+
+typedef int (__cdecl* ClientRandFn)(void);
+static const ClientRandFn kClientRand       = (ClientRandFn)0x0088B867;
+static const uintptr_t    kClientRandScale  = 0x00A47720;
+static const uintptr_t    kClientMathRandom = 0x00851640;
+
+// Everything after the call to __getptd, whose rel32 depends on the load
+// address: mov ecx,[eax+14h] / imul ecx,343FDh / add ecx,269EC3h / store /
+// shr 16 / and 7FFFh / ret.
+static const unsigned char kClientRandTail[29] = {
+    0x8B, 0x48, 0x14, 0x69, 0xC9, 0xFD, 0x43, 0x03, 0x00, 0x81, 0xC1, 0xC3,
+    0x9E, 0x26, 0x00, 0x89, 0x48, 0x14, 0x8B, 0xC1, 0xC1, 0xE8, 0x10, 0x25,
+    0xFF, 0x7F, 0x00, 0x00, 0xC3
+};
+
+static int    g_mathRandomReady = -1;   // -1 not checked yet, 0 refused, 1 ready
+static double g_mathRandomScale = 0.0;
+
+static bool MathRandomReady() {
+    if (g_mathRandomReady >= 0) return g_mathRandomReady == 1;
+    g_mathRandomReady = 0;
+    // The original this replaces has to be the client's own, or the formula
+    // above describes something else.
+    if ((uintptr_t)orig_math_random != kClientMathRandom) {
+        Log("[LuaFastPath] math.random fast path off: the function it replaces is "
+            "0x%08X, not the client's 0x%08X", (unsigned)(uintptr_t)orig_math_random,
+            (unsigned)kClientMathRandom);
+        return false;
+    }
+    const unsigned char* p = (const unsigned char*)kClientRand;
+    if (p[0] != 0xE8 || memcmp(p + 5, kClientRandTail, sizeof(kClientRandTail)) != 0) {
+        Log("[LuaFastPath] math.random fast path off: the bytes at 0x%08X are not "
+            "the client's rand()", (unsigned)(uintptr_t)kClientRand);
+        return false;
+    }
+    const double scale = *(const double*)kClientRandScale;
+    if (!(scale > 3.0518e-05 && scale < 3.0519e-05)) {
+        Log("[LuaFastPath] math.random fast path off: the scale at 0x%08X is %.17g, "
+            "not 1/32767", (unsigned)kClientRandScale, scale);
+        return false;
+    }
+    g_mathRandomScale = scale;
+    g_mathRandomReady = 1;
+    return true;
+}
+
+// An argument the fast path can take: a number that is already an exact
+// integer and small enough that u - l + 1 cannot overflow.
+static inline bool ExactSmallInt(double d, int* out) {
+    if (!(d >= -536870912.0 && d <= 536870912.0)) return false;
+    const int i = (int)d;
+    if ((double)i != d) return false;
+    *out = i;
+    return true;
+}
 
 static int __cdecl Hooked_Math_Random(lua_State* L) {
     uintptr_t Lp = (uintptr_t)L;
-    if (Lp < 0x10000 || Lp > 0xFFE00000) {
+    if (Lp < 0x10000 || Lp > 0xFFE00000 || !MathRandomReady()) {
         g_mathRandomFallbacks++; return orig_math_random(L);
     }
     __try {
@@ -2645,53 +2742,37 @@ static int __cdecl Hooked_Math_Random(lua_State* L) {
             g_mathRandomFallbacks++; return orig_math_random(L);
         }
 
-        int nargs = (int)(top - base);
+        const int nargs = (int)(top - base);
         if (nargs > 2) {
             g_mathRandomFallbacks++; return orig_math_random(L);
         }
 
-        // --- nargs == 0: return [0, 1) ---
-        if (nargs == 0) {
-            double r = (double)rand() / (double)RAND_MAX;
-            top->value.n = r;
-            top->tt      = LUA_TNUMBER;
-            top->taint   = 0;
-            SetStackTopFast(L, top + 1);
-            g_mathRandomHits++;
-            return 1;
+        // Read and check every argument before drawing, so that a call handed
+        // back to the client has not already advanced the generator.
+        int l = 0, u = 0;
+        if (nargs >= 1) {
+            if (base->tt != LUA_TNUMBER || !ExactSmallInt(base->value.n, &u)) {
+                g_mathRandomFallbacks++; return orig_math_random(L);
+            }
         }
-
-        // --- Validate arg types and read values directly from the stack ---
-        if (base->tt != LUA_TNUMBER) {
+        if (nargs == 2) {
+            RawTValue* slot2 = base + 1;
+            l = u;
+            if (slot2->tt != LUA_TNUMBER || !ExactSmallInt(slot2->value.n, &u)) {
+                g_mathRandomFallbacks++; return orig_math_random(L);
+            }
+            if (l > u) { g_mathRandomFallbacks++; return orig_math_random(L); }
+        } else if (nargs == 1 && u < 1) {
             g_mathRandomFallbacks++; return orig_math_random(L);
         }
-        double val1 = base->value.n;
 
-        if (nargs == 1) {
-            int n = (int)val1;
-            if (n < 1) { g_mathRandomFallbacks++; return orig_math_random(L); }
-            double r = 1.0 + (double)(rand() % n);
-            top->value.n = r;
-            top->tt      = LUA_TNUMBER;
-            top->taint   = 0;
-            SetStackTopFast(L, top + 1);
-            g_mathRandomHits++;
-            return 1;
-        }
+        const double r = (double)(kClientRand() % 0x7FFF) * g_mathRandomScale;
+        double result;
+        if (nargs == 0)      result = r;
+        else if (nargs == 1) result = floor((double)u * r) + 1.0;
+        else                 result = floor((double)(u - l + 1) * r) + (double)l;
 
-        // nargs == 2: return [m, n]
-        RawTValue* slot2 = base + 1;
-        if ((uintptr_t)slot2 > 0xFFE00000 || slot2->tt != LUA_TNUMBER) {
-            g_mathRandomFallbacks++; return orig_math_random(L);
-        }
-        double val2 = slot2->value.n;
-
-        int m = (int)val1;
-        int n = (int)val2;
-        if (n < m) { g_mathRandomFallbacks++; return orig_math_random(L); }
-        int range = n - m + 1;
-        double r = (double)m + (double)(rand() % range);
-        top->value.n = r;
+        top->value.n = result;
         top->tt      = LUA_TNUMBER;
         top->taint   = 0;
         SetStackTopFast(L, top + 1);

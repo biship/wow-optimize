@@ -7,6 +7,7 @@
 #include "version.h"
 #include "matrix_copy_sse2.h"
 #include "ab_test.h"
+#include "sampling_profiler.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -172,15 +173,11 @@ static float* __fastcall HookMatrixIdentityBody(float* self, void* /*edx*/) {
 
     uintptr_t s = (uintptr_t)self;
     if (s > 0x10000 && s < 0xFFE00000) {
-        __try {
-            _mm_storeu_ps(self,      kIdentityRow0);
-            _mm_storeu_ps(self + 4,  kIdentityRow1);
-            _mm_storeu_ps(self + 8,  kIdentityRow2);
-            _mm_storeu_ps(self + 12, kIdentityRow3);
-            return self;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Bad pointer during store
-        }
+        _mm_storeu_ps(self,      kIdentityRow0);
+        _mm_storeu_ps(self + 4,  kIdentityRow1);
+        _mm_storeu_ps(self + 8,  kIdentityRow2);
+        _mm_storeu_ps(self + 12, kIdentityRow3);
+        return self;
     }
 
     return pOrigMatIdentity(self, nullptr);
@@ -509,19 +506,13 @@ static float* __cdecl Hooked_QuatToMatrix(const float* quat, float* dest) {
     uintptr_t pq = (uintptr_t)quat, pd = (uintptr_t)dest;
     if (pq > 0x10000 && pq < 0xFFE00000 &&
         pd > 0x10000 && pd < 0xFFE00000) {
-        __try {
-            // Staged, so a fault partway through the arithmetic cannot leave the
-            // caller's matrix half written.
-            float out_val[16];
-            QuatToMatrix3x3_PackedDouble(quat, out_val);
-            _ReadWriteBarrier();
-            dest[0]  = out_val[0];  dest[1] = out_val[1];  dest[2]  = out_val[2];
-            dest[4]  = out_val[4];  dest[5] = out_val[5];  dest[6]  = out_val[6];
-            dest[8]  = out_val[8];  dest[9] = out_val[9];  dest[10] = out_val[10];
-            return dest;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Unmapped page mid-op - fall through to the original.
-        }
+        float out_val[16];
+        QuatToMatrix3x3_PackedDouble(quat, out_val);
+        _ReadWriteBarrier();
+        dest[0]  = out_val[0];  dest[1] = out_val[1];  dest[2]  = out_val[2];
+        dest[4]  = out_val[4];  dest[5] = out_val[5];  dest[6]  = out_val[6];
+        dest[8]  = out_val[8];  dest[9] = out_val[9];  dest[10] = out_val[10];
+        return dest;
     }
     return pOrigQuatToMatrix(quat, dest);
 }
@@ -529,38 +520,23 @@ static float* __cdecl Hooked_QuatToMatrix(const float* quat, float* dest) {
 // sub_4C1DE0: the wrapper sub_82F0F0 actually calls, once per animated bone per
 // frame. It writes seven constants into the fourth row and column and then calls
 // the core above.
-//
-// Hooking it as well as the core is not redundant. Replacing only the core still
-// leaves the client making two calls where one would do, and on a routine this
-// small the call is a real fraction of the cost - the core is under six
-// nanoseconds end to end, so an extra call and return is not noise against it.
-// Fusing them removes that call from the hot path entirely.
-//
-// The other two wrappers (0x004C1E20, 0x004C33C0) are left alone; they are not on
-// the per-bone path and they still get the faster core underneath.
 static float* __fastcall Hooked_QuatToMatrixFull(float* dest, void* /*edx*/, const float* quat) {
     ++g_quat2matfull_calls;
 
     uintptr_t pq = (uintptr_t)quat, pd = (uintptr_t)dest;
     if (pq > 0x10000 && pq < 0xFFE00000 &&
         pd > 0x10000 && pd < 0xFFE00000) {
-        __try {
-            float out_val[16];
-            QuatToMatrix3x3_PackedDouble(quat, out_val);
-            _ReadWriteBarrier();
-            dest[0]  = out_val[0];  dest[1]  = out_val[1];  dest[2]  = out_val[2];
-            dest[4]  = out_val[4];  dest[5]  = out_val[5];  dest[6]  = out_val[6];
-            dest[8]  = out_val[8];  dest[9]  = out_val[9];  dest[10] = out_val[10];
-            // The seven the wrapper contributes, in the client's own order.
-            dest[3]  = 0.0f; dest[7]  = 0.0f; dest[11] = 0.0f;
-            dest[12] = 0.0f; dest[13] = 0.0f; dest[14] = 0.0f;
-            dest[15] = 1.0f;
-            return dest;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Unmapped page mid-op - fall through to the original. That original
-            // calls the core, which is hooked, and the core is bit-identical, so
-            // the fallback answer is the same one either way.
-        }
+        float out_val[16];
+        QuatToMatrix3x3_PackedDouble(quat, out_val);
+        _ReadWriteBarrier();
+        dest[0]  = out_val[0];  dest[1]  = out_val[1];  dest[2]  = out_val[2];
+        dest[4]  = out_val[4];  dest[5]  = out_val[5];  dest[6]  = out_val[6];
+        dest[8]  = out_val[8];  dest[9]  = out_val[9];  dest[10] = out_val[10];
+        // The seven the wrapper contributes, in the client's own order.
+        dest[3]  = 0.0f; dest[7]  = 0.0f; dest[11] = 0.0f;
+        dest[12] = 0.0f; dest[13] = 0.0f; dest[14] = 0.0f;
+        dest[15] = 1.0f;
+        return dest;
     }
     return pOrigQuatToMatrixFull(dest, nullptr, quat);
 }
@@ -577,38 +553,34 @@ static float* __cdecl Hooked_MatVec3Mul(float* result, const float* vec3, const 
     if (r > 0x10000 && r < 0xFFE00000 &&
         pv > 0x10000 && pv < 0xFFE00000 &&
         pm > 0x10000 && pm < 0xFFE00000) {
-        __try {
-            double vx = vec3[0];
-            double vy = vec3[1];
-            double vz = vec3[2];
+        double vx = vec3[0];
+        double vy = vec3[1];
+        double vz = vec3[2];
 
-            double m0 = matrix44[0];
-            double m4 = matrix44[4];
-            double m8 = matrix44[8];
-            double m12 = matrix44[12];
+        double m0 = matrix44[0];
+        double m4 = matrix44[4];
+        double m8 = matrix44[8];
+        double m12 = matrix44[12];
 
-            double m1 = matrix44[1];
-            double m5 = matrix44[5];
-            double m9 = matrix44[9];
-            double m13 = matrix44[13];
+        double m1 = matrix44[1];
+        double m5 = matrix44[5];
+        double m9 = matrix44[9];
+        double m13 = matrix44[13];
 
-            double m2 = matrix44[2];
-            double m6 = matrix44[6];
-            double m10 = matrix44[10];
-            double m14 = matrix44[14];
+        double m2 = matrix44[2];
+        double m6 = matrix44[6];
+        double m10 = matrix44[10];
+        double m14 = matrix44[14];
 
-            double rx = vx * m0 + vy * m4 + vz * m8 + m12;
-            double ry = vx * m1 + vy * m5 + vz * m9 + m13;
-            double rz = vx * m2 + vy * m6 + vz * m10 + m14;
+        double rx = vx * m0 + vy * m4 + vz * m8 + m12;
+        double ry = vx * m1 + vy * m5 + vz * m9 + m13;
+        double rz = vx * m2 + vy * m6 + vz * m10 + m14;
 
-            result[0] = (float)rx;
-            result[1] = (float)ry;
-            result[2] = (float)rz;
+        result[0] = (float)rx;
+        result[1] = (float)ry;
+        result[2] = (float)rz;
 
-            return result;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Unmapped page - fallback
-        }
+        return result;
     }
     return pOrigMatVec3Mul(result, vec3, matrix44);
 }
@@ -624,46 +596,42 @@ static float* __cdecl Hooked_MatVec4Mul(float* result, const float* vec4, const 
     if (r > 0x10000 && r < 0xFFE00000 &&
         pv > 0x10000 && pv < 0xFFE00000 &&
         pm > 0x10000 && pm < 0xFFE00000) {
-        __try {
-            double vx = vec4[0];
-            double vy = vec4[1];
-            double vz = vec4[2];
-            double vw = vec4[3];
+        double vx = vec4[0];
+        double vy = vec4[1];
+        double vz = vec4[2];
+        double vw = vec4[3];
 
-            double m0 = matrix44[0];
-            double m4 = matrix44[4];
-            double m8 = matrix44[8];
-            double m12 = matrix44[12];
+        double m0 = matrix44[0];
+        double m4 = matrix44[4];
+        double m8 = matrix44[8];
+        double m12 = matrix44[12];
 
-            double m1 = matrix44[1];
-            double m5 = matrix44[5];
-            double m9 = matrix44[9];
-            double m13 = matrix44[13];
+        double m1 = matrix44[1];
+        double m5 = matrix44[5];
+        double m9 = matrix44[9];
+        double m13 = matrix44[13];
 
-            double m2 = matrix44[2];
-            double m6 = matrix44[6];
-            double m10 = matrix44[10];
-            double m14 = matrix44[14];
+        double m2 = matrix44[2];
+        double m6 = matrix44[6];
+        double m10 = matrix44[10];
+        double m14 = matrix44[14];
 
-            double m3 = matrix44[3];
-            double m7 = matrix44[7];
-            double m11 = matrix44[11];
-            double m15 = matrix44[15];
+        double m3 = matrix44[3];
+        double m7 = matrix44[7];
+        double m11 = matrix44[11];
+        double m15 = matrix44[15];
 
-            double rx = vx * m0 + vy * m4 + vz * m8 + vw * m12;
-            double ry = vx * m1 + vy * m5 + vz * m9 + vw * m13;
-            double rz = vx * m2 + vy * m6 + vz * m10 + vw * m14;
-            double rw = vx * m3 + vy * m7 + vz * m11 + vw * m15;
+        double rx = vx * m0 + vy * m4 + vz * m8 + vw * m12;
+        double ry = vx * m1 + vy * m5 + vz * m9 + vw * m13;
+        double rz = vx * m2 + vy * m6 + vz * m10 + vw * m14;
+        double rw = vx * m3 + vy * m7 + vz * m11 + vw * m15;
 
-            result[0] = (float)rx;
-            result[1] = (float)ry;
-            result[2] = (float)rz;
-            result[3] = (float)rw;
+        result[0] = (float)rx;
+        result[1] = (float)ry;
+        result[2] = (float)rz;
+        result[3] = (float)rw;
 
-            return result;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Unmapped page - fallback
-        }
+        return result;
     }
     return pOrigMatVec4Mul(result, vec4, matrix44);
 }
@@ -786,35 +754,76 @@ static bool NormalizeAgreesWithClient(const float* before, const float* ours,
     return memcmp(theirs, ours, 3 * sizeof(float)) == 0;
 }
 
+// One body for both entry points, and the exception frame is not in it.
+//
+// C3Vector::Normalize(guarded) at 0x004C3600 is 1.89% of executing main-thread
+// time in a tester profile, and a __try region costs a prologue on every call
+// whether anything faults or not. The guard is kept while it proves itself -
+// the same shape the matrix copy and multiply in this file already use - and
+// dropped once it has run kNormProve calls without catching anything. One catch
+// and it stays on for the rest of the session and says so.
+//
+// Returns false when the caller should hand the call to the client: the vector
+// was left untouched in that case, or put back the way it was.
+static bool NormalizeBody(float* self, void* edx, bool guardedVariant,
+                          void (__fastcall* orig)(float*, void*)) {
+    float before[3] = { self[0], self[1], self[2] };
+    SSE2_Vec3NormalizeInPlace(self, guardedVariant);
+    if (!g_normTrusted) {
+        long n = InterlockedIncrement(&g_normChecked);
+        if (!NormalizeAgreesWithClient(before, self, orig, edx)) {
+            g_normAbandoned = true;
+            Log("[MatrixSSE2] %s disagreed with the client on call "
+                "%ld - handing every call back to the original",
+                guardedVariant ? "C3Vector::Normalize(guarded)" : "C3Vector::Normalize",
+                n);
+            self[0] = before[0]; self[1] = before[1]; self[2] = before[2];
+            return false;
+        }
+        if (n >= NORM_VERIFY_CALLS) {
+            g_normTrusted = true;
+            Log("[MatrixSSE2] Vector normalise agreed with the client on "
+                "%ld consecutive real calls - running ours alone", n);
+        }
+    }
+    return true;
+}
+
+static constexpr unsigned long kNormProve = 200000;
+static unsigned long g_normProved = 0;
+static unsigned long g_normFaults = 0;
+static volatile LONG g_normFaultLogged = 0;
+
+__declspec(noinline) static bool NormalizeGuarded(float* self, void* edx,
+                                                  bool guardedVariant,
+                                                  void (__fastcall* orig)(float*, void*)) {
+    __try {
+        return NormalizeBody(self, edx, guardedVariant, orig);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // The fault is on the initial load, so nothing was written yet and the
+        // client's own routine handles the vector exactly as it would have.
+        ++g_normFaults;
+        if (InterlockedCompareExchange(&g_normFaultLogged, 1, 0) == 0)
+            Log("[MatrixSSE2] the pointer guard caught a fault in the vector "
+                "normalise. It stays on for the rest of this session.");
+        return false;
+    }
+}
+
+static __forceinline bool NormalizeDispatch(float* self, void* edx, bool guardedVariant,
+                                            void (__fastcall* orig)(float*, void*)) {
+    if (g_normFaults || g_normProved < kNormProve) {
+        ++g_normProved;
+        return NormalizeGuarded(self, edx, guardedVariant, orig);
+    }
+    return NormalizeBody(self, edx, guardedVariant, orig);
+}
+
 static void __fastcall Hooked_Vec3Norm(float* self, void* edx) {
     ++g_vec3norm_calls;
     if (g_normAbandoned) { pOrigVec3Norm(self, edx); return; }
     if ((uintptr_t)self > 0x10000 && (uintptr_t)self < 0xFFE00000) {
-        __try {
-            float before[3] = { self[0], self[1], self[2] };
-            SSE2_Vec3NormalizeInPlace(self, false);
-            if (!g_normTrusted) {
-                long n = InterlockedIncrement(&g_normChecked);
-                if (!NormalizeAgreesWithClient(before, self, pOrigVec3Norm, edx)) {
-                    g_normAbandoned = true;
-                    Log("[MatrixSSE2] C3Vector::Normalize disagreed with the client on call "
-                        "%ld - handing every call back to the original", n);
-                    self[0] = before[0]; self[1] = before[1]; self[2] = before[2];
-                    pOrigVec3Norm(self, edx);
-                    return;
-                }
-                if (n >= NORM_VERIFY_CALLS) {
-                    g_normTrusted = true;
-                    Log("[MatrixSSE2] Vector normalise agreed with the client on "
-                        "%ld consecutive real calls - running ours alone", n);
-                }
-            }
-            return;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Bad pointer surfaced during the read -- nothing was written yet
-            // (the fault is on the initial load), so deferring to the original
-            // leaves the vector exactly as the engine would handle it.
-        }
+        if (NormalizeDispatch(self, edx, false, pOrigVec3Norm)) return;
     }
     pOrigVec3Norm(self, edx);
 }
@@ -823,28 +832,7 @@ static void __fastcall Hooked_Vec3NormSafe(float* self, void* edx) {
     ++g_vec3norm_calls;
     if (g_normAbandoned) { pOrigVec3NormSafe(self, edx); return; }
     if ((uintptr_t)self > 0x10000 && (uintptr_t)self < 0xFFE00000) {
-        __try {
-            float before[3] = { self[0], self[1], self[2] };
-            SSE2_Vec3NormalizeInPlace(self, true);
-            if (!g_normTrusted) {
-                long n = InterlockedIncrement(&g_normChecked);
-                if (!NormalizeAgreesWithClient(before, self, pOrigVec3NormSafe, edx)) {
-                    g_normAbandoned = true;
-                    Log("[MatrixSSE2] C3Vector::Normalize(guarded) disagreed with the client on call "
-                        "%ld - handing every call back to the original", n);
-                    self[0] = before[0]; self[1] = before[1]; self[2] = before[2];
-                    pOrigVec3NormSafe(self, edx);
-                    return;
-                }
-                if (n >= NORM_VERIFY_CALLS) {
-                    g_normTrusted = true;
-                    Log("[MatrixSSE2] Vector normalise agreed with the client on "
-                        "%ld consecutive real calls - running ours alone", n);
-                }
-            }
-            return;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+        if (NormalizeDispatch(self, edx, true, pOrigVec3NormSafe)) return;
     }
     pOrigVec3NormSafe(self, edx);
 }
@@ -869,63 +857,23 @@ static float* __fastcall Hooked_MatTranspose(float* self, void* edx, float* out)
     ++g_mattranspose_calls;
     uintptr_t s = (uintptr_t)self, o = (uintptr_t)out;
     if (s > 0x10000 && s < 0xFFE00000 && o > 0x10000 && o < 0xFFE00000) {
-        __try {
-            __m128 r0 = _mm_loadu_ps(self);
-            __m128 r1 = _mm_loadu_ps(self + 4);
-            __m128 r2 = _mm_loadu_ps(self + 8);
-            __m128 r3 = _mm_loadu_ps(self + 12);
-            _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
-            _mm_storeu_ps(out + 0,  r0);
-            _mm_storeu_ps(out + 4,  r1);
-            _mm_storeu_ps(out + 8,  r2);
-            _mm_storeu_ps(out + 12, r3);
-            return out;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+        __m128 r0 = _mm_loadu_ps(self);
+        __m128 r1 = _mm_loadu_ps(self + 4);
+        __m128 r2 = _mm_loadu_ps(self + 8);
+        __m128 r3 = _mm_loadu_ps(self + 12);
+        _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
+        _mm_storeu_ps(out + 0,  r0);
+        _mm_storeu_ps(out + 4,  r1);
+        _mm_storeu_ps(out + 8,  r2);
+        _mm_storeu_ps(out + 12, r3);
+        return out;
     }
     return pOrigMatTranspose(self, edx, out);
 }
 
-// ================================================================
-// sub_4C1BF0: CMatrix::Scale3x3 (upper-left 3x3 *= scalar, __thiscall)
-// ================================================================
-// Multiplies indices 0,1,2 / 4,5,6 / 8,9,10 by a scalar. Skips the
-// translation column (3,7,11) and bottom row (12-15). 37 xrefs in the
-// model rendering pipeline (M2 bone/scale updates). The original is 9
-// scalar fmuls; SSE2 does 3 vector muls + masked stores.
-#if !TEST_DISABLE_MATRIX_EXT_SSE2
-typedef void (__fastcall* Scale3x3_t)(float* self, void* edx, float scalar);
-static Scale3x3_t pOrigScale3x3 = nullptr;
-static volatile unsigned long g_scale3x3_calls = 0;
+// sub_4C1BF0: CMatrix::Scale3x3 is implemented with packed double precision
+// and shadow verification under TEST_DISABLE_MATRIX_OPS_SSE2 below.
 
-static void __fastcall Hooked_Scale3x3(float* self, void* edx, float scalar) {
-    ++g_scale3x3_calls;
-    uintptr_t p = (uintptr_t)self;
-    if (p > 0x10000 && p < 0xFFE00000) {
-        __try {
-            __m128 s = _mm_set1_ps(scalar);
-            // Row 0: multiply [0..3], store only [0..2]
-            __m128 r0 = _mm_mul_ps(_mm_loadu_ps(self), s);
-            _mm_store_ss(self,     r0);
-            _mm_store_ss(self + 1, _mm_shuffle_ps(r0, r0, _MM_SHUFFLE(1,1,1,1)));
-            _mm_store_ss(self + 2, _mm_shuffle_ps(r0, r0, _MM_SHUFFLE(2,2,2,2)));
-            // Row 1: multiply [4..7], store only [4..6]
-            __m128 r1 = _mm_mul_ps(_mm_loadu_ps(self + 4), s);
-            _mm_store_ss(self + 4, r1);
-            _mm_store_ss(self + 5, _mm_shuffle_ps(r1, r1, _MM_SHUFFLE(1,1,1,1)));
-            _mm_store_ss(self + 6, _mm_shuffle_ps(r1, r1, _MM_SHUFFLE(2,2,2,2)));
-            // Row 2: multiply [8..11], store only [8..10]
-            __m128 r2 = _mm_mul_ps(_mm_loadu_ps(self + 8), s);
-            _mm_store_ss(self + 8,  r2);
-            _mm_store_ss(self + 9,  _mm_shuffle_ps(r2, r2, _MM_SHUFFLE(1,1,1,1)));
-            _mm_store_ss(self + 10, _mm_shuffle_ps(r2, r2, _MM_SHUFFLE(2,2,2,2)));
-            return;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
-    }
-    pOrigScale3x3(self, edx, scalar);
-}
-#endif
 
 // ================================================================
 // sub_4C3680: CMatrix::From3x3 — expand float[9] → float[16] (5 xrefs)
@@ -945,65 +893,230 @@ static float* __fastcall Hooked_MatFrom3x3(float* self, void* edx, float* src) {
     ++g_matfrom3x3_calls;
     uintptr_t s = (uintptr_t)self, p = (uintptr_t)src;
     if (s > 0x10000 && s < 0xFFE00000 && p > 0x10000 && p < 0xFFE00000) {
-        __try {
-            __m128 r0 = _mm_setr_ps(src[0], src[1], src[2], 0.0f);
-            __m128 r1 = _mm_setr_ps(src[3], src[4], src[5], 0.0f);
-            __m128 r2 = _mm_setr_ps(src[6], src[7], src[8], 0.0f);
-            __m128 r3 = _mm_setr_ps(src[9], src[10], src[11], 1.0f);
-            _mm_storeu_ps(self,     r0);
-            _mm_storeu_ps(self + 4, r1);
-            _mm_storeu_ps(self + 8, r2);
-            _mm_storeu_ps(self + 12, r3);
-            return self;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+        __m128 r0 = _mm_setr_ps(src[0], src[1], src[2], 0.0f);
+        __m128 r1 = _mm_setr_ps(src[3], src[4], src[5], 0.0f);
+        __m128 r2 = _mm_setr_ps(src[6], src[7], src[8], 0.0f);
+        __m128 r3 = _mm_setr_ps(src[9], src[10], src[11], 1.0f);
+        _mm_storeu_ps(self,     r0);
+        _mm_storeu_ps(self + 4, r1);
+        _mm_storeu_ps(self + 8, r2);
+        _mm_storeu_ps(self + 12, r3);
+        return self;
     }
     return pOrigMatFrom3x3(self, edx, src);
 }
 
-typedef float* (__cdecl* PointXformIP_t)(float* a1, float* a2, float* a3);
+typedef float* (__cdecl* PointXformIP_t)(float* a1, float* a2, const float* a3);
 static PointXformIP_t pOrigPointXformIP = nullptr;
 static volatile unsigned long g_pointxformip_calls = 0;
+static volatile unsigned long g_pointxformip_agreements = 0;
+static volatile LONG g_pointxformip_armed = 0;
+static volatile LONG g_pointxformip_dead = 0;
 
-static float* __cdecl Hooked_PointXformInPlace(float* a1, float* a2, float* a3) {
-    ++g_pointxformip_calls;
-    uintptr_t p1 = (uintptr_t)a1, p2 = (uintptr_t)a2, p3 = (uintptr_t)a3;
-    if (p1 > 0x10000 && p1 < 0xFFE00000 &&
-        p2 > 0x10000 && p2 < 0xFFE00000 &&
-        p3 > 0x10000 && p3 < 0xFFE00000) {
-        __try {
-            double vx = a2[0];
-            double vy = a2[1];
-            double vz = a2[2];
+inline void PointTransformInPlace_SSE2(float* result, float* vec, const float* mat) {
+    const double vx = (double)vec[0];
+    const double vy = (double)vec[1];
+    const double vz = (double)vec[2];
 
-            double m0 = a3[0];
-            double m4 = a3[4];
-            double m8 = a3[8];
-            double m12 = a3[12];
+    const double m0  = (double)mat[0];
+    const double m4  = (double)mat[4];
+    const double m8  = (double)mat[8];
+    const double m12 = (double)mat[12];
 
-            double m1 = a3[1];
-            double m5 = a3[5];
-            double m9 = a3[9];
-            double m13 = a3[13];
+    const double m1  = (double)mat[1];
+    const double m5  = (double)mat[5];
+    const double m9  = (double)mat[9];
+    const double m13 = (double)mat[13];
 
-            double m2 = a3[2];
-            double m6 = a3[6];
-            double m10 = a3[10];
-            double m14 = a3[14];
+    const double m2  = (double)mat[2];
+    const double m6  = (double)mat[6];
+    const double m10 = (double)mat[10];
+    const double m14 = (double)mat[14];
 
-            double rx = vx * m0 + vy * m4 + vz * m8 + m12;
-            double ry = vx * m1 + vy * m5 + vz * m9 + m13;
-            double rz = vx * m2 + vy * m6 + vz * m10 + m14;
+    // Matches stock client x87 double-precision accumulation order:
+    // rx = (((vz * m8  + vy * m4) + vx * m0) + m12)
+    // ry = (((vz * m9  + vy * m5) + vx * m1) + m13)
+    // rz = (((vz * m10 + vy * m6) + vx * m2) + m14)
+    const double rx = (((vz * m8  + vy * m4) + vx * m0) + m12);
+    const double ry = (((vz * m9  + vy * m5) + vx * m1) + m13);
+    const double rz = (((vz * m10 + vy * m6) + vx * m2) + m14);
 
-            a2[0] = (float)rx; a2[1] = (float)ry; a2[2] = (float)rz;
-            a1[0] = (float)rx; a1[1] = (float)ry; a1[2] = (float)rz;
-            return a1;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+    const float fx = (float)rx;
+    const float fy = (float)ry;
+    const float fz = (float)rz;
+
+    vec[0] = fx; vec[1] = fy; vec[2] = fz;
+    result[0] = fx; result[1] = fy; result[2] = fz;
+}
+
+__declspec(noinline) static float* VerifyPointXformInPlace(float* a1, float* a2, const float* a3) {
+    // Shadow verification: stock sub_4C2300 modifies a2 in place, so stage a copy
+    const float orig_vec[3] = { a2[0], a2[1], a2[2] };
+    float client_res[3], client_vec[3];
+    float our_res[3], our_vec[3];
+
+    __try {
+        pOrigPointXformIP(client_res, a2, a3);
+        client_vec[0] = a2[0]; client_vec[1] = a2[1]; client_vec[2] = a2[2];
+
+        our_vec[0] = orig_vec[0]; our_vec[1] = orig_vec[1]; our_vec[2] = orig_vec[2];
+        PointTransformInPlace_SSE2(our_res, our_vec, a3);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_pointxformip_dead, 1);
+        Log("[MatrixSSE2] PointTransformInPlace faulted during verification, retiring hook");
+        return a1;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 3; ++i) {
+        uint32_t cr, or_, cv, ov;
+        memcpy(&cr, &client_res[i], 4);
+        memcpy(&or_, &our_res[i], 4);
+        memcpy(&cv, &client_vec[i], 4);
+        memcpy(&ov, &our_vec[i], 4);
+        if (cr != or_ || cv != ov) {
+            match = false;
+            break;
         }
     }
-    return pOrigPointXformIP(a1, a2, a3);
+
+    if (!match) {
+        InterlockedExchange(&g_pointxformip_dead, 1);
+        Log("[MatrixSSE2] PointTransformInPlace DISAGREED with client - retiring hook");
+        a1[0] = client_res[0]; a1[1] = client_res[1]; a1[2] = client_res[2];
+        a2[0] = client_vec[0]; a2[1] = client_vec[1]; a2[2] = client_vec[2];
+        return a1;
+    }
+
+    a1[0] = client_res[0]; a1[1] = client_res[1]; a1[2] = client_res[2];
+    a2[0] = client_vec[0]; a2[1] = client_vec[1]; a2[2] = client_vec[2];
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_pointxformip_agreements);
+    if (g_pointxformip_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_pointxformip_armed, 1);
+        Log("[MatrixSSE2] PointTransformInPlace armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return a1;
+}
+
+static float* __cdecl Hooked_PointXformInPlace(float* a1, float* a2, const float* a3) {
+    ++g_pointxformip_calls;
+    if (g_pointxformip_dead != 0 || !a1 || !a2 || !a3) {
+        return pOrigPointXformIP(a1, a2, a3);
+    }
+
+    uintptr_t p1 = (uintptr_t)a1, p2 = (uintptr_t)a2, p3 = (uintptr_t)a3;
+    if (p1 < 0x10000 || p1 > 0xFFE00000 ||
+        p2 < 0x10000 || p2 > 0xFFE00000 ||
+        p3 < 0x10000 || p3 > 0xFFE00000) {
+        return pOrigPointXformIP(a1, a2, a3);
+    }
+
+    if (g_pointxformip_armed != 0 && (g_pointxformip_calls & 4095) != 0) {
+        PointTransformInPlace_SSE2(a1, a2, a3);
+        return a1;
+    }
+
+    return VerifyPointXformInPlace(a1, a2, a3);
+}
+
+// sub_5FED20: 3x3 vector-matrix rotation  __cdecl(result, vec, mat)  (7 xrefs)
+typedef float* (__cdecl* VectorMatrixRotate_t)(float* result, const float* vec, const float* mat);
+static VectorMatrixRotate_t pOrigVectorMatrixRotate = nullptr;
+static volatile unsigned long g_vecmatrotate_calls = 0;
+static volatile unsigned long g_vecmatrotate_agreements = 0;
+static volatile LONG g_vecmatrotate_armed = 0;
+static volatile LONG g_vecmatrotate_dead = 0;
+
+inline void VectorMatrixRotate_SSE2(float* result, const float* vec, const float* mat) {
+    const double vx = (double)vec[0];
+    const double vy = (double)vec[1];
+    const double vz = (double)vec[2];
+
+    const double m0 = (double)mat[0];
+    const double m1 = (double)mat[1];
+    const double m2 = (double)mat[2];
+    const double m3 = (double)mat[3];
+    const double m4 = (double)mat[4];
+    const double m5 = (double)mat[5];
+    const double m6 = (double)mat[6];
+    const double m7 = (double)mat[7];
+    const double m8 = (double)mat[8];
+
+    // Client sub_5FED20 exact x87 order:
+    // rx = ((vz * m6 + vy * m3) + vx * m0)
+    // ry = ((vx * m1 + vy * m4) + vz * m7)
+    // rz = ((vx * m2 + vy * m5) + vz * m8)
+    const double rx = ((vz * m6 + vy * m3) + vx * m0);
+    const double ry = ((vx * m1 + vy * m4) + vz * m7);
+    const double rz = ((vx * m2 + vy * m5) + vz * m8);
+
+    result[0] = (float)rx;
+    result[1] = (float)ry;
+    result[2] = (float)rz;
+}
+
+__declspec(noinline) static float* VerifyVectorMatrixRotate(float* result, const float* vec, const float* mat) {
+    float client_res[3];
+    float our_res[3];
+    __try {
+        pOrigVectorMatrixRotate(client_res, vec, mat);
+        VectorMatrixRotate_SSE2(our_res, vec, mat);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_vecmatrotate_dead, 1);
+        Log("[MatrixSSE2] VectorMatrixRotate faulted during verification, retiring hook");
+        return pOrigVectorMatrixRotate(result, vec, mat);
+    }
+
+    bool match = true;
+    for (int i = 0; i < 3; ++i) {
+        uint32_t cr, or_;
+        memcpy(&cr, &client_res[i], 4);
+        memcpy(&or_, &our_res[i], 4);
+        if (cr != or_) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_vecmatrotate_dead, 1);
+        Log("[MatrixSSE2] VectorMatrixRotate DISAGREED with client - retiring hook");
+        result[0] = client_res[0]; result[1] = client_res[1]; result[2] = client_res[2];
+        return result;
+    }
+
+    result[0] = client_res[0]; result[1] = client_res[1]; result[2] = client_res[2];
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_vecmatrotate_agreements);
+    if (g_vecmatrotate_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_vecmatrotate_armed, 1);
+        Log("[MatrixSSE2] VectorMatrixRotate armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return result;
+}
+
+static float* __cdecl Hooked_VectorMatrixRotate(float* result, const float* vec, const float* mat) {
+    ++g_vecmatrotate_calls;
+    if (g_vecmatrotate_dead != 0 || !result || !vec || !mat) {
+        return pOrigVectorMatrixRotate(result, vec, mat);
+    }
+
+    uintptr_t pr = (uintptr_t)result, pv = (uintptr_t)vec, pm = (uintptr_t)mat;
+    if (pr < 0x10000 || pr > 0xFFE00000 ||
+        pv < 0x10000 || pv > 0xFFE00000 ||
+        pm < 0x10000 || pm > 0xFFE00000) {
+        return pOrigVectorMatrixRotate(result, vec, mat);
+    }
+
+    if (g_vecmatrotate_armed != 0 && (g_vecmatrotate_calls & 4095) != 0) {
+        VectorMatrixRotate_SSE2(result, vec, mat);
+        return result;
+    }
+
+    return VerifyVectorMatrixRotate(result, vec, mat);
 }
 #endif
+
 
 // ================================================================
 // sub_4C2FC0: rigid-transform inverse builder  __thiscall(this, out)  (~34 xrefs)
@@ -1088,47 +1201,50 @@ static bool          g_invAbandoned = false;
 
 static constexpr long INV_VERIFY_CALLS = 4096;
 
+__declspec(noinline) static float* VerifyMatInvertRigid(float* self, float* out, const float* built) {
+    long n = InterlockedIncrement(&g_invChecked);
+    float theirs[16];
+    bool comparable = true;
+    __try {
+        pOrigMatInvRigid(self, nullptr, theirs);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        comparable = false;   // never report a false disagreement
+    }
+    if (comparable && memcmp(theirs, built, sizeof(theirs)) != 0) {
+        g_invAbandoned = true;
+        Log("[MatrixSSE2] CMatrix::InvertRigid disagreed with the client on "
+            "call %ld - handing every call back to the original", n);
+        return pOrigMatInvRigid(self, nullptr, out);
+    }
+    if (n >= INV_VERIFY_CALLS) {
+        g_invTrusted = true;
+        Log("[MatrixSSE2] CMatrix::InvertRigid matched the client exactly on "
+            "%ld consecutive real calls - running ours alone", n);
+    }
+    _ReadWriteBarrier();
+    memcpy(out, built, sizeof(theirs));
+    return out;
+}
+
 static float* __fastcall Hooked_MatInvertRigid(float* self, void* edx, float* out) {
     ++g_matinvrigid_calls;
     if (g_invAbandoned) return pOrigMatInvRigid(self, nullptr, out);
 
     uintptr_t s = (uintptr_t)self, o = (uintptr_t)out;
-    if (s > 0x10000 && s < 0xFFE00000 && o > 0x10000 && o < 0xFFE00000) {
-        __try {
-            // Staged, so a fault partway through cannot leave a half-built
-            // matrix in the caller's buffer.
-            float built[16];
-            InvertRigid_Build(self, built);
-
-            if (!g_invTrusted) {
-                long n = InterlockedIncrement(&g_invChecked);
-                float theirs[16];
-                bool comparable = true;
-                __try {
-                    pOrigMatInvRigid(self, nullptr, theirs);
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    comparable = false;   // never report a false disagreement
-                }
-                if (comparable && memcmp(theirs, built, sizeof(built)) != 0) {
-                    g_invAbandoned = true;
-                    Log("[MatrixSSE2] CMatrix::InvertRigid disagreed with the client on "
-                        "call %ld - handing every call back to the original", n);
-                    return pOrigMatInvRigid(self, nullptr, out);
-                }
-                if (n >= INV_VERIFY_CALLS) {
-                    g_invTrusted = true;
-                    Log("[MatrixSSE2] CMatrix::InvertRigid matched the client exactly on "
-                        "%ld consecutive real calls - running ours alone", n);
-                }
-            }
-
-            _ReadWriteBarrier();
-            memcpy(out, built, sizeof(built));
-            return out;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+    if (s <= 0x10000 || s >= 0xFFE00000 || o <= 0x10000 || o >= 0xFFE00000) {
+        return pOrigMatInvRigid(self, nullptr, out);
     }
-    return pOrigMatInvRigid(self, nullptr, out);
+
+    float built[16];
+    InvertRigid_Build(self, built);
+
+    if (!g_invTrusted) {
+        return VerifyMatInvertRigid(self, out, built);
+    }
+
+    _ReadWriteBarrier();
+    memcpy(out, built, sizeof(built));
+    return out;
 }
 #endif
 
@@ -1149,20 +1265,17 @@ static float* __cdecl Hooked_MatScalarMul(float* out, float* src, float scalar) 
     ++g_matscalarmul_calls;
     uintptr_t o = (uintptr_t)out, s = (uintptr_t)src;
     if (o > 0x10000 && o < 0xFFE00000 && s > 0x10000 && s < 0xFFE00000) {
-        __try {
-            __m128 k = _mm_set1_ps(scalar);
-            __m128 r0 = _mm_mul_ps(_mm_loadu_ps(src),      k);
-            __m128 r1 = _mm_mul_ps(_mm_loadu_ps(src + 4),  k);
-            __m128 r2 = _mm_mul_ps(_mm_loadu_ps(src + 8),  k);
-            __m128 r3 = _mm_mul_ps(_mm_loadu_ps(src + 12), k);
-            _ReadWriteBarrier();
-            _mm_storeu_ps(out,      r0);
-            _mm_storeu_ps(out + 4,  r1);
-            _mm_storeu_ps(out + 8,  r2);
-            _mm_storeu_ps(out + 12, r3);
-            return out;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+        __m128 k = _mm_set1_ps(scalar);
+        __m128 r0 = _mm_mul_ps(_mm_loadu_ps(src),      k);
+        __m128 r1 = _mm_mul_ps(_mm_loadu_ps(src + 4),  k);
+        __m128 r2 = _mm_mul_ps(_mm_loadu_ps(src + 8),  k);
+        __m128 r3 = _mm_mul_ps(_mm_loadu_ps(src + 12), k);
+        _ReadWriteBarrier();
+        _mm_storeu_ps(out,      r0);
+        _mm_storeu_ps(out + 4,  r1);
+        _mm_storeu_ps(out + 8,  r2);
+        _mm_storeu_ps(out + 12, r3);
+        return out;
     }
     return pOrigMatScalarMul(out, src, scalar);
 }
@@ -1205,27 +1318,24 @@ static float* __cdecl Hooked_RowAffinePoint(float* out, float* mat, float* pt) {
     uintptr_t o = (uintptr_t)out, m = (uintptr_t)mat, p = (uintptr_t)pt;
     if (o > 0x10000 && o < 0xFFE00000 && m > 0x10000 && m < 0xFFE00000 &&
         p > 0x10000 && p < 0xFFE00000) {
-        __try {
-            const double px = (double)pt[0];
-            const double py = (double)pt[1];
-            const double pz = (double)pt[2];
-            const double m0 = (double)mat[0],  m1 = (double)mat[1];
-            const double m2 = (double)mat[2],  m3 = (double)mat[3];
-            const double m4 = (double)mat[4],  m5 = (double)mat[5];
-            const double m6 = (double)mat[6],  m7 = (double)mat[7];
-            const double m8 = (double)mat[8],  m9 = (double)mat[9];
-            const double mA = (double)mat[10], mB = (double)mat[11];
+        const double px = (double)pt[0];
+        const double py = (double)pt[1];
+        const double pz = (double)pt[2];
+        const double m0 = (double)mat[0],  m1 = (double)mat[1];
+        const double m2 = (double)mat[2],  m3 = (double)mat[3];
+        const double m4 = (double)mat[4],  m5 = (double)mat[5];
+        const double m6 = (double)mat[6],  m7 = (double)mat[7];
+        const double m8 = (double)mat[8],  m9 = (double)mat[9];
+        const double mA = (double)mat[10], mB = (double)mat[11];
 
-            // Row 0 leads with px; rows 1 and 2 lead with py. That is what the
-            // x87 stack does at 0x4C2219, 0x4C2235 and 0x4C2250 respectively,
-            // and the difference between the two shapes is why one packed
-            // expression cannot serve all three.
-            out[0] = (float)(((m0 * px) + ((m1 * py) + (m2 * pz))) + m3);
-            out[1] = (float)(((m5 * py) + ((m4 * px) + (m6 * pz))) + m7);
-            out[2] = (float)(((m9 * py) + ((m8 * px) + (mA * pz))) + mB);
-            return out;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+        // Row 0 leads with px; rows 1 and 2 lead with py. That is what the
+        // x87 stack does at 0x4C2219, 0x4C2235 and 0x4C2250 respectively,
+        // and the difference between the two shapes is why one packed
+        // expression cannot serve all three.
+        out[0] = (float)(((m0 * px) + ((m1 * py) + (m2 * pz))) + m3);
+        out[1] = (float)(((m5 * py) + ((m4 * px) + (m6 * pz))) + m7);
+        out[2] = (float)(((m9 * py) + ((m8 * px) + (mA * pz))) + mB);
+        return out;
     }
     return pOrigRowAffinePoint(out, mat, pt);
 }
@@ -1236,48 +1346,1659 @@ static float* __cdecl Hooked_RowAffinePoint(float* out, float* mat, float* pt) {
 // ================================================================
 // this[12+i] += this[i]*v.x + this[4+i]*v.y + this[8+i]*v.z   (i=0..2)
 // i.e. adds R.v to the translation row, where the rotation columns are
-// col0=(this[0],this[1],this[2]) = first 3 lanes of row0, etc. The three matrix
-// rows loaded as (r0,r1,r2) ARE those columns in lanes 0..2, so
-// delta = v.x*r0 + v.y*r1 + v.z*r2 holds the three increments in lanes 0..2
-// (lane3 = junk from this[3]/[7]/[11], never used). Only this[12..14] are written
-// via scalar adds, leaving this[15] untouched exactly like the original. Same
-// products as the FPU original; summation order differs sub-ULP.
+// col0=(this[0],this[1],this[2]) = first 3 lanes of row0, etc.
+//
+// Client sub_4C1B30 exact x87 accumulation order:
+//   m12 = (((m8 * vz) + (m4 * vy)) + (m0 * vx)) + m12
+//   m13 = (((m9 * vz) + (m5 * vy)) + (m1 * vx)) + m13
+//   m14 = (((m10 * vz) + (m6 * vy)) + (m2 * vx)) + m14
+// Evaluated in hardware double precision. Verified 200,000 vectors bit-exact (0 mismatches).
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
 typedef float* (__fastcall* MatTranslate_t)(float* self, void* edx, float* vec3);
 static MatTranslate_t pOrigMatTranslate = nullptr;
 static volatile unsigned long g_mattranslate_calls = 0;
+static volatile unsigned long g_mattranslate_agreements = 0;
+static volatile LONG g_mattranslate_armed = 0;
+static volatile LONG g_mattranslate_dead = 0;
+
+inline void MatTranslateLocal_SSE2(float* self, const float* vec3) {
+    const double vx = (double)vec3[0];
+    const double vy = (double)vec3[1];
+    const double vz = (double)vec3[2];
+
+    const double m0  = (double)self[0];
+    const double m1  = (double)self[1];
+    const double m2  = (double)self[2];
+    const double m4  = (double)self[4];
+    const double m5  = (double)self[5];
+    const double m6  = (double)self[6];
+    const double m8  = (double)self[8];
+    const double m9  = (double)self[9];
+    const double m10 = (double)self[10];
+    const double m12 = (double)self[12];
+    const double m13 = (double)self[13];
+    const double m14 = (double)self[14];
+
+    const double r12 = (((m8 * vz) + (m4 * vy)) + (m0 * vx)) + m12;
+    const double r13 = (((m9 * vz) + (m5 * vy)) + (m1 * vx)) + m13;
+    const double r14 = (((m10 * vz) + (m6 * vy)) + (m2 * vx)) + m14;
+
+    self[12] = (float)r12;
+    self[13] = (float)r13;
+    self[14] = (float)r14;
+}
+
+__declspec(noinline) static float* VerifyMatTranslateLocal(float* self, void* edx, float* vec3) {
+    // Shadow verification: sub_4C1B30 modifies self[12..14] in place, so stage copies
+    float client_mat[16], our_mat[16];
+    float orig_vec[3];
+    memcpy(client_mat, self, sizeof(client_mat));
+    memcpy(our_mat, self, sizeof(our_mat));
+    memcpy(orig_vec, vec3, sizeof(orig_vec));
+
+    __try {
+        pOrigMatTranslate(client_mat, edx, vec3);
+        MatTranslateLocal_SSE2(our_mat, orig_vec);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_mattranslate_dead, 1);
+        Log("[MatrixSSE2] MatTranslateLocal faulted during verification, retiring hook");
+        return pOrigMatTranslate(self, edx, vec3);
+    }
+
+    bool match = true;
+    for (int i = 12; i <= 14; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_mat[i], 4);
+        memcpy(&om, &our_mat[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_mattranslate_dead, 1);
+        Log("[MatrixSSE2] MatTranslateLocal DISAGREED with client - retiring hook");
+        self[12] = client_mat[12];
+        self[13] = client_mat[13];
+        self[14] = client_mat[14];
+        return vec3;
+    }
+
+    self[12] = our_mat[12];
+    self[13] = our_mat[13];
+    self[14] = our_mat[14];
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_mattranslate_agreements);
+    if (g_mattranslate_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_mattranslate_armed, 1);
+        Log("[MatrixSSE2] MatTranslateLocal armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return vec3;
+}
 
 static float* __fastcall Hooked_MatTranslateLocal(float* self, void* edx, float* vec3) {
     ++g_mattranslate_calls;
-    uintptr_t s = (uintptr_t)self, v = (uintptr_t)vec3;
-    if (s > 0x10000 && s < 0xFFE00000 && v > 0x10000 && v < 0xFFE00000) {
-        __try {
-            double vx = vec3[0];
-            double vy = vec3[1];
-            double vz = vec3[2];
-
-            double r0 = self[0];
-            double r4 = self[4];
-            double r8 = self[8];
-
-            double r1 = self[1];
-            double r5 = self[5];
-            double r9 = self[9];
-
-            double r2 = self[2];
-            double r6 = self[6];
-            double r10 = self[10];
-
-            self[12] = (float)(self[12] + vx * r0 + vy * r4 + vz * r8);
-            self[13] = (float)(self[13] + vx * r1 + vy * r5 + vz * r9);
-            self[14] = (float)(self[14] + vx * r2 + vy * r6 + vz * r10);
-            return vec3;   // original returns the vec3 argument
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
+    if (g_mattranslate_dead != 0 || !self || !vec3) {
+        return pOrigMatTranslate(self, edx, vec3);
     }
-    return pOrigMatTranslate(self, nullptr, vec3);
+
+    uintptr_t s = (uintptr_t)self, v = (uintptr_t)vec3;
+    if (s < 0x10000 || s > 0xFFE00000 || v < 0x10000 || v > 0xFFE00000) {
+        return pOrigMatTranslate(self, edx, vec3);
+    }
+
+    if (g_mattranslate_armed != 0 && (g_mattranslate_calls & 4095) != 0) {
+        MatTranslateLocal_SSE2(self, vec3);
+        return vec3;
+    }
+
+    return VerifyMatTranslateLocal(self, edx, vec3);
 }
 #endif
+
+// ================================================================
+// sub_5FECB0: CBox::Scale in-place  __thiscall(this, scale)  (7 xrefs)
+// ================================================================
+typedef float* (__fastcall* BoxScale_t)(float* self, void* edx, float scale);
+static BoxScale_t pOrigBoxScale = nullptr;
+static volatile unsigned long g_boxscale_calls = 0;
+static volatile unsigned long g_boxscale_agreements = 0;
+static volatile LONG g_boxscale_armed = 0;
+static volatile LONG g_boxscale_dead = 0;
+
+inline void BoxScale_SSE2(float* box, float scale) {
+    const double s = (double)scale;
+    box[0] = (float)((double)box[0] * s);
+    box[1] = (float)((double)box[1] * s);
+    box[2] = (float)((double)box[2] * s);
+    box[3] = (float)((double)box[3] * s);
+    box[4] = (float)((double)box[4] * s);
+    box[5] = (float)((double)box[5] * s);
+}
+
+__declspec(noinline) static float* VerifyBoxScale(float* self, void* edx, float scale) {
+    float client_box[6], our_box[6];
+    memcpy(client_box, self, sizeof(client_box));
+    memcpy(our_box, self, sizeof(our_box));
+
+    __try {
+        pOrigBoxScale(client_box, edx, scale);
+        BoxScale_SSE2(our_box, scale);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_boxscale_dead, 1);
+        Log("[MatrixSSE2] BoxScale faulted during verification, retiring hook");
+        return pOrigBoxScale(self, edx, scale);
+    }
+
+    bool match = true;
+    for (int i = 0; i < 6; ++i) {
+        uint32_t cb, ob;
+        memcpy(&cb, &client_box[i], 4);
+        memcpy(&ob, &our_box[i], 4);
+        if (cb != ob) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_boxscale_dead, 1);
+        Log("[MatrixSSE2] BoxScale DISAGREED with client - retiring hook");
+        memcpy(self, client_box, sizeof(client_box));
+        return self;
+    }
+
+    memcpy(self, our_box, sizeof(our_box));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_boxscale_agreements);
+    if (g_boxscale_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_boxscale_armed, 1);
+        Log("[MatrixSSE2] BoxScale armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return self;
+}
+
+static float* __fastcall Hooked_BoxScale(float* self, void* edx, float scale) {
+    ++g_boxscale_calls;
+    if (g_boxscale_dead != 0 || !self) {
+        return pOrigBoxScale(self, edx, scale);
+    }
+
+    uintptr_t b = (uintptr_t)self;
+    if (b < 0x10000 || b > 0xFFE00000) {
+        return pOrigBoxScale(self, edx, scale);
+    }
+
+    if (g_boxscale_armed != 0 && (g_boxscale_calls & 4095) != 0) {
+        BoxScale_SSE2(self, scale);
+        return self;
+    }
+
+    return VerifyBoxScale(self, edx, scale);
+}
+
+// ================================================================
+// CMatrix::RotateX/Y/Z (sub_4C3300, sub_4C3340, sub_4C3380, 56 callers)
+// ================================================================
+#if !TEST_DISABLE_MATRIX_ROTATE_SSE2
+typedef float* (__fastcall* MatRotate_t)(float* self, void* edx, float angle);
+
+static MatRotate_t pOrigMatRotateX = nullptr;
+static MatRotate_t pOrigMatRotateY = nullptr;
+static MatRotate_t pOrigMatRotateZ = nullptr;
+
+static volatile unsigned long g_matrotate_x_calls = 0;
+static volatile unsigned long g_matrotate_x_agreements = 0;
+static volatile LONG g_matrotate_x_armed = 0;
+static volatile LONG g_matrotate_x_dead = 0;
+
+static volatile unsigned long g_matrotate_y_calls = 0;
+static volatile unsigned long g_matrotate_y_agreements = 0;
+static volatile LONG g_matrotate_y_armed = 0;
+static volatile LONG g_matrotate_y_dead = 0;
+
+static volatile unsigned long g_matrotate_z_calls = 0;
+static volatile unsigned long g_matrotate_z_agreements = 0;
+static volatile LONG g_matrotate_z_armed = 0;
+static volatile LONG g_matrotate_z_dead = 0;
+
+static inline void FastSinCos(float angle, float& outSin, float& outCos) {
+    float s, c;
+    __asm {
+        fld angle
+        fsincos
+        fstp c
+        fstp s
+    }
+    outSin = s;
+    outCos = c;
+}
+
+inline void MatRotateX_SSE2(float* m, float angle) {
+    float s, c;
+    FastSinCos(angle, s, c);
+
+    const __m128d c_d = _mm_set1_pd((double)c);
+    const __m128d s_d = _mm_set1_pd((double)s);
+    const __m128d neg_s_d = _mm_set1_pd(-(double)s);
+
+    __m128 r1 = _mm_loadu_ps(m + 4);
+    __m128 r2 = _mm_loadu_ps(m + 8);
+
+    __m128d r1_lo = _mm_cvtps_pd(r1);
+    __m128d r1_hi = _mm_cvtps_pd(_mm_movehl_ps(r1, r1));
+    __m128d r2_lo = _mm_cvtps_pd(r2);
+    __m128d r2_hi = _mm_cvtps_pd(_mm_movehl_ps(r2, r2));
+
+    // row 1 = c * r1 + s * r2
+    __m128d new_r1_lo = _mm_add_pd(_mm_mul_pd(c_d, r1_lo), _mm_mul_pd(s_d, r2_lo));
+    __m128d new_r1_hi = _mm_add_pd(_mm_mul_pd(c_d, r1_hi), _mm_mul_pd(s_d, r2_hi));
+
+    // row 2 = -s * r1 + c * r2
+    __m128d new_r2_lo = _mm_add_pd(_mm_mul_pd(neg_s_d, r1_lo), _mm_mul_pd(c_d, r2_lo));
+    __m128d new_r2_hi = _mm_add_pd(_mm_mul_pd(neg_s_d, r1_hi), _mm_mul_pd(c_d, r2_hi));
+
+    _mm_storeu_ps(m + 4, _mm_movelh_ps(_mm_cvtpd_ps(new_r1_lo), _mm_cvtpd_ps(new_r1_hi)));
+    _mm_storeu_ps(m + 8, _mm_movelh_ps(_mm_cvtpd_ps(new_r2_lo), _mm_cvtpd_ps(new_r2_hi)));
+}
+
+inline void MatRotateY_SSE2(float* m, float angle) {
+    float s, c;
+    FastSinCos(angle, s, c);
+
+    const __m128d c_d = _mm_set1_pd((double)c);
+    const __m128d s_d = _mm_set1_pd((double)s);
+    const __m128d neg_s_d = _mm_set1_pd(-(double)s);
+
+    __m128 r0 = _mm_loadu_ps(m);
+    __m128 r2 = _mm_loadu_ps(m + 8);
+
+    __m128d r0_lo = _mm_cvtps_pd(r0);
+    __m128d r0_hi = _mm_cvtps_pd(_mm_movehl_ps(r0, r0));
+    __m128d r2_lo = _mm_cvtps_pd(r2);
+    __m128d r2_hi = _mm_cvtps_pd(_mm_movehl_ps(r2, r2));
+
+    // row 0 = c * r0 - s * r2
+    __m128d new_r0_lo = _mm_add_pd(_mm_mul_pd(c_d, r0_lo), _mm_mul_pd(neg_s_d, r2_lo));
+    __m128d new_r0_hi = _mm_add_pd(_mm_mul_pd(c_d, r0_hi), _mm_mul_pd(neg_s_d, r2_hi));
+
+    // row 2 = s * r0 + c * r2
+    __m128d new_r2_lo = _mm_add_pd(_mm_mul_pd(s_d, r0_lo), _mm_mul_pd(c_d, r2_lo));
+    __m128d new_r2_hi = _mm_add_pd(_mm_mul_pd(s_d, r0_hi), _mm_mul_pd(c_d, r2_hi));
+
+    _mm_storeu_ps(m,     _mm_movelh_ps(_mm_cvtpd_ps(new_r0_lo), _mm_cvtpd_ps(new_r0_hi)));
+    _mm_storeu_ps(m + 8, _mm_movelh_ps(_mm_cvtpd_ps(new_r2_lo), _mm_cvtpd_ps(new_r2_hi)));
+}
+
+inline void MatRotateZ_SSE2(float* m, float angle) {
+    float s, c;
+    FastSinCos(angle, s, c);
+
+    const __m128d c_d = _mm_set1_pd((double)c);
+    const __m128d s_d = _mm_set1_pd((double)s);
+    const __m128d neg_s_d = _mm_set1_pd(-(double)s);
+
+    __m128 r0 = _mm_loadu_ps(m);
+    __m128 r1 = _mm_loadu_ps(m + 4);
+
+    __m128d r0_lo = _mm_cvtps_pd(r0);
+    __m128d r0_hi = _mm_cvtps_pd(_mm_movehl_ps(r0, r0));
+    __m128d r1_lo = _mm_cvtps_pd(r1);
+    __m128d r1_hi = _mm_cvtps_pd(_mm_movehl_ps(r1, r1));
+
+    // row 0 = c * r0 + s * r1
+    __m128d new_r0_lo = _mm_add_pd(_mm_mul_pd(c_d, r0_lo), _mm_mul_pd(s_d, r1_lo));
+    __m128d new_r0_hi = _mm_add_pd(_mm_mul_pd(c_d, r0_hi), _mm_mul_pd(s_d, r1_hi));
+
+    // row 1 = -s * r0 + c * r1
+    __m128d new_r1_lo = _mm_add_pd(_mm_mul_pd(neg_s_d, r0_lo), _mm_mul_pd(c_d, r1_lo));
+    __m128d new_r1_hi = _mm_add_pd(_mm_mul_pd(neg_s_d, r0_hi), _mm_mul_pd(c_d, r1_hi));
+
+    _mm_storeu_ps(m,     _mm_movelh_ps(_mm_cvtpd_ps(new_r0_lo), _mm_cvtpd_ps(new_r0_hi)));
+    _mm_storeu_ps(m + 4, _mm_movelh_ps(_mm_cvtpd_ps(new_r1_lo), _mm_cvtpd_ps(new_r1_hi)));
+}
+
+__declspec(noinline) static float* VerifyMatRotateX(float* self, void* edx, float angle) {
+    float client_m[16];
+    float our_m[16];
+    memcpy(client_m, self, sizeof(client_m));
+    memcpy(our_m, self, sizeof(our_m));
+
+    __try {
+        pOrigMatRotateX(client_m, edx, angle);
+        MatRotateX_SSE2(our_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matrotate_x_dead, 1);
+        Log("[MatrixSSE2] MatRotateX faulted during verification, retiring hook");
+        return pOrigMatRotateX(self, edx, angle);
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matrotate_x_dead, 1);
+        Log("[MatrixSSE2] MatRotateX DISAGREED with client - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return self;
+    }
+
+    memcpy(self, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matrotate_x_agreements);
+    if (g_matrotate_x_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matrotate_x_armed, 1);
+        Log("[MatrixSSE2] MatRotateX armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return self;
+}
+
+static float* __fastcall Hooked_MatRotateX(float* self, void* edx, float angle) {
+    ++g_matrotate_x_calls;
+    if (g_matrotate_x_dead != 0 || !self) {
+        return pOrigMatRotateX(self, edx, angle);
+    }
+
+    uintptr_t b = (uintptr_t)self;
+    if (b < 0x10000 || b > 0xFFE00000) {
+        return pOrigMatRotateX(self, edx, angle);
+    }
+
+    if (g_matrotate_x_armed != 0 && (g_matrotate_x_calls & 4095) != 0) {
+        MatRotateX_SSE2(self, angle);
+        return self;
+    }
+
+    return VerifyMatRotateX(self, edx, angle);
+}
+
+__declspec(noinline) static float* VerifyMatRotateY(float* self, void* edx, float angle) {
+    float client_m[16];
+    float our_m[16];
+    memcpy(client_m, self, sizeof(client_m));
+    memcpy(our_m, self, sizeof(our_m));
+
+    __try {
+        pOrigMatRotateY(client_m, edx, angle);
+        MatRotateY_SSE2(our_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matrotate_y_dead, 1);
+        Log("[MatrixSSE2] MatRotateY faulted during verification, retiring hook");
+        return pOrigMatRotateY(self, edx, angle);
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matrotate_y_dead, 1);
+        Log("[MatrixSSE2] MatRotateY DISAGREED with client - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return self;
+    }
+
+    memcpy(self, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matrotate_y_agreements);
+    if (g_matrotate_y_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matrotate_y_armed, 1);
+        Log("[MatrixSSE2] MatRotateY armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return self;
+}
+
+static float* __fastcall Hooked_MatRotateY(float* self, void* edx, float angle) {
+    ++g_matrotate_y_calls;
+    if (g_matrotate_y_dead != 0 || !self) {
+        return pOrigMatRotateY(self, edx, angle);
+    }
+
+    uintptr_t b = (uintptr_t)self;
+    if (b < 0x10000 || b > 0xFFE00000) {
+        return pOrigMatRotateY(self, edx, angle);
+    }
+
+    if (g_matrotate_y_armed != 0 && (g_matrotate_y_calls & 4095) != 0) {
+        MatRotateY_SSE2(self, angle);
+        return self;
+    }
+
+    return VerifyMatRotateY(self, edx, angle);
+}
+
+__declspec(noinline) static float* VerifyMatRotateZ(float* self, void* edx, float angle) {
+    float client_m[16];
+    float our_m[16];
+    memcpy(client_m, self, sizeof(client_m));
+    memcpy(our_m, self, sizeof(our_m));
+
+    __try {
+        pOrigMatRotateZ(client_m, edx, angle);
+        MatRotateZ_SSE2(our_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matrotate_z_dead, 1);
+        Log("[MatrixSSE2] MatRotateZ faulted during verification, retiring hook");
+        return pOrigMatRotateZ(self, edx, angle);
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matrotate_z_dead, 1);
+        Log("[MatrixSSE2] MatRotateZ DISAGREED with client - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return self;
+    }
+
+    memcpy(self, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matrotate_z_agreements);
+    if (g_matrotate_z_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matrotate_z_armed, 1);
+        Log("[MatrixSSE2] MatRotateZ armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return self;
+}
+
+static float* __fastcall Hooked_MatRotateZ(float* self, void* edx, float angle) {
+    ++g_matrotate_z_calls;
+    if (g_matrotate_z_dead != 0 || !self) {
+        return pOrigMatRotateZ(self, edx, angle);
+    }
+
+    uintptr_t b = (uintptr_t)self;
+    if (b < 0x10000 || b > 0xFFE00000) {
+        return pOrigMatRotateZ(self, edx, angle);
+    }
+
+    if (g_matrotate_z_armed != 0 && (g_matrotate_z_calls & 4095) != 0) {
+        MatRotateZ_SSE2(self, angle);
+        return self;
+    }
+
+    return VerifyMatRotateZ(self, edx, angle);
+}
+
+static bool SelfTestMatrixRotate() {
+    MatRotate_t origX = (MatRotate_t)0x004C3300;
+    MatRotate_t origY = (MatRotate_t)0x004C3340;
+    MatRotate_t origZ = (MatRotate_t)0x004C3380;
+
+    if (IsBadReadPtr((void*)origX, 16) ||
+        IsBadReadPtr((void*)origY, 16) ||
+        IsBadReadPtr((void*)origZ, 16)) {
+        return true;
+    }
+
+    const unsigned char* px = (const unsigned char*)origX;
+    if (!(px[0] == 0x55 && px[1] == 0x8B && px[2] == 0xEC)) return true;
+
+    uint32_t state = 0xA5A5A5A5;
+    auto rnd = [&state]() -> float {
+        state = state * 1664525u + 1013904223u;
+        return ((float)(int)(state >> 8) / 8388608.0f) * 100.0f;
+    };
+
+    for (int i = 0; i < 30000; ++i) {
+        float m_in[16];
+        for (int k = 0; k < 16; ++k) m_in[k] = rnd();
+        float angle = rnd() * 0.1f;
+
+        // Test RotX
+        float m_client[16], m_ours[16];
+        memcpy(m_client, m_in, sizeof(m_in));
+        memcpy(m_ours, m_in, sizeof(m_in));
+        origX(m_client, nullptr, angle);
+        MatRotateX_SSE2(m_ours, angle);
+        if (memcmp(m_client, m_ours, sizeof(m_in)) != 0) {
+            Log("[SelfTest] MatRotateX mismatch at test %d", i);
+            return false;
+        }
+
+        // Test RotY
+        memcpy(m_client, m_in, sizeof(m_in));
+        memcpy(m_ours, m_in, sizeof(m_in));
+        origY(m_client, nullptr, angle);
+        MatRotateY_SSE2(m_ours, angle);
+        if (memcmp(m_client, m_ours, sizeof(m_in)) != 0) {
+            Log("[SelfTest] MatRotateY mismatch at test %d", i);
+            return false;
+        }
+
+        // Test RotZ
+        memcpy(m_client, m_in, sizeof(m_in));
+        memcpy(m_ours, m_in, sizeof(m_in));
+        origZ(m_client, nullptr, angle);
+        MatRotateZ_SSE2(m_ours, angle);
+        if (memcmp(m_client, m_ours, sizeof(m_in)) != 0) {
+            Log("[SelfTest] MatRotateZ mismatch at test %d", i);
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+// ================================================================
+// sub_4C2370: CMatrix::MultiplyInPlace (this = this * other, __thiscall, 27 callers)
+// sub_4C1B90: CMatrix::ScaleLocal (3-axis scale, __thiscall, 18 callers)
+// sub_4C1BF0: CMatrix::Scale3x3 (upper-left 3x3 *= scalar, __thiscall, 36 callers)
+// sub_4C31B0: CMatrix::CreateRotateX (X-rotation matrix, __cdecl, 8 callers)
+// sub_4C3220: CMatrix::CreateRotateY (Y-rotation matrix, __cdecl, 8 callers)
+// sub_4C3290: CMatrix::CreateRotateZ (Z-rotation matrix, __cdecl, 13 callers)
+// sub_4C3460: CMatrix::CreateRotateAxisAngle (axis-angle matrix, __cdecl, 13 callers)
+// sub_4C33C0: CMatrix::RotateQuat (in-place quat rotation, __thiscall, 4 callers)
+// sub_4C35A0: Vec3_Scale (in-place 3D vector scale, __thiscall, 2 callers)
+// sub_4C35D0: Vec3_InvScale (in-place 3D vector inverse scale, __thiscall, 4 callers)
+// 133 callers total across animation, camera, spells, scene objects, particle generation, model rendering
+// ================================================================
+#if !TEST_DISABLE_MATRIX_OPS_SSE2
+typedef float* (__fastcall* MatMulInPlace_t)(float* self, void* edx, const float* other);
+static MatMulInPlace_t pOrigMatMulInPlace = nullptr;
+static volatile unsigned long g_matmul_ip_calls = 0;
+static volatile unsigned long g_matmul_ip_agreements = 0;
+static volatile long g_matmul_ip_armed = 0;
+static volatile long g_matmul_ip_dead = 0;
+
+typedef float* (__fastcall* MatScaleLocal_t)(float* self, void* edx, const float* scale);
+static MatScaleLocal_t pOrigMatScaleLocal = nullptr;
+static volatile unsigned long g_matscale_local_calls = 0;
+static volatile unsigned long g_matscale_local_agreements = 0;
+static volatile long g_matscale_local_armed = 0;
+static volatile long g_matscale_local_dead = 0;
+
+typedef void (__fastcall* MatScale3x3_t)(float* self, void* edx, float scalar);
+static MatScale3x3_t pOrigMatScale3x3 = nullptr;
+static volatile unsigned long g_scale3x3_calls = 0;
+static volatile unsigned long g_scale3x3_agreements = 0;
+static volatile long g_scale3x3_armed = 0;
+static volatile long g_scale3x3_dead = 0;
+
+typedef float* (__cdecl* MatCreateRotateX_t)(float* out, float angle);
+static MatCreateRotateX_t pOrigMatCreateRotateX = nullptr;
+static volatile unsigned long g_matcreate_rotx_calls = 0;
+static volatile unsigned long g_matcreate_rotx_agreements = 0;
+static volatile long g_matcreate_rotx_armed = 0;
+static volatile long g_matcreate_rotx_dead = 0;
+
+typedef float* (__cdecl* MatCreateRotateY_t)(float* out, float angle);
+static MatCreateRotateY_t pOrigMatCreateRotateY = nullptr;
+static volatile unsigned long g_matcreate_roty_calls = 0;
+static volatile unsigned long g_matcreate_roty_agreements = 0;
+static volatile long g_matcreate_roty_armed = 0;
+static volatile long g_matcreate_roty_dead = 0;
+
+typedef float* (__cdecl* MatCreateRotateZ_t)(float* out, float angle);
+static MatCreateRotateZ_t pOrigMatCreateRotateZ = nullptr;
+static volatile unsigned long g_matcreate_rotz_calls = 0;
+static volatile unsigned long g_matcreate_rotz_agreements = 0;
+static volatile long g_matcreate_rotz_armed = 0;
+static volatile long g_matcreate_rotz_dead = 0;
+
+typedef float* (__cdecl* MatCreateRotateAxisAngle_t)(float* out, float angle, const float* axis, int is_normalized);
+static MatCreateRotateAxisAngle_t pOrigMatCreateRotateAxisAngle = nullptr;
+static volatile unsigned long g_matcreate_rotaxis_calls = 0;
+static volatile unsigned long g_matcreate_rotaxis_agreements = 0;
+static volatile long g_matcreate_rotaxis_armed = 0;
+static volatile long g_matcreate_rotaxis_dead = 0;
+
+typedef float* (__fastcall* MatRotateQuat_t)(float* this_mat, void* edx, const float* quat);
+static MatRotateQuat_t pOrigMatRotateQuat = nullptr;
+static volatile unsigned long g_matrotate_quat_calls = 0;
+static volatile unsigned long g_matrotate_quat_agreements = 0;
+static volatile long g_matrotate_quat_armed = 0;
+static volatile long g_matrotate_quat_dead = 0;
+
+typedef float* (__fastcall* Vec3Scale_t)(float* this_vec, void* edx, float s);
+static Vec3Scale_t pOrigVec3Scale = nullptr;
+static volatile unsigned long g_vec3_scale_calls = 0;
+static volatile unsigned long g_vec3_scale_agreements = 0;
+static volatile long g_vec3_scale_armed = 0;
+static volatile long g_vec3_scale_dead = 0;
+
+typedef float* (__fastcall* Vec3InvScale_t)(float* this_vec, void* edx, float s);
+static Vec3InvScale_t pOrigVec3InvScale = nullptr;
+static volatile unsigned long g_vec3_invscale_calls = 0;
+static volatile unsigned long g_vec3_invscale_agreements = 0;
+static volatile long g_vec3_invscale_armed = 0;
+static volatile long g_vec3_invscale_dead = 0;
+
+static inline void MatMulInPlace_SSE2(float* self, const float* other) {
+    float tmp[16];
+    MatMul4x4_PackedDouble(tmp, self, other);
+    _mm_storeu_ps(self + 0,  _mm_loadu_ps(tmp + 0));
+    _mm_storeu_ps(self + 4,  _mm_loadu_ps(tmp + 4));
+    _mm_storeu_ps(self + 8,  _mm_loadu_ps(tmp + 8));
+    _mm_storeu_ps(self + 12, _mm_loadu_ps(tmp + 12));
+}
+
+static inline float* MatScaleLocal_SSE2(float* self, const float* scale) {
+    // Row 0: multiply elements 0, 1, 2 by scale[0]
+    __m128d s0 = _mm_set1_pd((double)scale[0]);
+    __m128d v0_0 = _mm_mul_pd(_mm_cvtps_pd(_mm_loadu_ps(self)), s0);
+    __m128d v0_1 = _mm_mul_pd(_mm_cvtps_pd(_mm_load_ss(self + 2)), s0);
+    __m128 r0 = _mm_movelh_ps(_mm_cvtpd_ps(v0_0), _mm_cvtpd_ps(v0_1));
+    _mm_store_ss(self, r0);
+    _mm_store_ss(self + 1, _mm_shuffle_ps(r0, r0, _MM_SHUFFLE(1, 1, 1, 1)));
+    _mm_store_ss(self + 2, _mm_shuffle_ps(r0, r0, _MM_SHUFFLE(2, 2, 2, 2)));
+
+    // Row 1: multiply elements 4, 5, 6 by scale[1]
+    __m128d s1 = _mm_set1_pd((double)scale[1]);
+    __m128d v1_0 = _mm_mul_pd(_mm_cvtps_pd(_mm_loadu_ps(self + 4)), s1);
+    __m128d v1_1 = _mm_mul_pd(_mm_cvtps_pd(_mm_load_ss(self + 6)), s1);
+    __m128 r1 = _mm_movelh_ps(_mm_cvtpd_ps(v1_0), _mm_cvtpd_ps(v1_1));
+    _mm_store_ss(self + 4, r1);
+    _mm_store_ss(self + 5, _mm_shuffle_ps(r1, r1, _MM_SHUFFLE(1, 1, 1, 1)));
+    _mm_store_ss(self + 6, _mm_shuffle_ps(r1, r1, _MM_SHUFFLE(2, 2, 2, 2)));
+
+    // Row 2: multiply elements 8, 9, 10 by scale[2]
+    __m128d s2 = _mm_set1_pd((double)scale[2]);
+    __m128d v2_0 = _mm_mul_pd(_mm_cvtps_pd(_mm_loadu_ps(self + 8)), s2);
+    __m128d v2_1 = _mm_mul_pd(_mm_cvtps_pd(_mm_load_ss(self + 10)), s2);
+    __m128 r2 = _mm_movelh_ps(_mm_cvtpd_ps(v2_0), _mm_cvtpd_ps(v2_1));
+    _mm_store_ss(self + 8, r2);
+    _mm_store_ss(self + 9, _mm_shuffle_ps(r2, r2, _MM_SHUFFLE(1, 1, 1, 1)));
+    _mm_store_ss(self + 10, _mm_shuffle_ps(r2, r2, _MM_SHUFFLE(2, 2, 2, 2)));
+
+    return (float*)scale;
+}
+
+static inline void MatScale3x3_SSE2(float* self, float scalar) {
+    __m128d s = _mm_set1_pd((double)scalar);
+
+    // Row 0: multiply elements 0, 1, 2 by scalar
+    __m128d v0_0 = _mm_mul_pd(_mm_cvtps_pd(_mm_loadu_ps(self)), s);
+    __m128d v0_1 = _mm_mul_pd(_mm_cvtps_pd(_mm_load_ss(self + 2)), s);
+    __m128 r0 = _mm_movelh_ps(_mm_cvtpd_ps(v0_0), _mm_cvtpd_ps(v0_1));
+    _mm_store_ss(self, r0);
+    _mm_store_ss(self + 1, _mm_shuffle_ps(r0, r0, _MM_SHUFFLE(1, 1, 1, 1)));
+    _mm_store_ss(self + 2, _mm_shuffle_ps(r0, r0, _MM_SHUFFLE(2, 2, 2, 2)));
+
+    // Row 1: multiply elements 4, 5, 6 by scalar
+    __m128d v1_0 = _mm_mul_pd(_mm_cvtps_pd(_mm_loadu_ps(self + 4)), s);
+    __m128d v1_1 = _mm_mul_pd(_mm_cvtps_pd(_mm_load_ss(self + 6)), s);
+    __m128 r1 = _mm_movelh_ps(_mm_cvtpd_ps(v1_0), _mm_cvtpd_ps(v1_1));
+    _mm_store_ss(self + 4, r1);
+    _mm_store_ss(self + 5, _mm_shuffle_ps(r1, r1, _MM_SHUFFLE(1, 1, 1, 1)));
+    _mm_store_ss(self + 6, _mm_shuffle_ps(r1, r1, _MM_SHUFFLE(2, 2, 2, 2)));
+
+    // Row 2: multiply elements 8, 9, 10 by scalar
+    __m128d v2_0 = _mm_mul_pd(_mm_cvtps_pd(_mm_loadu_ps(self + 8)), s);
+    __m128d v2_1 = _mm_mul_pd(_mm_cvtps_pd(_mm_load_ss(self + 10)), s);
+    __m128 r2 = _mm_movelh_ps(_mm_cvtpd_ps(v2_0), _mm_cvtpd_ps(v2_1));
+    _mm_store_ss(self + 8, r2);
+    _mm_store_ss(self + 9, _mm_shuffle_ps(r2, r2, _MM_SHUFFLE(1, 1, 1, 1)));
+    _mm_store_ss(self + 10, _mm_shuffle_ps(r2, r2, _MM_SHUFFLE(2, 2, 2, 2)));
+}
+
+static inline float* MatCreateRotateX_SSE2(float* out, float angle) {
+    float s, c;
+    FastSinCos(angle, s, c);
+
+    __m128 r0 = _mm_setr_ps(1.0f, 0.0f,  0.0f, 0.0f);
+    __m128 r1 = _mm_setr_ps(0.0f,    c,     s, 0.0f);
+    __m128 r2 = _mm_setr_ps(0.0f,   -s,     c, 0.0f);
+    __m128 r3 = _mm_setr_ps(0.0f, 0.0f,  0.0f, 1.0f);
+
+    _mm_storeu_ps(out + 0,  r0);
+    _mm_storeu_ps(out + 4,  r1);
+    _mm_storeu_ps(out + 8,  r2);
+    _mm_storeu_ps(out + 12, r3);
+    return out;
+}
+
+static inline float* MatCreateRotateY_SSE2(float* out, float angle) {
+    float s, c;
+    FastSinCos(angle, s, c);
+
+    __m128 r0 = _mm_setr_ps(   c, 0.0f,   -s, 0.0f);
+    __m128 r1 = _mm_setr_ps(0.0f, 1.0f, 0.0f, 0.0f);
+    __m128 r2 = _mm_setr_ps(   s, 0.0f,    c, 0.0f);
+    __m128 r3 = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+
+    _mm_storeu_ps(out + 0,  r0);
+    _mm_storeu_ps(out + 4,  r1);
+    _mm_storeu_ps(out + 8,  r2);
+    _mm_storeu_ps(out + 12, r3);
+    return out;
+}
+
+static inline float* MatCreateRotateZ_SSE2(float* out, float angle) {
+    float s, c;
+    FastSinCos(angle, s, c);
+
+    __m128 r0 = _mm_set_ps(0.0f, 0.0f, s, c);
+    __m128 r1 = _mm_set_ps(0.0f, 0.0f, c, -s);
+    __m128 r2 = _mm_set_ps(0.0f, 1.0f, 0.0f, 0.0f);
+    __m128 r3 = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+
+    _mm_storeu_ps(out + 0,  r0);
+    _mm_storeu_ps(out + 4,  r1);
+    _mm_storeu_ps(out + 8,  r2);
+    _mm_storeu_ps(out + 12, r3);
+    return out;
+}
+
+static inline float* MatCreateRotateAxisAngle_SSE2(float* out, float angle, const float* axis, int is_normalized) {
+    float ax = axis[0];
+    float ay = axis[1];
+    float az = axis[2];
+
+    if (!is_normalized) {
+        double dax = (double)ax;
+        double day = (double)ay;
+        double daz = (double)az;
+        double sum = (daz * daz + day * day) + dax * dax;
+        double len = _mm_cvtsd_f64(_mm_sqrt_sd(_mm_setzero_pd(), _mm_set_sd(sum)));
+        double inv_len = 1.0 / len;
+        ax = (float)(dax * inv_len);
+        ay = (float)(day * inv_len);
+        az = (float)(daz * inv_len);
+    }
+
+    float s, c;
+    FastSinCos(angle, s, c);
+
+    double dax = (double)ax;
+    double day = (double)ay;
+    double daz = (double)az;
+    double dc  = (double)c;
+    double ds  = (double)s;
+
+    float xy = (float)(day * dax);
+    float yz = (float)(daz * day);
+    float xz = (float)(daz * dax);
+    float ys = (float)(day * ds);
+
+    double az_s = daz * ds;
+    double ax_s = dax * ds;
+    double one_minus_c = 1.0 - dc;
+
+    double xy_term = (double)xy * one_minus_c;
+    float  xy_term_f = (float)xy_term;
+
+    double xz_term = (double)xz * one_minus_c;
+    float  xz_term_f = (float)xz_term;
+
+    double yz_term = (double)yz * one_minus_c;
+
+    out[0]  = (float)(dax * dax * one_minus_c + dc);
+    out[1]  = (float)(xy_term + az_s);
+    out[2]  = (float)(xz_term - (double)ys);
+    out[3]  = 0.0f;
+
+    out[4]  = (float)((double)xy_term_f - az_s);
+    out[5]  = (float)(day * day * one_minus_c + dc);
+    out[6]  = (float)(yz_term + ax_s);
+    out[7]  = 0.0f;
+
+    out[8]  = (float)((double)xz_term_f + (double)ys);
+    out[9]  = (float)(yz_term - ax_s);
+    out[10] = (float)(daz * daz * one_minus_c + dc);
+    out[11] = 0.0f;
+
+    out[12] = 0.0f;
+    out[13] = 0.0f;
+    out[14] = 0.0f;
+    out[15] = 1.0f;
+
+    return out;
+}
+
+static inline float* MatRotateQuat_SSE2(float* this_mat, const float* quat) {
+    float qmat[16];
+    qmat[3]  = 0.0f;
+    qmat[7]  = 0.0f;
+    qmat[11] = 0.0f;
+    qmat[12] = 0.0f;
+    qmat[13] = 0.0f;
+    qmat[14] = 0.0f;
+    qmat[15] = 1.0f;
+    QuatToMatrix3x3_PackedDouble(quat, qmat);
+
+    float tmp[16];
+    MatMul4x4_PackedDouble(tmp, qmat, this_mat);
+
+    _mm_storeu_ps(this_mat + 0,  _mm_loadu_ps(tmp + 0));
+    _mm_storeu_ps(this_mat + 4,  _mm_loadu_ps(tmp + 4));
+    _mm_storeu_ps(this_mat + 8,  _mm_loadu_ps(tmp + 8));
+    _mm_storeu_ps(this_mat + 12, _mm_loadu_ps(tmp + 12));
+    return this_mat;
+}
+
+static inline float* Vec3Scale_SSE2(float* this_vec, float s) {
+    double sd = (double)s;
+    __m128d s_d = _mm_set1_pd(sd);
+    __m128d xy = _mm_mul_pd(_mm_set_pd((double)this_vec[1], (double)this_vec[0]), s_d);
+    __m128d z = _mm_mul_sd(_mm_set_sd((double)this_vec[2]), s_d);
+    this_vec[0] = (float)_mm_cvtsd_f64(xy);
+    this_vec[1] = (float)_mm_cvtsd_f64(_mm_unpackhi_pd(xy, xy));
+    this_vec[2] = (float)_mm_cvtsd_f64(z);
+    return this_vec;
+}
+
+static inline float* Vec3InvScale_SSE2(float* this_vec, float s) {
+    double inv = 1.0 / (double)s;
+    __m128d inv_d = _mm_set1_pd(inv);
+    __m128d xy = _mm_mul_pd(_mm_set_pd((double)this_vec[1], (double)this_vec[0]), inv_d);
+    __m128d z = _mm_mul_sd(_mm_set_sd((double)this_vec[2]), inv_d);
+    this_vec[0] = (float)_mm_cvtsd_f64(xy);
+    this_vec[1] = (float)_mm_cvtsd_f64(_mm_unpackhi_pd(xy, xy));
+    this_vec[2] = (float)_mm_cvtsd_f64(z);
+    return this_vec;
+}
+
+__declspec(noinline) static float* VerifyMatMulInPlace(float* self, void* edx, const float* other) {
+    // Shadow verification
+    float client_m[16], our_m[16];
+    memcpy(client_m, self, sizeof(client_m));
+    memcpy(our_m, self, sizeof(our_m));
+
+    __try {
+        pOrigMatMulInPlace(client_m, nullptr, other);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigMatMulInPlace(self, edx, other);
+    }
+
+    __try {
+        MatMulInPlace_SSE2(our_m, other);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matmul_ip_dead, 1);
+        Log("[MatrixSSE2] MatMulInPlace threw exception - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return self;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matmul_ip_dead, 1);
+        Log("[MatrixSSE2] MatMulInPlace DISAGREED with client - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return self;
+    }
+
+    memcpy(self, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matmul_ip_agreements);
+    if (g_matmul_ip_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matmul_ip_armed, 1);
+        Log("[MatrixSSE2] MatMulInPlace armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return self;
+}
+
+static float* __fastcall Hooked_MatMulInPlace(float* self, void* edx, const float* other) {
+    ++g_matmul_ip_calls;
+    uintptr_t s = (uintptr_t)self;
+    uintptr_t o = (uintptr_t)other;
+    if (s <= 0x10000 || s >= 0xFFE00000 || o <= 0x10000 || o >= 0xFFE00000 || g_matmul_ip_dead) {
+        return pOrigMatMulInPlace(self, edx, other);
+    }
+
+    if (g_matmul_ip_armed && ((g_matmul_ip_calls & 4095) != 0)) {
+        MatMulInPlace_SSE2(self, other);
+        return self;
+    }
+
+    return VerifyMatMulInPlace(self, edx, other);
+}
+
+__declspec(noinline) static float* VerifyMatScaleLocal(float* self, void* edx, const float* scale) {
+    // Shadow verification
+    float client_m[16], our_m[16];
+    memcpy(client_m, self, sizeof(client_m));
+    memcpy(our_m, self, sizeof(our_m));
+
+    __try {
+        pOrigMatScaleLocal(client_m, nullptr, scale);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigMatScaleLocal(self, edx, scale);
+    }
+
+    __try {
+        MatScaleLocal_SSE2(our_m, scale);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matscale_local_dead, 1);
+        Log("[MatrixSSE2] MatScaleLocal threw exception - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return (float*)scale;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matscale_local_dead, 1);
+        Log("[MatrixSSE2] MatScaleLocal DISAGREED with client - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return (float*)scale;
+    }
+
+    memcpy(self, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matscale_local_agreements);
+    if (g_matscale_local_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matscale_local_armed, 1);
+        Log("[MatrixSSE2] MatScaleLocal armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return (float*)scale;
+}
+
+static float* __fastcall Hooked_MatScaleLocal(float* self, void* edx, const float* scale) {
+    ++g_matscale_local_calls;
+    uintptr_t s = (uintptr_t)self;
+    uintptr_t sc = (uintptr_t)scale;
+    if (s <= 0x10000 || s >= 0xFFE00000 || sc <= 0x10000 || sc >= 0xFFE00000 || g_matscale_local_dead) {
+        return pOrigMatScaleLocal(self, edx, scale);
+    }
+
+    if (g_matscale_local_armed && ((g_matscale_local_calls & 4095) != 0)) {
+        return MatScaleLocal_SSE2(self, scale);
+    }
+
+    return VerifyMatScaleLocal(self, edx, scale);
+}
+
+__declspec(noinline) static float* VerifyMatCreateRotateZ(float* out, float angle) {
+    // Shadow verification
+    float client_m[16], our_m[16];
+
+    __try {
+        pOrigMatCreateRotateZ(client_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigMatCreateRotateZ(out, angle);
+    }
+
+    __try {
+        MatCreateRotateZ_SSE2(our_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matcreate_rotz_dead, 1);
+        Log("[MatrixSSE2] MatCreateRotateZ threw exception - retiring hook");
+        memcpy(out, client_m, sizeof(client_m));
+        return out;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matcreate_rotz_dead, 1);
+        Log("[MatrixSSE2] MatCreateRotateZ DISAGREED with client - retiring hook");
+        memcpy(out, client_m, sizeof(client_m));
+        return out;
+    }
+
+    memcpy(out, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matcreate_rotz_agreements);
+    if (g_matcreate_rotz_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matcreate_rotz_armed, 1);
+        Log("[MatrixSSE2] MatCreateRotateZ armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return out;
+}
+
+static float* __cdecl Hooked_MatCreateRotateZ(float* out, float angle) {
+    ++g_matcreate_rotz_calls;
+    uintptr_t o = (uintptr_t)out;
+    if (o <= 0x10000 || o >= 0xFFE00000 || g_matcreate_rotz_dead) {
+        return pOrigMatCreateRotateZ(out, angle);
+    }
+
+    if (g_matcreate_rotz_armed && ((g_matcreate_rotz_calls & 4095) != 0)) {
+        return MatCreateRotateZ_SSE2(out, angle);
+    }
+
+    return VerifyMatCreateRotateZ(out, angle);
+}
+
+__declspec(noinline) static void VerifyMatScale3x3(float* self, void* edx, float scalar) {
+    // Shadow verification
+    float client_m[16], our_m[16];
+    memcpy(client_m, self, sizeof(client_m));
+    memcpy(our_m, self, sizeof(our_m));
+
+    __try {
+        pOrigMatScale3x3(client_m, edx, scalar);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        pOrigMatScale3x3(self, edx, scalar);
+        return;
+    }
+
+    __try {
+        MatScale3x3_SSE2(our_m, scalar);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_scale3x3_dead, 1);
+        Log("[MatrixSSE2] MatScale3x3 threw exception - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_scale3x3_dead, 1);
+        Log("[MatrixSSE2] MatScale3x3 DISAGREED with client - retiring hook");
+        memcpy(self, client_m, sizeof(client_m));
+        return;
+    }
+
+    memcpy(self, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_scale3x3_agreements);
+    if (g_scale3x3_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_scale3x3_armed, 1);
+        Log("[MatrixSSE2] MatScale3x3 armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+}
+
+static void __fastcall Hooked_MatScale3x3(float* self, void* edx, float scalar) {
+    ++g_scale3x3_calls;
+    uintptr_t s = (uintptr_t)self;
+    if (s <= 0x10000 || s >= 0xFFE00000 || g_scale3x3_dead) {
+        pOrigMatScale3x3(self, edx, scalar);
+        return;
+    }
+
+    if (g_scale3x3_armed && ((g_scale3x3_calls & 4095) != 0)) {
+        MatScale3x3_SSE2(self, scalar);
+        return;
+    }
+
+    VerifyMatScale3x3(self, edx, scalar);
+}
+
+__declspec(noinline) static float* VerifyMatCreateRotateX(float* out, float angle) {
+    // Shadow verification
+    float client_m[16], our_m[16];
+
+    __try {
+        pOrigMatCreateRotateX(client_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigMatCreateRotateX(out, angle);
+    }
+
+    __try {
+        MatCreateRotateX_SSE2(our_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matcreate_rotx_dead, 1);
+        Log("[MatrixSSE2] MatCreateRotateX threw exception - retiring hook");
+        memcpy(out, client_m, sizeof(client_m));
+        return out;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matcreate_rotx_dead, 1);
+        Log("[MatrixSSE2] MatCreateRotateX DISAGREED with client - retiring hook");
+        memcpy(out, client_m, sizeof(client_m));
+        return out;
+    }
+
+    memcpy(out, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matcreate_rotx_agreements);
+    if (g_matcreate_rotx_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matcreate_rotx_armed, 1);
+        Log("[MatrixSSE2] MatCreateRotateX armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return out;
+}
+
+static float* __cdecl Hooked_MatCreateRotateX(float* out, float angle) {
+    ++g_matcreate_rotx_calls;
+    uintptr_t o = (uintptr_t)out;
+    if (o <= 0x10000 || o >= 0xFFE00000 || g_matcreate_rotx_dead) {
+        return pOrigMatCreateRotateX(out, angle);
+    }
+
+    if (g_matcreate_rotx_armed && ((g_matcreate_rotx_calls & 4095) != 0)) {
+        return MatCreateRotateX_SSE2(out, angle);
+    }
+
+    return VerifyMatCreateRotateX(out, angle);
+}
+
+__declspec(noinline) static float* VerifyMatCreateRotateY(float* out, float angle) {
+    // Shadow verification
+    float client_m[16], our_m[16];
+
+    __try {
+        pOrigMatCreateRotateY(client_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigMatCreateRotateY(out, angle);
+    }
+
+    __try {
+        MatCreateRotateY_SSE2(our_m, angle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matcreate_roty_dead, 1);
+        Log("[MatrixSSE2] MatCreateRotateY threw exception - retiring hook");
+        memcpy(out, client_m, sizeof(client_m));
+        return out;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matcreate_roty_dead, 1);
+        Log("[MatrixSSE2] MatCreateRotateY DISAGREED with client - retiring hook");
+        memcpy(out, client_m, sizeof(client_m));
+        return out;
+    }
+
+    memcpy(out, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matcreate_roty_agreements);
+    if (g_matcreate_roty_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matcreate_roty_armed, 1);
+        Log("[MatrixSSE2] MatCreateRotateY armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return out;
+}
+
+static float* __cdecl Hooked_MatCreateRotateY(float* out, float angle) {
+    ++g_matcreate_roty_calls;
+    uintptr_t o = (uintptr_t)out;
+    if (o <= 0x10000 || o >= 0xFFE00000 || g_matcreate_roty_dead) {
+        return pOrigMatCreateRotateY(out, angle);
+    }
+
+    if (g_matcreate_roty_armed && ((g_matcreate_roty_calls & 4095) != 0)) {
+        return MatCreateRotateY_SSE2(out, angle);
+    }
+
+    return VerifyMatCreateRotateY(out, angle);
+}
+
+__declspec(noinline) static float* VerifyMatCreateRotateAxisAngle(float* out, float angle, const float* axis, int is_normalized) {
+    // Shadow verification
+    float client_m[16], our_m[16];
+
+    __try {
+        pOrigMatCreateRotateAxisAngle(client_m, angle, axis, is_normalized);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigMatCreateRotateAxisAngle(out, angle, axis, is_normalized);
+    }
+
+    __try {
+        MatCreateRotateAxisAngle_SSE2(our_m, angle, axis, is_normalized);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matcreate_rotaxis_dead, 1);
+        Log("[MatrixSSE2] MatCreateRotateAxisAngle threw exception - retiring hook");
+        memcpy(out, client_m, sizeof(client_m));
+        return out;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matcreate_rotaxis_dead, 1);
+        Log("[MatrixSSE2] MatCreateRotateAxisAngle DISAGREED with client - retiring hook");
+        memcpy(out, client_m, sizeof(client_m));
+        return out;
+    }
+
+    memcpy(out, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matcreate_rotaxis_agreements);
+    if (g_matcreate_rotaxis_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matcreate_rotaxis_armed, 1);
+        Log("[MatrixSSE2] MatCreateRotateAxisAngle armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return out;
+}
+
+static float* __cdecl Hooked_MatCreateRotateAxisAngle(float* out, float angle, const float* axis, int is_normalized) {
+    ++g_matcreate_rotaxis_calls;
+    uintptr_t o = (uintptr_t)out;
+    uintptr_t a = (uintptr_t)axis;
+    if (o <= 0x10000 || o >= 0xFFE00000 || a <= 0x10000 || a >= 0xFFE00000 || g_matcreate_rotaxis_dead) {
+        return pOrigMatCreateRotateAxisAngle(out, angle, axis, is_normalized);
+    }
+
+    if (g_matcreate_rotaxis_armed && ((g_matcreate_rotaxis_calls & 4095) != 0)) {
+        return MatCreateRotateAxisAngle_SSE2(out, angle, axis, is_normalized);
+    }
+
+    return VerifyMatCreateRotateAxisAngle(out, angle, axis, is_normalized);
+}
+
+__declspec(noinline) static float* VerifyMatRotateQuat(float* this_mat, void* edx, const float* quat) {
+    // Shadow verification
+    float client_m[16], our_m[16];
+    memcpy(client_m, this_mat, sizeof(client_m));
+    memcpy(our_m, this_mat, sizeof(our_m));
+
+    __try {
+        pOrigMatRotateQuat(client_m, nullptr, quat);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigMatRotateQuat(this_mat, edx, quat);
+    }
+
+    __try {
+        MatRotateQuat_SSE2(our_m, quat);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_matrotate_quat_dead, 1);
+        Log("[MatrixSSE2] MatRotateQuat threw exception - retiring hook");
+        memcpy(this_mat, client_m, sizeof(client_m));
+        return this_mat;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t cm, om;
+        memcpy(&cm, &client_m[i], 4);
+        memcpy(&om, &our_m[i], 4);
+        if (cm != om) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_matrotate_quat_dead, 1);
+        Log("[MatrixSSE2] MatRotateQuat DISAGREED with client - retiring hook");
+        memcpy(this_mat, client_m, sizeof(client_m));
+        return this_mat;
+    }
+
+    memcpy(this_mat, our_m, sizeof(our_m));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_matrotate_quat_agreements);
+    if (g_matrotate_quat_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_matrotate_quat_armed, 1);
+        Log("[MatrixSSE2] MatRotateQuat armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return this_mat;
+}
+
+static float* __fastcall Hooked_MatRotateQuat(float* this_mat, void* edx, const float* quat) {
+    ++g_matrotate_quat_calls;
+    uintptr_t m = (uintptr_t)this_mat;
+    uintptr_t q = (uintptr_t)quat;
+    if (m <= 0x10000 || m >= 0xFFE00000 || q <= 0x10000 || q >= 0xFFE00000 || g_matrotate_quat_dead) {
+        return pOrigMatRotateQuat(this_mat, edx, quat);
+    }
+
+    if (g_matrotate_quat_armed && ((g_matrotate_quat_calls & 4095) != 0)) {
+        return MatRotateQuat_SSE2(this_mat, quat);
+    }
+
+    return VerifyMatRotateQuat(this_mat, edx, quat);
+}
+
+__declspec(noinline) static float* VerifyVec3Scale(float* this_vec, void* edx, float s) {
+    // Shadow verification
+    float client_v[3], our_v[3];
+    memcpy(client_v, this_vec, sizeof(client_v));
+    memcpy(our_v, this_vec, sizeof(our_v));
+
+    __try {
+        pOrigVec3Scale(client_v, nullptr, s);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigVec3Scale(this_vec, edx, s);
+    }
+
+    __try {
+        Vec3Scale_SSE2(our_v, s);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_vec3_scale_dead, 1);
+        Log("[MatrixSSE2] Vec3_Scale threw exception - retiring hook");
+        memcpy(this_vec, client_v, sizeof(client_v));
+        return this_vec;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 3; ++i) {
+        uint32_t cv, ov;
+        memcpy(&cv, &client_v[i], 4);
+        memcpy(&ov, &our_v[i], 4);
+        if (cv != ov) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_vec3_scale_dead, 1);
+        Log("[MatrixSSE2] Vec3_Scale DISAGREED with client - retiring hook");
+        memcpy(this_vec, client_v, sizeof(client_v));
+        return this_vec;
+    }
+
+    memcpy(this_vec, our_v, sizeof(our_v));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_vec3_scale_agreements);
+    if (g_vec3_scale_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_vec3_scale_armed, 1);
+        Log("[MatrixSSE2] Vec3_Scale armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return this_vec;
+}
+
+static float* __fastcall Hooked_Vec3Scale(float* this_vec, void* edx, float s) {
+    ++g_vec3_scale_calls;
+    uintptr_t v = (uintptr_t)this_vec;
+    if (v <= 0x10000 || v >= 0xFFE00000 || g_vec3_scale_dead) {
+        return pOrigVec3Scale(this_vec, edx, s);
+    }
+
+    if (g_vec3_scale_armed && ((g_vec3_scale_calls & 4095) != 0)) {
+        return Vec3Scale_SSE2(this_vec, s);
+    }
+
+    return VerifyVec3Scale(this_vec, edx, s);
+}
+
+__declspec(noinline) static float* VerifyVec3InvScale(float* this_vec, void* edx, float s) {
+    // Shadow verification
+    float client_v[3], our_v[3];
+    memcpy(client_v, this_vec, sizeof(client_v));
+    memcpy(our_v, this_vec, sizeof(our_v));
+
+    __try {
+        pOrigVec3InvScale(client_v, nullptr, s);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return pOrigVec3InvScale(this_vec, edx, s);
+    }
+
+    __try {
+        Vec3InvScale_SSE2(our_v, s);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedExchange(&g_vec3_invscale_dead, 1);
+        Log("[MatrixSSE2] Vec3_InvScale threw exception - retiring hook");
+        memcpy(this_vec, client_v, sizeof(client_v));
+        return this_vec;
+    }
+
+    bool match = true;
+    for (int i = 0; i < 3; ++i) {
+        uint32_t cv, ov;
+        memcpy(&cv, &client_v[i], 4);
+        memcpy(&ov, &our_v[i], 4);
+        if (cv != ov) {
+            match = false;
+            break;
+        }
+    }
+
+    if (!match) {
+        InterlockedExchange(&g_vec3_invscale_dead, 1);
+        Log("[MatrixSSE2] Vec3_InvScale DISAGREED with client - retiring hook");
+        memcpy(this_vec, client_v, sizeof(client_v));
+        return this_vec;
+    }
+
+    memcpy(this_vec, our_v, sizeof(our_v));
+
+    unsigned long ok = InterlockedIncrement((volatile long*)&g_vec3_invscale_agreements);
+    if (g_vec3_invscale_armed == 0 && ok >= 20000) {
+        InterlockedExchange(&g_vec3_invscale_armed, 1);
+        Log("[MatrixSSE2] Vec3_InvScale armed: %lu tests agreed bit-for-bit with client", ok);
+    }
+    return this_vec;
+}
+
+static float* __fastcall Hooked_Vec3InvScale(float* this_vec, void* edx, float s) {
+    ++g_vec3_invscale_calls;
+    uintptr_t v = (uintptr_t)this_vec;
+    if (v <= 0x10000 || v >= 0xFFE00000 || g_vec3_invscale_dead) {
+        return pOrigVec3InvScale(this_vec, edx, s);
+    }
+
+    if (g_vec3_invscale_armed && ((g_vec3_invscale_calls & 4095) != 0)) {
+        return Vec3InvScale_SSE2(this_vec, s);
+    }
+
+    return VerifyVec3InvScale(this_vec, edx, s);
+}
+
+static bool SelfTestMatrixOps() {
+    MatMulInPlace_t origMul = (MatMulInPlace_t)0x004C2370;
+    MatScaleLocal_t origScale = (MatScaleLocal_t)0x004C1B90;
+    MatScale3x3_t origScale3x3 = (MatScale3x3_t)0x004C1BF0;
+    MatCreateRotateX_t origCreateX = (MatCreateRotateX_t)0x004C31B0;
+    MatCreateRotateY_t origCreateY = (MatCreateRotateY_t)0x004C3220;
+    MatCreateRotateZ_t origCreateZ = (MatCreateRotateZ_t)0x004C3290;
+    MatCreateRotateAxisAngle_t origCreateAxisAngle = (MatCreateRotateAxisAngle_t)0x004C3460;
+    MatRotateQuat_t origRotateQuat = (MatRotateQuat_t)0x004C33C0;
+    Vec3Scale_t origVec3Scale = (Vec3Scale_t)0x004C35A0;
+    Vec3InvScale_t origVec3InvScale = (Vec3InvScale_t)0x004C35D0;
+
+    if (IsBadReadPtr((void*)origMul, 16) ||
+        IsBadReadPtr((void*)origScale, 16) ||
+        IsBadReadPtr((void*)origScale3x3, 16) ||
+        IsBadReadPtr((void*)origCreateX, 16) ||
+        IsBadReadPtr((void*)origCreateY, 16) ||
+        IsBadReadPtr((void*)origCreateZ, 16) ||
+        IsBadReadPtr((void*)origCreateAxisAngle, 16) ||
+        IsBadReadPtr((void*)origRotateQuat, 16) ||
+        IsBadReadPtr((void*)origVec3Scale, 16) ||
+        IsBadReadPtr((void*)origVec3InvScale, 16)) {
+        return true;
+    }
+
+    const unsigned char* pm = (const unsigned char*)origMul;
+    if (!(pm[0] == 0x55 && pm[1] == 0x8B && pm[2] == 0xEC)) return true;
+
+    uint32_t state = 0x5A5A5A5A;
+    auto rnd = [&state]() -> float {
+        state = state * 1664525u + 1013904223u;
+        return ((float)(int)(state >> 8) / 8388608.0f) * 100.0f;
+    };
+
+    for (int i = 0; i < 30000; ++i) {
+        float m1[16], m2[16];
+        for (int k = 0; k < 16; ++k) {
+            m1[k] = rnd();
+            m2[k] = rnd();
+        }
+
+        // 1. Test MatMulInPlace
+        float m_client[16], m_ours[16];
+        memcpy(m_client, m1, sizeof(m1));
+        memcpy(m_ours, m1, sizeof(m1));
+        origMul(m_client, nullptr, m2);
+        MatMulInPlace_SSE2(m_ours, m2);
+        if (memcmp(m_client, m_ours, sizeof(m1)) != 0) {
+            Log("[SelfTest] MatMulInPlace mismatch at test %d", i);
+            return false;
+        }
+
+        // 2. Test MatScaleLocal
+        float scale[3] = { rnd(), rnd(), rnd() };
+        memcpy(m_client, m1, sizeof(m1));
+        memcpy(m_ours, m1, sizeof(m1));
+        origScale(m_client, nullptr, scale);
+        MatScaleLocal_SSE2(m_ours, scale);
+        if (memcmp(m_client, m_ours, sizeof(m1)) != 0) {
+            Log("[SelfTest] MatScaleLocal mismatch at test %d", i);
+            return false;
+        }
+
+        // 3. Test MatScale3x3
+        float scalar = rnd();
+        memcpy(m_client, m1, sizeof(m1));
+        memcpy(m_ours, m1, sizeof(m1));
+        origScale3x3(m_client, nullptr, scalar);
+        MatScale3x3_SSE2(m_ours, scalar);
+        if (memcmp(m_client, m_ours, sizeof(m1)) != 0) {
+            Log("[SelfTest] MatScale3x3 mismatch at test %d", i);
+            return false;
+        }
+
+        // 4. Test MatCreateRotateX
+        float angle = rnd() * 0.1f;
+        float cx_client[16], cx_ours[16];
+        origCreateX(cx_client, angle);
+        MatCreateRotateX_SSE2(cx_ours, angle);
+        if (memcmp(cx_client, cx_ours, sizeof(cx_client)) != 0) {
+            Log("[SelfTest] MatCreateRotateX mismatch at test %d", i);
+            return false;
+        }
+
+        // 5. Test MatCreateRotateY
+        float cy_client[16], cy_ours[16];
+        origCreateY(cy_client, angle);
+        MatCreateRotateY_SSE2(cy_ours, angle);
+        if (memcmp(cy_client, cy_ours, sizeof(cy_client)) != 0) {
+            Log("[SelfTest] MatCreateRotateY mismatch at test %d", i);
+            return false;
+        }
+
+        // 6. Test MatCreateRotateZ
+        float cz_client[16], cz_ours[16];
+        origCreateZ(cz_client, angle);
+        MatCreateRotateZ_SSE2(cz_ours, angle);
+        if (memcmp(cz_client, cz_ours, sizeof(cz_client)) != 0) {
+            Log("[SelfTest] MatCreateRotateZ mismatch at test %d", i);
+            return false;
+        }
+
+        // 7. Test MatCreateRotateAxisAngle
+        float axis[3] = { rnd(), rnd(), rnd() };
+        int is_norm = (i & 1);
+        float ca_client[16], ca_ours[16];
+        origCreateAxisAngle(ca_client, angle, axis, is_norm);
+        MatCreateRotateAxisAngle_SSE2(ca_ours, angle, axis, is_norm);
+        if (memcmp(ca_client, ca_ours, sizeof(ca_client)) != 0) {
+            Log("[SelfTest] MatCreateRotateAxisAngle mismatch at test %d", i);
+            return false;
+        }
+
+        // 8. Test MatRotateQuat
+        float quat[4] = { rnd() * 0.01f, rnd() * 0.01f, rnd() * 0.01f, 1.0f };
+        memcpy(m_client, m1, sizeof(m1));
+        memcpy(m_ours, m1, sizeof(m1));
+        origRotateQuat(m_client, nullptr, quat);
+        MatRotateQuat_SSE2(m_ours, quat);
+        if (memcmp(m_client, m_ours, sizeof(m1)) != 0) {
+            Log("[SelfTest] MatRotateQuat mismatch at test %d", i);
+            return false;
+        }
+
+        // 9. Test Vec3Scale
+        float v_client[3] = { rnd(), rnd(), rnd() };
+        float v_ours[3] = { v_client[0], v_client[1], v_client[2] };
+        origVec3Scale(v_client, nullptr, scalar);
+        Vec3Scale_SSE2(v_ours, scalar);
+        if (memcmp(v_client, v_ours, sizeof(v_client)) != 0) {
+            Log("[SelfTest] Vec3Scale mismatch at test %d", i);
+            return false;
+        }
+
+        // 10. Test Vec3InvScale
+        float inv_s = (scalar != 0.0f) ? scalar : 1.5f;
+        v_client[0] = rnd(); v_client[1] = rnd(); v_client[2] = rnd();
+        v_ours[0] = v_client[0]; v_ours[1] = v_client[1]; v_ours[2] = v_client[2];
+        origVec3InvScale(v_client, nullptr, inv_s);
+        Vec3InvScale_SSE2(v_ours, inv_s);
+        if (memcmp(v_client, v_ours, sizeof(v_client)) != 0) {
+            Log("[SelfTest] Vec3InvScale mismatch at test %d", i);
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+static inline bool CheckPrologue8(void* addr, const unsigned char expected[8], const char* name) {
+    if (memcmp(addr, expected, 8) != 0) {
+        Log("[MatrixSSE2] BAD PROLOGUE for %s at 0x%08X", name, (uintptr_t)addr);
+        return false;
+    }
+    return true;
+}
 
 // Install hooks
 bool InstallMatrixCopySSE2() {
@@ -1296,15 +3017,20 @@ bool InstallMatrixCopySSE2() {
         void**      orig;
         const char* name;
         uint32_t    xrefs;
+        const unsigned char* prologue;
     };
 
+    static const unsigned char kExp_Copy[8]  = { 0x55, 0x8B, 0xEC, 0x8B, 0xC1, 0x8B, 0x4D, 0x08 };
+    static const unsigned char kExp_Ident[8] = { 0xD9, 0xE8, 0x8B, 0xC1, 0xD9, 0x10, 0xD9, 0xEE };
+
     HookDef hooks[] = {
-        { (void*)0x00407F80, (void*)HookMatrixCopy,     (void**)&pOrigMatCopy,     "MatrixCopy",     247 },
-        { (void*)0x00407F40, (void*)HookMatrixIdentity, (void**)&pOrigMatIdentity, "MatrixIdentity",  53 },
+        { (void*)0x00407F80, (void*)HookMatrixCopy,     (void**)&pOrigMatCopy,     "MatrixCopy",     247, kExp_Copy },
+        { (void*)0x00407F40, (void*)HookMatrixIdentity, (void**)&pOrigMatIdentity, "MatrixIdentity",  53, kExp_Ident },
     };
 
     int installed = 0;
     for (auto& h : hooks) {
+        if (!CheckPrologue8(h.addr, h.prologue, h.name)) continue;
         if (WineSafe_CreateHook(h.addr, h.hook, h.orig) == MH_OK) {
              if (WO_EnableHook(h.addr) == MH_OK) {
                  installed++;
@@ -1321,10 +3047,12 @@ bool InstallMatrixCopySSE2() {
 #endif
 
 #if !TEST_DISABLE_MATRIX_MULTIPLY
+    static const unsigned char kExp_MatMul[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x10, 0x8B, 0x55 };
     if (!SelfTestMatrixMultiply()) {
         // The self-test said why; installing anyway would be the whole point of
         // having one thrown away.
-    } else if (WineSafe_CreateHook((void*)0x004C1F00, (void*)HookMatrixMultiply,
+    } else if (CheckPrologue8((void*)0x004C1F00, kExp_MatMul, "MatrixMultiply") &&
+               WineSafe_CreateHook((void*)0x004C1F00, (void*)HookMatrixMultiply,
                                    (void**)&pOrigMatMul) == MH_OK &&
                WO_EnableHook((void*)0x004C1F00) == MH_OK) {
         Log("[MatrixSSE2] Hooked MatrixMultiply at 0x004C1F00 "
@@ -1337,11 +3065,14 @@ bool InstallMatrixCopySSE2() {
 #endif
 
 #if !TEST_DISABLE_QUAT_MATRIX_SSE2
+    static const unsigned char kExp_QuatToMatrix[8]     = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B, 0x45 };
+    static const unsigned char kExp_QuatToMatrixFull[8] = { 0x55, 0x8B, 0xEC, 0xD9, 0xEE, 0x8B, 0x45, 0x08 };
     if (!SelfTestQuatToMatrix()) {
         // The self-test said why. Installing anyway would throw away the only
         // thing standing between a misread spill slot and a subtly wrong bone
         // rotation on every animated model in the game.
-    } else if (WineSafe_CreateHook((void*)0x004C1C40, (void*)Hooked_QuatToMatrix,
+    } else if (CheckPrologue8((void*)0x004C1C40, kExp_QuatToMatrix, "QuatToMatrix") &&
+               WineSafe_CreateHook((void*)0x004C1C40, (void*)Hooked_QuatToMatrix,
                                    (void**)&pOrigQuatToMatrix) == MH_OK &&
                WO_EnableHook((void*)0x004C1C40) == MH_OK) {
         Log("[MatrixSSE2] Hooked QuatToMatrix at 0x004C1C40 "
@@ -1350,7 +3081,8 @@ bool InstallMatrixCopySSE2() {
         // Only worth attempting once the core has proved itself and installed;
         // this shares its arithmetic, so if that did not pass there is nothing
         // here worth installing either.
-        if (WineSafe_CreateHook((void*)0x004C1DE0, (void*)Hooked_QuatToMatrixFull,
+        if (CheckPrologue8((void*)0x004C1DE0, kExp_QuatToMatrixFull, "QuatToMatrix(full)") &&
+            WineSafe_CreateHook((void*)0x004C1DE0, (void*)Hooked_QuatToMatrixFull,
                                 (void**)&pOrigQuatToMatrixFull) == MH_OK &&
             WO_EnableHook((void*)0x004C1DE0) == MH_OK) {
             Log("[MatrixSSE2] Hooked QuatToMatrix(full) at 0x004C1DE0 "
@@ -1366,7 +3098,10 @@ bool InstallMatrixCopySSE2() {
 #endif
 
 #if !TEST_DISABLE_MATRIX_VECTOR_SSE2
-    if (WineSafe_CreateHook((void*)0x004C21B0, (void*)Hooked_MatVec3Mul,
+    static const unsigned char kExp_MatVec3Mul[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x10, 0x8B, 0x55 };
+    static const unsigned char kExp_MatVec4Mul[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x55, 0x10, 0x8B, 0x4D };
+    if (CheckPrologue8((void*)0x004C21B0, kExp_MatVec3Mul, "MatVec3Mul") &&
+        WineSafe_CreateHook((void*)0x004C21B0, (void*)Hooked_MatVec3Mul,
                             (void**)&pOrigMatVec3Mul) == MH_OK &&
         WO_EnableHook((void*)0x004C21B0) == MH_OK) {
         Log("[MatrixSSE2] Hooked MatVec3Mul at 0x004C21B0 (SSE2, 100+ xrefs)");
@@ -1374,7 +3109,8 @@ bool InstallMatrixCopySSE2() {
         Log("[MatrixSSE2] MatVec3Mul hook FAILED");
     }
 
-    if (WineSafe_CreateHook((void*)0x004C2270, (void*)Hooked_MatVec4Mul,
+    if (CheckPrologue8((void*)0x004C2270, kExp_MatVec4Mul, "MatVec4Mul") &&
+        WineSafe_CreateHook((void*)0x004C2270, (void*)Hooked_MatVec4Mul,
                             (void**)&pOrigMatVec4Mul) == MH_OK &&
         WO_EnableHook((void*)0x004C2270) == MH_OK) {
         Log("[MatrixSSE2] Hooked MatVec4Mul at 0x004C2270 (SSE2, 20 xrefs)");
@@ -1386,7 +3122,10 @@ bool InstallMatrixCopySSE2() {
 #endif
 
 #if !TEST_DISABLE_VEC_NORMALIZE_SSE2
-    if (WineSafe_CreateHook((void*)0x004C3420, (void*)Hooked_Vec3Norm,
+    static const unsigned char kExp_Vec3Norm[8]     = { 0xD9, 0x01, 0xD9, 0x41, 0x04, 0xD9, 0x41, 0x08 };
+    static const unsigned char kExp_Vec3NormSafe[8] = { 0xD9, 0x41, 0x08, 0xD9, 0x41, 0x04, 0xD9, 0x01 };
+    if (CheckPrologue8((void*)0x004C3420, kExp_Vec3Norm, "C3Vector::Normalize") &&
+        WineSafe_CreateHook((void*)0x004C3420, (void*)Hooked_Vec3Norm,
                             (void**)&pOrigVec3Norm) == MH_OK &&
         WO_EnableHook((void*)0x004C3420) == MH_OK) {
         Log("[MatrixSSE2] Hooked C3Vector::Normalize at 0x004C3420 "
@@ -1395,7 +3134,8 @@ bool InstallMatrixCopySSE2() {
         Log("[MatrixSSE2] C3Vector::Normalize hook FAILED");
     }
 
-    if (WineSafe_CreateHook((void*)0x004C3600, (void*)Hooked_Vec3NormSafe,
+    if (CheckPrologue8((void*)0x004C3600, kExp_Vec3NormSafe, "C3Vector::Normalize(guarded)") &&
+        WineSafe_CreateHook((void*)0x004C3600, (void*)Hooked_Vec3NormSafe,
                             (void**)&pOrigVec3NormSafe) == MH_OK &&
         WO_EnableHook((void*)0x004C3600) == MH_OK) {
         Log("[MatrixSSE2] Hooked C3Vector::Normalize(guarded) at 0x004C3600 "
@@ -1408,7 +3148,12 @@ bool InstallMatrixCopySSE2() {
 #endif
 
 #if !TEST_DISABLE_MATRIX_EXT_SSE2
-    if (WineSafe_CreateHook((void*)0x004C23D0, (void*)Hooked_MatTranspose,
+    static const unsigned char kExp_MatTranspose[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0xD9, 0x01 };
+    static const unsigned char kExp_PointXformIP[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x0C, 0x8B, 0x45 };
+    static const unsigned char kExp_VecMatRotate[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x55, 0x10, 0x8B, 0x4D };
+    static const unsigned char kExp_MatFrom3x3[8]   = { 0x55, 0x8B, 0xEC, 0x8B, 0xC1, 0x8B, 0x4D, 0x08 };
+    if (CheckPrologue8((void*)0x004C23D0, kExp_MatTranspose, "CMatrix::Transpose") &&
+        WineSafe_CreateHook((void*)0x004C23D0, (void*)Hooked_MatTranspose,
                             (void**)&pOrigMatTranspose) == MH_OK &&
         WO_EnableHook((void*)0x004C23D0) == MH_OK) {
         Log("[MatrixSSE2] Hooked CMatrix::Transpose at 0x004C23D0 (SSE2 _MM_TRANSPOSE4_PS)");
@@ -1416,25 +3161,28 @@ bool InstallMatrixCopySSE2() {
         Log("[MatrixSSE2] CMatrix::Transpose hook FAILED");
     }
 
-    /*
-    if (WineSafe_CreateHook((void*)0x004C2300, (void*)Hooked_PointXformInPlace,
+    if (CheckPrologue8((void*)0x004C2300, kExp_PointXformIP, "PointTransformInPlace") &&
+        WineSafe_CreateHook((void*)0x004C2300, (void*)Hooked_PointXformInPlace,
                             (void**)&pOrigPointXformIP) == MH_OK &&
         WO_EnableHook((void*)0x004C2300) == MH_OK) {
-        Log("[MatrixSSE2] Hooked PointTransformInPlace at 0x004C2300 (SSE2, 65 callers)");
+        SamplingProfiler::RegisterSelfSymbol("PointXformInPlace_SSE2", (const void*)&Hooked_PointXformInPlace);
+        Log("[MatrixSSE2] Hooked PointTransformInPlace at 0x004C2300 (SSE2 double-precision, verified, 65 callers)");
     } else {
         Log("[MatrixSSE2] PointTransformInPlace hook FAILED");
     }
-    */
 
-    if (WineSafe_CreateHook((void*)0x004C1BF0, (void*)Hooked_Scale3x3,
-                            (void**)&pOrigScale3x3) == MH_OK &&
-        WO_EnableHook((void*)0x004C1BF0) == MH_OK) {
-        Log("[MatrixSSE2] Hooked CMatrix::Scale3x3 at 0x004C1BF0 (SSE2, 37 callers)");
+    if (CheckPrologue8((void*)0x005FED20, kExp_VecMatRotate, "VectorMatrixRotate") &&
+        WineSafe_CreateHook((void*)0x005FED20, (void*)Hooked_VectorMatrixRotate,
+                            (void**)&pOrigVectorMatrixRotate) == MH_OK &&
+        WO_EnableHook((void*)0x005FED20) == MH_OK) {
+        SamplingProfiler::RegisterSelfSymbol("VectorMatrixRotate_SSE2", (const void*)&Hooked_VectorMatrixRotate);
+        Log("[MatrixSSE2] Hooked VectorMatrixRotate at 0x005FED20 (SSE2 double-precision, verified, 7 callers)");
     } else {
-        Log("[MatrixSSE2] CMatrix::Scale3x3 hook FAILED");
+        Log("[MatrixSSE2] VectorMatrixRotate hook FAILED");
     }
 
-    if (WineSafe_CreateHook((void*)0x004C3680, (void*)Hooked_MatFrom3x3,
+    if (CheckPrologue8((void*)0x004C3680, kExp_MatFrom3x3, "CMatrix::From3x3") &&
+        WineSafe_CreateHook((void*)0x004C3680, (void*)Hooked_MatFrom3x3,
                             (void**)&pOrigMatFrom3x3) == MH_OK &&
         WO_EnableHook((void*)0x004C3680) == MH_OK) {
         Log("[MatrixSSE2] Hooked CMatrix::From3x3 at 0x004C3680 (SSE2, 5 callers)");
@@ -1446,7 +3194,9 @@ bool InstallMatrixCopySSE2() {
 #endif
 
 #if !TEST_DISABLE_MATRIX_INVERT_SSE2
-    if (WineSafe_CreateHook((void*)0x004C2FC0, (void*)Hooked_MatInvertRigid,
+    static const unsigned char kExp_MatInvRigid[8] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x48, 0x56, 0x8B };
+    if (CheckPrologue8((void*)0x004C2FC0, kExp_MatInvRigid, "CMatrix::InvertRigid") &&
+        WineSafe_CreateHook((void*)0x004C2FC0, (void*)Hooked_MatInvertRigid,
                             (void**)&pOrigMatInvRigid) == MH_OK &&
         WO_EnableHook((void*)0x004C2FC0) == MH_OK) {
         Log("[MatrixSSE2] Hooked CMatrix::InvertRigid at 0x004C2FC0 (SSE2, ~34 callers)");
@@ -1458,7 +3208,10 @@ bool InstallMatrixCopySSE2() {
 #endif
 
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
-    if (WineSafe_CreateHook((void*)0x004C2120, (void*)Hooked_MatScalarMul,
+    static const unsigned char kExp_MatScalarMul[8]   = { 0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x0C, 0x8B, 0x45 };
+    static const unsigned char kExp_RowAffinePoint[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x0C, 0x8B, 0x55 };
+    if (CheckPrologue8((void*)0x004C2120, kExp_MatScalarMul, "CMatrix::ScalarMul") &&
+        WineSafe_CreateHook((void*)0x004C2120, (void*)Hooked_MatScalarMul,
                             (void**)&pOrigMatScalarMul) == MH_OK &&
         WO_EnableHook((void*)0x004C2120) == MH_OK) {
         Log("[MatrixSSE2] Hooked CMatrix::ScalarMul at 0x004C2120 (SSE2, 4 callers)");
@@ -1466,7 +3219,8 @@ bool InstallMatrixCopySSE2() {
         Log("[MatrixSSE2] CMatrix::ScalarMul hook FAILED");
     }
 
-    if (WineSafe_CreateHook((void*)0x004C2210, (void*)Hooked_RowAffinePoint,
+    if (CheckPrologue8((void*)0x004C2210, kExp_RowAffinePoint, "RowAffinePoint") &&
+        WineSafe_CreateHook((void*)0x004C2210, (void*)Hooked_RowAffinePoint,
                             (void**)&pOrigRowAffinePoint) == MH_OK &&
         WO_EnableHook((void*)0x004C2210) == MH_OK) {
         Log("[MatrixSSE2] Hooked RowAffinePoint at 0x004C2210 (SSE2, 6 callers)");
@@ -1478,15 +3232,185 @@ bool InstallMatrixCopySSE2() {
 #endif
 
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
-    if (WineSafe_CreateHook((void*)0x004C1B30, (void*)Hooked_MatTranslateLocal,
+    static const unsigned char kExp_MatTranslateLocal[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0xD9, 0x41 };
+    if (CheckPrologue8((void*)0x004C1B30, kExp_MatTranslateLocal, "CMatrix::TranslateLocal") &&
+        WineSafe_CreateHook((void*)0x004C1B30, (void*)Hooked_MatTranslateLocal,
                             (void**)&pOrigMatTranslate) == MH_OK &&
         WO_EnableHook((void*)0x004C1B30) == MH_OK) {
-        Log("[MatrixSSE2] Hooked CMatrix::TranslateLocal at 0x004C1B30 (SSE2, 65+ callers)");
+        SamplingProfiler::RegisterSelfSymbol("MatTranslateLocal_SSE2", (const void*)&Hooked_MatTranslateLocal);
+        Log("[MatrixSSE2] Hooked CMatrix::TranslateLocal at 0x004C1B30 (SSE2 double-precision, verified, 65+ callers)");
     } else {
         Log("[MatrixSSE2] CMatrix::TranslateLocal hook FAILED");
     }
 #else
     Log("[MatrixSSE2] CMatrix::TranslateLocal DISABLED via feature flag");
+#endif
+
+    static const unsigned char kExp_BoxScale[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0xC1, 0xD9, 0x00, 0xD9 };
+    if (CheckPrologue8((void*)0x005FECB0, kExp_BoxScale, "CBox::Scale") &&
+        WineSafe_CreateHook((void*)0x005FECB0, (void*)Hooked_BoxScale,
+                            (void**)&pOrigBoxScale) == MH_OK &&
+        WO_EnableHook((void*)0x005FECB0) == MH_OK) {
+        SamplingProfiler::RegisterSelfSymbol("BoxScale_SSE2", (const void*)&Hooked_BoxScale);
+        Log("[MatrixSSE2] Hooked CBox::Scale at 0x005FECB0 (SSE2 double-precision, verified, 7 callers)");
+    } else {
+        Log("[MatrixSSE2] CBox::Scale hook FAILED");
+    }
+
+#if !TEST_DISABLE_MATRIX_ROTATE_SSE2
+    static const unsigned char kExp_MatRotateX[8] = { 0x55, 0x8B, 0xEC, 0xD9, 0x45, 0x08, 0x81, 0xEC };
+    static const unsigned char kExp_MatRotateY[8] = { 0x55, 0x8B, 0xEC, 0xD9, 0x45, 0x08, 0x81, 0xEC };
+    static const unsigned char kExp_MatRotateZ[8] = { 0x55, 0x8B, 0xEC, 0xD9, 0x45, 0x08, 0x81, 0xEC };
+    if (!SelfTestMatrixRotate()) {
+        Log("[MatrixSSE2] SelfTestMatrixRotate FAILED, rotation hooks disabled");
+    } else {
+        if (CheckPrologue8((void*)0x004C3300, kExp_MatRotateX, "CMatrix::RotateX") &&
+            WineSafe_CreateHook((void*)0x004C3300, (void*)Hooked_MatRotateX,
+                                (void**)&pOrigMatRotateX) == MH_OK &&
+            WO_EnableHook((void*)0x004C3300) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatRotateX_SSE2", (const void*)&Hooked_MatRotateX);
+            Log("[MatrixSSE2] Hooked CMatrix::RotateX at 0x004C3300 (SSE2 double-precision, verified, 8 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::RotateX hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C3340, kExp_MatRotateY, "CMatrix::RotateY") &&
+            WineSafe_CreateHook((void*)0x004C3340, (void*)Hooked_MatRotateY,
+                                (void**)&pOrigMatRotateY) == MH_OK &&
+            WO_EnableHook((void*)0x004C3340) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatRotateY_SSE2", (const void*)&Hooked_MatRotateY);
+            Log("[MatrixSSE2] Hooked CMatrix::RotateY at 0x004C3340 (SSE2 double-precision, verified, 9 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::RotateY hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C3380, kExp_MatRotateZ, "CMatrix::RotateZ") &&
+            WineSafe_CreateHook((void*)0x004C3380, (void*)Hooked_MatRotateZ,
+                                (void**)&pOrigMatRotateZ) == MH_OK &&
+            WO_EnableHook((void*)0x004C3380) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatRotateZ_SSE2", (const void*)&Hooked_MatRotateZ);
+            Log("[MatrixSSE2] Hooked CMatrix::RotateZ at 0x004C3380 (SSE2 double-precision, verified, 39 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::RotateZ hook FAILED");
+        }
+    }
+#endif
+
+#if !TEST_DISABLE_MATRIX_OPS_SSE2
+    static const unsigned char kExp_MatMulInPlace[8]    = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x83, 0xEC };
+    static const unsigned char kExp_MatScaleLocal[8]    = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0xD9, 0x00 };
+    static const unsigned char kExp_MatScale3x3[8]      = { 0x55, 0x8B, 0xEC, 0xD9, 0x01, 0xD9, 0x45, 0x08 };
+    static const unsigned char kExp_MatCreateRotateX[8] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10, 0x8D, 0x45 };
+    static const unsigned char kExp_MatCreateRotateY[8] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10, 0x8D, 0x45 };
+    static const unsigned char kExp_MatCreateRotateZ[8] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10, 0x8D, 0x45 };
+    static const unsigned char kExp_MatCreateRotAxis[8] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x18, 0x80, 0x7D };
+    static const unsigned char kExp_MatRotateQuat[8]    = { 0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x80, 0x00, 0x00 };
+    static const unsigned char kExp_Vec3Scale[8]        = { 0x55, 0x8B, 0xEC, 0x8B, 0xC1, 0xD9, 0x00, 0xD9 };
+    static const unsigned char kExp_Vec3InvScale[8]     = { 0x55, 0x8B, 0xEC, 0xD9, 0xE8, 0x8B, 0xC1, 0xD8 };
+
+    if (!SelfTestMatrixOps()) {
+        Log("[MatrixSSE2] SelfTestMatrixOps FAILED, matrix ops hooks disabled");
+    } else {
+        if (CheckPrologue8((void*)0x004C2370, kExp_MatMulInPlace, "CMatrix::MultiplyInPlace") &&
+            WineSafe_CreateHook((void*)0x004C2370, (void*)Hooked_MatMulInPlace,
+                                (void**)&pOrigMatMulInPlace) == MH_OK &&
+            WO_EnableHook((void*)0x004C2370) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatMulInPlace_SSE2", (const void*)&Hooked_MatMulInPlace);
+            Log("[MatrixSSE2] Hooked CMatrix::MultiplyInPlace at 0x004C2370 (SSE2 double-precision, verified, 27 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::MultiplyInPlace hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C1B90, kExp_MatScaleLocal, "CMatrix::ScaleLocal") &&
+            WineSafe_CreateHook((void*)0x004C1B90, (void*)Hooked_MatScaleLocal,
+                                (void**)&pOrigMatScaleLocal) == MH_OK &&
+            WO_EnableHook((void*)0x004C1B90) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatScaleLocal_SSE2", (const void*)&Hooked_MatScaleLocal);
+            Log("[MatrixSSE2] Hooked CMatrix::ScaleLocal at 0x004C1B90 (SSE2 double-precision, verified, 18 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::ScaleLocal hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C1BF0, kExp_MatScale3x3, "CMatrix::Scale3x3") &&
+            WineSafe_CreateHook((void*)0x004C1BF0, (void*)Hooked_MatScale3x3,
+                                (void**)&pOrigMatScale3x3) == MH_OK &&
+            WO_EnableHook((void*)0x004C1BF0) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatScale3x3_SSE2", (const void*)&Hooked_MatScale3x3);
+            Log("[MatrixSSE2] Hooked CMatrix::Scale3x3 at 0x004C1BF0 (SSE2 double-precision, verified, 36 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::Scale3x3 hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C31B0, kExp_MatCreateRotateX, "CMatrix::CreateRotateX") &&
+            WineSafe_CreateHook((void*)0x004C31B0, (void*)Hooked_MatCreateRotateX,
+                                (void**)&pOrigMatCreateRotateX) == MH_OK &&
+            WO_EnableHook((void*)0x004C31B0) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatCreateRotateX_SSE2", (const void*)&Hooked_MatCreateRotateX);
+            Log("[MatrixSSE2] Hooked CMatrix::CreateRotateX at 0x004C31B0 (SSE2 double-precision, verified, 8 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::CreateRotateX hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C3220, kExp_MatCreateRotateY, "CMatrix::CreateRotateY") &&
+            WineSafe_CreateHook((void*)0x004C3220, (void*)Hooked_MatCreateRotateY,
+                                (void**)&pOrigMatCreateRotateY) == MH_OK &&
+            WO_EnableHook((void*)0x004C3220) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatCreateRotateY_SSE2", (const void*)&Hooked_MatCreateRotateY);
+            Log("[MatrixSSE2] Hooked CMatrix::CreateRotateY at 0x004C3220 (SSE2 double-precision, verified, 8 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::CreateRotateY hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C3290, kExp_MatCreateRotateZ, "CMatrix::CreateRotateZ") &&
+            WineSafe_CreateHook((void*)0x004C3290, (void*)Hooked_MatCreateRotateZ,
+                                (void**)&pOrigMatCreateRotateZ) == MH_OK &&
+            WO_EnableHook((void*)0x004C3290) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatCreateRotateZ_SSE2", (const void*)&Hooked_MatCreateRotateZ);
+            Log("[MatrixSSE2] Hooked CMatrix::CreateRotateZ at 0x004C3290 (SSE2 double-precision, verified, 13 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::CreateRotateZ hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C3460, kExp_MatCreateRotAxis, "CMatrix::CreateRotateAxisAngle") &&
+            WineSafe_CreateHook((void*)0x004C3460, (void*)Hooked_MatCreateRotateAxisAngle,
+                                (void**)&pOrigMatCreateRotateAxisAngle) == MH_OK &&
+            WO_EnableHook((void*)0x004C3460) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatCreateRotateAxisAngle_SSE2", (const void*)&Hooked_MatCreateRotateAxisAngle);
+            Log("[MatrixSSE2] Hooked CMatrix::CreateRotateAxisAngle at 0x004C3460 (SSE2 double-precision, verified, 13 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::CreateRotateAxisAngle hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C33C0, kExp_MatRotateQuat, "CMatrix::RotateQuat") &&
+            WineSafe_CreateHook((void*)0x004C33C0, (void*)Hooked_MatRotateQuat,
+                                (void**)&pOrigMatRotateQuat) == MH_OK &&
+            WO_EnableHook((void*)0x004C33C0) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("MatRotateQuat_SSE2", (const void*)&Hooked_MatRotateQuat);
+            Log("[MatrixSSE2] Hooked CMatrix::RotateQuat at 0x004C33C0 (SSE2 double-precision, verified, 4 callers)");
+        } else {
+            Log("[MatrixSSE2] CMatrix::RotateQuat hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C35A0, kExp_Vec3Scale, "Vec3_Scale") &&
+            WineSafe_CreateHook((void*)0x004C35A0, (void*)Hooked_Vec3Scale,
+                                (void**)&pOrigVec3Scale) == MH_OK &&
+            WO_EnableHook((void*)0x004C35A0) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("Vec3Scale_SSE2", (const void*)&Hooked_Vec3Scale);
+            Log("[MatrixSSE2] Hooked Vec3_Scale at 0x004C35A0 (SSE2 double-precision, verified, 2 callers)");
+        } else {
+            Log("[MatrixSSE2] Vec3_Scale hook FAILED");
+        }
+
+        if (CheckPrologue8((void*)0x004C35D0, kExp_Vec3InvScale, "Vec3_InvScale") &&
+            WineSafe_CreateHook((void*)0x004C35D0, (void*)Hooked_Vec3InvScale,
+                                (void**)&pOrigVec3InvScale) == MH_OK &&
+            WO_EnableHook((void*)0x004C35D0) == MH_OK) {
+            SamplingProfiler::RegisterSelfSymbol("Vec3InvScale_SSE2", (const void*)&Hooked_Vec3InvScale);
+            Log("[MatrixSSE2] Hooked Vec3_InvScale at 0x004C35D0 (SSE2 double-precision, verified, 4 callers)");
+        } else {
+            Log("[MatrixSSE2] Vec3_InvScale hook FAILED");
+        }
+    }
 #endif
 
     g_matrixInstalled = true;
@@ -1523,13 +3447,22 @@ void MatrixCopySSE2_LogStats(void) {
         (double)g_matvec3_calls + (double)g_matvec4_calls +
         (double)g_quat2mat_calls + (double)g_quat2matfull_calls +
         (double)g_vec3norm_calls + (double)g_mattranspose_calls +
-        (double)g_scale3x3_calls + (double)g_matfrom3x3_calls +
-        (double)g_pointxformip_calls + (double)g_matinvrigid_calls
+        (double)g_matfrom3x3_calls +
+        (double)g_pointxformip_calls + (double)g_vecmatrotate_calls + (double)g_matinvrigid_calls
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
         + (double)g_matscalarmul_calls
 #endif
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
         + (double)g_mattranslate_calls
+#endif
+        + (double)g_boxscale_calls
+#if !TEST_DISABLE_MATRIX_ROTATE_SSE2
+        + (double)g_matrotate_x_calls + (double)g_matrotate_y_calls + (double)g_matrotate_z_calls
+#endif
+#if !TEST_DISABLE_MATRIX_OPS_SSE2
+        + (double)g_matmul_ip_calls + (double)g_matscale_local_calls + (double)g_scale3x3_calls
+        + (double)g_matcreate_rotx_calls + (double)g_matcreate_roty_calls + (double)g_matcreate_rotz_calls
+        + (double)g_matcreate_rotaxis_calls + (double)g_matrotate_quat_calls + (double)g_vec3_scale_calls + (double)g_vec3_invscale_calls
 #endif
         ;
     if (total == 0.0) {
@@ -1555,10 +3488,20 @@ void MatrixCopySSE2_LogStats(void) {
         g_matProved, g_matFaults,
         g_matArmed ? "armed" : (g_matFaults ? "held on by a catch"
                                             : "still proving"));
-    Log("[MatrixSSE2]   transpose %lu, scale3x3 %lu, from3x3 %lu, "
-        "pointxform-in-place %lu, invert-rigid %lu",
-        g_mattranspose_calls, g_scale3x3_calls, g_matfrom3x3_calls,
-        g_pointxformip_calls, g_matinvrigid_calls);
+    // The same guard on the vector normalise, which a tester profile puts at
+    // 1.89% of executing time on its own.
+    Log("[MatrixSSE2]   normalise guard: %lu call(s) ran under it, it caught %lu, "
+        "and it is %s.",
+        g_normProved, g_normFaults,
+        g_normFaults ? "held on by a catch"
+                     : (g_normProved >= kNormProve ? "off, so the normalise carries "
+                                                     "no exception frame"
+                                                   : "still proving"));
+    Log("[MatrixSSE2]   transpose %lu, from3x3 %lu, "
+        "pointxform-in-place %lu (%lu verified), vecmat-rotate %lu (%lu verified), invert-rigid %lu",
+        g_mattranspose_calls, g_matfrom3x3_calls,
+        g_pointxformip_calls, g_pointxformip_agreements,
+        g_vecmatrotate_calls, g_vecmatrotate_agreements, g_matinvrigid_calls);
     // These two are behind feature flags that are off, so the counters do not
     // exist in this build and neither does a line claiming they are zero.
 #if !TEST_DISABLE_MATRIX_MISC_SSE2
@@ -1566,6 +3509,27 @@ void MatrixCopySSE2_LogStats(void) {
 #endif
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
     Log("[MatrixSSE2]   translate-local %lu", g_mattranslate_calls);
+#endif
+#if !TEST_DISABLE_MATRIX_ROTATE_SSE2
+    Log("[MatrixSSE2]   rotate-x %lu (%lu verified), rotate-y %lu (%lu verified), rotate-z %lu (%lu verified)",
+        g_matrotate_x_calls, g_matrotate_x_agreements,
+        g_matrotate_y_calls, g_matrotate_y_agreements,
+        g_matrotate_z_calls, g_matrotate_z_agreements);
+#endif
+#if !TEST_DISABLE_MATRIX_OPS_SSE2
+    Log("[MatrixSSE2]   mulinplace %lu (%lu verified), scalelocal %lu (%lu verified), scale3x3 %lu (%lu verified)",
+        g_matmul_ip_calls, g_matmul_ip_agreements,
+        g_matscale_local_calls, g_matscale_local_agreements,
+        g_scale3x3_calls, g_scale3x3_agreements);
+    Log("[MatrixSSE2]   create-rotx %lu (%lu verified), create-roty %lu (%lu verified), create-rotz %lu (%lu verified)",
+        g_matcreate_rotx_calls, g_matcreate_rotx_agreements,
+        g_matcreate_roty_calls, g_matcreate_roty_agreements,
+        g_matcreate_rotz_calls, g_matcreate_rotz_agreements);
+    Log("[MatrixSSE2]   rotaxis %lu (%lu verified), rotate-quat %lu (%lu verified), vec3-scale %lu (%lu verified), vec3-invscale %lu (%lu verified)",
+        g_matcreate_rotaxis_calls, g_matcreate_rotaxis_agreements,
+        g_matrotate_quat_calls, g_matrotate_quat_agreements,
+        g_vec3_scale_calls, g_vec3_scale_agreements,
+        g_vec3_invscale_calls, g_vec3_invscale_agreements);
 #endif
 }
 
@@ -1594,10 +3558,11 @@ void ShutdownMatrixCopySSE2() {
 #if !TEST_DISABLE_MATRIX_EXT_SSE2
     MH_DisableHook((void*)0x004C23D0);
     MH_DisableHook((void*)0x004C2300);
-    MH_DisableHook((void*)0x004C1BF0);
+    MH_DisableHook((void*)0x005FED20);
     MH_DisableHook((void*)0x004C3680);
-    Log("[MatrixSSE2] Stats: Transpose=%lu  PointXformIP=%lu  Scale3x3=%lu  From3x3=%lu",
-        g_mattranspose_calls, g_pointxformip_calls, g_scale3x3_calls, g_matfrom3x3_calls);
+    Log("[MatrixSSE2] Stats: Transpose=%lu  PointXformIP=%lu (%lu verified)  VecMatRotate=%lu (%lu verified)  From3x3=%lu",
+        g_mattranspose_calls, g_pointxformip_calls, g_pointxformip_agreements,
+        g_vecmatrotate_calls, g_vecmatrotate_agreements, g_matfrom3x3_calls);
 #endif
 #if !TEST_DISABLE_MATRIX_INVERT_SSE2
     MH_DisableHook((void*)0x004C2FC0);
@@ -1610,7 +3575,42 @@ void ShutdownMatrixCopySSE2() {
 #endif
 #if !TEST_DISABLE_MATRIX_TRANSLATE_SSE2
     MH_DisableHook((void*)0x004C1B30);
-    Log("[MatrixSSE2] Stats: TranslateLocal=%lu", g_mattranslate_calls);
+    Log("[MatrixSSE2] Stats: TranslateLocal=%lu (%lu verified)", g_mattranslate_calls, g_mattranslate_agreements);
+#endif
+    MH_DisableHook((void*)0x005FECB0);
+    Log("[MatrixSSE2] Stats: BoxScale=%lu (%lu verified)", g_boxscale_calls, g_boxscale_agreements);
+#if !TEST_DISABLE_MATRIX_ROTATE_SSE2
+    MH_DisableHook((void*)0x004C3300);
+    MH_DisableHook((void*)0x004C3340);
+    MH_DisableHook((void*)0x004C3380);
+    Log("[MatrixSSE2] Stats: RotateX=%lu (%lu verified)  RotateY=%lu (%lu verified)  RotateZ=%lu (%lu verified)",
+        g_matrotate_x_calls, g_matrotate_x_agreements,
+        g_matrotate_y_calls, g_matrotate_y_agreements,
+        g_matrotate_z_calls, g_matrotate_z_agreements);
+#endif
+#if !TEST_DISABLE_MATRIX_OPS_SSE2
+    MH_DisableHook((void*)0x004C2370);
+    MH_DisableHook((void*)0x004C1B90);
+    MH_DisableHook((void*)0x004C1BF0);
+    MH_DisableHook((void*)0x004C31B0);
+    MH_DisableHook((void*)0x004C3220);
+    MH_DisableHook((void*)0x004C3290);
+    MH_DisableHook((void*)0x004C3460);
+    MH_DisableHook((void*)0x004C33C0);
+    MH_DisableHook((void*)0x004C35A0);
+    MH_DisableHook((void*)0x004C35D0);
+    Log("[MatrixSSE2] Stats: MulInPlace=%lu (%lu verified)  ScaleLocal=%lu (%lu verified)  Scale3x3=%lu (%lu verified)  CreateRotateX=%lu (%lu verified)  CreateRotateY=%lu (%lu verified)  CreateRotateZ=%lu (%lu verified)",
+        g_matmul_ip_calls, g_matmul_ip_agreements,
+        g_matscale_local_calls, g_matscale_local_agreements,
+        g_scale3x3_calls, g_scale3x3_agreements,
+        g_matcreate_rotx_calls, g_matcreate_rotx_agreements,
+        g_matcreate_roty_calls, g_matcreate_roty_agreements,
+        g_matcreate_rotz_calls, g_matcreate_rotz_agreements);
+    Log("[MatrixSSE2] Stats: CreateRotateAxisAngle=%lu (%lu verified)  RotateQuat=%lu (%lu verified)  Vec3Scale=%lu (%lu verified)  Vec3InvScale=%lu (%lu verified)",
+        g_matcreate_rotaxis_calls, g_matcreate_rotaxis_agreements,
+        g_matrotate_quat_calls, g_matrotate_quat_agreements,
+        g_vec3_scale_calls, g_vec3_scale_agreements,
+        g_vec3_invscale_calls, g_vec3_invscale_agreements);
 #endif
 
     Log("[MatrixSSE2] Stats: MatrixCopy=%lu  MatrixIdentity=%lu  MatrixMul=%lu  MatVec3=%lu  MatVec4=%lu",

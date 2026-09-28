@@ -142,6 +142,7 @@
 #include "sampling_profiler.h"
 #include "ab_test.h"
 #include "session_verdict.h"
+#include "self_bench.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -194,6 +195,11 @@ bool g_dead      = false;
 // number, not correctness. The report says the counts are lower bounds.
 unsigned long g_calls    = 0;
 unsigned long g_verified = 0;
+// Timed where the verification already runs both halves on the same
+// input. Nothing else in a session can say whether this replacement is
+// faster than the client code it stands in front of, and one of them in
+// this project turned out not to be.
+int g_benchSlot = -1;
 unsigned long g_unpacked = 0;
 
 constexpr unsigned long kVerifyFirst  = 30000;
@@ -317,11 +323,15 @@ void __cdecl Hooked_TrackQuatBody(void* obj, void* state, void* track,
     if (!g_armed || (g_calls & kResampleMask) == 0) {
         uint32_t saved[6], theirs[6];
         memcpy(saved, out, sizeof(saved));
+        const unsigned long long tA = SelfBench::Now();
         orig_TrackQuat(obj, state, track, out, defQuat);
+        const unsigned long long tB = SelfBench::Now();
         memcpy(theirs, out, sizeof(theirs));
         memcpy(out, saved, sizeof(saved));
 
+        const unsigned long long tC = SelfBench::Now();
         Evaluate(obj, (uint8_t*)state, (uint8_t*)track, out, defQuat);
+        SelfBench::Pair(g_benchSlot, SelfBench::Now() - tC, tB - tA);
         g_verified++;
 
         if (memcmp(out, theirs, sizeof(theirs)) != 0) {
@@ -388,6 +398,16 @@ bool Init() {
     g_scale = _mm_set1_pd((double)scaleF);
     g_one   = _mm_set1_pd(1.0);
 
+    // push ebp / mov ebp, esp / mov edx, [ebp+arg_4] / fldz
+    const unsigned char* p = (const unsigned char*)kTrackQuat;
+    if (p[0] != 0x55 || p[1] != 0x8B || p[2] != 0xEC || p[3] != 0x8B ||
+        p[4] != 0x55 || p[5] != 0x0C || p[6] != 0xD9 || p[7] != 0xEE) {
+        Log("[AnimQuatUnpack] 0x%08X does not start with the prologue this was read "
+            "from (%02X %02X %02X %02X %02X %02X %02X %02X) - not installing",
+            (unsigned)kTrackQuat, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+        return false;
+    }
+
     if (WineSafe_CreateHook((void*)kTrackQuat, (void*)Hooked_TrackQuat,
                             (void**)&orig_TrackQuat) != MH_OK) {
         Log("[AnimQuatUnpack] hook NOT created");
@@ -407,6 +427,7 @@ bool Init() {
 
     g_installed = true;
     SamplingProfiler::RegisterSelfSymbol("AnimQuatUnpack_SSE2", (const void*)&Hooked_TrackQuat);
+    g_benchSlot = SelfBench::Register("AnimQuatUnpack");
     Log("[AnimQuatUnpack] ACTIVE on sub_828680 (0x%08X), the bone rotation track, "
         "run once per animated bone per frame from the largest entry in the "
         "main-thread profile. Each keyframe is four uint16 expanded as v * K - "

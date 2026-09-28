@@ -72,6 +72,7 @@
 #include <emmintrin.h>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 
 #include "quat_lerp_sse2.h"
 #include "MinHook.h"
@@ -79,6 +80,8 @@
 #include "config.h"
 #include "ab_test.h"
 #include "session_verdict.h"
+#include "self_bench.h"
+#include "sampling_profiler.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -113,6 +116,11 @@ constexpr long kResampleMask = 1023;
 
 unsigned long g_calls      = 0;
 unsigned long g_agreements = 0;
+// Timed where the verification already runs both halves on the same input.
+// A replacement nobody has timed against the client is a replacement nobody
+// knows is one; this project already shipped a hash that was slower for its
+// whole life and counted every call as a win.
+int g_benchSlot = -1;
 volatile LONG g_armed      = 0;
 // Set at init when the A/B harness names this module, so the hot path
 // tests a plain bool instead of calling out on every invocation.
@@ -181,6 +189,45 @@ void Retire(const char* why) {
     }
 }
 
+// The guard, and why it comes off.
+//
+// A field session takes 3002320120 interpolations through this hook. Each one
+// ran inside a __try, and a __try region on 32-bit MSVC costs a prologue on
+// every call whether anything faults or not - measured at 2.48 ns elsewhere in
+// this project, which is seven seconds of main thread across a session.
+//
+// What the guard buys is nothing, and that is an argument about memory rather
+// than probability: the three pointers are checked for null above, and when the
+// handler fires control falls through to the client's own routine with the same
+// pointers, which reads the same four floats from each and writes the same four.
+// It cannot succeed where ours faulted. The guard does not recover a fault, it
+// moves it a few instructions later into the client's code.
+//
+// So it is kept until it has proven that. Every call runs under it for the
+// first kLerpProve; if it ever catches anything, that is logged and this stays
+// guarded for the rest of the session.
+constexpr unsigned long kLerpProve = 200000;
+unsigned long g_lerpProved = 0;
+unsigned long g_lerpFaults = 0;
+volatile LONG g_lerpFaultLogged = 0;
+
+__declspec(noinline) static bool LerpGuarded(float* out, float t, const float* a,
+                                             const float* b) {
+    __try {
+        LerpNormalise(out, t, a, b);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++g_lerpFaults;
+        if (InterlockedCompareExchange(&g_lerpFaultLogged, 1, 0) == 0)
+            Log("[QuatLerp] the pointer guard caught a fault in the vector path. It "
+                "stays on for the rest of this session, and the reasoning that it "
+                "never fires is wrong - the module's own note says so.");
+        return false;
+    }
+}
+
+__declspec(noinline) static float* VerifyQuatLerp(float* out, float t, const float* a, const float* b);
+
 float* __cdecl Hooked_QuatLerpBody(float* out, float t, const float* a, const float* b) {
     if (g_dead || !out || !a || !b) return orig_QuatLerp(out, t, a, b);
 
@@ -188,24 +235,35 @@ float* __cdecl Hooked_QuatLerpBody(float* out, float t, const float* a, const fl
     bool verifying = (g_armed == 0) || ((n & kResampleMask) == 0);
 
     if (!verifying) {
-        __try {
-            LerpNormalise(out, t, a, b);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Retire("the vector path faulted");
-            return orig_QuatLerp(out, t, a, b);
+        if (g_lerpFaults || g_lerpProved < kLerpProve) {
+            ++g_lerpProved;
+            if (!LerpGuarded(out, t, a, b)) {
+                Retire("the vector path faulted");
+                return orig_QuatLerp(out, t, a, b);
+            }
+            return out;
         }
+        LerpNormalise(out, t, a, b);
         return out;
     }
 
+    return VerifyQuatLerp(out, t, a, b);
+}
+
+__declspec(noinline) static float* VerifyQuatLerp(float* out, float t, const float* a, const float* b) {
     // While verifying, let the client write its own answer through `out` and put
     // ours somewhere else, then compare. The caller keeps the client's result,
     // so a session spent verifying behaves exactly like an unhooked one.
     float theirs[4];
     float mine[4];
     __try {
+        const unsigned long long tA = SelfBench::Now();
         orig_QuatLerp(out, t, a, b);
+        const unsigned long long tB = SelfBench::Now();
         theirs[0] = out[0]; theirs[1] = out[1]; theirs[2] = out[2]; theirs[3] = out[3];
+        const unsigned long long tC = SelfBench::Now();
         LerpNormalise(mine, t, a, b);
+        SelfBench::Pair(g_benchSlot, SelfBench::Now() - tC, tB - tA);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Retire("the vector path faulted during verification");
         return out;
@@ -262,9 +320,10 @@ float* __cdecl Hooked_QuatLerp(float* out, float t, const float* a, const float*
 bool Init() {
     if (!Config::g_settings.OptQuatLerpSse2) return true;
 
-    unsigned char* p = (unsigned char*)kQuatLerp;
-    if (IsBadReadPtr(p, 8)) {
-        Log("[QuatLerp] 0x%08X unreadable - not installing", (unsigned)kQuatLerp);
+    static const unsigned char kExp_QuatLerp[8] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10, 0x8B, 0x45 };
+    if (IsBadReadPtr((void*)kQuatLerp, 8) ||
+        memcmp((const void*)kQuatLerp, kExp_QuatLerp, 8) != 0) {
+        Log("[QuatLerp] 0x%08X bad prologue or unreadable - not installing", (unsigned)kQuatLerp);
         return false;
     }
 
@@ -286,6 +345,8 @@ bool Init() {
     }
 
     g_installed = true;
+    SamplingProfiler::RegisterSelfSymbol("QuatLerp_SSE2", (const void*)&Hooked_QuatLerp);
+    g_benchSlot = SelfBench::Register("QuatLerp");
     Log("[QuatLerp] ACTIVE on sub_982630, the per-bone quaternion interpolation. "
         "Two components at a time in double rather than one at a time on the "
         "x87 stack, which makes it bit-identical to the client rather than "
@@ -294,6 +355,7 @@ bool Init() {
         "bit patterns, with no tolerance, and one in %d stays checked after "
         "that. A single differing bit disables it for the session.",
         kLearnCalls, (int)(kResampleMask + 1));
+
     return true;
 }
 
@@ -301,10 +363,19 @@ void LogStats() {
     if (!Config::g_settings.OptQuatLerpSse2) return;
     if (!g_installed) { Log("[QuatLerp] not installed - nothing measured"); return; }
     if (g_calls == 0) { Log("[QuatLerp] installed but never called"); return; }
-    Log("[QuatLerp] %lu interpolations, %lu of them compared with the client "
+    Log("[QuatLerp] Lerp: %lu interpolations, %lu of them compared with the client "
         "and bit-identical%s",
         g_calls, g_agreements,
         g_dead ? " - DISABLED" : (g_armed ? "" : " (still verifying)"));
+    // Three states, and the middle one is the interesting one: a session
+    // that ends still proving has not yet dropped the exception frame this
+    // pays on every one of those interpolations.
+    Log("[QuatLerp]   pointer guard: %lu call(s) ran under it, it caught %lu, "
+        "and it is %s.", g_lerpProved, g_lerpFaults,
+        g_lerpFaults ? "held on by a catch"
+                     : (g_lerpProved >= kLerpProve
+                            ? "off, so the vector path carries no exception frame"
+                            : "still proving"));
 }
 
 } // namespace QuatLerpSse2

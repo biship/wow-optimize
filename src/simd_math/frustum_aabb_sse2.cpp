@@ -89,6 +89,11 @@ namespace {
 
 constexpr uintptr_t kIsVisible = 0x009839E0;
 constexpr uintptr_t kThreshold = 0x00AA2E74;
+constexpr uintptr_t kIsInside  = 0x00983A60;
+constexpr uintptr_t kThresholdInside = 0x00A3FDB8;
+constexpr uintptr_t kIsPointVisible = 0x00983D70;
+constexpr uintptr_t kIsSphereVisible = 0x00983D20;
+constexpr uintptr_t kTranslate       = 0x00983AE0;
 
 constexpr int kPlanes = 6;
 
@@ -96,8 +101,46 @@ constexpr int kPlanes = 6;
 typedef int (__fastcall* isVisible_fn)(void* frustum, void* edx, void* aabb);
 isVisible_fn orig_IsVisible = nullptr;
 
+typedef int (__fastcall* isInside_fn)(void* frustum, void* edx, void* aabb);
+isInside_fn orig_IsInside = nullptr;
+
+typedef void (__fastcall* isPointVisible_fn)(void* frustum, void* edx, const float* pt, uint8_t* outMask);
+isPointVisible_fn orig_IsPointVisible = nullptr;
+
+typedef int (__fastcall* isSphereVisible_fn)(void* frustum, void* edx, const float* sphere);
+isSphereVisible_fn orig_IsSphereVisible = nullptr;
+
+typedef const float* (__fastcall* translate_fn)(float* frustum, void* edx, const float* delta);
+translate_fn orig_Translate = nullptr;
+
 bool g_installed = false;
 bool g_armed     = false;
+bool g_insideInstalled = false;
+bool g_insideArmed     = false;
+bool g_insideDead      = false;
+unsigned long g_insideCalls = 0;
+unsigned long g_insideVerified = 0;
+double g_thresholdInside = 0.0;
+
+bool g_pointInstalled = false;
+bool g_pointArmed     = false;
+bool g_pointDead      = false;
+unsigned long g_pointCalls = 0;
+unsigned long g_pointVerified = 0;
+
+bool g_sphereInstalled = false;
+bool g_sphereArmed     = false;
+bool g_sphereDead      = false;
+unsigned long g_sphereCalls    = 0;
+unsigned long g_sphereVerified = 0;
+unsigned long g_sphereCulled   = 0;
+unsigned long g_sphereVisible  = 0;
+
+bool g_transInstalled  = false;
+bool g_transArmed      = false;
+bool g_transDead       = false;
+unsigned long g_transCalls    = 0;
+unsigned long g_transVerified = 0;
 // Set at init when the A/B harness names this module, so the hot path
 // tests a plain bool instead of calling out on every invocation.
 bool g_abSubject = false;
@@ -293,6 +336,86 @@ inline int Evaluate(void* frustum, void* aabb) {
     return 3;
 }
 
+inline int EvaluateInside(void* frustum, void* aabb) {
+    const float* base = (const float*)frustum;
+    const float* mn   = (const float*)aabb;
+    const float* mx   = mn + 3;
+
+    for (int i = 0; i < kPlanes; i++) {
+        const float* pl = base + 4 * i;
+
+        __m128d cxy;
+        double  cz;
+        Corner(mn, mx, pl, &cxy, &cz);
+
+        __m128d pxy  = _mm_cvtps_pd(_mm_castpd_ps(_mm_load_sd((const double*)pl)));
+        __m128d prod = _mm_mul_pd(pxy, cxy);
+
+        double xterm, yterm;
+        _mm_storel_pd(&xterm, prod);
+        _mm_storeh_pd(&yterm, prod);
+
+        double d = (((double)pl[2] * cz + yterm) + xterm) + (double)pl[3];
+
+        if (d > g_thresholdInside) {
+            return 0;
+        }
+    }
+    return 3;
+}
+
+inline void EvaluatePoint(void* frustum, const float* pt, uint8_t* outMask) {
+    const float* base = (const float*)frustum;
+    __m128d pxy_pt = _mm_cvtps_pd(_mm_castpd_ps(_mm_load_sd((const double*)pt)));
+    double  pt_z   = (double)pt[2];
+
+    uint8_t mask = 0;
+    for (int i = 0; i < kPlanes; i++) {
+        const float* pl = base + 4 * i;
+
+        __m128d pxy  = _mm_cvtps_pd(_mm_castpd_ps(_mm_load_sd((const double*)pl)));
+        __m128d prod = _mm_mul_pd(pxy, pxy_pt);
+
+        double xterm, yterm;
+        _mm_storel_pd(&xterm, prod);
+        _mm_storeh_pd(&yterm, prod);
+
+        double d = (((double)pl[2] * pt_z + yterm) + xterm) + (double)pl[3];
+
+        if (d < g_threshold) {
+            mask |= (uint8_t)(1u << i);
+        }
+    }
+    *outMask = mask;
+}
+
+inline int EvaluateSphere(void* frustum, const float* sphere) {
+    const float* base = (const float*)frustum;
+    const double sx = (double)sphere[0];
+    const double sy = (double)sphere[1];
+    const double sz = (double)sphere[2];
+    const double neg_r = -(double)sphere[3];
+
+    for (int i = 0; i < kPlanes; ++i) {
+        const float* pl = base + 4 * i;
+
+        // Matches stock client x87 double-precision accumulation order:
+        // ((nx * sx + nz * sz) + ny * sy) + d
+        const double term_x = (double)pl[0] * sx;
+        const double term_z = (double)pl[2] * sz;
+        const double sum_xz = term_x + term_z;
+        const double term_y = (double)pl[1] * sy;
+        const double sum_xzy = sum_xz + term_y;
+        const double dist = sum_xzy + (double)pl[3];
+
+        if (dist < neg_r) {
+            return 0; // Culled by this plane
+        }
+    }
+
+    return 3; // Visible across all 6 planes
+}
+
 }  // namespace
 
 // The checked path, kept out of line so the hook itself carries no exception
@@ -382,19 +505,251 @@ int __fastcall Hooked_IsVisible(void* frustum, void* edx, void* aabb) {
     return r;
 }
 
+__declspec(noinline)
+static int VerifyAgainstClientInside(void* frustum, void* edx, void* aabb) {
+    int mine;
+    __try {
+        mine = EvaluateInside(frustum, aabb);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return orig_IsInside(frustum, edx, aabb);
+    }
+    int theirs = orig_IsInside(frustum, edx, aabb);
+    g_insideVerified++;
+
+    if (mine != theirs) {
+        g_insideDead = true;
+        Verdict::Add(Verdict::Bad,
+                     "FrustumAabb IsInside disagreed with the client and retired itself");
+        Log("[FrustumAabb] IsInside DISAGREED with client after %lu tests - retired for session "
+            "(client=%d, sse2=%d)", g_insideVerified, theirs, mine);
+        return theirs;
+    }
+    if (!g_insideArmed && g_insideVerified >= kVerifyFirst) {
+        g_insideArmed = true;
+        Log("[FrustumAabb] IsInside armed: %lu tests agreed with client.", g_insideVerified);
+    }
+    return theirs;
+}
+
+int __fastcall Hooked_IsInside(void* frustum, void* edx, void* aabb) {
+    ++g_insideCalls;
+    if (g_insideDead || !frustum || !aabb) return orig_IsInside(frustum, edx, aabb);
+
+    if (!g_insideArmed || (g_insideCalls & kResampleMask) == 0)
+        return VerifyAgainstClientInside(frustum, edx, aabb);
+
+    return EvaluateInside(frustum, aabb);
+}
+
+__declspec(noinline)
+static void VerifyAgainstClientPoint(void* frustum, void* edx, const float* pt, uint8_t* outMask) {
+    uint8_t mine = 0xFF;
+    __try {
+        EvaluatePoint(frustum, pt, &mine);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        orig_IsPointVisible(frustum, edx, pt, outMask);
+        return;
+    }
+    uint8_t theirs = 0xFF;
+    orig_IsPointVisible(frustum, edx, pt, &theirs);
+    *outMask = theirs;
+    g_pointVerified++;
+
+    if (mine != theirs) {
+        g_pointDead = true;
+        Verdict::Add(Verdict::Bad,
+                     "FrustumAabb IsPointVisible disagreed with the client and retired itself");
+        Log("[FrustumAabb] IsPointVisible DISAGREED with client after %lu tests - retired for session "
+            "(client=0x%02X, sse2=0x%02X)", g_pointVerified, (unsigned)theirs, (unsigned)mine);
+        return;
+    }
+    if (!g_pointArmed && g_pointVerified >= kVerifyFirst) {
+        g_pointArmed = true;
+        Log("[FrustumAabb] IsPointVisible armed: %lu tests agreed with client.", g_pointVerified);
+    }
+}
+
+void __fastcall Hooked_IsPointVisible(void* frustum, void* edx, const float* pt, uint8_t* outMask) {
+    ++g_pointCalls;
+    if (g_pointDead || !frustum || !pt || !outMask) {
+        orig_IsPointVisible(frustum, edx, pt, outMask);
+        return;
+    }
+
+    if (!g_pointArmed || (g_pointCalls & kResampleMask) == 0) {
+        VerifyAgainstClientPoint(frustum, edx, pt, outMask);
+        return;
+    }
+
+    EvaluatePoint(frustum, pt, outMask);
+}
+
+__declspec(noinline)
+static int VerifyAgainstClientSphere(void* frustum, void* edx, const float* sphere) {
+    int mine = 0;
+    __try {
+        mine = EvaluateSphere(frustum, sphere);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return orig_IsSphereVisible(frustum, edx, sphere);
+    }
+
+    const int theirs = orig_IsSphereVisible(frustum, edx, sphere);
+    g_sphereVerified++;
+
+    if (mine != theirs) {
+        g_sphereDead = true;
+        Verdict::Add(Verdict::Bad,
+                     "FrustumAabb IsSphereVisible disagreed with the client and retired itself");
+        Log("[FrustumAabb] IsSphereVisible DISAGREED with client after %lu tests - retired for session "
+            "(client=%d, sse2=%d)", g_sphereVerified, theirs, mine);
+        return theirs;
+    }
+
+    if (!g_sphereArmed && g_sphereVerified >= kVerifyFirst) {
+        g_sphereArmed = true;
+        Log("[FrustumAabb] IsSphereVisible armed: %lu tests agreed with client.", g_sphereVerified);
+    }
+
+    return theirs;
+}
+
+int __fastcall Hooked_IsSphereVisible(void* frustum, void* edx, const float* sphere) {
+    ++g_sphereCalls;
+    if (g_sphereDead || !frustum || !sphere) {
+        return orig_IsSphereVisible(frustum, edx, sphere);
+    }
+
+    if (!g_sphereArmed || (g_sphereCalls & kResampleMask) == 0) {
+        const int r = VerifyAgainstClientSphere(frustum, edx, sphere);
+        if (r == 3) ++g_sphereVisible;
+        else ++g_sphereCulled;
+        return r;
+    }
+
+    const int r = EvaluateSphere(frustum, sphere);
+    if (r == 3) ++g_sphereVisible;
+    else ++g_sphereCulled;
+    return r;
+}
+
+inline void EvaluateTranslate(float* frustum, const float* delta) {
+    const double dx = (double)delta[0];
+    const double dy = (double)delta[1];
+    const double dz = (double)delta[2];
+
+    // 8 frustum corners (frustum + 24 to frustum + 47)
+    for (int i = 0; i < 8; ++i) {
+        float* pt = frustum + 24 + i * 3;
+        pt[0] = (float)((double)pt[0] + dx);
+        pt[1] = (float)((double)pt[1] + dy);
+        pt[2] = (float)((double)pt[2] + dz);
+    }
+
+    // 6 frustum planes (frustum + 0 to frustum + 23)
+    // Client sub_983AE0 exact stock x87 accumulation order:
+    // dot = ((Nz * dz) + (Ny * dy)) + (Nx * dx)
+    // new_D = D - dot
+    for (int p = 0; p < 6; ++p) {
+        float* plane = frustum + p * 4;
+        const double nz_dz = (double)plane[2] * dz;
+        const double ny_dy = (double)plane[1] * dy;
+        const double nx_dx = (double)plane[0] * dx;
+        const double dot = (nz_dz + ny_dy) + nx_dx;
+        plane[3] = (float)((double)plane[3] - dot);
+    }
+
+    // 2 center points (frustum + 48 to frustum + 53)
+    for (int i = 0; i < 2; ++i) {
+        float* pt = frustum + 48 + i * 3;
+        pt[0] = (float)((double)pt[0] + dx);
+        pt[1] = (float)((double)pt[1] + dy);
+        pt[2] = (float)((double)pt[2] + dz);
+    }
+}
+
+__declspec(noinline)
+static const float* VerifyAgainstClientTranslate(float* frustum, void* edx, const float* delta) {
+    float theirs[54];
+    float mine[54];
+    memcpy(theirs, frustum, sizeof(theirs));
+    memcpy(mine, frustum, sizeof(mine));
+
+    __try {
+        EvaluateTranslate(mine, delta);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return orig_Translate(frustum, edx, delta);
+    }
+
+    orig_Translate(theirs, edx, delta);
+    g_transVerified++;
+
+    bool same = true;
+    for (int i = 0; i < 54; ++i) {
+        uint32_t bt, bm;
+        memcpy(&bt, &theirs[i], 4);
+        memcpy(&bm, &mine[i], 4);
+        if (bt != bm) {
+            same = false;
+            break;
+        }
+    }
+
+    if (!same) {
+        g_transDead = true;
+        Verdict::Add(Verdict::Bad,
+                     "FrustumAabb Translate disagreed with client and retired itself");
+        Log("[FrustumAabb] Translate DISAGREED with client after %lu calls - retired for session",
+            g_transVerified);
+        memcpy(frustum, theirs, sizeof(theirs));
+        return delta;
+    }
+
+    if (!g_transArmed && g_transVerified >= kVerifyFirst) {
+        g_transArmed = true;
+        Log("[FrustumAabb] Translate armed: %lu calls agreed bit-for-bit with client.", g_transVerified);
+    }
+
+    memcpy(frustum, mine, sizeof(mine));
+    return delta;
+}
+
+const float* __fastcall Hooked_Translate(float* frustum, void* edx, const float* delta) {
+    ++g_transCalls;
+    if (g_transDead || !frustum || !delta) {
+        return orig_Translate(frustum, edx, delta);
+    }
+
+    if (!g_transArmed || (g_transCalls & kResampleMask) == 0) {
+        return VerifyAgainstClientTranslate(frustum, edx, delta);
+    }
+
+    EvaluateTranslate(frustum, delta);
+    return delta;
+}
+
+static inline bool CheckPrologue8(void* addr, const unsigned char expected[8], const char* name) {
+    if (IsBadReadPtr(addr, 8) || memcmp(addr, expected, 8) != 0) {
+        Log("[FrustumAabb] BAD PROLOGUE for %s at 0x%08X", name, (uintptr_t)addr);
+        return false;
+    }
+    return true;
+}
+
 bool Init() {
     if (!Config::g_settings.OptFrustumAabb) return true;
 
-    if (IsBadReadPtr((void*)kIsVisible, 16) || IsBadReadPtr((void*)kThreshold, 4)) {
-        Log("[FrustumAabb] 0x%08X unreadable - not installing", (unsigned)kIsVisible);
+    if (IsBadReadPtr((void*)kThreshold, 4)) {
+        Log("[FrustumAabb] 0x%08X unreadable - not installing", (unsigned)kThreshold);
         return false;
     }
-    // push ebp / mov ebp, esp / sub esp, 8
-    const unsigned char* p = (const unsigned char*)kIsVisible;
-    if (p[0] != 0x55 || p[1] != 0x8B || p[2] != 0xEC || p[3] != 0x83) {
-        Log("[FrustumAabb] 0x%08X does not start with the prologue this was read "
-            "from (%02X %02X %02X %02X) - not installing",
-            (unsigned)kIsVisible, p[0], p[1], p[2], p[3]);
+
+    static const unsigned char kExp_IsVisible[8]       = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B, 0x45 };
+    static const unsigned char kExp_IsInside[8]        = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B, 0x45 };
+    static const unsigned char kExp_IsPointVisible[8]  = { 0x55, 0x8B, 0xEC, 0x8B, 0x55, 0x08, 0x56, 0x8B };
+    static const unsigned char kExp_IsSphereVisible[8] = { 0x55, 0x8B, 0xEC, 0x56, 0x8B, 0x75, 0x08, 0xD9 };
+    static const unsigned char kExp_Translate[8]       = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0xD9, 0x41 };
+
+    if (!CheckPrologue8((void*)kIsVisible, kExp_IsVisible, "CFrustum::IsAABBVisible")) {
         return false;
     }
 
@@ -408,6 +763,54 @@ bool Init() {
     if (WO_EnableHook((void*)kIsVisible) != MH_OK) {
         Log("[FrustumAabb] hook created but could not be enabled");
         return false;
+    }
+
+    if (!IsBadReadPtr((void*)kThresholdInside, 4) &&
+        CheckPrologue8((void*)kIsInside, kExp_IsInside, "CFrustum::IsAABBInside")) {
+        g_thresholdInside = (double)*(const float*)kThresholdInside;
+        if (WineSafe_CreateHook((void*)kIsInside, (void*)Hooked_IsInside,
+                                (void**)&orig_IsInside) == MH_OK) {
+            if (WO_EnableHook((void*)kIsInside) == MH_OK) {
+                g_insideInstalled = true;
+                SamplingProfiler::RegisterSelfSymbol("FrustumInside_SSE2", (const void*)&Hooked_IsInside);
+                Log("[FrustumAabb] ACTIVE on CFrustum::IsAABBInside (0x%08X)", (unsigned)kIsInside);
+            }
+        }
+    }
+
+    if (CheckPrologue8((void*)kIsPointVisible, kExp_IsPointVisible, "CFrustum::IsPointVisible")) {
+        if (WineSafe_CreateHook((void*)kIsPointVisible, (void*)Hooked_IsPointVisible,
+                                (void**)&orig_IsPointVisible) == MH_OK) {
+            if (WO_EnableHook((void*)kIsPointVisible) == MH_OK) {
+                g_pointInstalled = true;
+                SamplingProfiler::RegisterSelfSymbol("FrustumPoint_SSE2", (const void*)&Hooked_IsPointVisible);
+                Log("[FrustumAabb] ACTIVE on CFrustum::IsPointVisible (0x%08X)", (unsigned)kIsPointVisible);
+            }
+        }
+    }
+
+    if (CheckPrologue8((void*)kIsSphereVisible, kExp_IsSphereVisible, "CFrustum::IsSphereVisible")) {
+        if (WineSafe_CreateHook((void*)kIsSphereVisible, (void*)Hooked_IsSphereVisible,
+                                (void**)&orig_IsSphereVisible) == MH_OK) {
+            if (WO_EnableHook((void*)kIsSphereVisible) == MH_OK) {
+                g_sphereInstalled = true;
+                SamplingProfiler::RegisterSelfSymbol("FrustumSphere_SSE2", (const void*)&Hooked_IsSphereVisible);
+                Log("[FrustumAabb] ACTIVE on CFrustum::IsSphereVisible (0x%08X)", (unsigned)kIsSphereVisible);
+            }
+        }
+    }
+
+    if (CheckPrologue8((void*)kTranslate, kExp_Translate, "CFrustum::Translate")) {
+        if (WineSafe_CreateHook((void*)kTranslate, (void*)Hooked_Translate,
+                                (void**)&orig_Translate) == MH_OK) {
+            if (WO_EnableHook((void*)kTranslate) == MH_OK) {
+                g_transInstalled = true;
+                SamplingProfiler::RegisterSelfSymbol("FrustumTranslate_SSE2", (const void*)&Hooked_Translate);
+                Log("[FrustumAabb] ACTIVE on CFrustum::Translate (0x%08X), 560 bytes, "
+                    "translates 10 points and updates 6 plane equations with double-precision SSE2.",
+                    (unsigned)kTranslate);
+            }
+        }
     }
 
     g_abSubject = AbTest::IsSubject("FrustumAabb", &g_abSubject);
@@ -463,10 +866,39 @@ void LogStats() {
         Log("[Wrong] [FrustumAabb] more tests came back visible than were run. "
             "That cannot happen, and it means these two counters are no longer "
             "being counted at the same boundary.");
+
+    if (g_insideInstalled && g_insideCalls > 0) {
+        Log("[FrustumAabb] %lu inside tests, %lu verified against client%s",
+            g_insideCalls, g_insideVerified,
+            g_insideDead ? " - RETIRED on a disagreement" : (g_insideArmed ? "" : " - still verifying"));
+    }
+
+    if (g_pointInstalled && g_pointCalls > 0) {
+        Log("[FrustumAabb] %lu point visibility tests, %lu verified against client%s",
+            g_pointCalls, g_pointVerified,
+            g_pointDead ? " - RETIRED on a disagreement" : (g_pointArmed ? "" : " - still verifying"));
+    }
+
+    if (g_sphereInstalled && g_sphereCalls > 0) {
+        const double culled_pct = 100.0 * (double)g_sphereCulled / (double)g_sphereCalls;
+        Log("[FrustumAabb] %lu sphere visibility tests, %lu culled (%.1f%%), %lu verified against client%s",
+            g_sphereCalls, g_sphereCulled, culled_pct, g_sphereVerified,
+            g_sphereDead ? " - RETIRED on a disagreement" : (g_sphereArmed ? "" : " - still verifying"));
+    }
+
+    if (g_transInstalled && g_transCalls > 0) {
+        Log("[FrustumAabb] %lu translate calls, %lu verified against client%s",
+            g_transCalls, g_transVerified,
+            g_transDead ? " - RETIRED on a disagreement" : (g_transArmed ? "" : " - still verifying"));
+    }
 }
 
 void Shutdown() {
     if (g_installed) MH_DisableHook((void*)kIsVisible);
+    if (g_insideInstalled) MH_DisableHook((void*)kIsInside);
+    if (g_pointInstalled) MH_DisableHook((void*)kIsPointVisible);
+    if (g_sphereInstalled) MH_DisableHook((void*)kIsSphereVisible);
+    if (g_transInstalled) MH_DisableHook((void*)kTranslate);
 }
 
 }  // namespace FrustumAabb

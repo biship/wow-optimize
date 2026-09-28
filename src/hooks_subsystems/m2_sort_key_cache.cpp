@@ -73,6 +73,7 @@
 #include "ab_test.h"
 #include "session_verdict.h"
 #include "high_tables.h"
+#include "self_bench.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -265,16 +266,28 @@ static __declspec(noinline) int CompareGuarded(void* a, void* b) {
     }
 }
 
+// Timed here and nowhere else, because this is the one path that runs both
+// halves on the same input. This module replaces a comparator a profile
+// measured at 2.44% of executing time, and in a later profile the detour itself
+// is 2.88% - which says nothing about whether the cache is faster than the
+// chain it removes, since the two numbers come from different machines. The
+// pair below answers that directly, and costs two rdtsc on a path that was
+// already doing the work twice.
+int g_benchSlot = -1;
+
 static __declspec(noinline) int CompareVerify(void* a, void* b) {
     {
         int mine;
+        const unsigned long long tA = SelfBench::Now();
         __try {
             mine = Compare(a, b);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             ++g_caught;
             return orig_Compare(a, b);
         }
+        const unsigned long long tB = SelfBench::Now();
         int theirs = orig_Compare(a, b);
+        SelfBench::Pair(g_benchSlot, tB - tA, SelfBench::Now() - tB);
         g_verified++;
 
         // The client's comparator is a bool-returning predicate. Both of its
@@ -360,12 +373,9 @@ bool Init() {
         Log("[M2SortKey] 0x%08X unreadable - not installing", (unsigned)kCompare);
         return false;
     }
-    // push ebp / mov ebp, esp / mov eax, [ebp+arg_0]
-    const unsigned char* p = (const unsigned char*)kCompare;
-    if (p[0] != 0x55 || p[1] != 0x8B || p[2] != 0xEC || p[3] != 0x8B) {
-        Log("[M2SortKey] 0x%08X does not start with the prologue this was read "
-            "from (%02X %02X %02X %02X) - not installing",
-            (unsigned)kCompare, p[0], p[1], p[2], p[3]);
+    static const unsigned char kExp_Compare[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x08, 0x8B, 0x01 };
+    if (memcmp((const void*)kCompare, kExp_Compare, 8) != 0) {
+        Log("[M2SortKey] 0x%08X bad prologue - not installing", (unsigned)kCompare);
         return false;
     }
     if (WineSafe_CreateHook((void*)kCompare, (void*)Hooked_Compare,
@@ -387,6 +397,7 @@ bool Init() {
 
     g_installed = true;
     SamplingProfiler::RegisterSelfSymbol("M2SortKey_Compare", (const void*)&Hooked_Compare);
+    g_benchSlot = SelfBench::Register("M2SortKey");
     Log("[M2SortKey] ACTIVE on the render batch comparator (sub_824B70 @ "
         "0x%08X), 2.44%% of executing time in an uncapped tester session - ninth "
         "in the profile, above every Lua entry. It does no arithmetic; it derives "

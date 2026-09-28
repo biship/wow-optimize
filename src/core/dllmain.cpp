@@ -43,16 +43,21 @@
 #include "lua_undump.h"
 #include "anim_lod.h"
 #include "collision_outcode_sse2.h"
+#include "collision_model_cache_sse2.h"
 #include "collision_ray_outcode_sse2.h"
 #include "high_tables.h"
 #include "x87_precision_check.h"
 #include "self_bench.h"
 #include "freeze_catcher.h"
 #include "ray_triangle_sse2.h"
+#include "occluder_sphere_sse2.h"
+#include "m2_anim_find_key_fast.h"
 #include "bone_matrix_upload_sse2.h"
 #include "ui_batch_fill_sse2.h"
 #include "particle_fill_sse2.h"
+#include "lua_vm_fast.h"
 #include "m2_matrix_slot_sse2.h"
+#include "m2_batch_matrix_sse2.h"
 #include "m2_anim_stride.h"
 #include "m2_anim_reuse.h"
 #include "mimalloc_high_arena.h"
@@ -62,9 +67,57 @@
 #include "aabb_overlap_sse2.h"
 #include "anim_quat_unpack_sse2.h"
 #include "anim_vec3_track_sse2.h"
+#include "anim_scalar_track_sse2.h"
+#include "anim_spline_track_sse2.h"
+#include "aabb_transform_sse2.h"
+#include "color_unpack_sse2.h"
 #include "m2_sort_key_cache.h"
+#include "m2_batch_sort.h"
+#include "m2_batch_cmp_transparent.h"
+#include "m2_batch_cmp_solid.h"
+#include "horizon_test_sse2.h"
+#include "m2_skin_proj_fast.h"
+#include "sstr_hash_fast.h"
+#include "reverb_clear_fast.h"
+#include "ui_layout_rect_fast.h"
+#include "ui_strata_overlap_fast.h"
+#include "particle_integrate_fast.h"
+#include "sincos_fast_sse2.h"
+#include "m2_batch_cmp_top.h"
+#include "particle_emitter_active.h"
+#include "collision_face_clip_sse2.h"
+#include "collision_poly_copy_sse2.h"
+#include "mat3_rot_axis_sse2.h"
+#include "m2_mesh_pick_fast.h"
+#include "m2_collision_outcode_sse2.h"
+#include "collision_tri_test.h"
+#include "collision_box_tri.h"
+#include "m2_ray_hit_sort.h"
+#include "terrain_point_outcode_sse2.h"
+#include "collision_bsp_traverse_sse2.h"
+#include "scene_light_grid_sse2.h"
+#include "collision_swept_bsp_sse2.h"
+#include "terrain_chunk_sort_sse2.h"
+#include "collision_frustum_bsp_sse2.h"
+#include "collision_swept_tri_sse2.h"
+#include "scene_entity_collect_fast.h"
+#include "m2_batch_cmp_skin.h"
+#include "collision_bsp_leaf_sse2.h"
+#include "collision_swept_leaf_sse2.h"
+#include "collision_segment_bsp_sse2.h"
+#include "collision_segment_leaf_sse2.h"
+#include "collision_poly_clip_sse2.h"
+#include "sky_texture_reuse.h"
+#include "sky_cloud_texels.h"
+#include "particle_track_eval_sse2.h"
+#include "particle_quad_sse2.h"
+#include "shader_const_dedup_sse2.h"
+#include "batch_colour_convert.h"
+#include "floor_split_sse2.h"
 #include "frustum_aabb_sse2.h"
 #include "segment_aabb_sse2.h"
+#include "world_vis_traverse_sse2.h"
+#include "ui_strata_opt.h"
 #include "runtime_vm/lua_hget_dispatch.h"
 #include "runtime_vm/lua_pool_fast.h"
 #include "anim_census.h"
@@ -113,6 +166,16 @@
 #include "hooks_subsystems/texture_unload_delay.h"
 #include "hooks_subsystems/quality_governor.h"
 #include "hooks_subsystems/spell_effect_culling.h"
+#include "collision_ray_verts_sse2.h"
+#include "fmod_parameq_sse2.h"
+#include "ui_rect_subdivide_sse2.h"
+#include "scene_vis_traverse_sse2.h"
+#include "particle_physics_sse2.h"
+#include "collision_reset_visited.h"
+#include "ui_strata_compact_sse2.h"
+#include "dbc_fast_rle.h"
+#include "pixel_format_blit_sse2.h"
+#include "ui_frame_remove.h"
 
 // Forward declaration - Log() defined later in this file
 extern "C" void Log(const char* fmt, ...);
@@ -813,6 +876,7 @@ void ClearCombatLogCache();
 #include "wow_memory_opt.h"
 #include "sound_mixer_opt.h"
 #include "lua_gc_governor.h"
+#include "lua_gc_pace.h"
 #include "async_tex_loader.h"
 #include "mip_bias_governor.h"
 #include "perf_diagnostics.h"
@@ -1093,60 +1157,44 @@ extern "C" void InvalidateObjVisCacheFor(void* This);
 #endif
 extern "C" void InvalidateUnitApiCacheFor(uint64_t guid);
 
+__declspec(noinline) static void InvalidateForUnlinkNode(void* This) {
+    __try {
+        uint32_t* j = (uint32_t*)This;
+        uint64_t guid = ((uint64_t)j[13] << 32) | j[12];
+        InvalidateUnitApiCacheFor(guid);
+        GuidLookupCache::Invalidate(guid);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 static void* __fastcall Hooked_UnlinkNode(void* This, void* unused) {
     if (This) {
         InvalidateDeferredFieldUpdatesFor(This);
 #if !TEST_DISABLE_OBJ_VIS_CACHE
         InvalidateObjVisCacheFor(This);
 #endif
-        __try {
-            uint32_t* j = (uint32_t*)This;
-            uint64_t guid = ((uint64_t)j[13] << 32) | j[12];
-            InvalidateUnitApiCacheFor(guid);
-            GuidLookupCache::Invalidate(guid);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        InvalidateForUnlinkNode(This);
     }
     void* result = orig_UnlinkNode(This);
     RcuObjMgr::UpdateActiveRcuArray();
     return result;
 }
 
-static void __fastcall Hooked_OnFieldUpdate(void* This, void* unused, int fieldId, int value) {
-    if (This) {
-        __try {
-            uint32_t* j = (uint32_t*)This;
-            uint64_t guid = ((uint64_t)j[13] << 32) | j[12];
-            InvalidateUnitApiCacheFor(guid);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-#if TEST_DISABLE_DEFERRED_FIELD_UPDATES
-    return orig_OnFieldUpdate(This, fieldId, value);
-#else
-    if (LoadingDefrag::IsLoadingActive()) {
-        return orig_OnFieldUpdate(This, fieldId, value);
-    }
+__declspec(noinline) static void InvalidateForFieldUpdate(void* This) {
     __try {
-        // Critical fields (HP, Mana, GUID, Flags, Level) process immediately
-        if (fieldId < 0x40) {
-            if (Config::g_settings.OptWorldStateCoalesce) {
-                if (WorldStateCoalesce::ProcessFieldUpdate(This, fieldId, value, (void*)orig_OnFieldUpdate)) {
-                    return;
-                }
-            }
-            return orig_OnFieldUpdate(This, fieldId, value);
-        }
+        uint32_t* j = (uint32_t*)This;
+        uint64_t guid = ((uint64_t)j[13] << 32) | j[12];
+        InvalidateUnitApiCacheFor(guid);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
 
-        // Process display, mount, and scale fields immediately to prevent model stretching/flickering
-        if (fieldId == 70 || fieldId == 71 || fieldId == 74 || fieldId == 75 || fieldId == 117) {
-            return orig_OnFieldUpdate(This, fieldId, value);
-        }
-
+__declspec(noinline) static bool TryEnqueueFieldUpdate(void* This, int fieldId, int value) {
+    __try {
         AcquireSRWLockExclusive(&g_fieldQueueLock);
         LONG tail = g_fieldTail;
         LONG nextTail = (tail + 1) & FIELD_QUEUE_MASK;
         if (nextTail == g_fieldHead) {
             ReleaseSRWLockExclusive(&g_fieldQueueLock);
-            return orig_OnFieldUpdate(This, fieldId, value); // Queue full
+            return false; // Queue full
         }
 
         g_fieldQueue[tail].fieldId = fieldId;
@@ -1154,27 +1202,72 @@ static void __fastcall Hooked_OnFieldUpdate(void* This, void* unused, int fieldI
         g_fieldQueue[tail].unit = This;
         g_fieldTail = nextTail;
         ReleaseSRWLockExclusive(&g_fieldQueueLock);
-        return;
+        return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void __fastcall Hooked_OnFieldUpdate(void* This, void* unused, int fieldId, int value) {
+    if (This) {
+        InvalidateForFieldUpdate(This);
+    }
+#if TEST_DISABLE_DEFERRED_FIELD_UPDATES
+    return orig_OnFieldUpdate(This, fieldId, value);
+#else
+    if (LoadingDefrag::IsLoadingActive()) {
         return orig_OnFieldUpdate(This, fieldId, value);
+    }
+
+    // Critical fields (HP, Mana, GUID, Flags, Level) process immediately
+    if (fieldId < 0x40) {
+        if (Config::g_settings.OptWorldStateCoalesce) {
+            if (WorldStateCoalesce::ProcessFieldUpdate(This, fieldId, value, (void*)orig_OnFieldUpdate)) {
+                return;
+            }
+        }
+        return orig_OnFieldUpdate(This, fieldId, value);
+    }
+
+    // Process display, mount, and scale fields immediately to prevent model stretching/flickering
+    if (fieldId == 70 || fieldId == 71 || fieldId == 74 || fieldId == 75 || fieldId == 117) {
+        return orig_OnFieldUpdate(This, fieldId, value);
+    }
+
+    if (!TryEnqueueFieldUpdate(This, fieldId, value)) {
+        orig_OnFieldUpdate(This, fieldId, value);
     }
 #endif
 }
 
 extern "C" void InvalidateDeferredFieldUpdatesFor(void* unit) {
 #if !TEST_DISABLE_DEFERRED_FIELD_UPDATES
-    if (!unit) return;
+    if (unit == nullptr) return;
+
     AcquireSRWLockExclusive(&g_fieldQueueLock);
     LONG head = g_fieldHead;
     LONG tail = g_fieldTail;
+
     while (head != tail) {
         if (g_fieldQueue[head].unit == unit) {
             g_fieldQueue[head].unit = nullptr;
         }
         head = (head + 1) & FIELD_QUEUE_MASK;
     }
+
     ReleaseSRWLockExclusive(&g_fieldQueueLock);
 #endif
+}
+
+__declspec(noinline) static void SafeDispatchDeferredFieldUpdate(void* unit, int fieldId, int value) {
+    __try {
+        uintptr_t p = (uintptr_t)unit;
+        if (p > 0x10000 && p < 0x7FFE0000) {
+            orig_OnFieldUpdate(unit, fieldId, value);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        // Unit was freed - safe to ignore
+    }
 }
 
 static void FlushFieldUpdates() {
@@ -1182,13 +1275,18 @@ static void FlushFieldUpdates() {
     // Thread safety: Flush must only run on the main thread
     if (g_mainThreadId != 0 && GetCurrentThreadId() != g_mainThreadId) return;
 
-    static constexpr int TEMP_SIZE = 4096;
-    static FieldTask tempQueue[TEMP_SIZE];
+    // If not locked quickly, skip this frame to prevent hitching
+    if (!TryAcquireSRWLockExclusive(&g_fieldQueueLock)) {
+        return;
+    }
+
+    constexpr int TEMP_SIZE = 256;
+    FieldTask tempQueue[TEMP_SIZE];
     int tempCount = 0;
 
-    AcquireSRWLockExclusive(&g_fieldQueueLock);
     LONG head = g_fieldHead;
     LONG tail = g_fieldTail;
+
     if (head == tail) {
         ReleaseSRWLockExclusive(&g_fieldQueueLock);
         return;
@@ -1209,14 +1307,7 @@ static void FlushFieldUpdates() {
     for (int i = 0; i < tempCount; i++) {
         void* unit = tempQueue[i].unit;
         if (unit != nullptr) {
-            __try {
-                uintptr_t p = (uintptr_t)unit;
-                if (p > 0x10000 && p < 0xFFE00000) {
-                    orig_OnFieldUpdate(unit, tempQueue[i].fieldId, tempQueue[i].value);
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                // Unit was freed - safe to ignore
-            }
+            SafeDispatchDeferredFieldUpdate(unit, tempQueue[i].fieldId, tempQueue[i].value);
         }
     }
 #endif
@@ -1227,12 +1318,26 @@ static bool InstallFieldUpdateHook() {
     Log("Deferred field updates: DISABLED (test toggle)");
     return false;
 #else
-    // Both of these used to return false without a word, so the log showed this
-    // module's section header and then nothing at all. A tester crashed 0x1A0
-    // bytes from this hook's target and the log gave no way to tell whether the
-    // hook was even installed - which is the one thing needed to rule it in or
-    // out. Same shape as the Lua bytecode cache, found the same day.
     void* target = (void*)0x006A3C40;
+    void* unlink_target = (void*)0x004D4C20;
+
+    if (!WowOpt_ClientPatchAllowed(target) || !WowOpt_ClientPatchAllowed(unlink_target)) {
+        Log("Deferred field updates: NOT active - client patches disallowed by policy");
+        return false;
+    }
+
+    static const unsigned char kExp_OnFieldUpdate[8] = { 0x55, 0x8B, 0xEC, 0x53, 0x8B, 0x5D, 0x0C, 0x56 };
+    static const unsigned char kExp_UnlinkNode[8]    = { 0x56, 0x8D, 0x41, 0x08, 0x57, 0x8B, 0x38, 0x85 };
+
+    if (IsBadReadPtr(target, 8) || memcmp(target, kExp_OnFieldUpdate, 8) != 0) {
+        Log("Deferred field updates: NOT active - bad prologue at 0x006A3C40");
+        return false;
+    }
+    if (IsBadReadPtr(unlink_target, 8) || memcmp(unlink_target, kExp_UnlinkNode, 8) != 0) {
+        Log("Deferred field updates: NOT active - bad prologue at 0x004D4C20");
+        return false;
+    }
+
     MH_STATUS st = WineSafe_CreateHook(target, (void*)Hooked_OnFieldUpdate,
                                        (void**)&orig_OnFieldUpdate);
     if (st != MH_OK) {
@@ -1249,7 +1354,6 @@ static bool InstallFieldUpdateHook() {
         return false;
     }
 
-    void* unlink_target = (void*)0x004D4C20;
     if (WineSafe_CreateHook(unlink_target, (void*)Hooked_UnlinkNode, (void**)&orig_UnlinkNode) == MH_OK) {
         WO_EnableHook(unlink_target);
     }
@@ -2235,6 +2339,7 @@ static void MainThreadPump() {
 #if !TEST_DISABLE_LUA_GC_GOVERNOR
         LuaGCGovernor::OnFrame(elapsedMs);
 #endif
+        LuaGcPace::OnFrame();
 #if !TEST_DISABLE_ADAPTIVE_FARCLIP
     #endif
 #if !TEST_DISABLE_NET_ADDON_COALESCER
@@ -4692,7 +4797,22 @@ static void DetectMultiClient() {
 
 // 10. System timer resolution.
 //
+// This is the one setting here that reaches outside the game. Windows keeps a
+// single platform timer period and hands out the smallest anyone asked for, so
+// while this process is alive the whole machine ticks at the rate below, and
+// tools that display it show 0.5 ms with the game running. That costs idle
+// power, which a player on a laptop notices and has every right to refuse.
+//
+// It ran unconditionally and had no switch of any kind, so a tester who saw it
+// and did not want it had nothing to untick. It has one now, defaulting on
+// because that is what everyone has been running.
 static void SetHighTimerResolution() {
+    if (!Config::g_settings.OptTimerResolution) {
+        Log("Timer resolution: left alone - TimerResolution is off, so the system "
+            "timer keeps whatever period Windows or another process set. Frame "
+            "pacing and the sleep hook are coarser for it; that is the trade.");
+        return;
+    }
     typedef LONG (WINAPI* NtSetTimerRes_fn)(ULONG, BOOLEAN, PULONG);
     HMODULE h = GetModuleHandleA("ntdll.dll");
     if (!h) return;
@@ -5625,6 +5745,7 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("CrashDumper::FirstChanceSummary", CrashDumper::ReportFirstChanceSummary());
     STAT_TIME("PerfDiagnostics::LogStats", PerfDiagnostics::LogStats());
     STAT_TIME("LuaGCGovernor::LogStats", LuaGCGovernor::LogStats());
+    STAT_TIME("LuaGcPace::LogStats", LuaGcPace::LogStats());
     STAT_TIME("LuaMemPoolFast::LogStats", LuaMemPoolFast::LogStats());
     STAT_TIME("HeapCompactor_LogStats", HeapCompactor_LogStats());
     STAT_TIME("VertexFmtInline::LogStats", VertexFmtInline::LogStats());
@@ -5637,17 +5758,21 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("LuaBytecodeStore::SaveIfDirty", LuaBytecodeStore::SaveIfDirty());
     STAT_TIME("AnimLod::LogStats", AnimLod::LogStats());
     STAT_TIME("CollisionOutcode::LogStats", CollisionOutcode::LogStats());
+    STAT_TIME("CollisionModelCache::LogStats", CollisionModelCache::LogStats());
     STAT_TIME("CollisionRayOutcode::LogStats", CollisionRayOutcode::LogStats());
     STAT_TIME("HighTables::LogStats", HighTables::LogStats());
     STAT_TIME("X87Precision::LogStats", X87Precision::LogStats());
     STAT_TIME("SelfBench::LogStats", SelfBench::LogStats());
     STAT_TIME("FreezeCatcher::LogStats", FreezeCatcher::LogStats());
     STAT_TIME("RayTriangle::LogStats", RayTriangle::LogStats());
+    STAT_TIME("OccluderSphere::LogStats", OccluderSphere::LogStats());
+    STAT_TIME("M2AnimFindKey::LogStats", M2AnimFindKey::LogStats());
     STAT_TIME("ObjMgrEnumFast::LogStats", ObjMgrEnumFast::LogStats());
     STAT_TIME("MpqOpenCensus::LogStats", MpqOpenCensus::LogStats());
     STAT_TIME("BoneMatrixUpload::LogStats", BoneMatrixUpload::LogStats());
     STAT_TIME("UiBatchFill::LogStats", UiBatchFill::LogStats());
     STAT_TIME("ParticleFill::LogStats", ParticleFill::LogStats());
+    STAT_TIME("LuaVmFast::LogStats", LuaVmFast::LogStats());
     STAT_TIME("M2MatrixSlot::LogStats", M2MatrixSlot::LogStats());
     STAT_TIME("M2AnimStride::LogStats", M2AnimStride::LogStats());
     STAT_TIME("M2AnimReuse::LogStats", M2AnimReuse::LogStats());
@@ -5655,9 +5780,69 @@ static void DumpPeriodicStats(const char* why, bool atProcessExit) {
     STAT_TIME("HighPlacement::LogStats", HighPlacement::LogStats());
     STAT_TIME("ClientWriteBatch::LogStats", ClientWriteBatch::LogStats());
     STAT_TIME("AabbOverlap::LogStats", AabbOverlap::LogStats());
+    STAT_TIME("AabbTransform::LogStats", AabbTransform::LogStats());
+    STAT_TIME("ColorUnpack::LogStats", ColorUnpack::LogStats());
     STAT_TIME("AnimQuatUnpack::LogStats", AnimQuatUnpack::LogStats());
     STAT_TIME("AnimVec3Track::LogStats", AnimVec3Track::LogStats());
+    STAT_TIME("AnimScalarTrack::LogStats", AnimScalarTrack::LogStats());
+    STAT_TIME("AnimSplineTrack::LogStats", AnimSplineTrack::LogStats());
     STAT_TIME("M2SortKey::LogStats", M2SortKey::LogStats());
+    STAT_TIME("M2BatchSort::LogStats", M2BatchSort::LogStats());
+    STAT_TIME("M2BatchCmpTransparent::LogStats", M2BatchCmpTransparent::LogStats());
+    STAT_TIME("M2BatchCmpSolid::LogStats", M2BatchCmpSolid::LogStats());
+    STAT_TIME("HorizonTestSSE2::LogStats", HorizonTestSSE2::LogStats());
+    STAT_TIME("M2SkinProjFast::LogStats", M2SkinProjFast::LogStats());
+    STAT_TIME("SStrHashFast::LogStats", SStrHashFast::LogStats());
+    STAT_TIME("ReverbClearFast::LogStats", ReverbClearFast::LogStats());
+    STAT_TIME("UILayoutRectFast::LogStats", UILayoutRectFast::LogStats());
+    STAT_TIME("UIStrataOverlapFast::LogStats", UIStrataOverlapFast::LogStats());
+    STAT_TIME("ParticleIntegrateFast::LogStats", ParticleIntegrateFast::LogStats());
+    STAT_TIME("FastSinCos::LogStats", FastSinCos::LogStats());
+    STAT_TIME("M2BatchCmpTop::LogStats", M2BatchCmpTop::LogStats());
+    STAT_TIME("ParticleEmitterActive::LogStats", ParticleEmitterActive::LogStats());
+    STAT_TIME("CollisionFaceClip::LogStats", CollisionFaceClip::LogStats());
+    STAT_TIME("CollisionPolyCopy::LogStats", CollisionPolyCopy::LogStats());
+    STAT_TIME("Mat3RotAxis::LogStats", Mat3RotAxis::LogStats());
+    STAT_TIME("M2MeshPickFast::LogStats", M2MeshPickFast::LogStats());
+    STAT_TIME("M2CollisionOutcode::LogStats", M2CollisionOutcode::LogStats());
+    STAT_TIME("CollisionTriTest::LogStats", CollisionTriTest::LogStats());
+    STAT_TIME("CollisionBoxTri::LogStats", CollisionBoxTri::LogStats());
+    STAT_TIME("M2RayHitSort::LogStats", M2RayHitSort::LogStats());
+    STAT_TIME("TerrainPointOutcode::LogStats", TerrainPointOutcode::LogStats());
+    STAT_TIME("CollisionBspTraverse::LogStats", CollisionBspTraverse::LogStats());
+    STAT_TIME("SceneLightGrid::LogStats", SceneLightGrid::LogStats());
+    STAT_TIME("CollisionSweptBsp::LogStats", CollisionSweptBsp::LogStats());
+    STAT_TIME("TerrainChunkSort::LogStats", TerrainChunkSort::LogStats());
+    STAT_TIME("CollisionFrustumBsp::LogStats", CollisionFrustumBsp::LogStats());
+    STAT_TIME("CollisionSweptTri::LogStats", CollisionSweptTri::LogStats());
+    STAT_TIME("SceneEntityCollect::LogStats", SceneEntityCollect::LogStats());
+    STAT_TIME("M2BatchCmpSkin::LogStats", M2BatchCmpSkin::LogStats());
+    STAT_TIME("CollisionBspLeaf::LogStats", CollisionBspLeaf::LogStats());
+    STAT_TIME("CollisionSweptLeaf::LogStats", CollisionSweptLeaf::LogStats());
+    STAT_TIME("CollisionSegmentBsp::LogStats", CollisionSegmentBsp::LogStats());
+    STAT_TIME("CollisionSegmentLeaf::LogStats", CollisionSegmentLeaf::LogStats());
+    STAT_TIME("CollisionPolyClip::LogStats", CollisionPolyClip::LogStats());
+    STAT_TIME("SkyTextureReuse::LogStats", SkyTextureReuse::LogStats());
+    STAT_TIME("WorldVisTraverse::LogStats", WorldVisTraverse::LogStats());
+    STAT_TIME("UIStrataOpt::LogStats", UIStrataOpt::LogStats());
+    STAT_TIME("LuaErrorDiag::LogStats", LuaErrorDiagLogStats());
+    STAT_TIME("ParticleTrackEval::LogStats", ParticleTrackEval::LogStats());
+    STAT_TIME("ShaderConstDedup::LogStats", ShaderConstDedup::LogStats());
+    STAT_TIME("BatchColourConvert::LogStats", BatchColourConvert::LogStats());
+    STAT_TIME("SpellEffectCulling::LogStats", SpellEffectCulling::LogStats());
+    STAT_TIME("CollisionRayVerts::LogStats", CollisionRayVerts::LogStats());
+    STAT_TIME("FmodParamEq::LogStats", FmodParamEq::LogStats());
+    STAT_TIME("UIRectSubdivide::LogStats", UIRectSubdivide::LogStats());
+    STAT_TIME("SceneVisTraverse::LogStats", SceneVisTraverse::LogStats());
+    STAT_TIME("ParticlePhysics::LogStats", ParticlePhysics::LogStats());
+    STAT_TIME("CollisionResetVisited::LogStats", CollisionResetVisited::LogStats());
+    STAT_TIME("UIStrataCompact::LogStats", UIStrataCompact::LogStats());
+    STAT_TIME("DbcFastRle::LogStats", DbcFastRle::LogStats());
+    STAT_TIME("PixelFormatBlit::LogStats", PixelFormatBlit::LogStats());
+    STAT_TIME("UIFrameRemove::LogStats", UIFrameRemove::LogStats());
+    STAT_TIME("ParticleQuad::LogStats", ParticleQuad::LogStats());
+    STAT_TIME("FloorSplit::LogStats", FloorSplit::LogStats());
+    STAT_TIME("SkyCloudTexels::LogStats", SkyCloudTexels::LogStats());
     STAT_TIME("FrustumAabb::LogStats", FrustumAabb::LogStats());
     STAT_TIME("SegmentAabb::LogStats", SegmentAabb::LogStats());
     STAT_TIME("LuaHGetDispatch::LogStats", LuaHGetDispatch::LogStats());
@@ -8437,28 +8622,91 @@ static DWORD WINAPI MainThread(LPVOID param) {
     LuaBytecodeStore::Init();
     AnimLod::Init();
     CollisionOutcode::Init();
+    CollisionModelCache::Init();
     X87Precision::Sample("at DLL init");
     CollisionRayOutcode::Init();
     RayTriangle::Init();
+    OccluderSphere::Init();
+    M2AnimFindKey::Init();
     BoneMatrixUpload::Init();
     UiBatchFill::Init();
     ParticleFill::Init();
+    LuaVmFast::Init();
 
     Log("--- M2 Matrix Slot Copy (SSE2) ---");
     M2MatrixSlot::Install();
+    Log("--- M2 Batch Matrix Setup (SSE2) ---");
+    M2BatchMatrix::Install();
 
     Log("--- M2 Animation Stride ---");
     M2AnimStride::Install();
     M2AnimReuse::Init();
     CameraReplay::Init();
     AabbOverlap::Init();
+    AabbTransform::Init();
+    ColorUnpack::Init();
     AnimQuatUnpack::Init();
     AnimVec3Track::Init();
+    AnimScalarTrack::Init();
+    AnimSplineTrack::Init();
     M2SortKey::Init();
+    M2BatchSort::Init();
+    M2BatchCmpTransparent::Init();
+    M2BatchCmpSolid::Init();
+    HorizonTestSSE2::Init();
+    M2SkinProjFast::Init();
+    SStrHashFast::Init();
+    ReverbClearFast::Init();
+    UILayoutRectFast::Init();
+    UIStrataOverlapFast::Init();
+    ParticleIntegrateFast::Init();
+    FastSinCos::Init();
+    M2BatchCmpTop::Init();
+    ParticleEmitterActive::Init();
+    CollisionFaceClip::Init();
+    CollisionPolyCopy::Init();
+    Mat3RotAxis::Init();
+    M2MeshPickFast::Init();
+    M2CollisionOutcode::Init();
+    CollisionTriTest::Init();
+    CollisionBoxTri::Init();
+    M2RayHitSort::Init();
+    TerrainPointOutcode::Init();
+    CollisionBspTraverse::Init();
+    SceneLightGrid::Init();
+    CollisionSweptBsp::Init();
+    CollisionFrustumBsp::Init();
+    CollisionSweptTri::Init();
+    SceneEntityCollect::Init();
+    M2BatchCmpSkin::Init();
+    CollisionBspLeaf::Init();
+    CollisionSweptLeaf::Init();
+    CollisionSegmentBsp::Init();
+    CollisionSegmentLeaf::Init();
+    CollisionPolyClip::Init();
+    SkyTextureReuse::Init();
+    WorldVisTraverse::Init();
+    UIStrataOpt::Init();
+    ParticleTrackEval::Init();
+    ShaderConstDedup::Init();
+    BatchColourConvert::Init();
+    FloorSplit::Init();
+    SkyCloudTexels::Init();
     FrustumAabb::Init();
     SegmentAabb::Init();
     LuaHGetDispatch::Init();
     LuaPoolFast::Init();
+    CollisionRayVerts::Init();
+    FmodParamEq::Init();
+    UIRectSubdivide::Init();
+    SceneVisTraverse::Init();
+    ParticlePhysics::Init();
+    CollisionResetVisited::Init();
+    UIStrataCompact::Init();
+    DbcFastRle::Init();
+    PixelFormatBlit::Init();
+    UIFrameRemove::Init();
+    ParticleQuad::Init();
 
     Log("--- UnitAura Fast Path ---");
 #if !TEST_DISABLE_UNIT_AURA_FAST
@@ -8566,7 +8814,10 @@ static DWORD WINAPI MainThread(LPVOID param) {
     CrashDumper::RegisterFeature("Vec3CrossSSE2");
     CrashDumper::RegisterFeature("IsSphereVisibleSSE2");
     CrashDumper::RegisterFeature("FromAngleAxisSSE2");
-    CrashDumper::RegisterFeature("QuatSlerpSSE2");
+    // QuatSlerpSSE2 was registered here. The detour on 0x00982460 is gone - it
+    // drifted from the client because the client's own slerp goes through the
+    // CRT's atan2 and sin - so a registration for it would name a feature that
+    // cannot run, which is what the feature table is meant to stop doing.
     CrashDumper::RegisterFeature("FrameAccessorFast");
     CrashDumper::RegisterFeature("LayoutAccessorFast");
 #else
@@ -9481,6 +9732,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("");
     Log("--- Adaptive Lua GC Governor ---");
     if (Config::g_settings.OptLuaGcCoalesce) LuaGCGovernor::Init();
+    LuaGcPace::Init();
 
     Log("");
     Log("--- Adaptive Farclip Controller ---");
@@ -11535,9 +11787,64 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             BoneMatrixUpload::Shutdown();
             UiBatchFill::Shutdown();
             ParticleFill::Shutdown();
+            M2BatchSort::Shutdown();
+            M2BatchCmpTransparent::Shutdown();
+            M2BatchCmpSolid::Shutdown();
+            HorizonTestSSE2::Shutdown();
+            M2SkinProjFast::Shutdown();
+            SStrHashFast::Shutdown();
+            ReverbClearFast::Shutdown();
+            UILayoutRectFast::Shutdown();
+            UIStrataOverlapFast::Shutdown();
+            ParticleIntegrateFast::Shutdown();
+            FastSinCos::Shutdown();
+            M2BatchCmpTop::Shutdown();
+            ParticleEmitterActive::Shutdown();
+            CollisionFaceClip::Shutdown();
+            CollisionPolyCopy::Shutdown();
+            Mat3RotAxis::Shutdown();
+            M2MeshPickFast::Shutdown();
+            M2CollisionOutcode::Shutdown();
+            CollisionTriTest::Shutdown();
+            CollisionBoxTri::Shutdown();
+            M2RayHitSort::Shutdown();
+            TerrainPointOutcode::Shutdown();
+            CollisionBspTraverse::Shutdown();
+            SceneLightGrid::Shutdown();
+            CollisionSweptBsp::Shutdown();
+            CollisionFrustumBsp::Shutdown();
+            CollisionSweptTri::Shutdown();
+            SceneEntityCollect::Shutdown();
+            M2BatchCmpSkin::Shutdown();
+            CollisionPolyClip::Shutdown();
+            SkyTextureReuse::Shutdown();
+            WorldVisTraverse::Shutdown();
+            UIStrataOpt::Shutdown();
+            ParticleTrackEval::Shutdown();
+            ShaderConstDedup::Shutdown();
+            BatchColourConvert::Shutdown();
+            FloorSplit::Shutdown();
+            SkyCloudTexels::Shutdown();
+            CollisionRayVerts::Shutdown();
+            FmodParamEq::Shutdown();
+            UIRectSubdivide::Shutdown();
+            SceneVisTraverse::Shutdown();
+            ParticlePhysics::Shutdown();
+            CollisionResetVisited::Shutdown();
+            UIStrataCompact::Shutdown();
+            DbcFastRle::Shutdown();
+            PixelFormatBlit::Shutdown();
+            UIFrameRemove::Shutdown();
+            ParticleQuad::Shutdown();
+            LuaVmFast::Shutdown();
             CollisionRayOutcode::Shutdown();
             RayTriangle::Shutdown();
             M2MatrixSlot::Shutdown();
+            M2BatchMatrix::Shutdown();
+            AnimScalarTrack::Shutdown();
+            AnimSplineTrack::Shutdown();
+            AabbTransform::Shutdown();
+            ColorUnpack::Shutdown();
             M2AnimStride::Shutdown();
             M2AnimReuse::Shutdown();
             SamplingProfiler::Shutdown();
@@ -11616,11 +11923,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             WorldStateCoalesce::Shutdown();
             SoundMixerOpt::Shutdown();
             LuaGCGovernor::Shutdown();
+            LuaGcPace::Shutdown();
             AdaptiveFarclip::Shutdown();
             FontGlyphCache::Shutdown();
             CombatLogFilter::Shutdown();
             SoundVolumeLimit::Shutdown();
             TerrainHeightCache::Shutdown();
+            HorizonOcclusion::Shutdown();
             QualityGovernor::Shutdown();
             ReportHotFunctionStats();
             CrashDumper::ReportFeatureActivity();

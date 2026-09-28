@@ -96,6 +96,7 @@
 #include "sampling_profiler.h"
 #include "ab_test.h"
 #include "session_verdict.h"
+#include "self_bench.h"
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -143,6 +144,11 @@ bool g_dead      = false;
 // than correctness. The report says the counts are lower bounds.
 unsigned long g_calls    = 0;
 unsigned long g_verified = 0;
+// Timed where the verification already runs both halves on the same
+// input. Nothing else in a session can say whether this replacement is
+// faster than the client code it stands in front of, and one of them in
+// this project turned out not to be.
+int g_benchSlot = -1;
 unsigned long g_lerps    = 0;
 unsigned long g_blends   = 0;
 
@@ -257,11 +263,15 @@ void __cdecl Hooked_VecTrackBody(void* obj, void* state, void* track,
     if (!g_armed || (g_calls & kResampleMask) == 0) {
         uint32_t saved[5], theirs[5];
         memcpy(saved, out, sizeof(saved));
+        const unsigned long long tA = SelfBench::Now();
         orig_VecTrack(obj, state, track, out, defVec);
+        const unsigned long long tB = SelfBench::Now();
         memcpy(theirs, out, sizeof(theirs));
         memcpy(out, saved, sizeof(saved));
 
+        const unsigned long long tC = SelfBench::Now();
         Evaluate(obj, (uint8_t*)state, (uint8_t*)track, out, defVec);
+        SelfBench::Pair(g_benchSlot, SelfBench::Now() - tC, tB - tA);
         g_verified++;
 
         if (memcmp(out, theirs, sizeof(theirs)) != 0) {
@@ -312,12 +322,9 @@ bool Init() {
         Log("[AnimVec3Track] 0x%08X unreadable - not installing", (unsigned)kVecTrack);
         return false;
     }
-    // push ebp / mov ebp, esp / mov edx, [ebp+arg_4]
-    const unsigned char* p = (const unsigned char*)kVecTrack;
-    if (p[0] != 0x55 || p[1] != 0x8B || p[2] != 0xEC || p[3] != 0x8B) {
-        Log("[AnimVec3Track] 0x%08X does not start with the prologue this was read "
-            "from (%02X %02X %02X %02X) - not installing",
-            (unsigned)kVecTrack, p[0], p[1], p[2], p[3]);
+    static const unsigned char kExp_VecTrack[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x55, 0x0C, 0x0F, 0xB7 };
+    if (memcmp((const void*)kVecTrack, kExp_VecTrack, 8) != 0) {
+        Log("[AnimVec3Track] BAD PROLOGUE for AnimVec3Track at 0x%08X", (unsigned)kVecTrack);
         return false;
     }
     if (WineSafe_CreateHook((void*)kVecTrack, (void*)Hooked_VecTrack,
@@ -339,6 +346,7 @@ bool Init() {
 
     g_installed = true;
     SamplingProfiler::RegisterSelfSymbol("AnimVec3Track_SSE2", (const void*)&Hooked_VecTrack);
+    g_benchSlot = SelfBench::Register("AnimVec3Track");
     Log("[AnimVec3Track] ACTIVE on sub_82B0A0 (0x%08X), the vector animation "
         "track. Eight call sites, six of them inside the largest entry in the "
         "main-thread profile, against one for the quaternion track already "

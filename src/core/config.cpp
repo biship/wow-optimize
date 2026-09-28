@@ -31,6 +31,7 @@ struct BoolSetting {
 
 static const BoolSetting kBoolSettings[] = {
     { "General", "SleepPrecision", &Settings::OptSleepPrecision },
+    { "General", "TimerResolution", &Settings::OptTimerResolution },
     { "General", "SessionLogs", &Settings::OptSessionLogs },
     { "UI_Lua", "LuaStackFast", &Settings::OptLuaStackFast },
     { "Graphics_Sound", "QualityGovernor", &Settings::OptQualityGovernor },
@@ -121,6 +122,7 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "TerrainPrefetch", &Settings::OptTerrainPrefetch },
     { "Graphics_Sound", "TickListPrefetch", &Settings::OptTickListPrefetch },
     { "UI_Lua", "LuaGcStockPace", &Settings::OptLuaGcStockPace },
+    { "UI_Lua", "LuaGcPace", &Settings::OptLuaGcPace },
     { "UI_Lua", "LuaTableCensus", &Settings::OptLuaTableCensus },
     { "UI_Lua", "UiScriptHandlerCache", &Settings::OptUiScriptHandlerCache },
     { "UI_Lua", "UnitApiFastPath", &Settings::OptUnitApiFastPath },
@@ -136,12 +138,16 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "ObjMgrFindFast", &Settings::OptObjMgrFindFast },
     { "Graphics_Sound", "QuatLerpSse2", &Settings::OptQuatLerpSse2 },
     { "UI_Lua", "LuaProtoCache", &Settings::OptLuaProtoCache },
+    { "UI_Lua", "LuaVmFast", &Settings::OptLuaVmFast },
     { "UI_Lua", "LuaBytecodeStore", &Settings::OptLuaBytecodeStore },
     { "UI_Lua", "LuaThisFast", &Settings::OptLuaThisFast },
     { "Graphics_Sound", "AnimLod", &Settings::OptAnimLod },
     { "Graphics_Sound", "CollisionOutcode", &Settings::OptCollisionOutcode },
+    { "Graphics_Sound", "CollisionModelCache", &Settings::OptCollisionModelCache },
     { "Graphics_Sound", "CollisionRayOutcode", &Settings::OptCollisionRayOutcode },
     { "Graphics_Sound", "RayTriangleSse2", &Settings::OptRayTriangleSse2 },
+    { "Graphics_Sound", "OccluderSphere", &Settings::OptOccluderSphere },
+    { "Graphics_Sound", "M2AnimFindKey", &Settings::OptM2AnimFindKey },
     { "Graphics_Sound", "BoneMatrixUpload", &Settings::OptBoneMatrixUpload },
     { "Graphics_Sound", "UiBatchFill", &Settings::OptUiBatchFill },
     { "Graphics_Sound", "ParticleFill", &Settings::OptParticleFill },
@@ -151,10 +157,22 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "HighPlacementClient", &Settings::OptHighPlacementClient },
     { "General", "ClientWriteBatch", &Settings::OptClientWriteBatch },
     { "Graphics_Sound", "AabbOverlap", &Settings::OptAabbOverlap },
+    { "Graphics_Sound", "AabbTransform", &Settings::OptAabbTransform },
+    { "Graphics_Sound", "ColorUnpack", &Settings::OptColorUnpack },
     { "Graphics_Sound", "AnimQuatUnpack", &Settings::OptAnimQuatUnpack },
     { "UI_Lua", "LuaPoolFast", &Settings::OptLuaPoolFast },
     { "Graphics_Sound", "AnimVec3Track", &Settings::OptAnimVec3Track },
     { "Graphics_Sound", "M2SortKey", &Settings::OptM2SortKey },
+    { "Graphics_Sound", "M2BatchSort", &Settings::OptM2BatchSort },
+    { "Graphics_Sound", "CollisionPolyClip", &Settings::OptCollisionPolyClip },
+    { "Graphics_Sound", "SkyTextureReuse", &Settings::OptSkyTextureReuse },
+    { "Graphics_Sound", "WorldVisTraverse", &Settings::OptWorldVisTraverse },
+    { "UI_Lua", "UIStrataOpt", &Settings::OptUIStrataOpt },
+    { "Graphics_Sound", "ParticleTrackEval", &Settings::OptParticleTrackEval },
+    { "Graphics_Sound", "ShaderConstDedup", &Settings::OptShaderConstDedup },
+    { "Graphics_Sound", "BatchColourConvert", &Settings::OptBatchColourConvert },
+    { "Graphics_Sound", "FloorSplit", &Settings::OptFloorSplit },
+    { "Graphics_Sound", "SkyCloudTexels", &Settings::OptSkyCloudTexels },
     { "Graphics_Sound", "FrustumAabb", &Settings::OptFrustumAabb },
     { "Graphics_Sound", "SegmentAabb", &Settings::OptSegmentAabb },
     { "UI_Lua", "LuaHGetDispatch", &Settings::OptLuaHGetDispatch },
@@ -180,6 +198,9 @@ static const BoolSetting kBoolSettings[] = {
     { "Graphics_Sound", "DrawCensus", &Settings::OptDrawCensus },
     { "Graphics_Sound", "DrawMerge", &Settings::OptDrawMerge },
     { "Graphics_Sound", "M2MatrixSlotSse2", &Settings::OptM2MatrixSlotSse2 },
+    { "Graphics_Sound", "M2BatchMatrixSse2", &Settings::OptM2BatchMatrixSse2 },
+    { "Graphics_Sound", "AnimScalarTrack", &Settings::OptAnimScalarTrack },
+    { "Graphics_Sound", "AnimSplineTrack", &Settings::OptAnimSplineTrack },
     { "Graphics_Sound", "M2AnimStride", &Settings::OptM2AnimStride },
     { "Graphics_Sound", "M2AnimReuse", &Settings::OptM2AnimReuse },
     { "UI_Lua", "LuaAllocCensus", &Settings::OptLuaAllocCensus },
@@ -193,6 +214,50 @@ static const BoolSetting kBoolSettings[] = {
     { "General", "SavedVarsBackup", &Settings::OptSavedVarsBackup },
     { "Graphics_Sound", "SoundCoalescer", &Settings::OptSoundCoalescer },
     { "General", "VertexBufferPrealloc", &Settings::OptVertexBufferPrealloc },
+    { "Graphics_Sound", "CollisionRayVerts", &Settings::OptCollisionRayVerts },
+    { "Graphics_Sound", "FmodParamEq", &Settings::OptFmodParamEq },
+    { "UI_Lua", "UIRectSubdivide", &Settings::OptUIRectSubdivide },
+    { "Graphics_Sound", "SceneVisTraverse", &Settings::OptSceneVisTraverse },
+    { "Graphics_Sound", "ParticlePhysics", &Settings::OptParticlePhysics },
+    { "Graphics_Sound", "CollisionResetVisited", &Settings::OptCollisionResetVisited },
+    { "UI_Lua", "UIStrataCompact", &Settings::OptUIStrataCompact },
+    { "General", "DbcFastRle", &Settings::OptDbcFastRle },
+    { "Graphics_Sound", "PixelFormatBlit", &Settings::OptPixelFormatBlit },
+    { "UI_Lua", "UIFrameRemove", &Settings::OptUIFrameRemove },
+    { "Graphics_Sound", "M2BatchCmpTransparent", &Settings::OptM2BatchCmpTransparent },
+    { "Graphics_Sound", "M2BatchCmpSolid", &Settings::OptM2BatchCmpSolid },
+    { "Graphics_Sound", "ParticleQuad", &Settings::OptParticleQuad },
+    { "Graphics_Sound", "HorizonTestAABB", &Settings::OptHorizonTestAABB },
+    { "Graphics_Sound", "M2SkinProjection", &Settings::OptM2SkinProjection },
+    { "General", "SStrHashFast", &Settings::OptSStrHashFast },
+    { "Graphics_Sound", "ReverbClearFast", &Settings::OptReverbClearFast },
+    { "UI_Lua", "UILayoutRectFast", &Settings::OptUILayoutRectFast },
+    { "UI_Lua", "UIStrataOverlapFast", &Settings::OptUIStrataOverlapFast },
+    { "Graphics_Sound", "ParticleIntegrateFast", &Settings::OptParticleIntegrateFast },
+    { "Graphics_Sound", "FastSinCos", &Settings::OptFastSinCos },
+    { "Graphics_Sound", "M2BatchCmpTop", &Settings::OptM2BatchCmpTop },
+    { "Graphics_Sound", "ParticleEmitterActive", &Settings::OptParticleEmitterActive },
+    { "Graphics_Sound", "CollisionFaceClip", &Settings::OptCollisionFaceClip },
+    { "Graphics_Sound", "CollisionPolyCopy", &Settings::OptCollisionPolyCopy },
+    { "Graphics_Sound", "Mat3RotAxis", &Settings::OptMat3RotAxis },
+    { "Graphics_Sound", "M2MeshPickFast", &Settings::OptM2MeshPickFast },
+    { "Graphics_Sound", "M2CollisionOutcode", &Settings::OptM2CollisionOutcode },
+    { "Graphics_Sound", "CollisionTriTest", &Settings::OptCollisionTriTest },
+    { "Graphics_Sound", "CollisionBoxTri", &Settings::OptCollisionBoxTri },
+    { "Graphics_Sound", "M2RayHitSort", &Settings::OptM2RayHitSort },
+    { "Graphics_Sound", "TerrainPointOutcode", &Settings::OptTerrainPointOutcode },
+    { "Graphics_Sound", "CollisionBspTraverse", &Settings::OptCollisionBspTraverse },
+    { "Graphics_Sound", "SceneLightGrid", &Settings::OptSceneLightGrid },
+    { "Graphics_Sound", "CollisionSweptBsp", &Settings::OptCollisionSweptBsp },
+    { "Graphics_Sound", "TerrainChunkSort", &Settings::OptTerrainChunkSort },
+    { "Graphics_Sound", "CollisionFrustumBsp", &Settings::OptCollisionFrustumBsp },
+    { "Graphics_Sound", "CollisionSweptTri", &Settings::OptCollisionSweptTri },
+    { "Graphics_Sound", "SceneEntityCollect", &Settings::OptSceneEntityCollect },
+    { "Graphics_Sound", "M2BatchCmpSkin", &Settings::OptM2BatchCmpSkin },
+    { "Graphics_Sound", "CollisionBspLeaf", &Settings::OptCollisionBspLeaf },
+    { "Graphics_Sound", "CollisionSweptLeaf", &Settings::OptCollisionSweptLeaf },
+    { "Graphics_Sound", "CollisionSegmentBsp", &Settings::OptCollisionSegmentBsp },
+    { "Graphics_Sound", "CollisionSegmentLeaf", &Settings::OptCollisionSegmentLeaf },
 };
 
 static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolSettings[0]));
@@ -452,7 +517,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
             WritePrivateProfileStringA("Graphics_Sound", "D3d9StateManager", "1", iniPath.c_str());
             WritePrivateProfileStringA("UI_Lua", "LayoutRelinkFast", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "FrameLimiter", "0", iniPath.c_str());
-            WritePrivateProfileStringA("General", "ObjVisCache", "1", iniPath.c_str());
+            WritePrivateProfileStringA("General", "ObjVisCache", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "DbcPreload", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "OomGovernor", "0", iniPath.c_str());
             WritePrivateProfileStringA("General", "HardwareCursor", "0", iniPath.c_str());
@@ -519,6 +584,10 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         // Read all settings
         // General
         g_settings.OptSleepPrecision      = GetPrivateProfileIntA("General", "SleepPrecision", 1, iniPath.c_str()) != 0;
+        // Defaults on, because it already ran for everyone with no switch at
+        // all. A new key defaulting off would take a running feature away
+        // from every user who never wrote it, which is the 3.18.1 regression.
+        g_settings.OptTimerResolution     = GetPrivateProfileIntA("General", "TimerResolution", 1, iniPath.c_str()) != 0;
         g_settings.SleepPrecisionValue    = GetPrivateProfileIntA("General", "SleepPrecisionValue", 8, iniPath.c_str());
         g_settings.OptSessionLogs         = GetPrivateProfileIntA("General", "SessionLogs", 1, iniPath.c_str()) != 0;
         g_settings.OptLuaStackFast        = GetPrivateProfileIntA("UI_Lua", "LuaStackFast", 0, iniPath.c_str()) != 0;
@@ -547,7 +616,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptLayoutRelinkFast    = GetPrivateProfileIntA("UI_Lua", "LayoutRelinkFast", 0, iniPath.c_str()) != 0;
         g_settings.OptTimingCvarPin       = GetPrivateProfileIntA("General", "TimingCvarPin", 1, iniPath.c_str()) != 0;
         g_settings.OptFrameLimiter        = GetPrivateProfileIntA("General", "FrameLimiter", 0, iniPath.c_str()) != 0;
-        g_settings.OptObjVisCache         = GetPrivateProfileIntA("General", "ObjVisCache", 1, iniPath.c_str()) != 0;
+        g_settings.OptObjVisCache         = GetPrivateProfileIntA("General", "ObjVisCache", 0, iniPath.c_str()) != 0;
         g_settings.OptOomGovernor         = GetPrivateProfileIntA("General", "OomGovernor", 0, iniPath.c_str()) != 0;
         g_settings.OptHardwareCursor      = GetPrivateProfileIntA("General", "HardwareCursor", 0, iniPath.c_str()) != 0;
         g_settings.OptSamplingProfiler    = GetPrivateProfileIntA("General", "SamplingProfiler", 0, iniPath.c_str()) != 0;
@@ -622,7 +691,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptUnitAuraFast        = GetPrivateProfileIntA("Combat_Net", "UnitAuraFast", 0, iniPath.c_str()) != 0;
         g_settings.OptNetworkGuidSse2     = GetPrivateProfileIntA("Combat_Net", "NetworkGuidSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptApiCache   = GetPrivateProfileIntA("Combat_Net", "ApiCache", 1, iniPath.c_str()) != 0;
-        g_settings.OptGuidLookupCache   = GetPrivateProfileIntA("Combat_Net", "GuidLookupCache", 1, iniPath.c_str()) != 0;
+        g_settings.OptGuidLookupCache   = GetPrivateProfileIntA("Combat_Net", "GuidLookupCache", 0, iniPath.c_str()) != 0;
         g_settings.OptPacketOffload       = GetPrivateProfileIntA("Combat_Net", "PacketOffload", 0, iniPath.c_str()) != 0;
         g_settings.OptNameplateMT         = GetPrivateProfileIntA("Combat_Net", "NameplateMT", 0, iniPath.c_str()) != 0;
 
@@ -651,6 +720,7 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptTerrainPrefetch     = GetPrivateProfileIntA("General", "TerrainPrefetch", 0, iniPath.c_str()) != 0;
         g_settings.OptTickListPrefetch    = GetPrivateProfileIntA("Graphics_Sound", "TickListPrefetch", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaGcStockPace      = GetPrivateProfileIntA("UI_Lua", "LuaGcStockPace", 0, iniPath.c_str()) != 0;
+        g_settings.OptLuaGcPace           = GetPrivateProfileIntA("UI_Lua", "LuaGcPace", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaTableCensus      = GetPrivateProfileIntA("UI_Lua", "LuaTableCensus", 0, iniPath.c_str()) != 0;
         // Inherit UIFrameBatch when absent, which is what these two were
         // gated on before they had switches of their own.
@@ -671,12 +741,16 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptObjMgrFindFast      = GetPrivateProfileIntA("General", "ObjMgrFindFast", 0, iniPath.c_str()) != 0;
         g_settings.OptQuatLerpSse2        = GetPrivateProfileIntA("Graphics_Sound", "QuatLerpSse2", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaProtoCache       = GetPrivateProfileIntA("UI_Lua", "LuaProtoCache", 1, iniPath.c_str()) != 0;
+        g_settings.OptLuaVmFast           = GetPrivateProfileIntA("UI_Lua", "LuaVmFast", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaBytecodeStore    = GetPrivateProfileIntA("UI_Lua", "LuaBytecodeStore", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaThisFast         = GetPrivateProfileIntA("UI_Lua", "LuaThisFast", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimLod             = GetPrivateProfileIntA("Graphics_Sound", "AnimLod", 0, iniPath.c_str()) != 0;
         g_settings.OptCollisionOutcode    = GetPrivateProfileIntA("Graphics_Sound", "CollisionOutcode", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionModelCache = GetPrivateProfileIntA("Graphics_Sound", "CollisionModelCache", 0, iniPath.c_str()) != 0;
         g_settings.OptCollisionRayOutcode = GetPrivateProfileIntA("Graphics_Sound", "CollisionRayOutcode", 0, iniPath.c_str()) != 0;
         g_settings.OptRayTriangleSse2     = GetPrivateProfileIntA("Graphics_Sound", "RayTriangleSse2", 0, iniPath.c_str()) != 0;
+        g_settings.OptOccluderSphere      = GetPrivateProfileIntA("Graphics_Sound", "OccluderSphere", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2AnimFindKey       = GetPrivateProfileIntA("Graphics_Sound", "M2AnimFindKey", 0, iniPath.c_str()) != 0;
         g_settings.OptBoneMatrixUpload    = GetPrivateProfileIntA("Graphics_Sound", "BoneMatrixUpload", 0, iniPath.c_str()) != 0;
         g_settings.OptUiBatchFill         = GetPrivateProfileIntA("Graphics_Sound", "UiBatchFill", 0, iniPath.c_str()) != 0;
         g_settings.OptParticleFill        = GetPrivateProfileIntA("Graphics_Sound", "ParticleFill", 0, iniPath.c_str()) != 0;
@@ -702,10 +776,22 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         if (g_settings.HighPlacementMinKB < 64)    g_settings.HighPlacementMinKB = 64;
         if (g_settings.HighPlacementMinKB > 65536) g_settings.HighPlacementMinKB = 65536;
         g_settings.OptAabbOverlap         = GetPrivateProfileIntA("Graphics_Sound", "AabbOverlap", 0, iniPath.c_str()) != 0;
+        g_settings.OptAabbTransform       = GetPrivateProfileIntA("Graphics_Sound", "AabbTransform", 0, iniPath.c_str()) != 0;
+        g_settings.OptColorUnpack         = GetPrivateProfileIntA("Graphics_Sound", "ColorUnpack", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimQuatUnpack      = GetPrivateProfileIntA("Graphics_Sound", "AnimQuatUnpack", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaPoolFast     = GetPrivateProfileIntA("UI_Lua", "LuaPoolFast", 0, iniPath.c_str()) != 0;
         g_settings.OptAnimVec3Track   = GetPrivateProfileIntA("Graphics_Sound", "AnimVec3Track", 0, iniPath.c_str()) != 0;
         g_settings.OptM2SortKey       = GetPrivateProfileIntA("Graphics_Sound", "M2SortKey", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2BatchSort     = GetPrivateProfileIntA("Graphics_Sound", "M2BatchSort", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionPolyClip = GetPrivateProfileIntA("Graphics_Sound", "CollisionPolyClip", 0, iniPath.c_str()) != 0;
+        g_settings.OptSkyTextureReuse  = GetPrivateProfileIntA("Graphics_Sound", "SkyTextureReuse", 0, iniPath.c_str()) != 0;
+        g_settings.OptWorldVisTraverse = GetPrivateProfileIntA("Graphics_Sound", "WorldVisTraverse", 0, iniPath.c_str()) != 0;
+        g_settings.OptUIStrataOpt     = GetPrivateProfileIntA("UI_Lua", "UIStrataOpt", 0, iniPath.c_str()) != 0;
+        g_settings.OptParticleTrackEval = GetPrivateProfileIntA("Graphics_Sound", "ParticleTrackEval", 0, iniPath.c_str()) != 0;
+        g_settings.OptShaderConstDedup = GetPrivateProfileIntA("Graphics_Sound", "ShaderConstDedup", 0, iniPath.c_str()) != 0;
+        g_settings.OptBatchColourConvert = GetPrivateProfileIntA("Graphics_Sound", "BatchColourConvert", 0, iniPath.c_str()) != 0;
+        g_settings.OptFloorSplit      = GetPrivateProfileIntA("Graphics_Sound", "FloorSplit", 0, iniPath.c_str()) != 0;
+        g_settings.OptSkyCloudTexels  = GetPrivateProfileIntA("Graphics_Sound", "SkyCloudTexels", 0, iniPath.c_str()) != 0;
         g_settings.OptFrustumAabb     = GetPrivateProfileIntA("Graphics_Sound", "FrustumAabb", 0, iniPath.c_str()) != 0;
         g_settings.OptSegmentAabb     = GetPrivateProfileIntA("Graphics_Sound", "SegmentAabb", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaHGetDispatch = GetPrivateProfileIntA("UI_Lua", "LuaHGetDispatch", 0, iniPath.c_str()) != 0;
@@ -750,6 +836,9 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
         g_settings.OptDrawCensus = GetPrivateProfileIntA("Graphics_Sound", "DrawCensus", 0, iniPath.c_str()) != 0;
         g_settings.OptDrawMerge = GetPrivateProfileIntA("Graphics_Sound", "DrawMerge", 0, iniPath.c_str()) != 0;
         g_settings.OptM2MatrixSlotSse2 = GetPrivateProfileIntA("Graphics_Sound", "M2MatrixSlotSse2", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2BatchMatrixSse2 = GetPrivateProfileIntA("Graphics_Sound", "M2BatchMatrixSse2", 0, iniPath.c_str()) != 0;
+        g_settings.OptAnimScalarTrack = GetPrivateProfileIntA("Graphics_Sound", "AnimScalarTrack", 0, iniPath.c_str()) != 0;
+        g_settings.OptAnimSplineTrack = GetPrivateProfileIntA("Graphics_Sound", "AnimSplineTrack", 0, iniPath.c_str()) != 0;
         g_settings.OptM2AnimStride = GetPrivateProfileIntA("Graphics_Sound", "M2AnimStride", 0, iniPath.c_str()) != 0;
         g_settings.OptM2AnimReuse  = GetPrivateProfileIntA("Graphics_Sound", "M2AnimReuse", 0, iniPath.c_str()) != 0;
         g_settings.OptLuaAllocCensus = GetPrivateProfileIntA("UI_Lua", "LuaAllocCensus", 0, iniPath.c_str()) != 0;
@@ -768,6 +857,50 @@ static const int kBoolSettingCount = (int)(sizeof(kBoolSettings) / sizeof(kBoolS
 
         g_loadedFrom = iniPath;
         g_settings.OptVertexBufferPrealloc = GetPrivateProfileIntA("General", "VertexBufferPrealloc", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionRayVerts    = GetPrivateProfileIntA("Graphics_Sound", "CollisionRayVerts", 0, iniPath.c_str()) != 0;
+        g_settings.OptFmodParamEq          = GetPrivateProfileIntA("Graphics_Sound", "FmodParamEq", 0, iniPath.c_str()) != 0;
+        g_settings.OptUIRectSubdivide      = GetPrivateProfileIntA("UI_Lua", "UIRectSubdivide", 0, iniPath.c_str()) != 0;
+        g_settings.OptSceneVisTraverse     = GetPrivateProfileIntA("Graphics_Sound", "SceneVisTraverse", 0, iniPath.c_str()) != 0;
+        g_settings.OptParticlePhysics      = GetPrivateProfileIntA("Graphics_Sound", "ParticlePhysics", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionResetVisited = GetPrivateProfileIntA("Graphics_Sound", "CollisionResetVisited", 0, iniPath.c_str()) != 0;
+        g_settings.OptUIStrataCompact      = GetPrivateProfileIntA("UI_Lua", "UIStrataCompact", 0, iniPath.c_str()) != 0;
+        g_settings.OptDbcFastRle           = GetPrivateProfileIntA("General", "DbcFastRle", 0, iniPath.c_str()) != 0;
+        g_settings.OptPixelFormatBlit      = GetPrivateProfileIntA("Graphics_Sound", "PixelFormatBlit", 0, iniPath.c_str()) != 0;
+        g_settings.OptUIFrameRemove        = GetPrivateProfileIntA("UI_Lua", "UIFrameRemove", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2BatchCmpTransparent = GetPrivateProfileIntA("Graphics_Sound", "M2BatchCmpTransparent", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2BatchCmpSolid       = GetPrivateProfileIntA("Graphics_Sound", "M2BatchCmpSolid", 0, iniPath.c_str()) != 0;
+        g_settings.OptParticleQuad         = GetPrivateProfileIntA("Graphics_Sound", "ParticleQuad", 0, iniPath.c_str()) != 0;
+        g_settings.OptHorizonTestAABB      = GetPrivateProfileIntA("Graphics_Sound", "HorizonTestAABB", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2SkinProjection     = GetPrivateProfileIntA("Graphics_Sound", "M2SkinProjection", 0, iniPath.c_str()) != 0;
+        g_settings.OptSStrHashFast         = GetPrivateProfileIntA("General", "SStrHashFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptReverbClearFast      = GetPrivateProfileIntA("Graphics_Sound", "ReverbClearFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptUILayoutRectFast     = GetPrivateProfileIntA("UI_Lua", "UILayoutRectFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptUIStrataOverlapFast  = GetPrivateProfileIntA("UI_Lua", "UIStrataOverlapFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptParticleIntegrateFast = GetPrivateProfileIntA("Graphics_Sound", "ParticleIntegrateFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptFastSinCos            = GetPrivateProfileIntA("Graphics_Sound", "FastSinCos", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2BatchCmpTop         = GetPrivateProfileIntA("Graphics_Sound", "M2BatchCmpTop", 0, iniPath.c_str()) != 0;
+        g_settings.OptParticleEmitterActive = GetPrivateProfileIntA("Graphics_Sound", "ParticleEmitterActive", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionFaceClip     = GetPrivateProfileIntA("Graphics_Sound", "CollisionFaceClip", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionPolyCopy     = GetPrivateProfileIntA("Graphics_Sound", "CollisionPolyCopy", 0, iniPath.c_str()) != 0;
+        g_settings.OptMat3RotAxis           = GetPrivateProfileIntA("Graphics_Sound", "Mat3RotAxis", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2MeshPickFast        = GetPrivateProfileIntA("Graphics_Sound", "M2MeshPickFast", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2CollisionOutcode    = GetPrivateProfileIntA("Graphics_Sound", "M2CollisionOutcode", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionTriTest      = GetPrivateProfileIntA("Graphics_Sound", "CollisionTriTest", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionBoxTri       = GetPrivateProfileIntA("Graphics_Sound", "CollisionBoxTri", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2RayHitSort          = GetPrivateProfileIntA("Graphics_Sound", "M2RayHitSort", 0, iniPath.c_str()) != 0;
+        g_settings.OptTerrainPointOutcode   = GetPrivateProfileIntA("Graphics_Sound", "TerrainPointOutcode", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionBspTraverse  = GetPrivateProfileIntA("Graphics_Sound", "CollisionBspTraverse", 0, iniPath.c_str()) != 0;
+        g_settings.OptSceneLightGrid        = GetPrivateProfileIntA("Graphics_Sound", "SceneLightGrid", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionSweptBsp     = GetPrivateProfileIntA("Graphics_Sound", "CollisionSweptBsp", 0, iniPath.c_str()) != 0;
+        g_settings.OptTerrainChunkSort      = GetPrivateProfileIntA("Graphics_Sound", "TerrainChunkSort", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionFrustumBsp   = GetPrivateProfileIntA("Graphics_Sound", "CollisionFrustumBsp", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionSweptTri     = GetPrivateProfileIntA("Graphics_Sound", "CollisionSweptTri", 0, iniPath.c_str()) != 0;
+        g_settings.OptSceneEntityCollect    = GetPrivateProfileIntA("Graphics_Sound", "SceneEntityCollect", 0, iniPath.c_str()) != 0;
+        g_settings.OptM2BatchCmpSkin        = GetPrivateProfileIntA("Graphics_Sound", "M2BatchCmpSkin", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionBspLeaf      = GetPrivateProfileIntA("Graphics_Sound", "CollisionBspLeaf", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionSweptLeaf    = GetPrivateProfileIntA("Graphics_Sound", "CollisionSweptLeaf", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionSegmentBsp  = GetPrivateProfileIntA("Graphics_Sound", "CollisionSegmentBsp", 0, iniPath.c_str()) != 0;
+        g_settings.OptCollisionSegmentLeaf = GetPrivateProfileIntA("Graphics_Sound", "CollisionSegmentLeaf", 0, iniPath.c_str()) != 0;
     }
 }
 

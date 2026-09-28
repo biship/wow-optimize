@@ -16,6 +16,7 @@ namespace Config {
     struct Settings {
         // General & Memory
         bool OptSleepPrecision = true;
+        bool OptTimerResolution = true;
         int SleepPrecisionValue = 8;
         // One log per session preserves earlier runs, which is the whole point
         // when a tester is comparing two configurations - a single overwritten
@@ -110,7 +111,7 @@ namespace Config {
         // it used to have no switch at all and lived inside CvarNullGuard.
         bool OptTimingCvarPin = true;
         bool OptFrameLimiter = false;
-        bool OptObjVisCache = true;
+        bool OptObjVisCache = false;
         bool OptOomGovernor = false;
         bool OptHardwareCursor = false;
         bool OptSamplingProfiler = false;
@@ -221,7 +222,7 @@ namespace Config {
         // Lock-free GUID -> object lookup cache. On by default because it has
         // always been installed unconditionally - it had no setting at all - and
         // this only gives that behaviour a switch.
-        bool OptGuidLookupCache = true;
+        bool OptGuidLookupCache = false;
         bool OptPacketOffload = false;
         // Off, and it does not matter which way it is set: the module is compiled
         // out by TEST_DISABLE_NAMEPLATE_MT, in this build and in 3.18.0, and its
@@ -274,6 +275,7 @@ namespace Config {
         // stop stepping it by hand, so the pace it normally sets can be
         // measured against doing nothing. Off, because on is what ships today.
         bool OptLuaGcStockPace = false;
+        bool OptLuaGcPace = false;
         // Diagnostic. Samples the tables the collector walks and reports how
         // many of their slots are empty, which is the number a table compactor
         // would have to justify itself against.
@@ -360,6 +362,9 @@ namespace Config {
         // any of it. A stale Proto is refused by its own fingerprint rather
         // than handed back, and a state swap drops everything.
         bool OptLuaProtoCache = true;
+        // The client's Lua interpreter, transcribed, with the string-key table
+        // lookup inlined. Off: it is the function every line of Lua runs through.
+        bool OptLuaVmFast = false;
         // The other 1868 ms of that same loading screen: source the session had
         // never seen, which no cache inside the process can help with. This one
         // keeps the compiled form on disk between sessions. Off by default -
@@ -385,8 +390,21 @@ namespace Config {
         // applied, so this is bit-exact rather than close. Opt-in, and it
         // predicts the client's whole output and compares before trusting itself.
         bool OptCollisionOutcode = false;
+        // The 8-way set-associative BSP collision model cache lookup (sub_79B1F0).
+        // Uses dual 128-bit SSE2 vector comparisons to test all 8 set slots
+        // simultaneously with zero branch mispredictions and bitscan hit extraction.
+        bool OptCollisionModelCache = false;
         bool OptCollisionRayOutcode = false;
         bool OptRayTriangleSse2 = false;
+        // The convex occluder volume sphere culling test (sub_7CCE00).
+        // Uses 4-wide transposed SSE2 vector dot products to evaluate occluder
+        // planes in parallel instead of serial scalar x87 loops.
+        bool OptOccluderSphere = false;
+        // The M2 animation track timeline keyframe binary search (sub_8284D0).
+        // Evaluated across all bone translation, rotation, and scaling tracks.
+        // Replaces serialized x87 float divisions and store forwarding stalls
+        // with branch-optimized keyframe resolution and SSE math.
+        bool OptM2AnimFindKey = false;
         // The bone matrix upload loop inside sub_829BA0, 3.35% of executing
         // time and the largest entry in the corrected profile with nothing
         // shipped against it. Twelve x87 load/store pairs a bone transpose a
@@ -395,8 +413,8 @@ namespace Config {
         // Opt-in, and it does the first bones both ways and compares.
         bool OptBoneMatrixUpload = false;
         // The per-vertex and per-index fill in the client's UI batch draw,
-        // sub_484B00. Off by default and experimental; it predicts batches and
-        // compares them with what the client writes before it takes over.
+        // sub_484B00. Predicts batches and compares them with what the client
+        // writes before taking over.
         bool OptUiBatchFill = false;
         bool OptParticleFill = false;
         // Hands mimalloc a block of address space above 2GB so it grows there
@@ -446,6 +464,15 @@ namespace Config {
         // all, so bit-exact rather than close. Opt-in, and it checks itself
         // against the client before it stops calling it.
         bool OptAabbOverlap = false;
+        // Bounding box transformation (sub_7F9430 and sub_7F93D0), evaluated
+        // across 22 callers during scene graph visibility traversal and culling.
+        // Replaces 18 serialized x87 status-word transfers (fnstsw ax) and 9
+        // data-dependent branches per box with hardware double-precision SSE2.
+        bool OptAabbTransform = false;
+        // Vectorized color unpacking (sub_984C90 and sub_982970) and vector
+        // dominant axis calculation (sub_9829B0). Converts packed BGRA/BGR bytes
+        // into normalized floats using SSE2, and evaluates dominant axis via bitwise fabs.
+        bool OptColorUnpack = false;
         // The bone rotation track (sub_828680), run once per animated bone per
         // frame from the largest entry in the main-thread profile. Keyframes are
         // four uint16 expanded as v * K - 1.0, and x86 has no register path from
@@ -470,6 +497,43 @@ namespace Config {
         // dependent loads on every comparison inside a sort. Opt-in; the
         // comparator is pure, so both answers are simply compared.
         bool OptM2SortKey = false;
+        // The opaque M2 batch sort: gathers what the comparator reads once per
+        // record and runs the client's own heapsort on it. Verified per comparison
+        // before it takes over; opt-in until a tester log shows it armed.
+        bool OptM2BatchSort = false;
+        // The collision polygon clip: answers the two decisions the client makes
+        // after its distance pass and leaves a real clip to the client. Checked
+        // against the client per call before it takes over; opt-in until run.
+        bool OptCollisionPolyClip = false;
+        // The cloud texture build: skips a pass whose inputs repeat a pass that
+        // built the same rows, after proving on live data that the rebuild came
+        // out byte for byte identical. Measures whether that ever happens.
+        bool OptSkyTextureReuse = false;
+        // World visibility traversal: replaces terrain cell AABB overlap and
+        // candidate object distance culling in sub_7BCC00 and sub_7BCF20 with
+        // SSE2 vector operations, eliminating serialized x87 status-word stalls.
+        bool OptWorldVisTraverse = false;
+        // UI strata frame sorting and draw: caches sorted frame indices across
+        // frames when UI frame count and generation stay unchanged in sub_47AE20,
+        // avoiding repeated std::sort comparator calls on every rendered frame.
+        bool OptUIStrataOpt = false;
+        // The per-particle track evaluation: the same arithmetic in SSE2 doubles,
+        // with the client's round-to-nearest converts. Compared byte for byte
+        // against the client per call before it answers; opt-in until run.
+        bool OptParticleTrackEval = false;
+        // The shader constant shadow compare: one packed compare a register in place
+        // of four x87 compares. No arithmetic in it, so the bits are the same by
+        // construction; compared against the client per call before it answers.
+        bool OptShaderConstDedup = false;
+        // The colour block inside the M2 batch state setup: three clamps and three
+        // converts with no x87 mode change. This one replaces client code by writing
+        // into it rather than by a hook, so it verifies before it patches.
+        bool OptBatchColourConvert = false;
+        // The float split at sub_5FE800: one truncate instead of two x87 control-word
+        // loads, on a leaf called from 26 sites. Compared bit for bit against the
+        // client per call before it answers; opt-in until run.
+        bool OptFloorSplit = false;
+        bool OptSkyCloudTexels = false;
         // CFrustum::IsAABBVisible (sub_9839E0), 0.82% of executing time. Most
         // of it is eighteen sign tests and eighteen dependent loads to pick box
         // corners, which SSE2 does as a blend. Opt-in; the function is pure so
@@ -568,6 +632,15 @@ namespace Config {
         // with four SSE2 moves each. No arithmetic, so the bytes written are
         // the bytes read.
         bool OptM2MatrixSlotSse2 = false;
+        // Replaces serialized sixteen-float matrix setup copies in sub_823130
+        // (M2 batch render pass setup) with four SSE2 vector moves each.
+        bool OptM2BatchMatrixSse2 = false;
+        // Hardware double-precision SSE2 rewrite of the M2 scalar and color
+        // animation track evaluators (sub_82AF40 and sub_82B340).
+        bool OptAnimScalarTrack = false;
+        // Hardware double-precision SSE2 rewrite of the M2 3D vector and scalar
+        // cubic spline animation track evaluators (sub_82B460 and sub_82B8A0).
+        bool OptAnimSplineTrack = false;
         // Holds a distant model's skeleton for a frame by taking the
         // client's own no-bones branch out of the bone loop. The tail still
         // runs, so materials and attachments keep animating.
@@ -602,6 +675,52 @@ namespace Config {
         bool OptSavedVarsBackup = false;
         bool OptSoundCoalescer = false;
         bool OptVertexBufferPrealloc = false;
+
+        // 5 Colossal Engine Optimizations
+        bool OptCollisionRayVerts = false;
+        bool OptFmodParamEq = false;
+        bool OptUIRectSubdivide = false;
+        bool OptSceneVisTraverse = false;
+        bool OptParticlePhysics = false;
+        bool OptCollisionResetVisited = false;
+        bool OptUIStrataCompact = false;
+        bool OptDbcFastRle = false;
+        bool OptPixelFormatBlit = false;
+        bool OptUIFrameRemove = false;
+        bool OptM2BatchCmpTransparent = false;
+        bool OptM2BatchCmpSolid = false;
+        bool OptParticleQuad = false;
+        bool OptHorizonTestAABB = false;
+        bool OptM2SkinProjection = false;
+        bool OptSStrHashFast = false;
+        bool OptReverbClearFast = false;
+        bool OptUILayoutRectFast = false;
+        bool OptUIStrataOverlapFast = false;
+        bool OptParticleIntegrateFast = false;
+        bool OptFastSinCos = false;
+        bool OptM2BatchCmpTop = false;
+        bool OptParticleEmitterActive = false;
+        bool OptCollisionFaceClip = false;
+        bool OptCollisionPolyCopy = false;
+        bool OptMat3RotAxis = false;
+        bool OptM2MeshPickFast = false;
+        bool OptM2CollisionOutcode = false;
+        bool OptCollisionTriTest = false;
+        bool OptCollisionBoxTri = false;
+        bool OptM2RayHitSort = false;
+        bool OptTerrainPointOutcode = false;
+        bool OptCollisionBspTraverse = false;
+        bool OptSceneLightGrid = false;
+        bool OptCollisionSweptBsp = false;
+        bool OptTerrainChunkSort = false;
+        bool OptCollisionFrustumBsp = false;
+        bool OptCollisionSweptTri = false;
+        bool OptSceneEntityCollect = false;
+        bool OptM2BatchCmpSkin = false;
+        bool OptCollisionBspLeaf = false;
+        bool OptCollisionSweptLeaf = false;
+        bool OptCollisionSegmentBsp = false;
+        bool OptCollisionSegmentLeaf = false;
     };
 
     extern Settings g_settings;

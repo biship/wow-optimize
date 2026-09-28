@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Diagnostics;
 using System.Collections.Generic;
@@ -56,7 +56,11 @@ namespace WowOptimizeLauncher {
             "AbTest", "SamplingProfiler", "AddonProfiler", "LuaAddonProfile",
             "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
             "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
-            "VaCensus", "CameraReplay",
+            "VaCensus", "CameraReplay", "SkyCloudTexels", "LuaGcPace",
+            // Both only measure. They were filed as unproven replacements because
+            // they are experimental, which put them on the NOT PROVEN tab beside
+            // things that change what the game does.
+            "FreezeCatcher", "MpqOpenCensus",
         };
         private static readonly string[] LogKeys = new string[] {
             "SessionLogs", "FlightRecorder", "NetDiag", "CpuTopology",
@@ -77,6 +81,14 @@ namespace WowOptimizeLauncher {
             "QualityGovernor", "MipBiasGovernor", "SpellEffectCulling",
             "SoundVolumeLimit",
         };
+
+        // A replacement for something the client already does, as opposed to a
+        // census, a look-and-sound trade, a crash guard or one that lost its
+        // measurement. What "TRY THE UNPROVEN ONES" is allowed to turn on.
+        public static bool IsReplacement(string key) {
+            return !In(DiagKeys, key) && !In(TradeKeys, key) && !In(LostKeys, key)
+                && !In(LogKeys, key) && !In(FixKeys, key);
+        }
 
         private static bool In(string[] set, string key) {
             for (int i = 0; i < set.Length; i++) {
@@ -107,7 +119,11 @@ namespace WowOptimizeLauncher {
             "AbTest", "SamplingProfiler", "AddonProfiler", "LuaAddonProfile",
             "LuaAllocCensus", "LuaCompileCensus", "LuaTableCensus", "AnimCensus",
             "DrawCensus", "ShadowStateProbe", "LockSpinHooks", "NoClientPatches",
-            "VaCensus", "CameraReplay",
+            "VaCensus", "CameraReplay", "SkyCloudTexels", "LuaGcPace",
+            // Both only measure. They were filed as unproven replacements because
+            // they are experimental, which put them on the NOT PROVEN tab beside
+            // things that change what the game does.
+            "FreezeCatcher", "MpqOpenCensus",
 
             // Buys frames by making the game look or sound different. That is a
             // real trade and it is the player's to make, not this button's. A
@@ -171,9 +187,8 @@ namespace WowOptimizeLauncher {
         public CheckBox Ctrl;
         public string Tooltip;
 
-        // Marks a switch that has not been proven. It used to decide which tab the
-        // row appeared on, which put nearly half of them on one tab; now it only
-        // decides whether the row is marked [+] or [!]. A tester was
+        // Marks a switch that has not been proven in a game. A replacement with
+        // this set appears on the NOT PROVEN tab rather than its area's. A tester was
         // asked to leave one of these off so we could tell whether it caused their
         // addon errors; they pressed Enable All, it went on with everything else,
         // and the comparison measured nothing. A switch that exists to be left off
@@ -360,7 +375,8 @@ namespace WowOptimizeLauncher {
 
                 Color textColor = selected ? CyanAccent : TabIdle;
                 using (Font tabFont = new Font("Segoe UI", 8f, FontStyle.Bold)) {
-                    TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter;
+                    TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter
+                                          | TextFormatFlags.EndEllipsis;
                     TextRenderer.DrawText(g, TabPages[i].Text, tabFont, tabRect, textColor,
                                           flags | TextFormatFlags.NoPrefix);
                 }
@@ -414,7 +430,7 @@ namespace WowOptimizeLauncher {
         // remote version.txt to decide whether to show the update notification,
         // and shown in the version label. Keep in sync with version.txt and
         // src/core/version.h on every release.
-        private const string APP_VERSION = "3.19.3";
+        private const string APP_VERSION = "3.20.0";
 
         private string iniPath;
         private Dictionary<string, SettingItem> settingsMap;
@@ -432,6 +448,13 @@ namespace WowOptimizeLauncher {
         private FlowLayoutPanel uiLuaFlow;
         private FlowLayoutPanel combatNetFlow;
         private FlowLayoutPanel graphicsSoundFlow;
+        // Two tabs that collect by what a switch is rather than by which part of
+        // the game it touches. Everything the preset buttons deliberately leave
+        // off used to be scattered across the four section tabs, so "why is this
+        // one still off" had no place to be answered.
+        private FlowLayoutPanel notProvenFlow;
+        private FlowLayoutPanel triedFlow;
+        private FlowLayoutPanel diagFlow;
         private TextBox searchBox;
 
         // Background image
@@ -580,9 +603,10 @@ namespace WowOptimizeLauncher {
             settingsMap = new Dictionary<string, SettingItem>() {
                 // General
                 { "Precise Sleep Frame Pacing", new SettingItem("General", "SleepPrecision", true, null, "Enforces millisecond-accurate frame-rate sleep pacing to reduce input lag and stabilize frame delivery.") },
+                { "Ask Windows For A Half-Millisecond Timer", new SettingItem("General", "TimerResolution", true, null, "Windows keeps one timer period for the whole machine and uses the shortest any running program asked for. This tool asks for half a millisecond, which is what makes frame pacing and the sleep hook accurate, and it is also why a timer tool shows 0.5000 while the game is open and why an idle laptop draws a little more. Until now there was no way to refuse it. Untick this and the tool leaves the system timer exactly as it found it; frames are paced more coarsely in exchange. It is on by default because it has always been on.") },
                 { "Keep a Log File per Session", new SettingItem("General", "SessionLogs", true, null, "Writes a separate timestamped log for every session, so two runs can be compared. Older ones are deleted automatically (SessionLogsToKeep in wow_opt.ini, default 10). Turn off to keep only the single overwritten wow_optimize.log.") },
                 { "Lua Allocation Census", new SettingItem("UI_Lua", "LuaAllocCensus", false, null, "Counts every object the Lua VM allocates and reports the size distribution at the end of your log. A measurement, not a speed-up: it decides whether giving Lua its own memory arena would be worth building. Turn it on for one session, send the log, turn it back off.", true) },
-                { "SSE2 Terrain Horizon (experimental)", new SettingItem("Graphics_Sound", "HorizonOcclusionSse2", false, null, "Vectorises the terrain horizon builder, measured at 2.46% of main-thread time in a tester profile. It rasterises up to 384 screen columns one at a time; this does four per instruction. Off by default because it replaces a culling routine, and a wrong answer is terrain that fails to draw. It checks itself: the first 512 calls run both this and the client's version and compare all 384 output values exactly, and any single difference hands every later call back to the client and names the column in your log. Look for \"[Horizon] Matched the client's output exactly\" before trusting it.", true) },
+                { "SSE2 Terrain Horizon", new SettingItem("Graphics_Sound", "HorizonOcclusionSse2", false, null, "Vectorises the terrain horizon builder, measured at 2.46% of main-thread time in a tester profile. It rasterises up to 384 screen columns one at a time; this does four per instruction. It checks itself: the first 512 calls run both this and the client's version and compare all 384 output values exactly, and any single difference hands every later call back to the client and names the column in your log.", true) },
                 { "Shadow State Probe", new SettingItem("Graphics_Sound", "ShadowStateProbe", false, null, "For the shadow flicker some people see when Shadow Quality is set below the highest step. That is not caused by this DLL - a tester reproduced it with every feature here switched off and without DXVK - but nobody has ever looked at what the game itself is doing when it happens. This watches the client's own shadow state and writes what it sees to your log every ten seconds. It changes nothing. Turn it on, play a few minutes with the setting that breaks for you, send the log, turn it off.", true) },
                 { "Lua Compile Census", new SettingItem("UI_Lua", "LuaCompileCensus", true, null, "Counts what the game compiles while you play, and names it. About 5% of the client's CPU in one measured session was spent inside the Lua compiler - not because the game compiles a lot, but because one addon was building code in a loop instead of once. Nothing had ever been able to say which. On by default and completely silent on a healthy client; if your log starts listing something with a five-figure count, that is the addon to update or drop, and it is worth several percent of your frame rate.") },
                 { "Addon CPU Profiler", new SettingItem("UI_Lua", "AddonProfiler", false, null, "Answers \"which of my addons is eating the frame rate\". The client has a script profiler built in that nothing in the interface ever switches on; this switches it on and writes a ranked table to your log every two minutes - each addon, its milliseconds, and its share. It costs you frames while it is on: collecting the totals walks every addon, and the client's own accounting is not free either. Turn it on for one session when the game stutters, send the log, turn it back off. If every addon reads zero, type /reload once. On a client with no scriptProfile setting it says so and switches itself off instead of costing you anything.", true) },
@@ -627,6 +651,8 @@ namespace WowOptimizeLauncher {
                 { "Flight Recorder (mark a moment)", new SettingItem("General", "FlightRecorder", true, null, "Keeps the last 512 frames and writes 240 of them to the log when you press Scroll Lock. Press it the moment you see something wrong. Nothing is written until you do, and it also marks itself for a disconnect, a freeze and a bad SavedVariables filename. Change the key with FlightRecorderKey in wow_opt.ini.") },
                 { "Camera Replay Benchmark", new SettingItem("General", "CameraReplay", false, null, "Measurement only. Stand still somewhere, press Shift+Pause, move the camera around, and press Shift+Pause again: the camera's motion is saved. Press Pause to play it back while the log measures every frame of the playback on its own. Run it once per build or setting from the same spot, facing the same way, with vsync off, and compare the BENCHMARK WINDOW blocks. Only the camera is replayed; other players and NPCs still move, so repeat each side. Hooks one wow.exe function, so leave it off on servers that kick for client patches. Change the key with CameraReplayKey in wow_opt.ini.", true) },
                 { "A/B Test a Feature", new SettingItem("General", "AbTest", false, null, "Turns one feature on and off in stints while you play and compares the two halves. It can only measure features you have switched on. Tick the features you want compared as well, or it has nothing to measure. Play at least 45 minutes.", true) },
+                { "Thread ID Cache", new SettingItem("General", "ThreadIdCache", true, null, "Caches GetCurrentThreadId in a thread-local slot to avoid redundant kernel queries on hot paths.") },
+                { "Object Visibility Lookup Cache", new SettingItem("General", "ObjVisCache", false, null, "Caches GUID-to-object visibility hash lookups in a thread-safe slot pool. Experimental, off by default.", true) },
 
                 // UI & Lua
                 { "Fast UI Frame Accessors", new SettingItem("UI_Lua", "UIFrameAccessorFast", false, null, "Bypasses standard Lua stack queries to retrieve UI frame parameters (IsShown, GetAlpha) instantly.") },
@@ -642,6 +668,7 @@ namespace WowOptimizeLauncher {
                 { "Lua Suite: table & index caches", new SettingItem("UI_Lua", "LuaOpcacheTables", true, null, "Part of the suite above, and the first group to suspect: the global, table, index and luaH_getstr caches, plus the VM table indexing path. These are the hooks that can hand back a value for the wrong key, which is what wrong addon names look like. Only has any effect when the suite above is on.", true) },
                 { "Lua Suite: string & buffer paths", new SettingItem("UI_Lua", "LuaOpcacheStrings", true, null, "Part of the suite above: pushstring, pushfstring, the string buffer helpers, tolstring, loadstring and the compiled pattern cache. Second group to suspect for wrong text. Only has any effect when the suite above is on.", true) },
                 { "Lua Suite: accessors, arg checks & debug", new SettingItem("UI_Lua", "LuaOpcacheReads", true, null, "Part of the suite above, and the least likely group: type queries, length, toboolean, the luaL_check/opt argument helpers, and the debug and error helpers. Mostly read-only. Only has any effect when the suite above is on.", true) },
+                { "Lua Suite: setters & object creation", new SettingItem("UI_Lua", "LuaOpcacheWrites", true, null, "Part of the suite above: pushcclosure, createtable, rawset, rawseti, settable, setfield, and register/ref fast paths. Only has any effect when the suite above is on.", true) },
                 { "Adaptive Lua GC Governor", new SettingItem("UI_Lua", "LuaGcCoalesce", false, null, "Paces incremental garbage collection per frame from the live game state - relaxed while a loading screen is up, stopped in combat below 256MB, aggressive while idle.") },
                 { "Module Handle Cache", new SettingItem("UI_Lua", "ModuleHandleCache", false, null, "Caches GetModuleHandle results, which the client queries repeatedly for already-loaded modules.") },
                 
@@ -672,6 +699,7 @@ namespace WowOptimizeLauncher {
                 { "UI Frame Batch (parent switch)", new SettingItem("UI_Lua", "UIFrameBatch", false, null, "The setting the two below inherit from when they are absent from the file. It used to be read by the tool with no entry here at all, so it could only be changed by editing the ini by hand, and it has been off for everyone since issue #36 reported flickering. It no longer switches anything by itself: the two halves it really controlled have their own entries, and the other two things it appeared to control are compiled out of the build. Leave it off and use the two below.", true) },
                 { "Table Emptiness Census", new SettingItem("UI_Lua", "LuaTableCensus", false, null, "Diagnostic, not an optimization. The garbage collector walks every slot of every table it visits, including the empty ones, and a table that once held a thousand entries keeps a thousand slots for as long as nothing new is inserted into it. That function is the most expensive Lua thing in every profile taken so far. This samples one table in five hundred of the collector's walk and reports how many of the slots it stepped over were empty. It only counts and never changes anything. The answer decides whether a compactor is worth writing.", true) },
                 { "Leave Lua Garbage Collection Alone", new SettingItem("UI_Lua", "LuaGcStockPace", false, null, "The garbage collector governor normally makes Lua collect more eagerly than it would on its own, to keep memory down and avoid a large pause later. That eagerness has a price the tool has never measured: it is paid inside the game's own collector, and in profiled sessions those two functions are the two most expensive Lua things running, ahead of the script interpreter itself. Tick this to leave the collector exactly as the game sets it and step nothing by hand. Run one session each way and compare the two lines the log prints; that is the entire experiment.", true) },
+                { "Measure The Lua Clean-Up Pacing", new SettingItem("UI_Lua", "LuaGcPace", false, null, "Lua cleans up after itself while you play, and in a profiled session those two clean-up routines were the two most expensive things running on the main thread - ahead of the graphics driver. How often that clean-up starts is set by two numbers, one of them the game's and one of them this tool's, and neither has ever been measured. This switch measures them: it alternates between the two settings every twenty seconds and the log reports, for each of them, the frame times and how much memory Lua was holding. Turn on the A/B test alongside it and set its subject to LuaGcPace. It changes how the game performs while it runs, so it is for one measuring session, not for playing.") },
                 { "Object Tick Prefetch", new SettingItem("Graphics_Sound", "TickListPrefetch", false, null, "Every frame the game walks a linked list of objects and pokes each one, and almost every poke does nothing but read two fields and return. Those two fields sit in different cache lines, so each object costs the processor two waits, and it cannot start the next object until it has finished the previous one. This tells the processor to start fetching the next object while the current one is still being handled. It was 1.39% of main-thread time in a measured session. It changes nothing about what the game computes - a prefetch is only a hint - and it refuses to install unless the function is byte-for-byte the one it was written against.", true) },
                 { "Terrain Read-Ahead", new SettingItem("General", "TerrainPrefetch", false, null, "Watches where the world is streaming from, projects that forward, and reads the terrain tiles ahead of you out of the MPQ archives on a background thread so they are in the OS cache before the game asks. It read its coordinate from an address the game never writes, so from the day it was added until 3.19.1 it queued nothing at all on any machine - which is also why nobody has ever tested what it does when it works. It does real background disk reads.", true) },
                 { "Lua Type Fast Path", new SettingItem("UI_Lua", "LuaTypeFast", false, null, "Resolves a Lua stack index inline in lua_type instead of calling the engine's index2adr. Also used to be switched by the DBC cache, which it has nothing to do with.") },
@@ -680,15 +708,22 @@ namespace WowOptimizeLauncher {
                 { "Lock Spin Counts", new SettingItem("General", "LockSpinHooks", false, null, "Adds spin counts to CriticalSection and WaitForSingleObject so a short wait does not go straight to the kernel. These used to be switched by the heap defragmenter, a different subsystem.") },
                 { "Bone Rotation Maths (SSE2)", new SettingItem("Graphics_Sound", "QuatLerpSse2", false, null, "Every animated bone of every model gets its rotation blended between two keyframes, every frame. The game does the four numbers one at a time on the old floating-point stack; this does all four in one instruction. Not identical to the last bit: measured over 12 million values the largest difference is 0.0000003, which is under three of the smallest steps a float can take, and the result is renormalised straight afterwards. It checks itself against the game for the first 20000 blends and switches off if anything drifts further than rounding explains.", true) },
                 { "Reuse Compiled Scripts", new SettingItem("UI_Lua", "LuaProtoCache", true, null, "Interface scripts written inside XML templates are recompiled from scratch every time a frame is built from that template. Counted on real sessions: 88 out of every 100 chunks the game compiled were text it had already compiled that same session, 332 MB of repeated work. This keeps the compiled form and reuses it when the text and the chunk name are both identical, checked byte for byte rather than by a hash. The game still builds the function itself, so its environment and its addon ownership are unchanged. It compares the first 2000 reuses against a fresh compile and switches off if any of them differ.", true) },
+                { "Lua Interpreter (experimental)", new SettingItem("UI_Lua", "LuaVmFast", false, null, "Runs the game's Lua interpreter out of this DLL instead of out of WoW.exe, transcribed instruction by instruction from it, with one thing changed: the table lookup behind every global read and every method call is done in place rather than through three nested calls. Anything the transcription does not cover exactly - an arithmetic metamethod, a comparison that is not two numbers, a debug hook - is handed straight back to the game. The inlined lookup is checked against the game's own for its first 65536 hits and one in 1024 after that, and a single disagreement retires it for the session and says so in your log. Off by default: this is the function every line of Lua in the game runs through.", true) },
                 { "Reuse Compiled Scripts Between Sessions", new SettingItem("UI_Lua", "LuaBytecodeStore", false, null, "Reuse Compiled Scripts only helps the second time the game compiles something in one sitting. On a measured loading screen that was 260 of the 2128 milliseconds spent compiling; the other 1868 were scripts the session had never seen, which nothing running inside the game can avoid. This writes the compiled form to Cache\\wow_optimize_bytecode.bin and reads it back on the next launch, so a script compiled yesterday is not compiled again today. The game can write that form but has no code to read it, so the reading is ours: every script rebuilt from the file is compared against a real compile of the same text, field by field and constant by constant, for the first 2000 of them and one in every 256 after that, and the whole store switches off for good the first time two of them differ. The file is discarded automatically if Wow.exe changes.", true) },
                 { "Collision Box Test (SSE2)", new SettingItem("Graphics_Sound", "CollisionOutcode", false, null, "Every line-of-sight check, every mouse click on the world and every projectile path makes the game sort the corners of a collision model against a box, one corner at a time on the old floating-point stack - six comparisons per corner. A corrected profile puts that single function at 3.8% of main-thread time, the largest one left outside model animation. This does four corners per instruction. Unlike the other maths replacements in this tool it is exact rather than close: the box bounds are read as plain numbers with no arithmetic done to them, so the vector comparison gives the same answer as the game's for every possible input. Before it changes anything it works out what the game is about to produce - which corners are outside and which triangles get queued - lets the game run, and compares the two lists. Three thousand of those have to match before it takes over.", true) },
+                { "Collision Model Cache (SSE2)", new SettingItem("Graphics_Sound", "CollisionModelCache", false, null, "Accelerates the 8-way set-associative BSP collision model cache lookup on sub_79B1F0. Uses dual 128-bit SSE2 vector comparisons to test all 8 set slots simultaneously with zero branch mispredictions. Verified against original lookup with automatic miss fallback.", true) },
                 { "Collision Ray Test (SSE2)", new SettingItem("Graphics_Sound", "CollisionRayOutcode", false, null, "The other half of the same collision work. A line-of-sight check or a mouse click on the world casts a ray, and before the ray meets a single triangle the game sorts every corner of the model against a box and compares each one six times on the old floating-point stack. Each of those comparisons is a branch on whether a corner is outside one face, which is a coin toss, so a model of a few hundred corners costs a few hundred mispredicted branches. A corrected profile puts the function at 2.6% of main-thread time. This does four corners at a time with no branch in it. The box here is nudged outward by a hundredth of a yard and the game keeps that nudge at a wider precision than a normal number, so the comparisons are done at that wider precision too and give the game's own answer for every possible input. Before it changes anything it computes the whole classification alongside the game's, lets the game run, and compares. Three thousand calls have to match before it takes over.", true) },
                 { "Ray vs Triangle Test (SSE2)", new SettingItem("Graphics_Sound", "RayTriangleSse2", false, null, "The third and last piece of the collision work. Once the game has narrowed a ray down to the handful of triangles it might actually touch, it tests each one, and that test is shared by every collision path in the game - line of sight, mouse clicks on the world, projectiles, footing. A corrected profile puts the whole collision family at 6.4% of main-thread time and this is the part of it doing the real arithmetic: 231 old floating-point-stack instructions with five round trips through the status register, each one feeding a branch on whether the ray missed, which the processor cannot predict. This carries the same numbers at the same width and compares them directly. It is a transcription rather than a tidy-up: wherever the game narrows an intermediate value to a smaller number this narrows it too, because writing the same formula cleanly gives a different distance on more than a quarter of hits. Before it answers anything it computes the result alongside the game twenty thousand times and compares the answer and every number written; one call in four thousand keeps checking afterwards.", true) },
+                { "Occluder Sphere Test (SSE2)", new SettingItem("Graphics_Sound", "OccluderSphere", false, null, "Accelerates the convex occluder volume sphere culling test on sub_7CCE00. Evaluates occluder planes 4-wide in parallel using transposed SSE2 SIMD dot products instead of serial x87 calculations, eliminating x87 pipeline stalls across world and model visibility passes.", true) },
+                { "M2 Animation Track Search", new SettingItem("Graphics_Sound", "M2AnimFindKey", false, null, "Accelerates the M2 animation timeline keyframe search on sub_8284D0. Replaces serialized x87 float divisions and store forwarding stalls with branch-optimized keyframe resolution and SSE math across all bone and model animation tracks.", true) },
                 { "Bone Matrix Upload (SSE2)", new SettingItem("Graphics_Sound", "BoneMatrixUpload", false, null, "Replaces the bone matrix transpose in the draw path with SSE2. 3.35% of main-thread time in the profile. Nothing is computed, only copied, so the result is identical bit for bit; it still checks the first 20000 bones against the client and backs out if they differ.", true) },
                 { "Particle Vertex Fill (SSE2)", new SettingItem("Graphics_Sound", "ParticleFill", false, null, "Replaces the per-particle vertex fill in the client's particle emitter (2.5% of self time in a combat profile). For every particle the client calls a getter and adds the offset on the x87 stack; this reads the getter once per fill and does the add with SSE, writing the same bytes. It first predicts 4096 fills and compares each byte for byte with what the client itself wrote, keeps comparing one in 1024 after that, and switches itself off for the session at the first difference.", true) },
                 { "UI Batch Fill (SSE2)", new SettingItem("Graphics_Sound", "UiBatchFill", false, null, "Replaces the per-vertex fill in the client's UI batch draw (UI_BatchDraw, 2.3% of executing time in a combat profile with a busy interface). For every vertex the client calls a getter and reloads six values; this reads them once per batch and writes the same bytes. It first predicts 4096 batches and compares each byte for byte with what the client itself wrote, keeps comparing one in 1024 after that, and switches itself off for the session at the first difference.", true) },
-                { "M2 Matrix Slot Copy (SSE2)", new SettingItem("Graphics_Sound", "M2MatrixSlotSse2", false, null, "Replaces the two places in the model animation update that copy a finished bone matrix into the model one float at a time - sixteen x87 moves each - with four SSE2 moves. There is no arithmetic in either, so the bytes written are the bytes read. The animation family is about a fifth of the frame. Experimental.", true) },
-                { "Model Animation Stride (experimental)", new SettingItem("Graphics_Sound", "M2AnimStride", false, null, "Holds a distant model's skeleton for a frame instead of re-solving every bone. Its materials, particles and attached items keep animating - only the bones pause. Nothing within 45 yards is ever held; past that a model updates every 2nd, 3rd or 4th frame by distance, and each one is on its own phase so they do not all update together. The animation family is about a fifth of the frame.\r\n\r\nReported stuttering visibly on environment animation, the lava in Ironforge among it. Distance is a poor stand-in for whether a held skeleton is seen: a large animation fills the screen at any range. No measured frame gain stands against that yet - the sessions that showed the stutter were frame capped, where a saving inside the frame changes no frame time. It is an A/B subject; that run has not happened.", true) },
+                { "M2 Matrix Slot Copy (SSE2)", new SettingItem("Graphics_Sound", "M2MatrixSlotSse2", false, null, "Replaces the two places in the model animation update that copy a finished bone matrix into the model one float at a time - sixteen x87 moves each - with four SSE2 moves. There is no arithmetic in either, so the bytes written are the bytes read. The animation family is about a fifth of the frame.", true) },
+                { "M2 Batch Matrix Setup (SSE2)", new SettingItem("Graphics_Sound", "M2BatchMatrixSse2", false, null, "Replaces the serialized sixteen-float matrix setup copies in sub_823130 (M2 batch render pass setup) with four SSE2 vector moves each. Eliminates x87 store-forwarding stalls during model rendering.", true) },
+                { "M2 Scalar Animation Tracks (SSE2)", new SettingItem("Graphics_Sound", "AnimScalarTrack", false, null, "Vectorizes the packed int16 and float scalar animation track evaluators in sub_82AF40 and sub_82B340 using hardware double-precision SSE2. Handles transparency, alpha channels, camera FOV, and model colors with bit-exact float outputs across keyframe interpolation and blending.", true) },
+                { "M2 Spline Animation Tracks (SSE2)", new SettingItem("Graphics_Sound", "AnimSplineTrack", false, null, "Vectorizes the 3D vector and scalar cubic spline animation track evaluators in sub_82B460 and sub_82B8A0 using hardware double-precision SSE2. Evaluates cubic Hermite and Bezier spline tracks for models, ribbons, lights, and cameras with bit-exact float outputs and dual-run verification.", true) },
+                { "Model Animation Stride (experimental)", new SettingItem("Graphics_Sound", "M2AnimStride", false, null, "Holds a distant model's skeleton for a frame instead of re-solving every bone. Its materials, particles and attached items keep animating - only the bones pause. Hardened with a 4-tier guard: crowd threshold (runs at 100% animation fidelity when under 24 models in scene), bounding radius and extents guard (models with radius > 6.0 yards or extents > 10.0 yards are never held, completely eliminating previous stutter on Ironforge lava and environment machinery), and an apparent screen-footprint guard ((radius^2)/distSq <= 0.0015). Nothing within 45 yards is ever held; past that small player/creature models update every 2nd, 3rd or 4th frame by distance on their own phase. Off by default.", true) },
                 { "Reuse Repeated Animation Poses", new SettingItem("Graphics_Sound", "M2AnimReuse", false, null, "A model's skeleton is rebuilt from scratch every frame, and in one measured session nine times out of ten the game asked for a pose it had already worked out - same model, same animation, same moment - while the game's own check that is meant to catch that fired for none of a quarter million rebuilds. This keeps the pose when the question is word for word the same one, so what you see is the pose the game would have recalculated, not an old one. Everything after the skeleton still runs, so weapons, particles, lights and texture animation carry on. Models whose skeleton carries a running clock are left alone. Before it holds anything it fingerprints the skeleton the game produced and waits for five thousand of those to come out identical; one hold in four thousand keeps checking afterwards. Turn Model Animation Stride off to use this - they cut the game at the same instruction, and that one decides by distance, which is why it stuttered.", true) },
                 { "Keep the Allocator Above 2GB", new SettingItem("General", "MimallocHighArena", false, null, "A 32-bit client can only allocate from the low 2GB, and this tool's allocator grows into the same half. Three sessions ran out of it, and one had a SavedVariables file written under a garbage name. This reserves address space above 2GB and hands it to the allocator, which uses memory it is given before asking the OS - and hands over more as it fills, so the allocator never has a reason to come back down. Needs a large-address-aware client. It releases any block Windows places below 2GB rather than use it. Sizes are MimallocHighArenaMB and MimallocHighArenaMaxMB in wow_opt.ini.", true) },
                 { "Address Space Census", new SettingItem("General", "VaCensus", false, null, "Measurement only. Records every private address-space reservation by the module that made it - wow.exe, DXVK, the GPU driver, this tool - so the low-2GB dump in the log names who holds that half instead of calling it \"private\". Every out-of-memory report so far has said how much private memory sits below 2GB and never whose it is. Hooks two ntdll allocation entry points; nothing is placed or freed differently.", true) },
@@ -696,6 +731,8 @@ namespace WowOptimizeLauncher {
                 { "Large Reservations Above 2GB: wow.exe", new SettingItem("General", "HighPlacementClient", false, null, "The same for wow.exe's own reservations and heap growth. Riskier: the client's large-address-aware flag comes from a community patch, and nobody has checked that every path in it handles pointers above 2GB. If the game misbehaves with this on and not with it off, that is what it found.", true) },
                 { "Batch the Game's File Writes", new SettingItem("General", "ClientWriteBatch", true, null, "The game writes SavedVariables about nine bytes at a time. One tester's loading screen spent 2470 ms of 16828 inside 593557 of those calls, for 5.6 MB. This gathers them into 64KB pieces, so the same work is about ninety system calls. It buffers one file at a time, flushes on every close, seek, read and flush, and checks each closed file's size against what the game handed over - if a byte ever goes missing it switches itself off and says so. Needs File I/O Hooks.", true) },
                 { "Box Overlap Test (SSE2)", new SettingItem("Graphics_Sound", "AabbOverlap", false, null, "Before drawing anything the game asks, for every object in the scene and for every visibility pass over it, whether that object's box overlaps the one being tested. Seventeen different parts of the engine ask it. The test itself is six number comparisons, but each one is moved off the old floating-point stack through the slowest instruction available for that, and each is followed by a branch the scene data decides - so a walk over a mixed set of objects guesses wrong on most of them. This answers all six at once. Nothing is added or multiplied anywhere in the test, only compared, so the vector version gives the identical answer for every possible input rather than a close one. It checks itself against the game's own answer twenty thousand times before it starts answering alone, and keeps rechecking one call in four thousand after that.", true) },
+                { "Bounding Box Transform (SSE2)", new SettingItem("Graphics_Sound", "AabbTransform", false, null, "Transforms an object's bounding box by a 4x4 or 3x3 matrix (sub_7F9430 and sub_7F93D0) during scene graph visibility traversal and culling passes. Replaces Jim Arvo's algorithm on the x87 FPU - which suffers 18 status-word transfers (fnstsw ax) and 9 data-dependent branch mispredictions per box - with hardware double-precision SSE2 registers, achieving bit-exact floating point parity with dual-run verification.", true) },
+                { "Colour Pack and Unpack (SSE2)", new SettingItem("Graphics_Sound", "ColorUnpack", false, null, "Replaces the game's colour conversions - packing and unpacking BGRA and BGR, RGB to HSV and back - and the two routines that pick a vector's largest and smallest axis. Each is checked against the game's own routine before it is used and switches itself off on the first difference. Off by default: none of it has been run in a game yet.", true) },
                 { "Lua Pool Shortcuts", new SettingItem("UI_Lua", "LuaPoolFast", false, null, "The game keeps its own pool of memory for the interface scripting language, carved into chunks. Every time it hands a block back, it has to work out which chunk that block came from, and it does that by checking every chunk in turn, following a pointer to each one before it can even compare. This remembers the last few chunks along with their boundaries, so the usual answer is a couple of comparisons instead of a walk through scattered memory. The block is always re-checked against the chunk's own record before anything is written, so a stale entry costs a little time and can never put memory in the wrong place. It also tells the separate 'Lua Pool Allocation Hint' feature which chunk just got a block back, which is the one thing that feature could not know on its own: a measurement of a tester's session showed three quarters of allocations finding room immediately but nearly a fifth still searching through thirty-three chunks or more, and that tail is exactly memory freed into a chunk the search had already passed. Two testers' freeze reports have pointed at this code.", true) },
                 { "Matrix-Vector SSE2 (slower - off)", new SettingItem("Graphics_Sound", "MatrixVectorSse2", false, null, "Replaces one small piece of the game's 3D maths with a modern instruction set. It is off, and it will stay off unless you have a reason: measured side by side against the game's own code it came out slower - 3.3 against 2.5 nanoseconds a call - while producing exactly the same numbers, and it runs about five thousand times per frame. It was switched on for everyone by accident, tied to an unrelated text-search option, so nobody could turn it off. Left here only so the measurement can be repeated.", true) },
                 { "Steadier Shadows (flicker fix)", new SettingItem("Graphics_Sound", "ShadowCascadeHold", false, null, "Below the highest shadow setting the game does not redraw shadows every frame. It builds a new shadow map over nine frames around the point you were standing on when those frames began, then shows the whole thing at once - so the shadows do not fade in, they jump. The nearest map does that every two yards, which while running is about three times a second, and that jump is the flicker people see on buildings as they run past. This halves the distance, so the jumps are half the size and twice as often: many small corrections read as movement where a few large ones read as popping. It costs some frames the game would have skipped the shadow work on entirely. An earlier version went the other way and doubled the distance, which removed the flicker for one tester and gave another visibly lagging shadows. EXPERIMENTAL - this is a judgement about how a jump looks, not a measurement, so try it against having it off.", true) },
@@ -703,6 +740,18 @@ namespace WowOptimizeLauncher {
                 { "Line-of-Sight Box Test (SSE2)", new SettingItem("Graphics_Sound", "SegmentAabb", false, null, "Checking whether a line passes through a box. Almost all the time here goes on something other than the maths: to act on a comparison of two numbers, the old floating-point unit has to copy its status into a general register first, and the next instruction sits waiting for it. This function does that ten times per call, and the profiler's samples land exactly on the waiting instruction. Modern instructions produce the answer directly. Every one of those ten decisions was transcribed rather than guessed, including two that the game makes by inspecting raw bits rather than comparing values, so the answer is identical in every case. The test only reports a yes or no and changes nothing, so it is checked against the game's own answer twenty thousand times and regularly afterwards.", true) },
                 { "Visibility Box Test (SSE2)", new SettingItem("Graphics_Sound", "FrustumAabb", false, null, "Deciding whether something is on screen means testing its bounding box against the six sides of the view. Most of what the game spends there is not the maths: for each side it checks the sign of a number, uses that to look up which corner of the box to use, and then fetches the corner through that lookup - eighteen times per test. The processor can pick the corner directly from those signs with no lookup at all. The maths is done at the same width the game uses and in the same order, so the answer is identical. The test only reports a yes or no and changes nothing, so it is simply checked against the game's own answer, twenty thousand times at first and regularly afterwards.", true) },
                 { "Model Draw Order Key Cache", new SettingItem("Graphics_Sound", "M2SortKey", false, null, "Before drawing a model the game sorts its pieces into the right order, and the routine that decides which of two pieces comes first spends almost all its time chasing pointers through memory to look up a single number - five hops, each waiting on the one before it. In a profile of a tester's session this one routine was 2.44 percent of all the time the game spent working, ahead of every scripting entry. This remembers that number for the length of a single frame, which removes three of the five hops. The comparison itself is unchanged and does not alter anything, so the result is simply checked against the game's own answer, twenty thousand times at first and regularly afterwards.", true) },
+                { "Model Draw Order Sort", new SettingItem("Graphics_Sound", "M2BatchSort", false, null, "Every frame the game sorts the solid pieces of all visible models into drawing order. Each time it compares two pieces it follows the same chain of pointers for both of them first, and a sort compares each piece many times, so the routine doing it was 4.09 percent of the time the game spent working in a tester's profile, the largest single entry. This reads what the comparison needs once per piece before the sort starts and lets the game's own sort run on that. The order it produces is the same; for the first 512 sorts, and regularly afterwards, every comparison is also made the game's way and checked, and the first difference switches this off for the session.", true) },
+                { "Model Draw Order Sort: See-Through Pieces", new SettingItem("Graphics_Sound", "M2BatchCmpTransparent", false, null, "The game also sorts the see-through pieces of models - glass, flames, spell effects - into drawing order, and the routine that decides which of two pieces comes first was 2.01 percent of the time the game spent working in a three-hour profile. It reaches that decision through the old floating point unit, and every comparison copies that unit's status into a general register and stalls the processor while it does. This compares the same values in the same order without that copy. Nothing is calculated, only compared, so the order it produces is the same one. The first ten thousand comparisons are also made the game's way and checked against this one, then one in every hundred and twenty-eight, and the first difference switches it off for the session.", true) },
+                { "Model Draw Order Sort: Solid Pieces", new SettingItem("Graphics_Sound", "M2BatchCmpSolid", false, null, "The game sorts the solid pieces of models into drawing order, and the routine that decides which of two pieces comes first was 1.48 to 3.02 percent of the time the game spent working in a three-hour profile. It unconditionally chases three levels of pointers through memory for both pieces before checking whether their basic types or materials match. This compares the early fields first and only chases pointers if they match. Nothing is calculated, only compared, so the order it produces is identical. The first ten thousand comparisons are also made the game's way and checked against this one, then one in every hundred and twenty-eight, and the first difference switches it off for the session.", true) },
+                { "Collision Polygon Clip (SSE2)", new SettingItem("Graphics_Sound", "CollisionPolyClip", false, null, "When the game works out what a line of sight or a camera movement runs into, it cuts each surface against the planes around it. Before cutting anything it measures every corner of the surface against the plane, and most of the time the answer is that the surface is entirely on one side and nothing needs cutting - but it pays for the whole measurement to find that out, one corner at a time on the old floating point stack. In a tester's profile this was 8.75 percent of the time the game spent working. This does the measurement with vector instructions at the same precision the game uses, answers the two simple cases, and hands anything that really has to be cut back to the game. The first twenty thousand calls are answered by the game and the decision checked against what it did, and the first disagreement switches this off for the session.", true) },
+                { "Cloud Texture Reuse", new SettingItem("Graphics_Sound", "SkyTextureReuse", false, null, "The game draws its clouds from a texture it builds itself, a few rows every frame, cycling through the whole thing over and over. In a tester's profile that was 10.29 percent of the time the game spent working - the single largest thing it does. The pattern only moves when a counter tied to the cloud speed ticks over, so a full cycle that passes without a tick rebuilds exactly the bytes that are already there. This spots that and skips the rebuild, keeping everything else the game does. Whether it ever happens depends on the cloud speed and your frame rate, so it measures first: until it has seen rebuilds come out identical several times it changes nothing at all, and the log says how many passes could have been skipped.", true) },
+                { "World Visibility Traversal (SSE2)", new SettingItem("Graphics_Sound", "WorldVisTraverse", false, null, "When determining scene visibility and rendering shadow cascades, the game walks the 2D world grid cells and candidate models. Inside sub_7BCC00 and sub_7BCF20, it evaluates cell AABB bounding tests and model distance culling using legacy x87 instructions, causing up to six floating-point status-word stalls per cell and fourteen per candidate model. This replaces the bounding box overlap and distance culling checks with vectorized SSE2 instructions, eliminating CPU pipeline stalls while preserving exact coordinate thresholds. Off by default.", true) },
+                { "UI Strata Render Sort Cache", new SettingItem("UI_Lua", "UIStrataOpt", false, null, "Every frame when rendering the user interface, sub_47AE20 iterates all frame strata levels and sorts visible frames by level and draw order using std::sort. In raid environments with hundreds of UI frames, this sorting runs every frame even when no frames were created, shown, hidden, or re-parented. This caches the sorted frame indices while the frame list generation and count remain unchanged, bypassing redundant sorting passes while preserving exact draw order. Off by default.", true) },
+                { "Particle Track Evaluation (SSE2)", new SettingItem("Graphics_Sound", "ParticleTrackEval", false, null, "Every particle in every effect has its colour, size and two more values worked out from how far through its life it is. The game does that on the old floating point stack, and each of the seven values goes out to memory and comes back before it is turned into a number it can use. In a tester's profile this one routine was 1.75 percent of the time the game spent working, and the particle update around it another 2.09. This does the same arithmetic with vector instructions at the same precision and with the same rounding. The first twenty thousand particles are worked out both ways and compared byte for byte, and the first difference switches this off for the session.", true) },
+                { "Shader Constant Compare (SSE2)", new SettingItem("Graphics_Sound", "ShaderConstDedup", false, null, "Before the game sends numbers to the graphics card it checks each one against its own copy of what it sent last time, so it can skip the ones that have not changed. It does that check one number at a time on the old floating point stack, four per register, and in a tester's profile the checking was 1.17 percent of the time the game spent working. This compares all four at once with a single vector instruction. Nothing is calculated - the numbers are only compared and copied - so the result is the same bits for the same reason a copy is. The first four thousand calls are done by the game as well and the result compared byte for byte, and the first difference switches this off for the session.", true) },
+                { "Batch Colour Convert", new SettingItem("Graphics_Sound", "BatchColourConvert", false, null, "Setting up each piece of a model to be drawn, the game turns three fractions into a colour. Turning a fraction into a whole number on the old floating point unit means switching its rounding mode and switching it back, twice per number, and each switch empties that unit's pipeline - in a tester's profile the single hottest instruction in the whole routine was one of those switches. This does the three conversions with one instruction each and no mode change. The game's own version of this code was copied instruction for instruction and run against this one over four million cases with no difference, six of those cases are re-checked when the game starts, and the twenty bytes around the code being replaced are compared first, so a different build of the game is refused rather than half-changed.", true) },
+                { "Whole and Fractional Split (SSE2)", new SettingItem("Graphics_Sound", "FloorSplit", false, null, "A small routine the game uses to break a number into its whole and fractional parts, called from twenty-six places - twelve of them in the cloud maths, and two more inside the sine and cosine pair that runs once per particle. Each call switches the old floating point unit into a different rounding mode and back, and each switch empties that unit's pipeline; the same thing is one instruction with vector maths and no mode change. The first twenty thousand calls are also done the game's way and compared bit for bit, including the odd case of an input of exactly zero, and the first difference switches this off for the session.", true) },
+                { "Cloud Texture Loops: Check Against The Game", new SettingItem("Graphics_Sound", "SkyCloudTexels", false, null, "The cloud texture is rebuilt a few rows at a time, once a frame, and the loops that work out each of its pixels are the largest single piece of main-thread work one tester measured. This switch does not speed anything up. It runs our own copy of those loops a second time, on its own copy of the buffers, and compares every byte with what the game produced - forty-eight passes and then it stops. If they agree, those loops become ours to move onto a second processor core or to do two pixels at a time, and the log says so. Leave it off unless you were asked to run it: while it is on, that work is done twice.") },
                 { "Bone Movement Track (SSE2)", new SettingItem("Graphics_Sound", "AnimVec3Track", false, null, "Alongside a rotation, every animated bone carries a position, and the game works out where it should be by interpolating between two keyframes one number at a time. This does all three at once. It runs more often than the rotation work does - the same routine handles every three-number track in a model, and the animation code calls it eight times over against once for rotations. The tricky part is that the game rounds the result to lower precision in one place and deliberately does not in another, so both are reproduced exactly where they happen and the position that comes out is identical bit for bit, not merely close. It checks itself against the game's own answer for the first thirty thousand bones and keeps rechecking afterwards.", true) },
                 { "Bone Rotation Unpack (SSE2)", new SettingItem("Graphics_Sound", "AnimQuatUnpack", false, null, "Posing a skeleton means reading a rotation for every bone of every animated thing on screen, every frame - and each rotation is stored packed into four small integers that have to be expanded back into real numbers. A 32-bit processor has no direct route from an integer to the old floating-point unit, so the game writes each number to memory and immediately reads it back again, four times per rotation and up to sixteen times per bone. This converts two at a time inside the processor with no memory in the way. The maths is done at the same width the game uses and rounded at the same points, so the pose that comes out is identical bit for bit, not merely close. It compares all its output against the game's own for the first thirty thousand bones and keeps rechecking afterwards.", true) },
                 { "Spread Model Animation (crowd throttle)", new SettingItem("Graphics_Sound", "AnimLod", false, null, "Posing the skeletons of everything on screen is the single largest block of frame time the game spends: measured on real sessions at 3.68 milliseconds out of a 24.5 millisecond frame in a raid, across 114 models averaging 31 bones each. No one function inside it is worth optimising - the cost is spread across dozens - so the only way to reach it is to do less of it. Below 96 models on screen this changes nothing at all. Above that, each model has its pose refreshed every second, third or fourth frame instead of every frame, never less often than a quarter of your frame rate, and a model is never skipped before its first pose. It cannot make animations run slow or drift: the game works out where an animation should be from the clock each time rather than by counting frames, so a skipped update only delays when a pose is refreshed.\r\n\r\nReported stuttering visibly on environment animation, the Deeprun Tram tunnels among them. Its guard protects models whose materials or attachments still need work; it does not protect the skeleton, which is the thing being held. No measured frame gain stands against that yet - the sessions that showed the stutter were frame capped, where a saving inside the frame changes no frame time.", true) },
@@ -724,13 +773,55 @@ namespace WowOptimizeLauncher {
                 { "Lua String Interning Fast Path", new SettingItem("UI_Lua", "LuaSNewLstrFast", false, null, "Intercepts luaS_newlstr (0x00856C80), which every Lua string in the game passes through, and looks the string up in the VM's string table itself. Experimental: on a miss the engine repeats the same work, and it is under investigation as a possible cause of corrupted addon names. Leave off unless testing. Skipped by Enable All while it is under investigation.", true) },
                 { "Fast SSE2 Memory Clear (FastMemset)", new SettingItem("Graphics_Sound", "FastMemsetOpt", true, null, "SSE2 non-temporal memset replacement for large memory clears at 0x0040BB80.") },
                 { "Fast Case-Insensitive String Compare", new SettingItem("UI_Lua", "FastStrnicmpOpt", true, null, "SSE2 ASCII case-insensitive string comparison replacement at 0x0076E780.") },
+                { "Collision Pick-Ray Outcode Rejection (SSE2)", new SettingItem("Graphics_Sound", "CollisionRayVerts", false, null, "Vectorizes line-of-sight and pick-ray triangle outcode rejection in sub_7C6D50 using packed SSE2 comparisons. Eliminates 158 serialized x87 instructions and status-word stalls per raycast pass.", true) },
+                { "FMOD ParamEQ Audio Filter (SSE2)", new SettingItem("Graphics_Sound", "FmodParamEq", false, null, "Vectorizes the FMOD ParamEQ DSP multi-channel biquad audio filter in sub_8EDFC0 using dual-channel SSE2 vector arithmetic, eliminating scalar x87 math in combat audio mixing.", true) },
+                { "UI Scissor Rect Subdivision (SSE2)", new SettingItem("UI_Lua", "UIRectSubdivide", false, null, "Replaces serialized scalar comparisons in UI dirty rect subdivision and scissor clipping (sub_7762A0) with fast packed SSE2 disjoint bounding box tests.", true) },
+                { "Scene Graph Visibility Traversal (SSE2)", new SettingItem("Graphics_Sound", "SceneVisTraverse", false, null, "Vectorizes 6-float bounding box copies and accelerates visibility culling during scene graph traversal in sub_7A50C0.", true) },
+                { "M2 Particle Physics Integration (SSE2)", new SettingItem("Graphics_Sound", "ParticlePhysics", false, null, "Vectorizes 3D Euclidean distance calculations and velocity damping integration in M2 particle emitters (sub_97EB10) using SSE2 scalar and vector instructions.", true) },
+                { "Collision Query Reset Visited (sub_7C7610)", new SettingItem("Graphics_Sound", "CollisionResetVisited", false, null, "Replaces per-iteration global writes and pointer reloads with a hoisted 4-way unrolled clearing pass in sub_7C7610 (2.72% of executing time in field sessions).", true) },
+                { "UI Strata List Compaction (SSE2)", new SettingItem("UI_Lua", "UIStrataCompact", false, null, "Vectorizes UI strata frame pointer array compaction in sub_495060, removing 4 pointers per SSE2 step with bitmask compression.", true) },
+                { "DBC Fast RLE / Copy Unpack", new SettingItem("General", "DbcFastRle", false, null, "Optimizes DBC string and integer array unrolling in sub_4CFBB0 with 16-byte aligned vector copies and precomputed offsets.", true) },
+                { "ARGB Pixel Format Blit Converter (SSE2)", new SettingItem("Graphics_Sound", "PixelFormatBlit", false, null, "Vectorizes 32-bpp ARGB and RGBA pixel format unpacking and color channel conversion in sub_6ABC20 using SSE2 shuffles.", true) },
+                { "UI Frame Removal Fast Scan", new SettingItem("UI_Lua", "UIFrameRemove", false, null, "Accelerates UI frame removal and parent unlinking in sub_491160 using vectorized 16-byte pointer search and compact memmove.", true) },
+                { "Particle Billboard Quad (sub_97BE80)", new SettingItem("Graphics_Sound", "ParticleQuad", false, null, "Replaces 365 instructions of serialized x87 trigonometry and quad vertex generation in sub_97BE80 (billboard particle vertex calculations, hot in combat profiles) with bit-exact double precision quad generation and branchless AABB updates.", true) },
+                { "Terrain Horizon Bounding Test (SSE2)", new SettingItem("Graphics_Sound", "HorizonTestAABB", false, null, "When testing scene objects against the terrain horizon raster buffer, sub_78FDC0 projects the eight corners of an object bounding box using 8 matrix transforms and 8 x87 floating point divisions, tracking projected bounds and scanning the horizon buffer. This inlines the 3D-to-screen corner projection in exact double precision and accelerates the horizon buffer scan with 4-wide packed SSE2 comparisons. Off by default.", true) },
+                { "M2 Mesh Skin Planar Projection", new SettingItem("Graphics_Sound", "M2SkinProjection", false, null, "Accelerates M2 animated skin vertex planar projection in sub_81D680 (#10 CPU hotspot at 2.10% of frame time) by inlining point-matrix transformations in exact double precision, eliminating per-vertex function call overhead and dynamic stack realignment. Off by default.", true) },
+                { "Asset Path Hash Acceleration (SSE2)", new SettingItem("General", "SStrHashFast", false, null, "Accelerates asset path normalization and Jenkins hash computation in sub_76F640 using SSE2 16-byte vector case conversion and path separator replacement. Off by default.", true) },
+                { "FMOD Reverb Delay Buffer Clear (Fast)", new SettingItem("Graphics_Sound", "ReverbClearFast", false, null, "Accelerates FMOD SFX reverb delay-line buffer clearing in sub_927220 (up to 1.82% of frame time and 100-150ms hitches during area transitions) by replacing scalar x87 float-by-float store loops with vectorized memset stores. Off by default.", true) },
+                { "UI Layout Rect Fast Path (SSE2)", new SettingItem("UI_Lua", "UILayoutRectFast", false, null, "Accelerates CSimpleFrame layout rect calculations in sub_489570 (frequently queried across frame layout queries) using 4-wide packed SSE2 vector comparisons to resolve unchanged frames without serialized x87 calculations or helper function calls. Off by default.", true) },
+                { "UI Strata Overlap Detection (Fast)", new SettingItem("UI_Lua", "UIStrataOverlapFast", false, null, "Accelerates CFrameStrataManager frame occlusion and overlap testing in sub_494D20 (#3 hotspot in wow.exe at 0.70% of frame time) by hoisting query frame bounds, inlining parent hierarchy checks, and evaluating 2D AABB intersections directly without helper call overhead or serialized x87 math. Off by default.", true) },
+                { "Particle Integration Fast (sub_979BB0)", new SettingItem("Graphics_Sound", "ParticleIntegrateFast", false, null, "Accelerates particle physics and position integration in sub_979BB0 (>31,000 samples, ~3.0% of frame time across particle emitters) by eliminating serialized x87 calculations, inlining denormal flushing, and evaluating physics in exact double precision with zero function call overhead. Off by default.", true) },
+                { "Fast SinCos Derivation (sub_6F7A60)", new SettingItem("Graphics_Sound", "FastSinCos", false, null, "Accelerates sine and cosine calculation in sub_6F7A60 (69,623 samples across ribbon and billboard particle emitters) by eliminating serialized calls to sub_5FE800 and x87 control-word swaps, evaluating exact cubic polynomial approximation using 2-wide packed SSE2 double precision. Off by default.", true) },
+                { "Model Draw Order Sort: Master Comparator (sub_81F0E0)", new SettingItem("Graphics_Sound", "M2BatchCmpTop", false, null, "The master M2 batch comparator passed to heapsort in sub_81FAE2 was sampled 15,561 times at 0x0081F107 (~1.5% of executing time). It decides drawing order across all models and particle batches by evaluating record priority, types, depth components, and names. This inlines the priority and sub-structure comparisons with zero stack cookie overhead, evaluates bitfield extraction directly, and dual-run verifies against the client function. Off by default.", true) },
+                { "Particle Emitter Hierarchy Activity Check (sub_97B9E0)", new SettingItem("Graphics_Sound", "ParticleEmitterActive", false, null, "The recursive particle emitter activity check in sub_97B9E0 was sampled up to 8,803 times per snapshot during intense particle simulation and M2 model updates. It recursively walks emitter parent-child trees to determine whether any child emitter has active particles. This replaces the recursive __thiscall stack frames with a flattened iterative depth-first traversal using a safe bounded stack and early-exit active tests. Dual-run verified against the client function. Off by default.", true) },
+                { "Collision Mesh Face Query (sub_75C5A0)", new SettingItem("Graphics_Sound", "CollisionFaceClip", false, null, "When querying collision meshes against lines of sight and swept camera/player hulls, sub_75C5A0 evaluates each 3D triangle face of the mesh against bounding clipping planes. It zeroes 180 bytes on the stack on entry with 45 x87 instructions and executes an x87 dot product with status-word stalls for every face in the mesh. This eliminates the redundant stack zeroing and evaluates backface culling in bit-exact IEEE double precision matching client x87 operation order with zero /GS cookie overhead. Dual-run verified against the client function. Off by default.", true) },
+                { "Collision Polygon Copy & Stack Init (sub_75B610)", new SettingItem("Graphics_Sound", "CollisionPolyCopy", false, null, "The polygon copy helper in sub_75B610 was sampled 723 times (0.59% of executing time) in collision query profiling. It executes 45 serialized x87 stores to zero 180 bytes on the stack on every call, then immediately overwrites them with CRT memcpy. This inlines direct SSE2 copies and zeroing for triangle and quad polygons with zero /GS cookies or CRT call overhead. Dual-run verified against the client function. Off by default.", true) },
+                { "Matrix3x3 Rotation Axis-Angle (sub_4C5820)", new SettingItem("Graphics_Sound", "Mat3RotAxis", false, null, "Rodrigues rotation matrix derivation in sub_4C5820 was sampled 7,002 times in profiler logs. It executes 114 instructions with over 60 x87 floating point operations and stack register spills. This replaces it with inlined fsincos, bit-exact client x87 accumulation order, and zero stack cookies. Dual-run verified against the client function. Off by default.", true) },
+                { "M2 Mesh Triangle Ray Height Intersect (sub_81D510)", new SettingItem("Graphics_Sound", "M2MeshPickFast", false, null, "The 2D ray/point triangle intersection and Z height interpolation helper in sub_81D510 was sampled 9,066 times in profiler logs during scene interaction and model ray-casting. It executes a tight per-triangle loop with up to 5 x87 status-word transfers (fnstsw) and a 30+ cycle fdivrp on every triangle. This eliminates status-word stalls, defers division until after orientation and sign checks pass, and computes Z height in exact client x87 double precision with zero /GS stack cookies. Dual-run verified against the client function. Off by default.", true) },
+                { "M2 Collision Vertex Outcode (sub_82EC30)", new SettingItem("Graphics_Sound", "M2CollisionOutcode", false, null, "When evaluating M2 model collisions against bounding boxes, sub_82EC30 transforms every model vertex and classifies it into 6-plane AABB outcodes. Sampled 7,200 times at 0x0082ED18, this loop was dominated by serialized x87 status-word stalls and per-vertex call overhead to sub_4C21B0. This inlines double-precision vertex transformations matching client operation order bit for bit and computes outcodes directly with zero status-word stalls and zero /GS cookies. Dual-run verified against the client function. Off by default.", true) },
+                { "Collision Triangle Query Classification (sub_7C7660)", new SettingItem("Graphics_Sound", "CollisionTriTest", false, null, "When querying collision BSP trees during line-of-sight and character raycasts, sub_7C7660 tests each candidate triangle against view/query frustum planes. Sampled 2,893 times at 0x007C76C1 (1.15% of executing time), it executes 4 separate function calls per triangle and unconditionally evaluates 18 x87 plane equations across all three vertices even when vertex 0 is already inside all planes. This inlines 6-plane outcodes in exact client 53-bit x87 double precision, short-circuits early when vertex 0 or 1 is inside, and eliminates stack cookies and function call overhead. Dual-run verified against the client function. Off by default.", true) },
+                { "Collision Triangle AABB Culling (sub_7C7A00)", new SettingItem("Graphics_Sound", "CollisionBoxTri", false, null, "When querying scene collision BSP trees, sub_7C9B10 evaluates each candidate triangle against bounding boxes using sub_7C7A00 (211 bytes). It is a sibling in the collision pipeline to sub_7C7610 (CollisionResetVisited, 2.72% CPU) and sub_7C7660 (CollisionTriTest, 1.15% CPU). The client executes up to 18 serialized x87 subtractions with float stack spills and integer reloads to extract sign bits. This inlines direct IEEE 754 sign tests, short-circuits early when vertex 0 is inside the box on an axis, and returns immediately on the first culled axis with zero /GS stack cookies. Dual-run verified against the client function. Off by default.", true) },
+                { "M2 Raycast Hit Sort (sub_81CBC0)", new SettingItem("Graphics_Sound", "M2RayHitSort", false, null, "When evaluating ray intersections and collision queries against M2 scene geometry (sub_81DF10 and sub_81E110), candidate hits are gathered into 16-byte records and sorted by distance using heapsort sub_83DCF0 with comparator sub_81CBC0 (110 bytes). For every comparison the client executes up to four serialized x87 float loads and comparisons, stalling the execution pipeline on the status word (fnstsw ax) and parity flags. This evaluates float metrics directly without status-word stalls, eliminating frame overhead and /GS stack cookies. Dual-run verified against the client function. Off by default.", true) },
+                { "Terrain Point Outcode (sub_7A61D0)", new SettingItem("Graphics_Sound", "TerrainPointOutcode", false, null, "When testing terrain polygon vertices against bounding boxes during chunk culling and polygon generation (sub_7A61D0), the client calculates Cohen-Sutherland outcodes using six sequential x87 subtraction and addition cycles, storing each float to stack and reloading it as an integer, creating store-to-load forwarding stalls. This replaces the tests with 128-bit SSE2 vector arithmetic and movemask extraction, evaluating coordinates branchlessly in parallel with bit-exact parity. Dual-run verified against the client function. Off by default.", true) },
+                { "Collision World BSP Tree Traversal (sub_7CA920)", new SettingItem("Graphics_Sound", "CollisionBspTraverse", false, null, "When querying scene collision BSP trees during character movement, raycasting, and terrain collision queries (sub_7CB7B0 -> sub_7CA920), sub_7CA920 was sampled 98,447 times at 0x007CA939 as the primary traversal bottleneck. The client implementation uses recursive calls with 76-byte stack frames plus 3 register pushes per level (88 bytes) and executes up to 4 serialized x87 float compares with status-word transfers (fnstsw ax) per node. This transforms the recursive tree walk into an iterative traversal with an explicit small stack (up to 64 levels) and tail recursion along the active child path, evaluating float comparisons directly in IEEE single precision with zero /GS stack cookies. Bit-exact parity verified over 1,000,000 test cases with zero leaf sequence mismatches (harness only). Off by default.", true) },
+                { "Scene Light Grid Traversal (sub_81E400)", new SettingItem("Graphics_Sound", "SceneLightGrid", false, null, "When querying local and dynamic scene lights across models, terrain, and particles (sub_7964A0, sub_7984A0, sub_7D0050, sub_7D04A0, sub_7D4F40, sub_831AF0), sub_81E400 was sampled 213,225 times at 0x0081E533 as a major rendering hotspot. The client computes 64x64 toroidal grid cell bounds by invoking 4 separate CRT _floor calls with 8 x87 control-word swaps (fnstcw/fldcw) per query, draining the execution pipeline. This evaluates the cell bounds directly in IEEE double precision in client operation order, eliminating all 8 control-word swaps and 4 CRT floor calls per query, followed by toroidal grid iteration with zero /GS stack cookies. Bit-exact bounds and traversal verified over 1,000,000 test cases with zero mismatches (harness only). Off by default.", true) },
+                { "Collision Swept Ray BSP Traversal (sub_7CA600)", new SettingItem("Graphics_Sound", "CollisionSweptBsp", false, null, "When performing moving sphere and swept hull collision tests against terrain and world geometry (sub_7CB260 -> sub_7CA600), sub_7CA600 was sampled 4,984 times at 0x007CA61E as a primary collision traversal bottleneck. The client implementation uses recursive calls with 84-byte stack frames plus 3 register saves (96 bytes) and up to 10 serialized x87 float operations with status-word transfers (fnstsw ax) per node. This transforms the recursive tree walk into an iterative traversal with an explicit small stack (up to 64 levels) and tail recursion along the active child path, evaluating float comparisons branchlessly with zero /GS stack cookies and zero SEH frames. Bit-exact parity verified over 1,000,000 test cases with zero leaf sequence mismatches (harness only). Off by default.", true) },
+                { "Collision Frustum BSP Tree Traversal (sub_7CA440)", new SettingItem("Graphics_Sound", "CollisionFrustumBsp", false, null, "When querying scene collision BSP trees for frustum and cone collision queries (sub_7CB180 -> sub_7CA440), sub_7CA440 traverses BSP trees to classify candidate triangles in leaves via sub_7C9A60 for sub_7C7660 (CollisionTriTest, sampled 2,893 times at 1.15% CPU time). The client implementation uses recursive calls with 76-byte stack frames plus 3 register pushes per level (88 bytes) and executes up to 4 serialized x87 float compares with status-word transfers (fnstsw ax) per node. This transforms the recursive tree walk into an iterative traversal with an explicit small stack (up to 64 levels) and tail recursion along the active child path, evaluating float comparisons directly in IEEE single precision with zero /GS stack cookies. Bit-exact parity verified over 1,000,000 test cases across 2,278,508 visited leaves with zero mismatches (harness only). Off by default.", true) },
+                { "Collision Swept Ray Triangle Test (sub_7C6600)", new SettingItem("Graphics_Sound", "CollisionSweptTri", false, null, "When performing moving sphere and character swept hull collision queries against world geometry (sub_7CB260 -> sub_7CA600 -> sub_7C9AB0 -> sub_7C6600), candidate triangles in BSP leaves are tested against the swept hull. The client implementation uses virtual calls with 4 register pushes/pops per invocation and executes up to 6 serialized x87 float operations with status-word round trips (fnstsw ax) and complex parity branches (test ah, 41h; jp ...) per hit triangle. This evaluates distance bounds and updates directly in IEEE single precision with branchless flag filtering and zero /GS stack cookies. Bit-exact parity verified over 1,000,000 test cases with zero mismatches (1.43x speedup; harness only). Off by default.", true) },
+                { "Scene Entity Spatial Collection (sub_7A2760)", new SettingItem("Graphics_Sound", "SceneEntityCollect", false, null, "When performing scene visibility, raycasting, and collision queries (sub_7A3570, sub_7A30D0), sub_7A2760 traverses spatial hash bucket linked lists to collect candidate scene nodes for culling and line-of-sight testing. Sampled 251,081 times at 0x007A27F8, the client suffers from per-iteration stack spills, redundant dword_CE04C4 reloads, and duplicated list insertion paths. This replacement eliminates stack spills, unifies list insertion into a single branchless path, and prefetches bucket nodes with zero /GS stack cookies and zero SEH frames. Validated offline over 1,000,000 test cases with 0 mismatches (harness only). Off by default.", true) },
+                { "M2 Skin Batch Comparator (sub_824B70)", new SettingItem("Graphics_Sound", "M2BatchCmpSkin", false, null, "When sorting M2 model skin and submesh batches during rendering passes (sub_82E840, sub_82DC10, sub_82BC20), sub_824B70 was sampled 3,864 times (1.40% of executing time) at 0x00824C1F. The client comparator unconditionally spills registers to stack and traverses redundant model metadata pointer chases on every invocation. This replacement fast-paths comparisons for batches belonging to the same model, eliminates redundant pointer dereferences, and resolves tie-breakers with zero /GS stack cookies. Dual-run verified against the client function. Off by default.", true) },
+                { "Collision BSP Leaf Triangle Inlining (sub_7CA8C0)", new SettingItem("Graphics_Sound", "CollisionBspLeaf", false, null, "In world collision BSP queries, sub_7CA920 was sampled 98,447 times at 0x007CA939 as the primary scene traversal hotspot. Every leaf node reached invokes sub_7CA8C0, which executes a separate __thiscall function call to sub_7C9B10 for every single triangle in the leaf. This replacement inlines the leaf triangle processing loop directly, caching query context pointers and masks across all triangles in the leaf, eliminating per-triangle function call overhead, stack frames, and memory spills with zero /GS stack cookies. Bit-exact parity verified over 1,000,000 test cases with zero mismatches (harness only). Off by default.", true) },
+                { "Collision Swept Ray Leaf Inlining (sub_7CA7F0)", new SettingItem("Graphics_Sound", "CollisionSweptLeaf", false, null, "When performing moving sphere and character swept hull collision queries against world geometry (sub_7CB260 -> sub_7CA600 -> sub_7CA7F0), sub_7CA7F0 is invoked for every collision leaf encountered. The client function executes a separate __thiscall function call to sub_7C9AB0 for every single triangle in the leaf. This replacement inlines the swept leaf triangle processing loop directly, caching query context pointers and masks across all triangles in the leaf, eliminating per-triangle function call overhead, stack frames, and memory spills with zero /GS stack cookies. Bit-exact parity verified over 1,000,000 test cases with zero mismatches (harness only). Off by default.", true) },
+                { "Collision Segment BSP Tree Traversal (sub_7CA180)", new SettingItem("Graphics_Sound", "CollisionSegmentBsp", false, null, "When performing linear ray/segment collision queries against world geometry (sub_7CB000 -> sub_7CA180), sub_7CA180 is the recursive BSP tree traversal function that tests candidate triangles in leaves via sub_7C9A00. The client implementation uses recursive calls with 96-byte stack frames plus 3 register pushes per level (108 bytes) and executes serialized x87 float operations with status-word transfers (fnstsw ax) per node. This transforms the recursive tree walk into an iterative traversal with an explicit small stack (up to 64 levels) and tail recursion along the active child path, evaluating float comparisons in IEEE single precision and straddle splits in IEEE double precision matching client x87 semantics with zero /GS stack cookies. Bit-exact parity verified over 1,000,000 test cases across 2,642,398 visited leaves with zero mismatches (harness only). Off by default.", true) },
+                { "Collision Segment Leaf Triangle Inlining (sub_7CA0F0)", new SettingItem("Graphics_Sound", "CollisionSegmentLeaf", false, null, "When performing ray/segment collision queries against terrain and world geometry (sub_7CB000 -> sub_7CA180 -> sub_7CA0F0), sub_7CA0F0 is invoked for every collision leaf encountered. The client function executes a separate __thiscall function call to sub_7C9A00 for every single triangle in the leaf. This replacement inlines the segment leaf triangle processing loop directly, caching query context pointers and masks across all triangles in the leaf, eliminating per-triangle function call overhead, stack frames, and memory spills with zero /GS stack cookies. Bit-exact parity verified over 1,000,000 test cases with zero mismatches (harness only). Off by default.", true) },
+                { "Terrain Chunk Draw Distance Sort (sub_7C3E70)", new SettingItem("Graphics_Sound", "TerrainChunkSort", false, null, "When sorting terrain render chunks back-to-front relative to camera draw origin and view frustum (sub_7C4B20 -> sub_7C3E70), sub_7C3E70 was sampled 7,370 times at 0x007C3EB9 as a primary terrain rendering bottleneck. The client implementation performs AABB corner distance evaluation, plane sign lookups, and bucket sort insertion with multiple x87 float compares and stack spills. This evaluates camera quadrant signs branchlessly, computes chunk distance bounds directly in IEEE double precision in client operation order for exact bit parity, and accelerates chunk list insertion with zero /GS stack cookies and zero SEH frames. Dual-run verified against the client function. Off by default.", true) },
             };
 
             // Window Setup
             Text = "WoW-Optimize Launcher";
             // The background is scaled to the client area and covered with a
             // near-opaque wash, so the height is free to change.
-            ClientSize = new Size(920, 700);
+            ClientSize = new Size(1000, 772);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None;
             BackColor = DarkBg;
@@ -958,6 +1049,27 @@ namespace WowOptimizeLauncher {
                 + "This is the first thing to try when something is wrong. If the "
                 + "problem is still there with everything off, it is not us.");
             leftPanel.Controls.Add(btnVanilla);
+            y += 38;
+
+            DarkButton btnProve = new DarkButton(Color.FromArgb(0, 200, 140), false);
+            btnProve.Text = "TRY THE UNPROVEN ONES";
+            btnProve.Size = new Size(btnWidth, 32);
+            btnProve.Location = new Point(15, y);
+            btnProve.Click += delegate { SetUpProvingRun(); };
+            toolTip.SetToolTip(btnProve,
+                "Everything MAX PERFORMANCE turns on, plus everything on the "
+                + "NOT PROVEN tab that replaces something the game does, plus the "
+                + "sampling profiler.\r\n\r\n"
+                + "Each of those replacements checks its own answers against the "
+                + "game's for thousands of calls before it answers anything, keeps "
+                + "checking one call in a few thousand after that, and switches "
+                + "itself off for the session at the first disagreement. The log "
+                + "says which armed, which retired and why.\r\n\r\n"
+                + "This is the session that decides whether they ship on. Play "
+                + "normally for half an hour or more - a city, some combat - then "
+                + "send Logs\\wow_optimize.log. Press MAX PERFORMANCE or DEFAULT "
+                + "afterwards to put it back.");
+            leftPanel.Controls.Add(btnProve);
             y += 40;
 
             y += AddSectionLabel(leftPanel, "WHEN SOMETHING IS WRONG", y);
@@ -1065,11 +1177,26 @@ namespace WowOptimizeLauncher {
             // looked for once they do.
             string compatLayers = dllActive ? CompatLayersInFolder(baseDir) : null;
 
+            // Opened straight out of a zip, Windows runs the launcher from a
+            // throwaway copy under the temp folder, where neither DLL nor the
+            // game can be. A screenshot of exactly that - "looked in
+            // ...\AppData\Local\Temp\48c71ee" - is what the old message
+            // produced, naming the folder without saying why it was wrong.
+            // Both sides in their long form. The temp path usually comes back
+            // in 8.3 form (C:\Users\ALEKSA~1\...) and the folder the launcher
+            // runs from in the long one (C:\Users\Aleksander\...). Compared as
+            // they are, the two never match, which is how the first version of
+            // this check missed the very case it was written for.
+            string tempRoot = LongPath(Path.GetTempPath());
+            bool inTemp = !string.IsNullOrEmpty(tempRoot) &&
+                          LongPath(baseDir).StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase);
+
+            // The headline is one or two words so it never runs past the card;
+            // the reason goes on the line below, where it can wrap.
             string statusText;
-            if (foreignLoader) statusText = "NOT LOADED - version.dll belongs to another mod";
-            else if (!dllActive) statusText = "NOT LOADED - missing " + missing;
-            else if (compatLayers != null) statusText = "MAY NOT LOAD - compatibility setting";
-            else statusText = "OPTIMIZER ACTIVE (version.dll)";
+            if (dllActive && compatLayers != null) statusText = "MAY NOT LOAD";
+            else if (dllActive) statusText = "READY";
+            else statusText = "NOT LOADED";
 
             Label statusVal = new Label();
             statusVal.Text = statusText;
@@ -1078,7 +1205,7 @@ namespace WowOptimizeLauncher {
             else if (compatLayers != null) statusVal.ForeColor = Color.FromArgb(255, 193, 7);
             else statusVal.ForeColor = Color.FromArgb(0, 230, 118);
             statusVal.AutoSize = true;
-            statusVal.Location = new Point(10, 26);
+            statusVal.Location = new Point(10, 24);
             statusVal.BackColor = Color.Transparent;
             statusCard.Controls.Add(statusVal);
 
@@ -1090,31 +1217,39 @@ namespace WowOptimizeLauncher {
             // the payload loaded.
             string detail;
             if (foreignLoader) {
-                detail = "that version.dll has no optimizer loader in it - ReShade and other mods use the same filename";
+                detail = "The version.dll here belongs to another mod. ReShade and others use the same file name.";
+            } else if (!dllActive && inTemp) {
+                detail = "Running from inside a zip. Extract every file into the folder with the game's .exe and start the launcher from there.";
             } else if (!dllActive) {
-                detail = "looked in " + baseDir;
+                detail = "Missing " + missing + " in " + ShortPath(baseDir) + ".";
             } else if (compatLayers != null) {
                 detail = compatLayers + " - untick \"Disable fullscreen optimizations\" in its Properties > Compatibility";
             } else {
                 string lastRun = LastProxyResult(baseDir);
-                detail = (lastRun != null && lastRun.StartsWith("ERROR")) ? "last launch: " + lastRun : null;
+                detail = (lastRun != null && lastRun.StartsWith("ERROR")) ? "Last launch: " + lastRun : "Loads when the game starts.";
             }
 
-            if (detail != null) {
-                statusCard.Size = new Size(btnWidth, 72);
-                Label statusWhere = new Label();
-                statusWhere.Text = detail;
-                statusWhere.Font = new Font("Segoe UI", 7f, FontStyle.Regular);
-                statusWhere.ForeColor = Color.FromArgb(150, 163, 178);
-                statusWhere.AutoSize = false;
-                statusWhere.Size = new Size(btnWidth - 20, 28);
-                statusWhere.Location = new Point(10, 42);
-                statusWhere.BackColor = Color.Transparent;
-                statusCard.Controls.Add(statusWhere);
-            }
+            // Up to three wrapped lines, measured rather than assumed, so a long
+            // reason makes the card taller instead of running out of it. The full
+            // folder is on the tooltip for when the shortened one is not enough.
+            Label statusWhere = new Label();
+            statusWhere.Text = detail;
+            statusWhere.Font = new Font("Segoe UI", 7.5f, FontStyle.Regular);
+            statusWhere.ForeColor = Color.FromArgb(150, 163, 178);
+            statusWhere.AutoSize = false;
+            statusWhere.AutoEllipsis = true;
+            int detailH = Math.Min(42, TextRenderer.MeasureText(detail, statusWhere.Font,
+                new Size(btnWidth - 20, 1000), TextFormatFlags.WordBreak).Height);
+            statusWhere.Size = new Size(btnWidth - 20, detailH);
+            statusWhere.Location = new Point(10, 44);
+            statusWhere.BackColor = Color.Transparent;
+            statusCard.Controls.Add(statusWhere);
+            statusCard.Size = new Size(btnWidth, 44 + detailH + 8);
+            toolTip.SetToolTip(statusWhere, "Folder: " + baseDir);
+            toolTip.SetToolTip(statusVal, "Folder: " + baseDir);
 
             leftPanel.Controls.Add(statusCard);
-            y += (detail != null) ? 80 : 62;
+            y += statusCard.Height + 8;
 
             activeCountLabel = new Label();
             activeCountLabel.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
@@ -1145,28 +1280,7 @@ namespace WowOptimizeLauncher {
             logHint.Location = new Point(17, y);
             logHint.BackColor = Color.Transparent;
             leftPanel.Controls.Add(logHint);
-
-            // ── Launch, pinned to the bottom ────────────────────
-            //
-            // Anchored rather than flowed, so the column can gain or lose a
-            // button above without Launch moving. It used to follow the flow
-            // and ended up halfway up the panel with a void underneath.
-            int bottom = leftPanel.Height - 10;
-
-            DarkButton btnExit = new DarkButton(Color.FromArgb(80, 88, 110), false);
-            btnExit.Text = "EXIT LAUNCHER";
-            btnExit.Size = new Size(btnWidth, 30);
-            btnExit.Location = new Point(15, bottom - 30);
-            btnExit.Click += delegate { Application.Exit(); };
-            leftPanel.Controls.Add(btnExit);
-
-            DarkButton btnLaunch = new DarkButton(CyanAccent, true);
-            btnLaunch.Text = "LAUNCH WOW";
-            btnLaunch.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
-            btnLaunch.Size = new Size(btnWidth, 46);
-            btnLaunch.Location = new Point(15, bottom - 30 - 8 - 46);
-            btnLaunch.Click += delegate { LaunchWow(); };
-            leftPanel.Controls.Add(btnLaunch);
+            y += 34;
 
             versionLabel = new Label();
             versionLabel.Text = "v" + APP_VERSION + "-Release";
@@ -1176,6 +1290,40 @@ namespace WowOptimizeLauncher {
             versionLabel.Location = new Point(17, y);
             versionLabel.BackColor = Color.Transparent;
             leftPanel.Controls.Add(versionLabel);
+            y += 18;
+
+            // ── Launch and exit ─────────────────────────────────
+            //
+            // Pinned to the foot of the column, but never on top of the rows
+            // above it. Anchoring alone was not enough: a preset added to the
+            // stack pushed the flow down past the anchor, WinForms paints a
+            // control added later underneath one added earlier, and LAUNCH WOW
+            // ended up behind the status card where nobody could see or press
+            // the one control the tool exists for. So the anchor is a floor, the
+            // flow wins when it runs lower, the panel scrolls if that leaves the
+            // pair off the bottom, and both are brought to the front.
+            int launchY = leftPanel.Height - 10 - 30 - 8 - 46;
+            if (launchY < y + 10) {
+                launchY = y + 10;
+                leftPanel.AutoScroll = true;
+            }
+
+            DarkButton btnLaunch = new DarkButton(CyanAccent, true);
+            btnLaunch.Text = "LAUNCH WOW";
+            btnLaunch.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
+            btnLaunch.Size = new Size(btnWidth, 46);
+            btnLaunch.Location = new Point(15, launchY);
+            btnLaunch.Click += delegate { LaunchWow(); };
+            leftPanel.Controls.Add(btnLaunch);
+            btnLaunch.BringToFront();
+
+            DarkButton btnExit = new DarkButton(Color.FromArgb(80, 88, 110), false);
+            btnExit.Text = "EXIT LAUNCHER";
+            btnExit.Size = new Size(btnWidth, 30);
+            btnExit.Location = new Point(15, launchY + 46 + 8);
+            btnExit.Click += delegate { Application.Exit(); };
+            leftPanel.Controls.Add(btnExit);
+            btnExit.BringToFront();
 
             Controls.Add(leftPanel);
 
@@ -1183,29 +1331,16 @@ namespace WowOptimizeLauncher {
             int rightX = 300;
             int rightW = ClientSize.Width - rightX - 10;
 
-            // Tip label
+            // One plain line where a seven-mark legend used to be. The marks
+            // ([+], [!], [=] and the rest) were how a search told rows apart once
+            // it had dropped the group headings; the headings now stay during a
+            // search, so there is nothing left for a legend to decode.
             Label tipLabel = new Label();
-            // Two lines. It was one line 20 pixels tall holding six marks and a
-            // sentence, so it showed three of the marks and cut the third in half.
-            // The headings inside a tab carry this. The marks come back
-            // onto the rows only while a search has flattened the groups.
-            tipLabel.Text = "[+] faster   [!] not proven   [=] fixes   [.] logging\r\n"
-                          + "[?] diagnostics   [-] changes the look   [x] didn't help";
-            tipLabel.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
-            tipLabel.ForeColor = CyanAccent;
-            tipLabel.AutoSize = false;
-            tipLabel.Size = new Size(rightW - 270, 30);
-            tipLabel.Location = new Point(rightX, 8);
-            toolTip.SetToolTip(tipLabel,
-                "[+] makes the game faster, and something measured it.\r\n"
-                + "[!] should make it faster; not measured yet. Turn one on, "
-                + "play, and the log says what it did.\r\n"
-                + "[=] protects or repairs something; no speed claim.\r\n"
-                + "[?] measures the game, and costs frames to produce the number.\r\n"
-                + "[-] buys frames by changing how the game looks or sounds.\r\n"
-                + "[x] was measured against the client and lost; hover it to read what.\r\n"
-                + "[.] writes a log; negligible cost.\r\n\r\n"
-                + "Hover any feature for what it does.");
+            tipLabel.Text = "Hover a switch to read what it does.";
+            tipLabel.Font = new Font("Segoe UI", 8.5f, FontStyle.Regular);
+            tipLabel.ForeColor = Color.FromArgb(130, 142, 158);
+            tipLabel.AutoSize = true;
+            tipLabel.Location = new Point(rightX, 16);
             tipLabel.BackColor = Color.Transparent;
             Controls.Add(tipLabel);
 
@@ -1234,28 +1369,47 @@ namespace WowOptimizeLauncher {
             tabs = new DarkTabControl();
             tabs.Location = new Point(rightX, 44);
             tabs.Size = new Size(rightW, ClientSize.Height - 59);
-            tabs.SelectedIndexChanged += delegate {
-                if (searchBox != null) {
-                    FilterFeatures(searchBox.Text);
-                }
-            };
+            // Nothing happens on a tab switch. It used to run the whole search
+            // rebuild - clear all seven tabs, throw away and remake every group
+            // heading, add all two hundred rows back one by one - although what
+            // that builds does not depend on which tab is showing. That is what
+            // made a tab appear half drawn and finish a moment later.
 
             // Create tab pages
+            // The four areas hold what is known to work. Everything not yet
+            // proven in a game has its own tab, and so do the two kinds every
+            // preset leaves off, so a person looking for "what is still unticked
+            // and why" has three named places to look instead of seven headings
+            // spread over four tabs.
             TabPage tpGeneral = CreateTabPage("GENERAL");
             TabPage tpUiLua = CreateTabPage("UI & LUA");
             TabPage tpCombatNet = CreateTabPage("COMBAT & NET");
-            TabPage tpGraphicsSound = CreateTabPage("GRAPHICS & SOUND");
+            TabPage tpGraphicsSound = CreateTabPage("GFX & SOUND");
+            TabPage tpNotProven = CreateTabPage("NOT PROVEN");
+            TabPage tpTried = CreateTabPage("DIDN'T HELP");
+            TabPage tpDiag = CreateTabPage("DIAGNOSTICS");
 
             tabs.TabPages.Add(tpGeneral);
             tabs.TabPages.Add(tpUiLua);
             tabs.TabPages.Add(tpCombatNet);
             tabs.TabPages.Add(tpGraphicsSound);
+            tabs.TabPages.Add(tpNotProven);
+            tabs.TabPages.Add(tpTried);
+            tabs.TabPages.Add(tpDiag);
+
+            // Every tab the same width and all of them on screen. At a fixed 110
+            // pixels six tabs needed 660 of the 610 available and the last ones
+            // sat behind scroll arrows most people never noticed.
+            tabs.ItemSize = new Size(Math.Max(80, (tabs.Width - 6) / tabs.TabPages.Count), 28);
 
             // Get the scroll panels from each tab page
             generalFlow = (FlowLayoutPanel)((Panel)tpGeneral.Controls[0]).Controls[0];
             uiLuaFlow = (FlowLayoutPanel)((Panel)tpUiLua.Controls[0]).Controls[0];
             combatNetFlow = (FlowLayoutPanel)((Panel)tpCombatNet.Controls[0]).Controls[0];
             graphicsSoundFlow = (FlowLayoutPanel)((Panel)tpGraphicsSound.Controls[0]).Controls[0];
+            notProvenFlow = (FlowLayoutPanel)((Panel)tpNotProven.Controls[0]).Controls[0];
+            triedFlow = (FlowLayoutPanel)((Panel)tpTried.Controls[0]).Controls[0];
+            diagFlow = (FlowLayoutPanel)((Panel)tpDiag.Controls[0]).Controls[0];
 
 
 
@@ -1271,6 +1425,19 @@ namespace WowOptimizeLauncher {
 
             Controls.Add(tabs);
             ResumeLayout(false);
+
+            // A tab page nobody has opened has no windows for its rows yet, so
+            // the first time it is shown Windows creates a hundred of them and
+            // the page fills in over a visible moment - measured at 40 ms for
+            // the NOT PROVEN tab against 15 ms on a return visit. Selecting
+            // every page once in Load, when the form has a window but is not
+            // yet on screen, makes WinForms build each page's contents then,
+            // where nobody sees it. Asking each row for its handle in Shown was
+            // tried first and did not do it: the window count at start rose by
+            // the pages and their panels, not by the rows.
+            Load += delegate {
+                for (int i = tabs.TabPages.Count - 1; i >= 0; i--) tabs.SelectedIndex = i;
+            };
         }
 
         private void FilterFeatures(string query) {
@@ -1293,7 +1460,8 @@ namespace WowOptimizeLauncher {
         // is the same word twice.
         private void Rebuild(string query) {
             if (generalFlow == null || uiLuaFlow == null ||
-                combatNetFlow == null || graphicsSoundFlow == null) {
+                combatNetFlow == null || graphicsSoundFlow == null ||
+                notProvenFlow == null || triedFlow == null || diagFlow == null) {
                 return;
             }
 
@@ -1301,8 +1469,13 @@ namespace WowOptimizeLauncher {
             bool hasSearch = !string.IsNullOrEmpty(query);
 
             FlowLayoutPanel[] flows = new FlowLayoutPanel[] {
-                generalFlow, uiLuaFlow, combatNetFlow, graphicsSoundFlow
+                generalFlow, uiLuaFlow, combatNetFlow, graphicsSoundFlow,
+                notProvenFlow, triedFlow, diagFlow
             };
+            // Laid out once at the end. Without this every row added repositioned
+            // every row already there, which on a tab of a hundred rows is ten
+            // thousand placements for one keystroke in the search box.
+            for (int i = 0; i < flows.Length; i++) flows[i].SuspendLayout();
             // The checkboxes are made once and reused, so they are only removed.
             // The group headings are made fresh every time this runs, which is
             // every keystroke in the search box, so they have to be disposed or
@@ -1322,26 +1495,66 @@ namespace WowOptimizeLauncher {
                     !hasSearch || pair.Key.ToLower().Contains(query);
             }
 
+            // Headings stay while searching. They used to be dropped and each
+            // row prefixed with a mark instead - [+], [!], [=] - which then
+            // needed a legend at the top of the window to be read at all. A
+            // heading over the matches says the same thing in words.
             for (int f = 0; f < flows.Length; f++) {
-                for (int k = 0; k < Kinds.Order.Length; k++) {
-                    string kind = Kinds.Order[k];
+                bool byArea = (flows[f] == notProvenFlow);
+                string[] groups = byArea ? AreaOrder : Kinds.Order;
+                for (int k = 0; k < groups.Length; k++) {
                     bool headed = false;
 
                     foreach (KeyValuePair<string, SettingItem> pair in settingsMap) {
                         SettingItem data = pair.Value;
                         if (data.Ctrl == null || !data.Ctrl.Visible) continue;
                         if (FlowFor(data) != flows[f]) continue;
-                        if (Kinds.Of(data.Key, data.Experimental) != kind) continue;
+                        string group = byArea ? data.Section : Kinds.Of(data.Key, data.Experimental);
+                        if (group != groups[k]) continue;
 
-                        if (!headed && !hasSearch) {
-                            flows[f].Controls.Add(MakeGroupHeader(Kinds.Heading(kind)));
+                        if (!headed) {
+                            flows[f].Controls.Add(MakeGroupHeader(
+                                byArea ? AreaHeading(groups[k]) : Kinds.Heading(groups[k])));
                             headed = true;
                         }
-                        data.Ctrl.Text = hasSearch ? (kind + " " + pair.Key) : pair.Key;
+                        data.Ctrl.Text = pair.Key;
                         flows[f].Controls.Add(data.Ctrl);
                     }
                 }
             }
+            for (int i = 0; i < flows.Length; i++) flows[i].ResumeLayout(true);
+        }
+
+        // The order areas are listed in on the NOT PROVEN tab, and what each
+        // is called there. The keys are the ini sections.
+        private static readonly string[] AreaOrder = new string[] {
+            "General", "UI_Lua", "Combat_Net", "Graphics_Sound"
+        };
+
+        private static string AreaHeading(string section) {
+            if (section == "General")        return "GENERAL";
+            if (section == "UI_Lua")         return "UI AND LUA";
+            if (section == "Combat_Net")     return "COMBAT AND NETWORK";
+            if (section == "Graphics_Sound") return "GRAPHICS AND SOUND";
+            return section.ToUpper();
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetLongPathName(string shortPath, StringBuilder longPath, int size);
+
+        private static string LongPath(string path) {
+            if (string.IsNullOrEmpty(path)) return path;
+            StringBuilder sb = new StringBuilder(1024);
+            int n = GetLongPathName(path, sb, sb.Capacity);
+            return (n > 0 && n < sb.Capacity) ? sb.ToString() : path;
+        }
+
+        private static string ShortPath(string dir) {
+            string d = dir.TrimEnd(Path.DirectorySeparatorChar);
+            string[] parts = d.Split(Path.DirectorySeparatorChar);
+            if (parts.Length <= 3) return d;
+            return "..." + Path.DirectorySeparatorChar + parts[parts.Length - 2]
+                 + Path.DirectorySeparatorChar + parts[parts.Length - 1];
         }
 
         private Label MakeGroupHeader(string text) {
@@ -1396,13 +1609,23 @@ namespace WowOptimizeLauncher {
         // filter route through here, because they are the two places that have
         // already drifted apart once and emptied a tab between them.
         //
-        // There is no Experimental tab any more. It was a maturity axis wearing
-        // a category tab's clothes, and it held nearly half the switches, so
-        // the four real categories were half empty and nothing could be found
-        // where its name said it would be. Maturity is a property of a switch,
-        // not a place to keep it, so it is a mark on the row instead - [!] for
-        // what should help and has not been proven.
+        // What a switch is decides its tab before which part of the game it
+        // touches does. The four area tabs hold what has been shown to work;
+        // anything not yet proven in a game, anything measured and lost, and
+        // anything that only measures has a tab of its own.
+        //
+        // An Experimental tab existed once and was removed because it held
+        // nearly half the switches and left the area tabs thin. It is back, on
+        // purpose, for the same reason it was removed: more than half of the
+        // switches are still unproven, and mixing them into the area tabs made
+        // a tab that looked like a list of things that work into mostly things
+        // nobody has run. Inside it they are grouped by area, so the areas are
+        // still findable.
         private FlowLayoutPanel FlowFor(SettingItem data) {
+            string kind = Kinds.Of(data.Key, data.Experimental);
+            if (kind == Kinds.Lost) return triedFlow;
+            if (kind == Kinds.Diag || kind == Kinds.Log) return diagFlow;
+            if (kind == Kinds.Unproven) return notProvenFlow;
             switch (data.Section) {
                 case "General":        return generalFlow;
                 case "UI_Lua":         return uiLuaFlow;
@@ -1620,9 +1843,9 @@ namespace WowOptimizeLauncher {
                 + "Off: everything that measures the game, everything that buys "
                 + "frames by changing how it looks or sounds, and the few that "
                 + "were measured against the client and lost.\r\n\r\n"
-                + left.ToString() + " switch(es) marked [+] or [!] were left at "
-                + "their own default, because an unproven replacement should not "
-                + "be turned on by a button that says performance.\r\n\r\n"
+                + left.ToString() + " experimental switch(es) were left at their "
+                + "own default. Nobody has run them in a game yet, and a button "
+                + "called performance should not be the thing that turns them on.\r\n\r\n"
                 + "Saved. Launch when ready.",
                 "Max Performance", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -1632,6 +1855,78 @@ namespace WowOptimizeLauncher {
         
         
         
+
+        // The session that turns an unproven replacement into a proven one.
+        //
+        // Every switch on the NOT PROVEN tab was written against the disassembly,
+        // verified offline where the maths allows it, and never run in a game.
+        // They stay off for everyone until a log says otherwise, and nothing in
+        // this launcher asked for that log: MAX PERFORMANCE deliberately leaves
+        // them at their own default, which is off, so pressing every button in
+        // the tool still produced a session that measured none of them.
+        //
+        // The profiler comes with them, because a session that proves a
+        // replacement safe and cannot say what the frame time was spent on
+        // answers half the question. The censuses stay off - they cost frames
+        // and would move the very numbers this run is for.
+        private void SetUpProvingRun() {
+            int unproven = 0, on = 0, off = 0;
+            // Counted by reason, so the message can say what it left off and
+            // where to find it rather than leaving a tester to hunt for the
+            // boxes that are still unticked.
+            int diagOff = 0, lostOff = 0, tradeOff = 0;
+            foreach (SettingItem item in settingsMap.Values) {
+                if (item.Ctrl == null) continue;
+                bool want;
+                if (item.Key == "SamplingProfiler") {
+                    want = true;
+                } else if (item.Key == "FrameLimiter") {
+                    // A run that spends its frames waiting measures nothing: the
+                    // profile fills with the wait and every share in it is a
+                    // share of whatever is left. This one switch is the
+                    // difference between a log that answers the question and a
+                    // log that cannot.
+                    want = false;
+                } else if (item.Experimental) {
+                    // Only the ones that are a replacement for something the
+                    // client does. A census is experimental too and belongs off.
+                    want = Kinds.IsReplacement(item.Key);
+                    if (want) unproven++;
+                } else {
+                    want = Kinds.HelpsSpeed(item.Key);
+                }
+                item.Ctrl.Checked = want;
+                if (want) {
+                    on++;
+                } else {
+                    off++;
+                    string kind = Kinds.Of(item.Key, item.Experimental);
+                    if (kind == Kinds.Diag || kind == Kinds.Log) diagOff++;
+                    else if (kind == Kinds.Lost) lostOff++;
+                    else if (kind == Kinds.Trade) tradeOff++;
+                }
+            }
+            UpdateActiveModulesCount();
+            SaveSettings();
+            MessageBox.Show(
+                unproven.ToString() + " unproven replacement(s) on, " + on.ToString()
+                + " features on in all.\r\n\r\n"
+                + "Each one checks its answers against the game's before it answers "
+                + "anything, and switches itself off at the first disagreement. "
+                + "Nothing here changes how the game looks or sounds.\r\n\r\n"
+                + "Left off on purpose: " + diagOff.ToString() + " under the "
+                + "DIAGNOSTICS tab, which cost frames and would move the very numbers "
+                + "this run is for; " + lostOff.ToString() + " under TRIED, DIDN'T HELP, "
+                + "each measured against the game and beaten by it; " + tradeOff.ToString()
+                + " that buy frames by changing how the game looks or sounds, which is "
+                + "your call and not this button's; and the frame rate limiter, because a "
+                + "capped session measures nothing.\r\n\r\n"
+                + "Play normally for half an hour or more, then send "
+                + "Logs\\wow_optimize.log. Press MAX PERFORMANCE or DEFAULT to put "
+                + "it back.\r\n\r\nSaved. Launch when ready.",
+                "Try the unproven ones", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
         private void RestoreDefaults() {
             foreach (SettingItem item in settingsMap.Values) {
                 if (item.Ctrl != null) {

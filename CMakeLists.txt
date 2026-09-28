@@ -166,13 +166,31 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/objmgr_find_fast.cpp
     src/hooks_subsystems/anim_lod.cpp
     src/simd_math/collision_outcode_sse2.cpp
+    src/simd_math/collision_model_cache_sse2.cpp
     src/simd_math/collision_ray_outcode_sse2.cpp
     src/simd_math/x87_precision_check.cpp
     src/simd_math/ray_triangle_sse2.cpp
+    src/simd_math/occluder_sphere_sse2.cpp
+    src/simd_math/m2_anim_find_key_fast.cpp
     src/simd_math/aabb_overlap_sse2.cpp
     src/simd_math/anim_quat_unpack_sse2.cpp
     src/simd_math/anim_vec3_track_sse2.cpp
+    src/simd_math/anim_scalar_track_sse2.cpp
+    src/simd_math/anim_spline_track_sse2.cpp
+    src/simd_math/anim_spline_track_sse2.h
+    src/simd_math/aabb_transform_sse2.cpp
+    src/simd_math/aabb_transform_sse2.h
+    src/simd_math/color_unpack_sse2.cpp
+    src/simd_math/color_unpack_sse2.h
     src/hooks_subsystems/m2_sort_key_cache.cpp
+    src/hooks_subsystems/m2_batch_sort.cpp
+    src/simd_math/collision_poly_clip_sse2.cpp
+    src/hooks_subsystems/sky_texture_reuse.cpp
+    src/hooks_subsystems/sky_cloud_texels.cpp
+    src/simd_math/particle_track_eval_sse2.cpp
+    src/simd_math/shader_const_dedup_sse2.cpp
+    src/simd_math/batch_colour_convert.cpp
+    src/simd_math/floor_split_sse2.cpp
     src/simd_math/frustum_aabb_sse2.cpp
     src/simd_math/segment_aabb_sse2.cpp
     src/runtime_vm/lua_hget_dispatch.cpp
@@ -184,9 +202,17 @@ add_library(wow_optimize SHARED
     src/simd_math/bone_matrix_upload_sse2.cpp
     src/simd_math/ui_batch_fill_sse2.cpp
     src/simd_math/particle_fill_sse2.cpp
+    src/runtime_vm/lua_vm_fast.cpp
+    src/runtime_vm/lua_vm_fast.h
     src/simd_math/m2_matrix_slot_sse2.cpp
+    src/simd_math/m2_batch_matrix_sse2.cpp
+    src/simd_math/m2_batch_matrix_sse2.h
     src/hooks_subsystems/m2_anim_stride.cpp
     src/hooks_subsystems/m2_anim_reuse.cpp
+    src/hooks_subsystems/world_vis_traverse_sse2.cpp
+    src/hooks_subsystems/world_vis_traverse_sse2.h
+    src/hooks_subsystems/ui_strata_opt.cpp
+    src/hooks_subsystems/ui_strata_opt.h
     src/allocators/mimalloc_high_arena.cpp
     src/allocators/high_placement.cpp
     src/hooks_subsystems/client_write_batch.cpp
@@ -228,6 +254,7 @@ add_library(wow_optimize SHARED
     src/runtime_vm/lua_gc_fast.cpp
     src/runtime_vm/lua_gc_fast.h
     src/runtime_vm/lua_gc_governor.cpp
+    src/runtime_vm/lua_gc_pace.cpp
     src/runtime_vm/lua_gc_governor.h
     src/hooks_subsystems/sound_mixer_opt.cpp
     src/hooks_subsystems/sound_mixer_opt.h
@@ -510,6 +537,94 @@ add_library(wow_optimize SHARED
     src/hooks_subsystems/texture_unload_delay.h
     src/hooks_subsystems/spell_effect_culling.cpp
     src/hooks_subsystems/spell_effect_culling.h
+    src/simd_math/collision_ray_verts_sse2.cpp
+    src/simd_math/collision_ray_verts_sse2.h
+    src/hooks_subsystems/fmod_parameq_sse2.cpp
+    src/hooks_subsystems/fmod_parameq_sse2.h
+    src/hooks_subsystems/ui_rect_subdivide_sse2.cpp
+    src/hooks_subsystems/ui_rect_subdivide_sse2.h
+    src/hooks_subsystems/scene_vis_traverse_sse2.cpp
+    src/hooks_subsystems/scene_vis_traverse_sse2.h
+    src/simd_math/particle_physics_sse2.cpp
+    src/simd_math/particle_physics_sse2.h
+    src/simd_math/collision_reset_visited.cpp
+    src/simd_math/collision_reset_visited.h
+    src/hooks_subsystems/ui_strata_compact_sse2.cpp
+    src/hooks_subsystems/ui_strata_compact_sse2.h
+    src/simd_math/dbc_fast_rle.cpp
+    src/simd_math/dbc_fast_rle.h
+    src/simd_math/pixel_format_blit_sse2.cpp
+    src/simd_math/pixel_format_blit_sse2.h
+    src/hooks_subsystems/ui_frame_remove.cpp
+    src/hooks_subsystems/ui_frame_remove.h
+    src/hooks_subsystems/m2_batch_cmp_transparent.cpp
+    src/hooks_subsystems/m2_batch_cmp_transparent.h
+    src/hooks_subsystems/m2_batch_cmp_solid.cpp
+    src/hooks_subsystems/m2_batch_cmp_solid.h
+    src/simd_math/particle_quad_sse2.cpp
+    src/simd_math/particle_quad_sse2.h
+    src/simd_math/horizon_test_sse2.cpp
+    src/simd_math/horizon_test_sse2.h
+    src/simd_math/m2_skin_proj_fast.cpp
+    src/simd_math/m2_skin_proj_fast.h
+    src/hooks_subsystems/sstr_hash_fast.cpp
+    src/hooks_subsystems/sstr_hash_fast.h
+    src/hooks_subsystems/reverb_clear_fast.cpp
+    src/hooks_subsystems/reverb_clear_fast.h
+    src/hooks_subsystems/ui_layout_rect_fast.cpp
+    src/hooks_subsystems/ui_layout_rect_fast.h
+    src/hooks_subsystems/ui_strata_overlap_fast.cpp
+    src/hooks_subsystems/ui_strata_overlap_fast.h
+    src/simd_math/particle_integrate_fast.cpp
+    src/simd_math/particle_integrate_fast.h
+    src/simd_math/sincos_fast_sse2.cpp
+    src/simd_math/sincos_fast_sse2.h
+    src/hooks_subsystems/m2_batch_cmp_top.cpp
+    src/hooks_subsystems/m2_batch_cmp_top.h
+    src/hooks_subsystems/particle_emitter_active.cpp
+    src/hooks_subsystems/particle_emitter_active.h
+    src/simd_math/collision_face_clip_sse2.cpp
+    src/simd_math/collision_face_clip_sse2.h
+    src/simd_math/collision_poly_copy_sse2.cpp
+    src/simd_math/collision_poly_copy_sse2.h
+    src/simd_math/mat3_rot_axis_sse2.cpp
+    src/simd_math/mat3_rot_axis_sse2.h
+    src/simd_math/m2_mesh_pick_fast.cpp
+    src/simd_math/m2_mesh_pick_fast.h
+    src/simd_math/m2_collision_outcode_sse2.cpp
+    src/simd_math/m2_collision_outcode_sse2.h
+    src/simd_math/collision_tri_test.cpp
+    src/simd_math/collision_tri_test.h
+    src/simd_math/collision_box_tri.cpp
+    src/simd_math/collision_box_tri.h
+    src/hooks_subsystems/m2_ray_hit_sort.cpp
+    src/hooks_subsystems/m2_ray_hit_sort.h
+    src/simd_math/terrain_point_outcode_sse2.cpp
+    src/simd_math/terrain_point_outcode_sse2.h
+    src/simd_math/collision_bsp_traverse_sse2.cpp
+    src/simd_math/collision_bsp_traverse_sse2.h
+    src/simd_math/scene_light_grid_sse2.cpp
+    src/simd_math/scene_light_grid_sse2.h
+    src/simd_math/collision_swept_bsp_sse2.cpp
+    src/simd_math/collision_swept_bsp_sse2.h
+    src/simd_math/terrain_chunk_sort_sse2.cpp
+    src/simd_math/terrain_chunk_sort_sse2.h
+    src/simd_math/collision_frustum_bsp_sse2.cpp
+    src/simd_math/collision_frustum_bsp_sse2.h
+    src/simd_math/collision_swept_tri_sse2.cpp
+    src/simd_math/collision_swept_tri_sse2.h
+    src/hooks_subsystems/scene_entity_collect_fast.cpp
+    src/hooks_subsystems/scene_entity_collect_fast.h
+    src/hooks_subsystems/m2_batch_cmp_skin.cpp
+    src/hooks_subsystems/m2_batch_cmp_skin.h
+    src/simd_math/collision_bsp_leaf_sse2.cpp
+    src/simd_math/collision_bsp_leaf_sse2.h
+    src/simd_math/collision_swept_leaf_sse2.cpp
+    src/simd_math/collision_swept_leaf_sse2.h
+    src/simd_math/collision_segment_bsp_sse2.cpp
+    src/simd_math/collision_segment_bsp_sse2.h
+    src/simd_math/collision_segment_leaf_sse2.cpp
+    src/simd_math/collision_segment_leaf_sse2.h
 )
 
 target_link_libraries(wow_optimize PRIVATE
@@ -522,6 +637,45 @@ target_link_libraries(wow_optimize PRIVATE
 )
 
 target_link_options(wow_optimize PRIVATE /MAP)
+
+# The sampling profiler resolves an address inside this DLL to the nearest
+# symbol it was handed at runtime, and those are entry points with no size, so a
+# sample landing in an unregistered neighbour used to be printed under the name
+# above it. The linker already knows every function's address; this turns the
+# map it writes into a small table the profiler reads at startup, so a profile
+# names our own code exactly rather than guessing.
+#
+# The generator is written out at configure time rather than kept as a separate
+# script, so the build stays one file. The .sym is optional at runtime: without
+# it the profiler falls back to the registered entry points and says so.
+set(WO_SYMGEN "${CMAKE_CURRENT_BINARY_DIR}/wo_make_sym.cmake")
+file(WRITE "${WO_SYMGEN}" [=[
+file(STRINGS "${MAPFILE}" lines)
+set(base "")
+set(out "")
+foreach(line IN LISTS lines)
+  if(base STREQUAL "" AND line MATCHES "Preferred load address is ([0-9a-fA-F]+)")
+    set(base "${CMAKE_MATCH_1}")
+  endif()
+  if(NOT base STREQUAL "" AND line MATCHES "^ [0-9a-fA-F]+:[0-9a-fA-F]+ +([^ ]+) +([0-9a-fA-F]+) f")
+    set(name "${CMAKE_MATCH_1}")
+    set(rvabase "${CMAKE_MATCH_2}")
+    math(EXPR rva "0x${rvabase} - 0x${base}" OUTPUT_FORMAT HEXADECIMAL)
+    string(SUBSTRING "${name}" 0 63 name)
+    string(APPEND out "${rva} ${name}
+")
+  endif()
+endforeach()
+file(WRITE "${SYMFILE}" "${out}")
+]=])
+
+add_custom_command(TARGET wow_optimize POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+            -DMAPFILE=$<TARGET_FILE_DIR:wow_optimize>/wow_optimize.map
+            -DSYMFILE=$<TARGET_FILE_DIR:wow_optimize>/wow_optimize.sym
+            -P "${WO_SYMGEN}"
+    COMMENT "Writing wow_optimize.sym from the linker map"
+    VERBATIM)
 
 target_include_directories(wow_optimize PRIVATE
     ${minhook_SOURCE_DIR}/include

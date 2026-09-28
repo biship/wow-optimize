@@ -4,6 +4,7 @@
 #include "config.h"
 #include <atomic>
 #include <cmath>
+#include <cstring>
 
 extern "C" void Log(const char* fmt, ...);
 
@@ -23,6 +24,21 @@ namespace SpellEffectCulling {
     // one situation this feature exists for, a screen full of spell effects.
     static int g_frameSpawnCount = 0;
     static int g_lastFrameSpawnCount = 0;
+
+    // What the session did, because until now it could not say.
+    //
+    // This feature buys frames by drawing fewer particles, which is a trade the
+    // player is entitled to judge - and there was nothing to judge it on. It
+    // logged a line only while the density was down, so a session where it
+    // never fired and a session where it was never installed read the same.
+    // These are plain counters on the main thread; a particle spawn is a lock
+    // xadd's worth of cost away from being free, which is the one situation
+    // this exists for.
+    static unsigned long long g_frames = 0;
+    static unsigned long long g_spawnTotal = 0;
+    static int g_peakSpawns = 0;
+    static float g_lowestScale = 1.0f;
+    static unsigned long long g_framesScaled = 0;   // frames where it cut anything
 
     // ---- Density Getter Hook ----
     // sub_980ED0 returns flt_B2D678 (the particleDensity CVar value).
@@ -58,6 +74,16 @@ namespace SpellEffectCulling {
 
         // Hook sub_980ED0 - particle density getter
         void* target_DensityGetter = (void*)0x00980ED0;
+        if (!WowOpt_ClientPatchAllowed(target_DensityGetter)) {
+            Log("[SpellEffectCulling] NOT active: client patches disallowed at 0x%08X", (uintptr_t)target_DensityGetter);
+            return false;
+        }
+        static const unsigned char kExpDensity[8] = { 0xD9, 0x05, 0x78, 0xD6, 0xB2, 0x00, 0xC3, 0xCC };
+        if (std::memcmp(target_DensityGetter, kExpDensity, sizeof(kExpDensity)) != 0) {
+            Log("[SpellEffectCulling] BAD PROLOGUE at 0x00980ED0");
+            return false;
+        }
+
         if (WineSafe_CreateHook(target_DensityGetter, (void*)Hooked_DensityGetter, (void**)&orig_DensityGetter) != MH_OK) {
             Log("[SpellEffectCulling] Failed to hook DensityGetter (0x980ED0)");
             return false;
@@ -69,6 +95,16 @@ namespace SpellEffectCulling {
 
         // Hook sub_97D820 - per-particle spawn function
         void* target_ParticleSpawn = (void*)0x0097D820;
+        if (!WowOpt_ClientPatchAllowed(target_ParticleSpawn)) {
+            Log("[SpellEffectCulling] NOT active: client patches disallowed at 0x%08X", (uintptr_t)target_ParticleSpawn);
+            return false;
+        }
+        static const unsigned char kExpParticle[8] = { 0x55, 0x8B, 0xEC, 0x51, 0x56, 0x57, 0x8B, 0xF9 };
+        if (std::memcmp(target_ParticleSpawn, kExpParticle, sizeof(kExpParticle)) != 0) {
+            Log("[SpellEffectCulling] BAD PROLOGUE at 0x0097D820");
+            return false;
+        }
+
         if (WineSafe_CreateHook(target_ParticleSpawn, (void*)Hooked_ParticleSpawn, (void**)&orig_ParticleSpawn) != MH_OK) {
             Log("[SpellEffectCulling] Failed to hook ParticleSpawn (0x97D820)");
             return false;
@@ -115,6 +151,10 @@ namespace SpellEffectCulling {
             target = 0.10f;      // Emergency minimum
         }
 
+        ++g_frames;
+        g_spawnTotal += (unsigned long long)spawns;
+        if (spawns > g_peakSpawns) g_peakSpawns = spawns;
+
         g_scaleFactor = target;
 
         // Exponential moving average for smooth transitions (avoid particle pop-in/out)
@@ -124,6 +164,8 @@ namespace SpellEffectCulling {
         // Clamp to sane range
         if (g_smoothedScale < 0.10f) g_smoothedScale = 0.10f;
         if (g_smoothedScale > 1.0f)  g_smoothedScale = 1.0f;
+        if (g_smoothedScale < g_lowestScale) g_lowestScale = g_smoothedScale;
+        if (g_smoothedScale < 0.995f) ++g_framesScaled;
 
         // Log significant density changes (but not every frame to avoid spam)
         static int logThrottle = 0;
@@ -135,6 +177,40 @@ namespace SpellEffectCulling {
                     spawns, g_scaleFactor * 100.0f, g_smoothedScale * 100.0f);
                 lastLoggedScale = g_smoothedScale;
             }
+        }
+    }
+
+    void LogStats() {
+        if (!Config::g_settings.OptSpellEffectCulling) {
+            Log("[SpellEffectCulling] not measured: switched off.");
+            return;
+        }
+        if (!g_enabled) {
+            Log("[SpellEffectCulling] not measured: it did not install - the reason "
+                "is at the top of this log.");
+            return;
+        }
+        if (g_frames == 0) {
+            Log("[SpellEffectCulling] measured and zero: installed, and no frame has "
+                "reached it yet.");
+            return;
+        }
+        Log("[SpellEffectCulling] %llu frame(s), %llu particle spawn(s), %.0f a frame "
+            "on average, busiest frame %d. Counts are plain increments and lower "
+            "bounds.", g_frames, g_spawnTotal,
+            (double)g_spawnTotal / (double)g_frames, g_peakSpawns);
+        if (g_framesScaled == 0) {
+            Log("[SpellEffectCulling]   it never cut anything: no frame passed 2000 "
+                "spawns, which is where the first step is. On this session it was a "
+                "hook that counted and changed nothing you could see.");
+        } else {
+            Log("[SpellEffectCulling]   %llu frame(s) - %.1f%% - drew fewer particles "
+                "than the game asked for, and the density went as low as %.0f%% of "
+                "what you set. That is what it bought its frames with; whether the "
+                "trade is worth it is yours to judge and this is the number to judge "
+                "it on.", g_framesScaled,
+                100.0 * (double)g_framesScaled / (double)g_frames,
+                g_lowestScale * 100.0f);
         }
     }
 

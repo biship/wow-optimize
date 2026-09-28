@@ -1,8 +1,8 @@
 #pragma once
 
 #define WOW_OPTIMIZE_VERSION_MAJOR  3
-#define WOW_OPTIMIZE_VERSION_MINOR  19
-#define WOW_OPTIMIZE_VERSION_PATCH  3
+#define WOW_OPTIMIZE_VERSION_MINOR  20
+#define WOW_OPTIMIZE_VERSION_PATCH  0
 #define WOW_OPTIMIZE_VERSION_BUILD  0
 
 // Built from the numbers above rather than written out again. They had drifted:
@@ -360,7 +360,47 @@
 // this[8+i]). 3 dot products vectorized; only this[12..14] are written (this[15]
 // preserved, never stored). Same products as the FPU original (summation order
 // sub-ULP). In-place accumulate -> own isolation flag. Pointer-validated + SEH.
-#define TEST_DISABLE_MATRIX_TRANSLATE_SSE2         1
+#define TEST_DISABLE_MATRIX_TRANSLATE_SSE2         0
+
+// SSE2 in-place CMatrix::RotateX, RotateY, RotateZ (sub_4C3300, sub_4C3340, sub_4C3380,
+// 56 callers total across rendering, camera, particles, and models). Evaluates
+// axis-aligned rotation via fsincos in double precision directly updating only
+// the 2 rotating rows, bypassing stack-allocated temporary matrices, zero-multiplications,
+// and redundant memcpy operations. Pointer-validated + SEH + shadow verification.
+#define TEST_DISABLE_MATRIX_ROTATE_SSE2         0
+
+// SSE2 CMatrix::MultiplyInPlace (sub_4C2370, 27 callers), CMatrix::ScaleLocal
+// (sub_4C1B90, 18 callers), CMatrix::Scale3x3 (sub_4C1BF0, 36 callers),
+// CMatrix::CreateRotateX (sub_4C31B0, 8 callers), CMatrix::CreateRotateY
+// (sub_4C3220, 8 callers), CMatrix::CreateRotateZ (sub_4C3290, 13 callers),
+// CMatrix::CreateRotateAxisAngle (sub_4C3460, 13 callers), CMatrix::RotateQuat
+// (sub_4C33C0, 4 callers), Vec3_Scale (sub_4C35A0, 2 callers), and Vec3_InvScale
+// (sub_4C35D0, 4 callers).
+// Vectorizes in-place 4x4 matrix multiplication, 3-axis and uniform scaling,
+// arbitrary axis-angle/quaternion rotation, and 3D vector scaling in IEEE double
+// precision matching stock accumulation order. Pointer-validated + SEH + shadow verification.
+#define TEST_DISABLE_MATRIX_OPS_SSE2            0
+
+// SSE2 bounding box transformation, vertex bounding, and vector extremum math:
+//   sub_7F9430 / AABB_Transform (4x4 matrix, 22 callers), sub_7F93D0 / AABB_Transform3x3 (3x3 matrix),
+//   sub_984860 / AABB_TransformAffine (math 4x4 matrix, 6 callers: M2 model bounds, terrain WMO, culling),
+//   sub_984930 / AABB_FromVertices (10 callers), sub_715130 / CAxisAlignedBox::Union (17 callers),
+//   sub_714D10 / Vec3_Min (4 callers), sub_714D70 / Vec3_Max (4 callers).
+// Vectorizes 3D bounding box transformation (Jim Arvo's algorithm), union, and coordinate
+// extrema using hardware SSE2 minps/maxps and packed double precision, eliminating serialized
+// status-word round trips (fnstsw ax), nested stack frames, and branch mispredictions.
+#define TEST_DISABLE_AABB_FROM_VERTS_SSE2       0
+
+// SSE2 color conversion, packing, and vector coordinate extremum math:
+//   sub_984C90 / Color_UnpackBGRA (12 callers), sub_982970 / Color_UnpackBGR (6 callers),
+//   sub_48BD20 / Color_PackBGRA (21 callers), sub_9851A0 / Color_PackBGR (7 callers),
+//   sub_984F60 / Color_RGBToHSV (5 callers), sub_985030 / Color_HSVToRGB (8 callers),
+//   sub_9829B0 / Vec3_DominantAxis (8 callers), sub_9829F0 / Vec3_RecessiveAxis (1 caller).
+// Unpacks/packs 32-bit BGRA and 24-bit BGR colors in parallel using integer unpack/pack
+// and SSE conversion/multiply, eliminating stack spills and 8 pipeline-flushing fldcw
+// instructions. Vectorizes RGB-to-HSV and HSV-to-RGB color space conversions, evaluating
+// coordinate magnitudes branchlessly using bitwise IEEE fabs.
+#define TEST_DISABLE_COLOR_UNPACK_SSE2          0
 
 // Quaternion -> 3x3 rotation matrix (sub_4C1C40), the arithmetic core behind
 // all three of the client's quaternion wrappers. Runs once per animated bone
@@ -717,7 +757,7 @@
 //  Vec3Cross 0x5FEC70, IsSphereVisible 0x983D20, FromAngleAxis 0x982400,
 //  QuatSlerp 0x982460. IsSphereVisible + FromAngleAxis had __fastcall→__thiscall
 //  calling-convention bugs fixed (disassembly-verified). Default ENABLED.
-#define TEST_DISABLE_VEC3_CROSS_SSE2         1
+#define TEST_DISABLE_VEC3_CROSS_SSE2         0
 // IsSphereVisible DISABLED: second-pass _MM_TRANSPOSE4_PS mixes zeros into plane
 // normals (only 2 of 4 inputs are actual planes), corrupting frustum culling for
 // planes 4-5 and causing camera to clip through player character (zoom-in bug).

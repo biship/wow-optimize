@@ -24,7 +24,7 @@ The current public build is focused on real frametime stability, long-session sm
 ---
 
 ## Table of Contents
-* [What's New in v3.19.3](#whats-new-in-v3193)
+* [What's New in v3.20.0](#whats-new-in-v3200)
 * [Send me your log](#send-me-your-log)
   * [Measuring rather than reporting](#if-you-want-to-measure-something-rather-than-report-a-bug)
 * [Reviews & Acknowledgments](#reviews)
@@ -39,51 +39,53 @@ The current public build is focused on real frametime stability, long-session sm
 
 ---
 
-## What's New in v3.19.3
+## What's New in v3.20.0
 
 ### Fixed
 
-* **Entering the world with ReShade loaded.** The hook on
-  `InitializeCriticalSection` has its own switch, Critical Section Hook (All
-  Modules), and it is off. Reported by Hoshi [HSR].
-* **Hooks on Windows and CRT exports answer the game only.** ReShade, DXVK,
-  overlays and drivers get the real function. The switch is System Hooks: Game
-  Only.
-* **MAX PERFORMANCE leaves an unproven switch at its own default.** Anything
-  marked `[+]` or `[!]` is yours to tick.
-* **Quitting the game writes no access violation to the log.**
-* **Two clients started from one game folder** each get their own log file and
-  their own compiled-script store.
-* **Manual Lua collection survives a UI reload,** and with it the emergency
-  collection that starts at 300 MB of Lua memory.
-* **An intercepted Lua error keeps its traceback.**
+* **`math.random` could return exactly 1.0.** This tool replaces
+  `math.random` with a faster version, and that version returned 1.0 about
+  once in 32,768 calls, which the game's own never does. QuestHelper's routing
+  printed `no nod :(` each time. The same version drew from a generator that
+  was never seeded, so every addon got the same "random" numbers in every
+  session. It now uses the game's own generator and formula, checked against
+  the game's output for every value that generator can produce. Reported by
+  Feles Noctis.
+* **The Lua compile cache no longer switches itself off** when the name of a
+  script it has already seen moves in memory. It drops that one entry instead.
+* **DXVK is recognised from the details of `d3d9.dll` again** when the other
+  checks do not find it. A typo in a file path had kept that check from ever
+  running.
 
-### Faster
+### Launcher
 
-* **The game's string hash runs on an SSE2 replacement.** The game hashes
-  strings about twenty-seven million times an hour. The replacement is checked
-  against the game's own routine for its first 4096 calls and on one call in a
-  thousand after that; a single disagreement hands every later call back.
-* **Eight of the hottest replacements run without an exception frame** once a
-  million calls have gone by with nothing for the guard to catch.
-* **New SSE2 replacements,** each off by default and each checking itself
-  against the game's own routine before it is used: particle vertex fill, UI
-  batch fill, ray against triangle (1.89x), collision ray outcode (16.43x),
-  quaternion unpack (7.33x).
+* **Switches not yet proven in a game have their own tab, NOT PROVEN.** The
+  other tabs list what is known to work. DIDN'T HELP holds what was measured
+  and lost, and DIAGNOSTICS the switches that only measure.
+* **Switching tabs is immediate.** Every click used to rebuild every tab.
+* **The status box says READY, NOT LOADED or MAY NOT LOAD,** with the reason
+  underneath. Opened straight from the zip, the launcher now says to extract
+  the files first.
+* **TRY THE UNPROVEN ONES** turns on every unproven replacement and the
+  profiler, for a session that tests them. Each replacement checks its answers
+  against the game's own and switches itself off at the first difference.
+* **Ask Windows For A Half-Millisecond Timer can be switched off.** While the
+  game runs, Windows applies that timer setting to the whole machine.
+* Search keeps the group headings, so the `[+]` `[!]` symbol legend is gone.
+
+### New, off by default
+
+* **New replacements** for collision, particles, model animation, draw-order
+  sorting, UI layout and sound. They are on the NOT PROVEN tab, and none of
+  them runs unless you tick it.
 
 ### Reports
 
-* **A marked frame is in the dump it triggered.** The flight recorder keeps the
-  frames nearest the mark.
-* **A slow frame says what ran inside it:** a Lua compile over 20 ms, a change
-  in address-space pressure, a loading boundary, a lua_State swap. When several
-  slow frames share one report, the worst of them is named beside the one
-  written up.
-* **The packet-field fast path and the string-hash replacement report their
-  counters** in the periodic report, and say which of installed, idle and
-  switched off they are.
-* **A crash dump identifies the build it came from** without a log beside it.
-* **The periodic report times every part of itself** and prints what it cost.
+* **The download has a new file, `wow_optimize.sym`.** Next to
+  `wow_optimize.dll` it lets a profile name this tool's own functions. The game
+  runs the same without it; the profile is less precise.
+* **A caught Lua error names the addon it came from,** and a repeated error is
+  no longer written out line after line.
 
 ---
 
@@ -125,7 +127,7 @@ Comparing two sessions compares two different evenings. One session that
 alternates a feature on and off compares the same zone, the same addons and the
 same machine against itself.
 
-Tick **A/B Test a Feature** under General, and tick the features you want
+Tick **A/B Test a Feature** on the DIAGNOSTICS tab, and tick the features you want
 compared. The harness measures a feature that is switched on, because a feature
 registers with it at the moment it installs. These are the ones it can measure:
 
@@ -184,7 +186,7 @@ See what other players say: [Reviews and Testimonials](https://github.com/suprep
 This project wouldn't exist without the community. Every crash report, every bisection test, every "hey this broke my addon" message directly shaped the release. 
 
 Special thanks to:
-Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude, Houmbro
+Morbent, Darkmoore, Ethodeus, Billy Hoyle, tuan, NoGoodLife, feh_dois, David (`_oldq`), Keoo, UNOB, DarkRockDemon, Raymond, Vandal, Mantork, Falcon, Muus, szopachink17, Shandrax, pathetic-lynx, txtsd, Signalborn Soulweaver, Sicsoo, kojekude, Houmbro, Feles Noctis
 
 ### Code contributions
 
@@ -222,6 +224,10 @@ Every measured item in these notes came out of a log somebody sent in.
 - **[biship](https://github.com/suprepupre/wow-optimize/issues/50)** — read the
   timing switch's code and reported that it gated twelve unrelated things and
   described none of them.
+- **Feles Noctis** — QuestHelper printing `no nod :(` several times a minute,
+  with the lines of its router that produced it. That was enough to trace it
+  to this tool's `math.random` returning exactly 1.0, and from there to the
+  unseeded generator behind it.
 
 </details>
 
@@ -468,6 +474,7 @@ Copy into your WoW folder:
 - `wow_optimize_launcher.exe`
 - `version.dll`
 - `wow_optimize.dll`
+- `wow_optimize.sym`
 
 Then run `wow_optimize_launcher.exe` to configure settings, load/save profiles, and click **LAUNCH WOW**.
 
@@ -475,12 +482,14 @@ Then run `wow_optimize_launcher.exe` to configure settings, load/save profiles, 
 Copy into your WoW folder:
 - `version.dll`
 - `wow_optimize.dll`
+- `wow_optimize.sym`
 
 Then launch WoW normally. The proxy DLL will automatically load the optimizer with default settings.
 
 ### Option C - Standalone Loader
 Copy:
 - `wow_optimize.dll`
+- `wow_optimize.sym`
 - your injector
 
 Then inject after WoW starts.
@@ -518,7 +527,7 @@ wow_optimize automatically detects when multiple WoW instances are running.
 
 - Single client:
   - precise sleep
-  - 0.5 ms timer
+  - 0.5 ms timer (switch: Ask Windows For A Half-Millisecond Timer)
 - Multi-client:
   - yield-based sleep
   - 1.0 ms timer
